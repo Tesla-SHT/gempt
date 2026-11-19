@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "magpie": {
+    "base_url": "http://127.0.0.1:3425",
+    "api_key": "",
+    "api_key_env": "GEMPT_MAGPIE_API_KEY",
+    "cli_path": ""
+  },
+  "codex": {
+    "cli_path": "",
+    "default_sandbox": "workspace-write",
+    "approval_policy": "never",
+    "model_provider": "",
+    "extra_args": [],
+    "timeout_sec": 600
+  },
+  "routing_policy": {
+    "failover_mode": "subscription_only",
+    "magpie_group_strategy": "order",
+    "excluded_models": []
+  },
+  "tiers": {
+    "sonnet": {
+      "label": "Sonnet · 日常高频",
+      "when_to_use": "80% 日常写代码、加小功能、改 UI、写脚本",
+      "consult_model": "codex/gpt-6.2-sol",
+      "exec_model": "",
+      "reasoning_effort": "medium",
+      "api_mode": "responses",
+      "max_output_tokens": 16384,
+      "fallback_models": [],
+      "magpie_group_members": [
+        "codex/gpt-6.2-sol"
+      ]
+    },
+    "opus": {
+      "label": "Opus · 复杂工程",
+      "when_to_use": "跨文件重构、读大仓库、复杂逻辑设计与排查（常规 Sol + 疑难 Astra）",
+      "consult_model": "codex/gpt-6.2-sol",
+      "exec_model": "",
+      "escalate_model": "codex/gpt-6.2-astra",
+      "escalate_effort_threshold": "high",
+      "reasoning_effort": "medium",
+      "api_mode": "responses",
+      "max_output_tokens": 24576,
+      "fallback_models": [],
+      "magpie_group_members": [
+        "codex/gpt-6.2-sol",
+        "codex/gpt-6.2-astra"
+      ]
+    },
+    "fable": {
+      "label": "Fable · 顶配攻坚",
+      "when_to_use": "极难 Bug、核心算法/数学推导、长程架构设计",
+      "consult_model": "codex/gpt-6.2-astra",
+      "exec_model": "",
+      "reasoning_effort": "high",
+      "api_mode": "responses",
+      "max_output_tokens": 32768,
+      "fallback_models": [],
+      "magpie_group_members": [
+        "codex/gpt-6.2-astra"
+      ]
+    }
+  },
+  "utility": {
+    "label": "Chore · 免费打杂/压缩/分类",
+    "model": "auto/deepseek-v4.1-flash",
+    "reasoning_effort": "low",
+    "api_mode": "chat",
+    "max_output_tokens": 4096,
+    "fallback_models": [],
+    "use_for_magpie_compact": true,
+    "use_as_classifier": false
+  },
+  "limits": {
+    "max_internal_rounds": 3,
+    "max_context_file_bytes": 131072,
+    "max_total_context_bytes": 393216,
+    "consult_timeout_sec": 180
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "gempt": {
+      "command": "python",
+      "args": ["-m", "gempt.mcp_server"],
+      "env": {
+        "PYTHONPATH": "src",
+        "PYTHONUTF8": "1"
+      }
+    }
+  }
+}

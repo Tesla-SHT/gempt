@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gempt"
+version = "0.1.0"
+description = "Dual-mode GPT/Codex orchestrator, Magpie 3-tier router, and Antigravity plugin for Gemini-to-GPT delegation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+gempt = "gempt.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
