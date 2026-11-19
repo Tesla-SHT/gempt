@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>GemPT</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="page-header">
+      <div class="header-left">
+        <svg class="brand-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M5 17.5L10.5 6.5L14 13L18 8.5L15.5 17.5H5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+          <circle cx="18" cy="6" r="1.6" fill="currentColor"/>
+        </svg>
+        <h1 class="brand-name">GemPT</h1>
+        <span class="header-dot-sep" aria-hidden="true">·</span>
+        <span id="magpie-status" class="live-indicator" data-state="checking">
+          <span class="live-dot" aria-hidden="true"></span>
+          <span id="magpie-status-text">检查连接中…</span>
+        </span>
+      </div>
+      <div class="header-right">
+        <span class="role-caption">Antigravity 原生 Gemini → Magpie Codex</span>
+        <button id="refresh-btn" type="button" class="icon-btn" aria-label="刷新状态" title="刷新状态">
+          <svg class="icon-svg" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M13.5 8A5.5 5.5 0 1 1 11.9 4.1M13.5 2.5V5.2H10.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <main class="panel-main">
+      <section id="setup-banner" class="notice-banner" hidden aria-live="polite">
+        <div class="notice-content">
+          <p id="setup-banner-text" class="notice-text"></p>
+          <button id="init-sub-btn" type="button" class="primary-btn" hidden>一键启用订阅配置</button>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="route-section-label">
+        <div class="section-head">
+          <span id="route-section-label" class="section-eyebrow">当前路由</span>
+        </div>
+
+        <article class="surface route-card">
+          <div class="route-title-row">
+            <div class="route-title-group">
+              <strong id="active-tier-name" class="route-tier-name">Sonnet</strong>
+              <code id="active-tier-target" class="pill-code" hidden>group/gempt-harness-sonnet</code>
+            </div>
+            <span id="active-tier-effort" class="effort-tag">思考深度：中</span>
+          </div>
+
+          <div class="flow-grid">
+            <div class="flow-col-source">
+              <div class="source-card">
+                <div class="source-top">
+                  <span class="source-dot" aria-hidden="true"></span>
+                  <strong>Antigravity</strong>
+                </div>
+                <span class="source-sub">原生 Gemini · 官方通道</span>
+                <button id="active-slash-btn" type="button" class="pill-copy-btn" data-copy="/gempt-sonnet " title="点击复制单轮快捷指令">/gempt-sonnet</button>
+              </div>
+            </div>
+
+            <svg class="flow-arrow-h" viewBox="0 0 40 16" fill="none" aria-hidden="true">
+              <path d="M2 8H35" stroke="currentColor" stroke-width="1.3" stroke-dasharray="3 3" stroke-linecap="round"/>
+              <path d="M31.5 4.5L35.5 8L31.5 11.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+
+            <div id="flow-hub-box" class="flow-hub" title="http://127.0.0.1:3425">
+              <span class="hub-row">
+                <svg class="hub-mark" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <rect x="2" y="2.5" width="12" height="11" rx="3" stroke="currentColor" stroke-width="1.3"/>
+                  <path d="M5.5 8H10.5M8 5.5V10.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+                </svg>
+                <span class="hub-name">Magpie</span>
+              </span>
+              <span id="hub-mode-text" class="hub-sub">Codex 订阅直连</span>
+            </div>
+
+            <svg class="flow-fanout" viewBox="0 0 44 64" preserveAspectRatio="none" fill="none" aria-hidden="true">
+              <path d="M0 32 C 18 32, 22 14, 44 14" stroke="currentColor" stroke-width="1.25" stroke-dasharray="3 3"/>
+              <path d="M0 32 C 18 32, 22 32, 44 32" stroke="currentColor" stroke-width="1.25" stroke-dasharray="3 3"/>
+              <path d="M0 32 C 18 32, 22 50, 44 50" stroke="currentColor" stroke-width="1.25" stroke-dasharray="3 3"/>
+            </svg>
+
+            <ul id="route-chain" class="route-chain" aria-label="当前档位路由成员">
+              <li class="route-node is-primary">
+                <span class="node-left">
+                  <span class="node-dot" aria-hidden="true"></span>
+                  <span class="node-human">GPT-6.2-Sol</span>
+                  <code class="pill-code">codex/gpt-6.2-sol</code>
+                </span>
+                <span class="node-role">首选</span>
+              </li>
+            </ul>
+          </div>
+
+          <div class="route-controls">
+            <fieldset id="sandbox-control-group" class="control-fieldset">
+              <legend class="control-legend">Codex 执行权限</legend>
+              <div class="seg-control">
+                <span class="seg-option">
+                  <input id="sbx-readonly" class="seg-radio sr-only" type="radio" name="default_sandbox" value="read-only">
+                  <label class="seg-label" for="sbx-readonly">只读</label>
+                </span>
+                <span class="seg-option">
+                  <input id="sbx-workspace" class="seg-radio sr-only" type="radio" name="default_sandbox" value="workspace-write" checked>
+                  <label class="seg-label" for="sbx-workspace">工作区</label>
+                </span>
+                <span class="seg-option">
+                  <input id="sbx-full" class="seg-radio sr-only" type="radio" name="default_sandbox" value="danger-full-access">
+                  <label class="seg-label" for="sbx-full">全权限</label>
+                </span>
+              </div>
+              <span id="sandbox-hint" class="control-hint">仅允许修改当前工作区内的文件</span>
+            </fieldset>
+
+            <fieldset id="failover-control-group" class="control-fieldset" hidden>
+              <legend class="control-legend">容灾模式</legend>
+              <div class="seg-control">
+                <span class="seg-option">
+                  <input id="fm-sub" class="seg-radio sr-only" type="radio" name="failover_mode" value="subscription_only" checked>
+                  <label class="seg-label" for="fm-sub">仅订阅</label>
+                </span>
+                <span class="seg-option">
+                  <input id="fm-api" class="seg-radio sr-only" type="radio" name="failover_mode" value="api_fallback">
+                  <label class="seg-label" for="fm-api">API 兜底</label>
+                </span>
+              </div>
+              <span id="failover-hint" class="control-hint">仅用 ChatGPT/Codex 订阅额度，不走按量付费 API</span>
+            </fieldset>
+          </div>
+        </article>
+      </section>
+
+      <section class="section" aria-labelledby="tiers-section-label">
+        <div class="section-head">
+          <span id="tiers-section-label" class="section-eyebrow">默认委派档位</span>
+          <span class="section-meta">与 Antigravity 同步 · 点击切换</span>
+        </div>
+
+        <fieldset class="tier-fieldset">
+          <legend class="sr-only">默认委派档位</legend>
+          <div id="tier-list" class="tier-list">
+            <label class="card tier-row" for="tier-sonnet" data-tier="sonnet">
+              <input id="tier-sonnet" class="tier-radio sr-only" type="radio" name="default_tier" value="sonnet" checked>
+              <span class="tier-bullet" aria-hidden="true"></span>
+              <span class="tier-body">
+                <span class="tier-line-top">
+                  <strong class="tier-title" data-field="short_name">Sonnet</strong>
+                  <code class="pill-code" data-field="target_pill">codex/gpt-6.2-sol</code>
+                </span>
+                <span class="tier-line-sub" data-field="chain_summary">GPT-6.2-Sol</span>
+              </span>
+              <span class="tier-tail">
+                <span class="tier-when" data-field="role_desc">日常高频</span>
+                <span class="tier-effort-chip" data-field="effort_tag">思考：中</span>
+                <svg class="tier-check" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path d="M3.5 8.5L6.5 11.5L12.5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </span>
+            </label>
+
+            <label class="card tier-row" for="tier-opus" data-tier="opus">
+              <input id="tier-opus" class="tier-radio sr-only" type="radio" name="default_tier" value="opus">
+              <span class="tier-bullet" aria-hidden="true"></span>
+              <span class="tier-body">
+                <span class="tier-line-top">
+                  <strong class="tier-title" data-field="short_name">Opus</strong>
+                  <code class="pill-code" data-field="target_pill">codex/gpt-6.2-sol</code>
+                </span>
+                <span class="tier-line-sub" data-field="chain_summary">GPT-6.2-Sol ↗ 升级 GPT-6.2-Astra</span>
+              </span>
+              <span class="tier-tail">
+                <span class="tier-when" data-field="role_desc">复杂工程</span>
+                <span class="tier-effort-chip" data-field="effort_tag">思考：中 → 高</span>
+                <svg class="tier-check" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path d="M3.5 8.5L6.5 11.5L12.5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </span>
+            </label>
+
+            <label class="card tier-row" for="tier-fable" data-tier="fable">
+              <input id="tier-fable" class="tier-radio sr-only" type="radio" name="default_tier" value="fable">
+              <span class="tier-bullet" aria-hidden="true"></span>
+              <span class="tier-body">
+                <span class="tier-line-top">
+                  <strong class="tier-title" data-field="short_name">Fable</strong>
+                  <code class="pill-code" data-field="target_pill">codex/gpt-6.2-astra</code>
+                </span>
+                <span class="tier-line-sub" data-field="chain_summary">GPT-6.2-Astra</span>
+              </span>
+              <span class="tier-tail">
+                <span class="tier-when" data-field="role_desc">顶配攻坚</span>
+                <span class="tier-effort-chip" data-field="effort_tag">思考：高</span>
+                <svg class="tier-check" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path d="M3.5 8.5L6.5 11.5L12.5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </span>
+            </label>
+          </div>
+        </fieldset>
+      </section>
+
+      <div class="bottom-grid">
+        <article class="surface utility-card" aria-labelledby="utility-heading">
+          <header class="card-head">
+            <div class="card-head-left">
+              <span id="utility-heading" class="section-eyebrow">轻量杂活 &amp; 单轮指令</span>
+            </div>
+            <span class="section-meta">仅本轮临时覆盖</span>
+          </header>
+
+          <div class="utility-row">
+            <div class="utility-left">
+              <svg class="utility-glyph" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M8 2L9.4 6.6L14 8L9.4 9.4L8 14L6.6 9.4L2 8L6.6 6.6L8 2Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+              </svg>
+              <div class="utility-copy">
+                <div class="utility-title-line">
+                  <strong>Chore</strong>
+                  <code id="chore-model" class="pill-code">auto/deepseek-v4.1-flash</code>
+                </div>
+                <span id="chore-sub" class="utility-sub">仅咨询 · 自动压缩上下文</span>
+              </div>
+            </div>
+            <button type="button" class="icon-btn" data-copy="/gempt-chore " aria-label="复制 /gempt-chore" title="复制 /gempt-chore">
+              <svg class="icon-svg" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <rect x="5.5" y="5.5" width="7.5" height="8" rx="1.5" stroke="currentColor" stroke-width="1.3"/>
+                <path d="M10.5 5.5V4A1.5 1.5 0 0 0 9 2.5H4A1.5 1.5 0 0 0 2.5 4V9A1.5 1.5 0 0 0 4 10.5H5.5" stroke="currentColor" stroke-width="1.3"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="slash-strip" aria-label="Antigravity 斜杠快捷命令">
+            <span class="slash-label">单轮指令</span>
+            <div class="slash-buttons">
+              <button type="button" class="slash-btn" data-copy="/gempt-sonnet ">/gempt-sonnet</button>
+              <button type="button" class="slash-btn" data-copy="/gempt-opus ">/gempt-opus</button>
+              <button type="button" class="slash-btn" data-copy="/gempt-fable ">/gempt-fable</button>
+              <button type="button" class="slash-btn" data-copy="/gempt-chore ">/gempt-chore</button>
+            </div>
+          </div>
+        </article>
+
+        <article class="surface recent-card" aria-labelledby="recent-heading">
+          <header class="card-head">
+            <span id="recent-heading" class="section-eyebrow">最近委派记录</span>
+            <span id="activity-count" class="section-meta">0 条记录</span>
+          </header>
+          <ul id="activity-list" class="recent-list">
+            <li class="recent-empty">暂无最近委派记录。</li>
+          </ul>
+        </article>
+      </div>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <script src="/app.js"></script>
+</body>
+</html>

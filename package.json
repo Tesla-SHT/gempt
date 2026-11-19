@@ -1,0 +1,48 @@
+{
+  "name": "gempt-magpie-plugin",
+  "version": "0.1.0",
+  "description": "Control panel for Gemini-leads-GPT 3+1 routing tiers (Sonnet / Opus / Fable + Chore), shared with Antigravity.",
+  "type": "module",
+  "main": "./magpie_plugin/index.mjs",
+  "files": [
+    "magpie_plugin",
+    "README.md"
+  ],
+  "engines": {
+    "magpie": ">=0.1.1340"
+  },
+  "keywords": [
+    "magpie",
+    "magpie-page",
+    "magpie-plugin",
+    "gempt",
+    "routing"
+  ],
+  "license": "MIT",
+  "magpie": {
+    "name": "GemPT",
+    "summary": {
+      "en": "Control panel for Gemini-leads-GPT 3+1 routing tiers (Sonnet / Opus / Fable + Chore), shared with Antigravity.",
+      "zh": "控制 Gemini 主导 GPT 的 3+1 协作路由档位（Sonnet / Opus / Fable + Chore），与 Antigravity 实时共享配置。"
+    },
+    "page": {
+      "title": "GemPT",
+      "titles": {
+        "en": "GemPT",
+        "zh": "GemPT",
+        "zh-TW": "GemPT"
+      },
+      "file": "magpie_plugin/page/index.html",
+      "icon": "magpie_plugin/page/icon.svg",
+      "service": {
+        "port": 3498,
+        "option": "port"
+      }
+    },
+    "options": {
+      "port": 3498
+    },
+    "permissions": [],
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTYiIGZpbGw9IiMxODE4MWIiLz48cGF0aCBkPSJNMTYgNDRMMjggMjBMMzYgMzNMNDYgMjNMNDAgNDRIMTZaIiBmaWxsPSJub25lIiBzdHJva2U9IiNmZmZmZmYiIHN0cm9rZS13aWR0aD0iMy41IiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+PGNpcmNsZSBjeD0iNDYuNSIgY3k9IjE4LjUiIHI9IjMuNSIgZmlsbD0iIzM0ZDM5OSIvPjwvc3ZnPg=="
+  }
+}

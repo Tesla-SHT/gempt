@@ -94,8 +94,9 @@ Gemini 主控（Antigravity 官方原路 或 外部客户端经 Magpie 调 antig
 PYTHONPATH=src python -m gempt discover
 ```
 
-2. **接入客户端**：
-   - **Antigravity 原生插件**：运行 `bash install.sh --plugin`（或 `PYTHONPATH=src python -m gempt install-agy`），把 `plugin/`（`plugin.json`、`rules/`、`skills/`）与独立包副本安装到 `~/.gemini/config/plugins/gempt/`。
+2. **接入客户端与 Magpie 独立控制页**：
+   - **Magpie 独立子页面插件**（控制中心）：运行 `magpie plugin add .`（或安装后从仓库链接安装 `magpie plugin add github:Tesla-SHT/gempt`），即可在 Magpie 窗口左侧栏 **`Plugins → GemPT`** 看到独立子页面。只要在 Magpie 里登好了 ChatGPT/Codex 订阅账号，未初始化时可在页面内**一键启用订阅配置**，平时可随时切换共享的 **默认委派档位（Sonnet / Opus / Fable）** 与 **Codex 执行权限（只读 / 工作区 / 全权限）**，并复制 `/gempt-*` 单轮指令。
+   - **Antigravity 原生插件**：运行 `bash install.sh --plugin`（或 `PYTHONPATH=src python -m gempt install-agy`），把 `plugin/`（`plugin.json`、`rules/`、`skills/`）与独立包副本安装到 `~/.gemini/config/plugins/gempt/`。安装并重载插件后，保持原生 Gemini 官方登录即可在 `/` 菜单直接使用 `/gempt`、`/gempt-sonnet`、`/gempt-opus`、`/gempt-fable`、`/gempt-chore`。
    - **外部 Magpie 客户端（Claude Code / ZCode / Codex 等）**：运行 `bash install.sh --print-mcp`（或 `PYTHONPATH=src python -m gempt print-mcp --installed`），把输出粘贴进 Magpie `Library -> MCP` 或客户端配置；协作规范见 [plugin/skills/gempt/SKILL.md](plugin/skills/gempt/SKILL.md) 与 [plugin/rules/AGENTS.md](plugin/rules/AGENTS.md)。
 
 3. **首次初始化**：在客户端直接说“初始化 gempt”（Gemini 会调 `gempt_discover` + `gempt_configure`），或命令行运行：
@@ -109,6 +110,14 @@ PYTHONPATH=src python -m gempt init --non-interactive --sync-magpie --use-groups
 ### 常用 CLI 命令
 
 ```bash
+# 查看或切换 Codex 执行权限（只读 / 工作区 / 全权限）
+PYTHONPATH=src python -m gempt sandbox
+PYTHONPATH=src python -m gempt sandbox workspace-write
+
+# 查看或切换默认委派档位（工具调用省略 --tier / tier 时自动生效）
+PYTHONPATH=src python -m gempt tier
+PYTHONPATH=src python -m gempt tier opus
+
 # 查看当前配置（已脱敏）、Magpie/Codex 健康状态与近期会话
 PYTHONPATH=src python -m gempt status
 
@@ -127,13 +136,10 @@ PYTHONPATH=src python -m gempt exec --tier opus --escalate --cwd /path/to/repo -
 
 ---
 
-## 三、配置、容灾与安全边界
+## 三、配置、订阅直连与安全边界
 
 - 配置文件查找顺序：`--config` 参数 → 环境变量 `GEMPT_CONFIG` → 当前及上级目录 `.gempt.json` → `~/.config/gempt/config.json`。
-- 三种容灾预设（不硬编码私人密钥/账号）：
-  1. `subscription_only`（默认）：只用订阅模型，不自动切换按量 API，避免意外扣费；多订阅号在 Magpie 侧配 `#account` 或 `routing=drain/smart` 即可无感切换。
-  2. `api_fallback`：订阅失败时按顺序降级到按量 `openai/*` API。
-  3. `effort_only`：单模型仅用 `reasoning_effort`（`low` / `medium` / `high`）区分三档。
+- **纯订阅直连设计（面向绝大多数仅登录 ChatGPT/Codex 订阅的用户）**：只需在 Magpie 中登录 ChatGPT/Codex 订阅即可开箱即用，无需另配或付费购买 OpenAI API Key。多订阅账号在 Magpie 侧配 `#account` 或 `routing=drain/smart` 即可无感轮转；如需个人 API 兜底能力，可在独立分支 `yizhang-dream/api-fallback` 启用。
 - 若要在 `discover` / `status` 推荐里隐藏特定模型，可设置环境变量 `GEMPT_EXCLUDED_MODELS`（逗号分隔子串）或在宿主配置 `routing_policy.excluded_models` 中填入字符串列表。
 - 参考模板见 [templates/gempt.config.example.json](templates/gempt.config.example.json) 与 [templates/magpie-groups.template.json](templates/magpie-groups.template.json)。
 

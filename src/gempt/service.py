@@ -15,7 +15,9 @@ from .config import (
     ConfigError,
     config_exists,
     default_config_template,
+    get_default_tier,
     load_config,
+    normalize_tier_name,
     redact_config,
     resolve_magpie_api_key,
     resolve_tier,
@@ -35,6 +37,44 @@ from .protocol import (
 from .sessions import list_sessions, load_session, new_session_id, save_session
 
 
+def _normalize_default_tier(tier: str) -> str:
+    canonical = normalize_tier_name(tier)
+    if canonical not in TIER_ORDER:
+        raise ConfigError(f"Default tier must be one of: {', '.join(TIER_ORDER)}")
+    return canonical
+
+
+def set_default_tier(tier: str, *, config_path: str | Path | None = None) -> dict[str, Any]:
+    """Persist routing_policy.default_tier atomically without re-running discovery."""
+    canonical = _normalize_default_tier(tier)
+    target = config_path or os.environ.get("GEMPT_CONFIG") or DEFAULT_CONFIG_PATH
+    cfg, resolved_path = load_config(explicit=target, require_exists=True)
+    cfg.setdefault("routing_policy", {})["default_tier"] = canonical
+    saved_path = save_config(cfg, path=resolved_path)
+    return {
+        "saved": True,
+        "default_tier": canonical,
+        "config_path": str(saved_path),
+        "resolved": resolve_tier(cfg, canonical),
+    }
+
+
+def set_default_sandbox(sandbox: str, *, config_path: str | Path | None = None) -> dict[str, Any]:
+    """Persist codex.default_sandbox atomically without re-running discovery."""
+    cleaned = str(sandbox or "").strip()
+    if cleaned not in VALID_SANDBOXES:
+        raise ConfigError(f"Default sandbox must be one of: {', '.join(VALID_SANDBOXES)}")
+    target = config_path or os.environ.get("GEMPT_CONFIG") or DEFAULT_CONFIG_PATH
+    cfg, resolved_path = load_config(explicit=target, require_exists=True)
+    cfg.setdefault("codex", {})["default_sandbox"] = cleaned
+    saved_path = save_config(cfg, path=resolved_path)
+    return {
+        "saved": True,
+        "default_sandbox": cleaned,
+        "config_path": str(saved_path),
+    }
+
+
 def configure_gempt(
     *,
     config_path: str | Path | None = None,
@@ -44,6 +84,7 @@ def configure_gempt(
     codex_cli_path: str | None = None,
     default_sandbox: str | None = None,
     codex_model_provider: str | None = None,
+    default_tier: str | None = None,
     failover_mode: str = "subscription_only",
     magpie_group_strategy: str = "order",
     utility_model: str | None = None,
@@ -84,6 +125,13 @@ def configure_gempt(
     if codex_model_provider is not None:
         cfg["codex"]["model_provider"] = codex_model_provider.strip()
 
+    cleaned_mode = str(failover_mode or "subscription_only").strip()
+    if cleaned_mode != "subscription_only":
+        raise ConfigError("当前纯订阅版本仅支持 subscription_only 模式。")
+    failover_mode = "subscription_only"
+
+    if default_tier is not None and str(default_tier).strip():
+        cfg["routing_policy"]["default_tier"] = _normalize_default_tier(default_tier)
     cfg["routing_policy"]["failover_mode"] = failover_mode
     cfg["routing_policy"]["magpie_group_strategy"] = magpie_group_strategy
 
@@ -156,7 +204,7 @@ def configure_gempt(
 def run_consult(
     *,
     goal: str,
-    tier: str = "sonnet",
+    tier: str | None = None,
     context: str = "",
     file_paths: list[str] | None = None,
     constraints: str = "",
@@ -295,7 +343,7 @@ def run_exec(
     *,
     goal: str,
     cwd: str | Path,
-    tier: str = "sonnet",
+    tier: str | None = None,
     context: str = "",
     file_paths: list[str] | None = None,
     constraints: str = "",
@@ -491,6 +539,7 @@ def get_status(*, workspace_root: Path | None = None, config_path: str | Path | 
     return {
         "recent_runs": recent_runs(session_limit, workspace_root),
         "configured": exists,
+        "default_tier": get_default_tier(cfg) if exists else "sonnet",
         "config_path": str(resolved_path),
         "api_key_source": key_source,
         "config": redacted,

@@ -19,11 +19,12 @@ from . import (
     VALID_SANDBOXES,
     __version__,
 )
+from .config import get_default_tier, load_config, resolve_tier
 from .discover import discover_environment
 from .presets import apply_native_presets
 from .runs import dispatch_exec, read_run
 from .mcp_server import serve_stdio
-from .service import configure_gempt, get_status, run_consult
+from .service import configure_gempt, get_status, run_consult, set_default_sandbox, set_default_tier
 
 _TIER_CHOICES = (*CONSULT_TIERS, *TIER_ALIASES.keys())
 
@@ -93,33 +94,17 @@ def _interactive_init(args: argparse.Namespace) -> int:
 
     recs = info.get("recommendations") or {}
     presets = recs.get("presets") or {}
-    if not presets:
-        print("Error: No GPT/Codex models found in Magpie /v1/models. Add/expose GPT models in Magpie first.", file=sys.stderr)
-        return 1
-
-    print("\nFailover presets:")
-    mode_list = list(VALID_FAILOVER_MODES)
-    sub_available = bool((presets.get("subscription_only") or {}).get("tiers"))
-    default_idx = "1" if sub_available else "2"
-    default_mode = mode_list[int(default_idx) - 1]
-    for idx, mode in enumerate(mode_list, start=1):
-        p = presets.get(mode) or {}
-        tiers = p.get("tiers") or {}
-        summary = ", ".join(
-            f"{t}={tiers[t]['consult_model']}:{tiers[t]['reasoning_effort']}"
-            for t in TIER_ORDER
-            if t in tiers
-        ) or "unavailable (no matching models)"
-        print(f"  [{idx}] {mode}: {p.get('description', '')}")
-        print(f"      {summary}")
-
-    choice = input(f"\nSelect preset [1-3, default {default_idx}]: ").strip() or default_idx
-    failover_mode = mode_list[int(choice) - 1] if choice in {"1", "2", "3"} else default_mode
-
-    chosen_preset = (presets.get(failover_mode) or {}).get("tiers") or {}
+    chosen_preset = (presets.get("subscription_only") or {}).get("tiers") or {}
     if not chosen_preset:
-        print(f"Error: Preset '{failover_mode}' has no available models in Magpie /v1/models.", file=sys.stderr)
+        print("Error: 未检测到 Codex 订阅模型，请先在 Magpie 中登录 ChatGPT/Codex 订阅账号。", file=sys.stderr)
         return 1
+
+    print("\nDiscovered Codex subscription 3-tier routing (subscription_only):")
+    for t in TIER_ORDER:
+        rec = chosen_preset[t]
+        esc_note = f" -> escalate {rec['escalate_model']}" if rec.get("escalate_model") else ""
+        print(f"  - {t}: {rec['consult_model']} (effort={rec['reasoning_effort']}{esc_note})")
+
     tiers_override: dict[str, dict[str, Any]] = {}
     for t in TIER_ORDER:
         rec = chosen_preset[t]
@@ -147,7 +132,7 @@ def _interactive_init(args: argparse.Namespace) -> int:
         config_path=args.config,
         magpie_url=args.magpie_url,
         default_sandbox=sbx,
-        failover_mode=failover_mode,
+        failover_mode="subscription_only",
         magpie_group_strategy=args.strategy,
         utility_model=util_val,
         tiers_override=tiers_override,
@@ -197,7 +182,22 @@ def _cmd_install_agy(args: argparse.Namespace) -> int:
         src_sub = source_plugin / folder
         if src_sub.is_dir() and source_plugin != target:
             dst_sub = target / folder
-            shutil.copytree(src_sub, dst_sub, dirs_exist_ok=True)
+            shutil.copytree(
+                src_sub,
+                dst_sub,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "node_modules", ".DS_Store"),
+            )
+
+    stale_sidecar = target / "sidecars" / "gempt_panel"
+    if stale_sidecar.exists():
+        shutil.rmtree(stale_sidecar, ignore_errors=True)
+    stale_sidecars_dir = target / "sidecars"
+    if stale_sidecars_dir.is_dir():
+        try:
+            stale_sidecars_dir.rmdir()
+        except OSError:
+            pass
 
     package = Path(__file__).resolve().parent
     if package != src_root / "gempt":
@@ -213,8 +213,9 @@ def _cmd_install_agy(args: argparse.Namespace) -> int:
                 "plugin_dir": str(target),
                 "mcp_config": mcp_config,
                 "next_steps": [
-                    "Antigravity loads plugins automatically on the next turn (or toggle in Customizations).",
-                    "Tell Gemini: '初始化 gempt' to run gempt_discover + interactive 3-tier setup.",
+                    "Antigravity loads plugins automatically on the next turn (or toggle/reload in Customizations).",
+                    "Tell Gemini: '初始化 gempt' (or /gempt) to run gempt_discover + setup.",
+                    "Use /gempt-sonnet, /gempt-opus, /gempt-fable, /gempt-chore in chat, and install the GemPT control page inside Magpie (`magpie plugin add <repo>`).",
                     "For other clients (Claude Code / ZCode / Codex) using Magpie Gemini, run `gempt print-mcp --installed` and paste into Magpie Library -> MCP or your client config.",
                 ],
             },
@@ -258,7 +259,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--dry-run", action="store_true", help="Preview changes without writing config or groups")
 
     p_cons = sub.add_parser("consult", help="Consult GPT/utility via Magpie HTTP API (no Codex tool overhead)")
-    p_cons.add_argument("--tier", choices=_TIER_CHOICES, default="sonnet")
+    p_cons.add_argument("--tier", choices=_TIER_CHOICES, default=None, help="Target tier (defaults to routing_policy.default_tier)")
     p_cons.add_argument("--escalate", action="store_true", help="For opus tier: escalate to escalate_model (e.g. Astra)")
     p_cons.add_argument("--goal", required=True)
     p_cons.add_argument("--context", default="")
@@ -275,7 +276,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_cons.add_argument("--json", action="store_true")
 
     p_exec = sub.add_parser("exec", help="Delegate coding/verification task to headless Codex CLI")
-    p_exec.add_argument("--tier", choices=(*TIER_ORDER, "lite", "mid", "max"), default="sonnet")
+    p_exec.add_argument("--tier", choices=(*TIER_ORDER, "lite", "mid", "max"), default=None, help="Target tier (defaults to routing_policy.default_tier)")
     p_exec.add_argument("--escalate", action="store_true", help="For opus tier: escalate to escalate_model (e.g. Astra)")
     p_exec.add_argument("--cwd", default=".")
     p_exec.add_argument("--goal", required=True)
@@ -298,6 +299,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_stat.add_argument("--run-id", default="")
     p_stat.add_argument("--config", default=None)
     p_stat.add_argument("--sessions", type=int, default=10)
+
+    p_tier = sub.add_parser("tier", help="Show or switch the default gempt tier (sonnet/opus/fable)")
+    p_tier.add_argument("value", nargs="?", choices=(*TIER_ORDER, "lite", "mid", "max"), default=None)
+    p_tier.add_argument("--config", default=None)
+    p_tier.add_argument("--json", action="store_true")
+
+    p_sbx = sub.add_parser("sandbox", help="Show or switch the default Codex sandbox (read-only/workspace-write/danger-full-access)")
+    p_sbx.add_argument("value", nargs="?", choices=VALID_SANDBOXES, default=None)
+    p_sbx.add_argument("--config", default=None)
+    p_sbx.add_argument("--json", action="store_true")
 
     sub.add_parser("mcp", help="Run gempt stdio MCP server")
 
@@ -403,6 +414,42 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             data = get_status(config_path=args.config, session_limit=args.sessions)
             print(json.dumps(data, indent=2, ensure_ascii=False))
+            return 0
+
+        if args.command == "tier":
+            if args.value is not None:
+                res = set_default_tier(args.value, config_path=args.config)
+                if args.json:
+                    print(json.dumps(res, indent=2, ensure_ascii=False))
+                else:
+                    resolved = res["resolved"]
+                    print(f"default_tier: {res['default_tier']} ({resolved['model']}, effort={resolved['reasoning_effort']})")
+            else:
+                cfg, cfg_path = load_config(explicit=args.config, require_exists=True)
+                tier_name = get_default_tier(cfg)
+                resolved = resolve_tier(cfg, tier_name)
+                res = {"default_tier": tier_name, "config_path": str(cfg_path), "resolved": resolved}
+                if args.json:
+                    print(json.dumps(res, indent=2, ensure_ascii=False))
+                else:
+                    print(f"default_tier: {tier_name} ({resolved['model']}, effort={resolved['reasoning_effort']})")
+            return 0
+
+        if args.command == "sandbox":
+            if args.value is not None:
+                res = set_default_sandbox(args.value, config_path=args.config)
+                if args.json:
+                    print(json.dumps(res, indent=2, ensure_ascii=False))
+                else:
+                    print(f"default_sandbox: {res['default_sandbox']}")
+            else:
+                cfg, cfg_path = load_config(explicit=args.config, require_exists=True)
+                sbx_val = str(cfg.get("codex", {}).get("default_sandbox") or "workspace-write")
+                res = {"default_sandbox": sbx_val, "config_path": str(cfg_path)}
+                if args.json:
+                    print(json.dumps(res, indent=2, ensure_ascii=False))
+                else:
+                    print(f"default_sandbox: {sbx_val}")
             return 0
 
         if args.command == "mcp":

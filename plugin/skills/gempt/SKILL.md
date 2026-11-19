@@ -19,26 +19,22 @@ description: >-
 
 ## 1. Initial Setup Wizard（首次使用或用户要求调整配置时）
 
-当 `~/.config/gempt/config.json` 尚未初始化，或用户说“初始化 gempt / 配一下 gempt / 换模型或容灾策略”时：
+当 `~/.config/gempt/config.json` 尚未初始化，或用户说“初始化 gempt / 配一下 gempt / 换模型或权限”时，**主链路以 ChatGPT/Codex 订阅号直连（`subscription_only`）为准**，无需让普通用户准备或填写额外付费 API Key：
 
-1. **先自动探测**：调用 `gempt_discover`（不要让用户手工翻配置文件路径或模型 ID）。
-   - 检查输出里的 `magpie.gateway.reachable`、`codex_subscription_models`、`openai_api_models`、`utility_candidates`、`routing_groups`、`native_gempt_groups`、`gempt_groups`、`codex` CLI 与 `recommendations`。
-   - 如果 `magpie.gateway.reachable` 为 `false`，明确提示用户先启动本地 Magpie 网关（默认 `127.0.0.1:3425`）并确认已暴露 GPT/Codex 模型，再继续。
-2. **向用户确认关键决策**（展示自动推荐的默认映射，让用户一键确认或微调）：
-   - **三档 GPT 映射**：
-     - `sonnet`（日常高频 80%）：推荐 `Sol` 系列（如 `codex/gpt-6.2-sol`，`medium`）
-     - `opus`（复杂工程）：推荐常规 `Sol` + 疑难自动升级 `Astra`（如 `codex/gpt-6.2-sol` → `codex/gpt-6.2-astra`，`high`）
-     - `fable`（顶配攻坚）：推荐 `Astra` 系列（如 `codex/gpt-6.2-astra`，`high`）
-   - **免费打杂 / 压缩通道（`utility`）**：从 `utility_candidates` 推荐（如 `auto/deepseek-v4.1-flash`、`workbuddy/deepseek-v4.1-flash` 或其他已接入的免费快速模型），用于 `tier="chore"` 与 Magpie `compact` 规则。
-   - **容灾策略（`failover_mode`）**：
-     1. `subscription_only`（推荐默认）：仅用订阅号（不自动切按量 API，防意外扣费）；多号轮转/限流由 Magpie 订阅池承担。
-     2. `api_fallback`：订阅失败时按顺序切到按量 `openai/*` API 兜底。
-     3. `effort_only`：单模型仅靠 `reasoning_effort`（`low` / `medium` / `high`）区分三档。
-   - **可选：同步独立隔离路由组**：默认直接调用具体 GPT 模型 ID 即可工作（不会改动根目录 `install.sh` / `gempt presets` 建的 `group/gempt-*`）。仅当用户需要在 Magpie 侧使用多号轮转、`effort=high` 自动切 Astra 或 `compact` 规则时，才询问是否开启 `sync_magpie_groups: true`（同步 `group/gempt-harness-sonnet`、`group/gempt-harness-opus`、`group/gempt-harness-fable`）并开启 `use_magpie_group_ids: true`。外部客户端如需一次性装好原生路由组或打印 MCP 配置，也可运行 `bash install.sh --apply`、`bash install.sh --print-mcp` 或 `gempt presets --apply`。
-   - **默认 Codex 沙箱（`default_sandbox`）**：推荐 `workspace-write`（只在目标工作区可写），或按用户习惯选 `read-only` / `danger-full-access`。
-3. **落盘并验收**：
-   - 调用 `gempt_configure` 保存配置。
-   - 调用 `gempt_status` 验证配置已生效；必要时用 `gempt_consult(tier="chore", goal="Reply with OK")` 或 `sonnet` 跑一次极短连通性测试，然后把结果汇总给用户。
+1. **最简一键开启**：如果用户已经打开 Magpie 客户端的 **`Plugins → GemPT`** 页面，只要 Magpie 里已登录 ChatGPT/Codex 订阅，页面会自动检测到 `codex/*` 模型，直接点 **“一键启用订阅配置”** 即可完成初始化。
+2. **命令行 / 对话内探测与初始化**：调用 `gempt_discover`（不要让用户手工翻配置文件路径或模型 ID）。
+   - 检查输出里的 `magpie.gateway.reachable`、`subscription_ready`、`codex_subscription_models`、`utility_candidates`、`codex` CLI 与 `recommendations`。
+   - 如果 `magpie.gateway.reachable` 为 `false`，提示用户先启动本地 Magpie（默认 `127.0.0.1:3425`）；如果 `subscription_ready` 为 `false`，先在 Magpie 登录 ChatGPT/Codex 订阅账号再刷新重试。
+3. **确认三档映射与权限**：
+   - `sonnet`（日常高频 80%）：推荐 `Sol` 系列（如 `codex/gpt-6.2-sol`，`medium`）
+   - `opus`（复杂工程）：推荐常规 `Sol` + 疑难自动升级 `Astra`（如 `codex/gpt-6.2-sol` → `codex/gpt-6.2-astra`，`high`）
+   - `fable`（顶配攻坚）：推荐 `Astra` 系列（如 `codex/gpt-6.2-astra`，`high`）
+   - **免费打杂 / 压缩通道（`utility`）**：从 `utility_candidates` 推荐免费高速模型（如 `auto/deepseek-v4.1-flash`），用于 `tier="chore"` 与 Magpie `compact` 规则。
+   - **路由策略**：固定 `subscription_only`（纯 Codex 订阅直连，不扣按量 API 费用；多订阅号由 Magpie 自动轮转）。
+   - **可选：同步独立隔离路由组**：默认直接调用具体 `codex/*` 订阅模型 ID 即可工作。仅当用户需要在 Magpie 侧使用多号轮转、`effort=high` 自动切 Astra 或 `compact` 规则时，才开启 `sync_magpie_groups: true` 与 `use_magpie_group_ids: true`。
+   - **默认 Codex 沙箱（`default_sandbox`）**：推荐 `workspace-write`（只在目标工作区可写），可在 Magpie `Plugins → GemPT` 页面随手切换 `只读 / 工作区 / 全权限`。
+4. **落盘并验收**：
+   - 调用 `gempt_configure` 保存配置，调用 `gempt_status` 验证生效；必要时用 `gempt_consult(tier="chore", goal="Reply with OK")` 或 `sonnet` 跑一次极短连通性测试后汇报。
 
 ---
 
@@ -55,12 +51,14 @@ description: >-
 
 ### 档位选择：3 主档 + 1 打杂档
 
-| 档位 | 对标定位 | 典型场景 | 备注 |
+| 档位 / 快捷命令 | 对标定位 | 典型场景 | 备注 |
 | :--- | :--- | :--- | :--- |
-| **`chore`** | 免费打杂/压缩/分类 | 日志提纯、大文本摘要、粗分类、格式整理 | 仅限 `gempt_consult`；走 `utility.model`（如 `DeepSeek-V4.1-Flash`） |
-| **`sonnet`** | 日常高频（~80%） | 常规单/少文件实现、加小功能、改 UI、写脚本、常规审阅 | 默认档位 |
-| **`opus`** | 复杂工程 | 跨文件重构、读大仓库、复杂逻辑设计与排查 | 常规用主模型；遇到硬骨头传 `escalate=true` 或 `reasoning_effort="high"` 自动升级到 `Astra` |
-| **`fable`** | 顶配攻坚 | 极难 Bug、核心算法/数学推导、长程架构设计 | 直接上最强模型高推理深度；慎用 `ultra`，只在最难问题上手动指定 |
+| **`chore`** (`/gempt-chore`) | 免费打杂/压缩/分类 | 日志提纯、大文本摘要、粗分类、格式整理 | 仅限 `gempt_consult`；走 `utility.model`（如 `DeepSeek-V4.1-Flash`） |
+| **`sonnet`** (`/gempt-sonnet`) | 日常高频（~80%） | 常规单/少文件实现、加小功能、改 UI、写脚本、常规审阅 | 初始默认档位（可在面板切换 `default_tier`） |
+| **`opus`** (`/gempt-opus`) | 复杂工程 | 跨文件重构、读大仓库、复杂逻辑设计与排查 | 常规用主模型；遇到硬骨头传 `escalate=true` 或 `reasoning_effort="high"` 自动升级到 `Astra` |
+| **`fable`** (`/gempt-fable`) | 顶配攻坚 | 极难 Bug、核心算法/数学推导、长程架构设计 | 直接上最强模型高推理深度；慎用 `ultra`，只在最难问题上手动指定 |
+
+> **控制面板与单回合快捷命令**：保持 Antigravity 原生 Gemini 官方登录不变（不反代原生 Gemini），日常在 **Magpie 左侧栏 `Plugins → GemPT` 独立子页面**（或终端运行 `gempt tier [sonnet|opus|fable]`）统一查看状态并切换 `routing_policy.default_tier`；在 Antigravity 对话输入框键入 `/` 可用 `/gempt-sonnet`、`/gempt-opus`、`/gempt-fable`、`/gempt-chore` 单回合锁定档位。工具调用省略 `tier` 时自动沿用当前 `default_tier`。
 
 ---
 

@@ -26,6 +26,7 @@ from gempt.config import (
     ConfigError,
     ConfigNotFoundError,
     default_config_template,
+    get_default_tier,
     load_config,
     redact_config,
     resolve_tier,
@@ -38,6 +39,7 @@ from gempt.mcp_server import _handle_tool_call
 from gempt.presets import apply_native_presets, build_native_preset_commands, strip_model_modifiers
 from gempt.protocol import build_consult_prompt, build_exec_prompt, read_context_files
 from gempt.runs import recent_runs, verification_result
+from gempt.service import configure_gempt, set_default_sandbox, set_default_tier
 from gempt.sessions import list_sessions, load_session, save_session
 
 
@@ -97,6 +99,75 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 validate_config(bad_cfg)
 
+    def test_default_tier_sandbox_and_subscription_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "gempt.json"
+            cfg = default_config_template()
+            cfg["magpie"]["api_key"] = "sk-keep-me"
+            cfg["routing_policy"]["failover_mode"] = "subscription_only"
+            cfg["routing_policy"]["default_tier"] = "max"
+            save_config(cfg, path=cfg_path)
+
+            loaded, _ = load_config(explicit=cfg_path, require_exists=True)
+            self.assertEqual(get_default_tier(loaded), "fable")
+            self.assertEqual(resolve_tier(loaded, None)["tier"], "fable")
+            self.assertEqual(resolve_tier(loaded, "")["tier"], "fable")
+
+            bad_mode_cfg = default_config_template()
+            bad_mode_cfg["routing_policy"]["failover_mode"] = "api_fallback"
+            with self.assertRaises(ConfigError):
+                validate_config(bad_mode_cfg)
+            with self.assertRaises(ConfigError):
+                configure_gempt(config_path=cfg_path, failover_mode="api_fallback")
+
+            for bad_default in ("chore", "unknown", 42):
+                bad_cfg = default_config_template()
+                bad_cfg["routing_policy"]["default_tier"] = bad_default
+                with self.assertRaises(ConfigError):
+                    validate_config(bad_cfg)
+
+            with self.assertRaises(ConfigError):
+                set_default_tier("chore", config_path=cfg_path)
+            with self.assertRaises(ConfigError):
+                set_default_sandbox("invalid-mode", config_path=cfg_path)
+
+            res = set_default_tier("opus", config_path=cfg_path)
+            self.assertTrue(res["saved"])
+            self.assertEqual(res["default_tier"], "opus")
+
+            sbx_res = set_default_sandbox("read-only", config_path=cfg_path)
+            self.assertTrue(sbx_res["saved"])
+            self.assertEqual(sbx_res["default_sandbox"], "read-only")
+
+            reloaded, _ = load_config(explicit=cfg_path, require_exists=True)
+            self.assertEqual(reloaded["routing_policy"]["default_tier"], "opus")
+            self.assertEqual(reloaded["codex"]["default_sandbox"], "read-only")
+            self.assertEqual(reloaded["magpie"]["api_key"], "sk-keep-me")
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(["tier", "--config", str(cfg_path), "--json"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(buf.getvalue())["default_tier"], "opus")
+
+            buf2 = io.StringIO()
+            with contextlib.redirect_stdout(buf2):
+                rc2 = cli_main(["tier", "fable", "--config", str(cfg_path), "--json"])
+            self.assertEqual(rc2, 0)
+            self.assertEqual(json.loads(buf2.getvalue())["default_tier"], "fable")
+
+            buf3 = io.StringIO()
+            with contextlib.redirect_stdout(buf3):
+                rc3 = cli_main(["sandbox", "workspace-write", "--config", str(cfg_path), "--json"])
+            self.assertEqual(rc3, 0)
+            self.assertEqual(json.loads(buf3.getvalue())["default_sandbox"], "workspace-write")
+
+            buf4 = io.StringIO()
+            with contextlib.redirect_stdout(buf4):
+                rc4 = cli_main(["sandbox", "--config", str(cfg_path), "--json"])
+            self.assertEqual(rc4, 0)
+            self.assertEqual(json.loads(buf4.getvalue())["default_sandbox"], "workspace-write")
+
 
 class DiscoverTests(unittest.TestCase):
     def test_recommendations_exclude_forbidden_model_and_build_presets(self) -> None:
@@ -119,14 +190,16 @@ class DiscoverTests(unittest.TestCase):
         recs = build_tier_recommendations(catalog)
         self.assertTrue(recs["available"])
         self.assertEqual(recs["utility_model"], "auto/deepseek-v4.1-flash")
+        self.assertEqual(list(recs["presets"].keys()), ["subscription_only"])
         sub = recs["presets"]["subscription_only"]["tiers"]
         self.assertEqual(sub["sonnet"]["consult_model"], "codex/gpt-6.2-sol")
         self.assertEqual(sub["opus"]["consult_model"], "codex/gpt-6.2-sol")
         self.assertEqual(sub["opus"]["escalate_model"], "codex/gpt-6.2-astra")
         self.assertEqual(sub["fable"]["consult_model"], "codex/gpt-6.2-astra")
 
-        api_fb = recs["presets"]["api_fallback"]["tiers"]
-        self.assertIn("openai/gpt-6-astra", api_fb["fable"]["fallback_models"])
+        api_only_recs = build_tier_recommendations({**catalog, "codex_subscription_models": []})
+        self.assertFalse(api_only_recs["available"])
+        self.assertFalse(api_only_recs["presets"]["subscription_only"]["tiers"])
 
     def test_probe_filters_forbidden_model(self) -> None:
         fake_payload = {
@@ -264,17 +337,15 @@ class MagpieClientAndCodexRunnerTests(unittest.TestCase):
 
     def test_sync_magpie_groups_dry_run_commands(self) -> None:
         cfg = default_config_template()
-        cfg["routing_policy"]["failover_mode"] = "api_fallback"
         res = sync_magpie_groups(cfg, cli_path="magpie", dry_run=True)
         self.assertEqual(len(res), 3)
         by_tier = {item["tier"]: item for item in res}
         self.assertEqual(by_tier["sonnet"]["group"], "group/gempt-harness-sonnet")
-        self.assertIn("group/auto-deepseek-v4-1-flash", by_tier["sonnet"]["members"])
+        self.assertEqual(by_tier["sonnet"]["members"], ["codex/gpt-6.2-sol"])
 
         opus_cmds = [" ".join(c) for c in by_tier["opus"]["commands"]]
         self.assertTrue(any("group add gempt-harness-opus" in c for c in opus_cmds))
         self.assertTrue(any("group rule add gempt-harness-opus use=codex/gpt-6.2-astra effort=high" in c for c in opus_cmds))
-        self.assertTrue(any("group rule add gempt-harness-opus use=group/auto-deepseek-v4-1-flash compact" in c for c in opus_cmds))
 
     def test_codex_cmd_invocation_no_shell_interpolation(self) -> None:
         if sys.platform == "win32":
@@ -339,9 +410,13 @@ class CliPackagingTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "gempt-installed"
+            legacy_sidecar = target / "sidecars" / "gempt_panel"
+            legacy_sidecar.mkdir(parents=True)
+            (legacy_sidecar / "sidecar.json").write_text("{}", encoding="utf-8")
+
             inst_buf = io.StringIO()
             with contextlib.redirect_stdout(inst_buf):
-                rc_inst = cli_main(["install-agy", "--target", str(target)])
+                rc_inst = cli_main(["install-agy", "--target", str(target), "--force"])
             self.assertEqual(rc_inst, 0)
             inst_payload = json.loads(inst_buf.getvalue())
             self.assertTrue(inst_payload["installed"])
@@ -351,10 +426,17 @@ class CliPackagingTests(unittest.TestCase):
                 "README.md",
                 "rules/AGENTS.md",
                 "skills/gempt/SKILL.md",
+                "skills/gempt-sonnet/SKILL.md",
+                "skills/gempt-opus/SKILL.md",
+                "skills/gempt-fable/SKILL.md",
+                "skills/gempt-chore/SKILL.md",
                 "runtime/gempt/__init__.py",
                 "mcp_config.json",
             ):
                 self.assertTrue((target / rel).is_file(), f"missing installed file: {rel}")
+
+            self.assertFalse((target / "sidecars" / "gempt_panel").exists())
+            self.assertFalse((target / "sidecars").exists())
 
             written_mcp = json.loads((target / "mcp_config.json").read_text(encoding="utf-8"))
             self.assertEqual(
@@ -499,6 +581,34 @@ class BugfixRegressionTests(unittest.TestCase):
                 items = recent_runs(5, root=root)
             self.assertEqual(len(items), 1)
             self.assertEqual(items[0]["run_id"], "a" * 32)
+
+    def test_mcp_consult_and_exec_honor_configured_default_tier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / "config.json"
+            sess_dir = Path(tmp) / "sessions"
+            cfg = default_config_template()
+            cfg["routing_policy"]["default_tier"] = "fable"
+            save_config(cfg, conf)
+
+            with mock.patch.dict(
+                os.environ,
+                {"GEMPT_CONFIG": str(conf), "GEMPT_SESSIONS_DIR": str(sess_dir), "GEMPT_WORKSPACE_ROOT": tmp},
+            ):
+                with mock.patch(
+                    "gempt.service.consult_with_fallback",
+                    return_value={"served_model": "codex/gpt-6.2-astra", "elapsed_sec": 0.1, "text": "OK", "usage": {}},
+                ) as mock_consult:
+                    res = _handle_tool_call("gempt_consult", {"goal": "check default tier"})
+                    self.assertIn("codex/gpt-6.2-astra", res["content"][0]["text"])
+                    self.assertEqual(mock_consult.call_args.kwargs["primary_model"], "codex/gpt-6.2-astra")
+
+                with mock.patch("gempt.mcp_server.dispatch_exec", return_value={"ok": True, "verification": {}}) as mock_exec:
+                    _handle_tool_call("gempt_exec", {"goal": "run check", "cwd": tmp})
+                    self.assertIsNone(mock_exec.call_args.kwargs["tier"])
+
+                with mock.patch("gempt.mcp_server.configure_gempt", return_value={"saved": True}) as mock_cfg:
+                    _handle_tool_call("gempt_configure", {"default_tier": "opus"})
+                    self.assertEqual(mock_cfg.call_args.kwargs["default_tier"], "opus")
 
 
 if __name__ == "__main__":

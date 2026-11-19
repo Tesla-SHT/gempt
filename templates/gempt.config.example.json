@@ -15,6 +15,7 @@
     "timeout_sec": 600
   },
   "routing_policy": {
+    "default_tier": "sonnet",
     "failover_mode": "subscription_only",
     "magpie_group_strategy": "order",
     "excluded_models": []

@@ -41,8 +41,8 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "gempt_configure",
         "description": (
-            "Create or update the user's gempt configuration (~/.config/gempt/config.json by default), setting the "
-            "3-tier GPT routing (sonnet/opus/fable) + utility/compact model, failover mode, sandbox default, and optionally "
+            "Create or update the user's gempt configuration (~/.config/gempt/config.json by default), setting "
+            "3-tier Codex subscription routing (sonnet/opus/fable) + utility/compact model, sandbox default, and optionally "
             "syncing Magpie routing groups (group/gempt-harness-sonnet, group/gempt-harness-opus, group/gempt-harness-fable)."
         ),
         "inputSchema": {
@@ -62,11 +62,16 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "Optional Codex model_provider override (e.g. 'magpie' if Codex uses profile/provider separation).",
                 },
+                "default_tier": {
+                    "type": "string",
+                    "enum": list(TIER_ORDER),
+                    "description": "Default tier used when gempt_consult or gempt_exec omits `tier` (sonnet, opus, or fable).",
+                },
                 "failover_mode": {
                     "type": "string",
-                    "enum": ["subscription_only", "api_fallback", "effort_only"],
+                    "enum": ["subscription_only"],
                     "default": "subscription_only",
-                    "description": "3-tier preset policy.",
+                    "description": "Subscription-only routing policy (Codex accounts via Magpie).",
                 },
                 "magpie_group_strategy": {
                     "type": "string",
@@ -118,7 +123,11 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "goal": {"type": "string", "description": "Clear statement of what the model should solve, critique, summarize, or decide."},
-                "tier": {"type": "string", "enum": list(CONSULT_TIERS), "default": "sonnet"},
+                "tier": {
+                    "type": "string",
+                    "enum": list(CONSULT_TIERS),
+                    "description": "Target tier (chore/sonnet/opus/fable). Omit to use routing_policy.default_tier from config.",
+                },
                 "escalate": {
                     "type": "boolean",
                     "default": False,
@@ -159,7 +168,11 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "goal": {"type": "string", "description": "Exact engineering task and scope for Codex to implement/verify."},
                 "cwd": {"type": "string", "description": "Absolute path to the target workspace directory."},
-                "tier": {"type": "string", "enum": list(TIER_ORDER), "default": "sonnet"},
+                "tier": {
+                    "type": "string",
+                    "enum": list(TIER_ORDER),
+                    "description": "Target tier (sonnet/opus/fable). Omit to use routing_policy.default_tier from config.",
+                },
                 "escalate": {
                     "type": "boolean",
                     "default": False,
@@ -262,6 +275,7 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             codex_cli_path=args.get("codex_cli_path"),
             default_sandbox=args.get("default_sandbox"),
             codex_model_provider=args.get("codex_model_provider"),
+            default_tier=args.get("default_tier"),
             failover_mode=str(args.get("failover_mode") or "subscription_only"),
             magpie_group_strategy=str(args.get("magpie_group_strategy") or "order"),
             utility_model=args.get("utility_model"),
@@ -276,7 +290,7 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "gempt_consult":
         res = run_consult(
             goal=str(args["goal"]),
-            tier=str(args.get("tier") or "sonnet"),
+            tier=args.get("tier") or None,
             context=str(args.get("context") or ""),
             file_paths=args.get("file_paths"),
             constraints=str(args.get("constraints") or ""),
@@ -297,7 +311,7 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             config_path=trusted_config,
             goal=str(args["goal"]),
             cwd=str(args["cwd"]),
-            tier=str(args.get("tier") or "sonnet"),
+            tier=args.get("tier") or None,
             context=str(args.get("context") or ""),
             file_paths=args.get("file_paths"),
             constraints=str(args.get("constraints") or ""),

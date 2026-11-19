@@ -23,5 +23,5 @@ TIER_ALIASES = {
 VALID_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 EFFORT_RANK = {name: idx for idx, name in enumerate(VALID_EFFORTS)}
 VALID_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
-VALID_FAILOVER_MODES = ("subscription_only", "api_fallback", "effort_only")
+VALID_FAILOVER_MODES = ("subscription_only",)
 VALID_GROUP_STRATEGIES = ("order", "smart", "rotate", "pace", "drain", "usage")

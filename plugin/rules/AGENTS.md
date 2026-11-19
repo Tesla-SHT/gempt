@@ -6,7 +6,7 @@
 - **When to delegate via `gempt`**:
   - Use `gempt_consult` for non-text/math/algorithm reasoning, deep bug diagnosis, architecture second opinions, or free utility summarization/classification (`tier="chore"`). It avoids Codex CLI's ~18K–50K token tool-injection overhead.
   - Use `gempt_exec` when GPT/Codex should read/edit files and run commands/tests inside a workspace.
-  - Pick the right tier: `sonnet` (80% daily work), `opus` (complex cross-file engineering; pass `escalate=true` for hard subproblems), `fable` (extreme bugs, core algorithms, long-horizon architecture).
+  - Pick the right tier: `sonnet` (80% daily work), `opus` (complex cross-file engineering; pass `escalate=true` for hard subproblems), `fable` (extreme bugs, core algorithms, long-horizon architecture). Omitting `tier` automatically uses `routing_policy.default_tier` (switchable alongside `default_sandbox` in Magpie's `Plugins -> GemPT` page or via `gempt tier` / `gempt sandbox`); `/gempt-sonnet`, `/gempt-opus`, `/gempt-fable`, and `/gempt-chore` pin a specific tier for the current turn. Subscription-only routing is used by default — users only need ChatGPT/Codex signed in on Magpie.
 - **Task quality**: Always send structured Task Packets (Goal, Verified Context/Files, Hard Constraints, Verification Commands, Expected Report). Never forward vague human chat verbatim.
 - **Human handoff**: Translate dense or opaque GPT/Astra technical output into clear, concise human conclusions, modified files, verification evidence, and open decisions.
 - **Unconfigured setup**: If any `gempt_*` tool reports missing config, load the `gempt` skill and run its Initial Setup flow (`gempt_discover` -> confirm user choices -> `gempt_configure`).

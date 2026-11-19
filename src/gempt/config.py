@@ -67,6 +67,7 @@ def default_config_template() -> dict[str, Any]:
             "timeout_sec": 600,
         },
         "routing_policy": {
+            "default_tier": "sonnet",
             "failover_mode": "subscription_only",
             "magpie_group_strategy": "order",
             "excluded_models": [],
@@ -192,6 +193,25 @@ def load_config(
     return merged, path
 
 
+def get_default_tier(cfg: dict[str, Any]) -> str:
+    """Return the configured default delegation tier (sonnet, opus, or fable)."""
+    policy = cfg.get("routing_policy") or {}
+    raw_val = policy.get("default_tier")
+    if raw_val is None:
+        return "sonnet"
+    if not isinstance(raw_val, str):
+        raise ConfigError("Config error: routing_policy.default_tier must be a string")
+    raw = raw_val.strip().lower()
+    if not raw:
+        return "sonnet"
+    mapped = TIER_ALIASES.get(raw, raw)
+    if mapped not in TIER_ORDER:
+        raise ConfigError(
+            f"Config error: routing_policy.default_tier '{raw_val}' must be one of: {', '.join(TIER_ORDER)}"
+        )
+    return mapped
+
+
 def validate_config(cfg: dict[str, Any]) -> None:
     """Validate critical config sections and tier definitions."""
     tiers = cfg.get("tiers")
@@ -221,6 +241,7 @@ def validate_config(cfg: dict[str, Any]) -> None:
             raise ConfigError("Config error: utility.api_mode must be 'responses' or 'chat'")
 
     policy = cfg.get("routing_policy") or {}
+    get_default_tier(cfg)
     failover = str(policy.get("failover_mode") or "subscription_only")
     if failover not in VALID_FAILOVER_MODES:
         raise ConfigError(f"Config error: routing_policy.failover_mode '{failover}' not in {VALID_FAILOVER_MODES}")
@@ -315,7 +336,7 @@ def require_subscription(models: list[str]) -> None:
 
 def resolve_tier(
     cfg: dict[str, Any],
-    tier_name: str,
+    tier_name: str | None = None,
     *,
     model_override: str | None = None,
     effort_override: str | None = None,
@@ -325,7 +346,8 @@ def resolve_tier(
     escalate: bool = False,
 ) -> dict[str, Any]:
     """Resolve effective model, effort, mode, escalation, and limits for a requested tier."""
-    key = normalize_tier_name(tier_name)
+    effective_tier = tier_name if (tier_name is not None and str(tier_name).strip()) else get_default_tier(cfg)
+    key = normalize_tier_name(effective_tier)
 
     if key == "chore":
         if for_exec:
