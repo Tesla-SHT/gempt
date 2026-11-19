@@ -163,7 +163,7 @@
     if (isGroup && members.length) {
       members.forEach((m, idx) => {
         if (idx === 0) pushNode(m, 'primary');
-        else if (m === tier.escalate_model || m.includes('astra')) pushNode(m, 'escalate');
+        else if (tier.escalate_model && m === tier.escalate_model) pushNode(m, 'escalate');
         else pushNode(m, 'fallback');
       });
     } else {
@@ -184,15 +184,14 @@
   function formatTierSummary(tier) {
     const chain = buildRouteChain(tier);
     if (!chain.length) return formatEffortLabel(tier.reasoning_effort, { detailed: false });
-    const primary = chain[0].human;
+    let summary = chain[0].human;
     const escNode = chain.slice(1).find((n) => n.role === 'escalate');
     const fbCount = chain.slice(1).filter((n) => n.role !== 'escalate').length;
-    const parts = [primary];
-    if (escNode) parts.push(`↗ 升级 ${escNode.human}`);
-    else if (fbCount === 1) parts.push(`→ 备用 ${chain[1].human}`);
-    if (escNode && fbCount > 0) parts.push(`+${fbCount} 备用`);
-    else if (!escNode && fbCount > 1) parts.push(`+${fbCount} 备用`);
-    return parts.join(' · ');
+    if (escNode) summary += ` ↗ 升级 ${escNode.human}`;
+    else if (fbCount === 1) summary += ` → 备用 ${chain[1].human}`;
+    if (escNode && fbCount > 0) summary += ` · +${fbCount} 备用`;
+    else if (!escNode && fbCount > 1) summary += ` · +${fbCount} 备用`;
+    return summary;
   }
 
   function renderSetupBanner(state) {
