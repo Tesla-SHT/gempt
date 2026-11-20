@@ -384,6 +384,10 @@
     const createBtn = $('create-native-btn');
     const ng = state.native_groups || {};
     if (nativeCopy && nativePills && createBtn) {
+      const installedSet = new Set((ng.tiers || []).filter((t) => t.installed).map((t) => t.group_id));
+      for (const pill of nativePills.querySelectorAll('[data-copy]')) {
+        pill.hidden = !installedSet.has(pill.getAttribute('data-copy'));
+      }
       if (ng.complete) {
         nativeCopy.textContent = '已就绪（3/3）· 在任意接入 Magpie 的客户端模型栏直接选下方 ID：';
         nativePills.hidden = false;
@@ -752,6 +756,12 @@
 
     renderActivity(state);
     syncHasFallbackClasses();
+    markUiReady();
+  }
+
+  function markUiReady() {
+    if (document.documentElement.classList.contains('gp-ready')) return;
+    requestAnimationFrame(() => requestAnimationFrame(() => document.documentElement.classList.add('gp-ready')));
   }
 
   async function refreshState({ manual = false } = {}) {
@@ -766,6 +776,7 @@
     } catch (err) {
       if (manual) showToast(`刷新失败: ${err.message}`, 'error');
     } finally {
+      markUiReady();
       if (refreshBtn) refreshBtn.classList.remove('is-spinning');
     }
   }

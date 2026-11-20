@@ -172,6 +172,16 @@ code {
   border: 0;
 }
 
+[hidden] {
+  display: none !important;
+}
+
+:root:not(.gp-ready) *,
+:root:not(.gp-ready) *::before,
+:root:not(.gp-ready) *::after {
+  transition: none !important;
+}
+
 .page-shell {
   min-height: 100%;
   display: flex;
