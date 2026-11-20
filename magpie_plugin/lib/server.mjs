@@ -14,7 +14,14 @@ import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createNativeGroups, initSubscriptionConfig, readState, setDefaultSandbox, setDefaultTier } from './backend.mjs';
+import {
+  createNativeGroups,
+  initSubscriptionConfig,
+  readState,
+  setDefaultSandbox,
+  setDefaultTier,
+  setEffortSettings,
+} from './backend.mjs';
 
 export const DEFAULT_PORT = 3498;
 const MAX_POST_BYTES = 8192;
@@ -190,17 +197,38 @@ export async function startServer({
         }
         if (req.method === 'POST' && pathname === '/api/settings') {
           const body = await readJsonBody(req);
-          if (body && Object.prototype.hasOwnProperty.call(body, 'failover_mode')) {
+          const has = (k) => Boolean(body && Object.prototype.hasOwnProperty.call(body, k));
+          if (has('failover_mode')) {
             return send(req, res, 400, {
               ok: false,
               error: '当前纯订阅版本不支持切换 API 兜底模式。',
             });
           }
-          if (body && Object.prototype.hasOwnProperty.call(body, 'default_sandbox')) {
-            const result = setDefaultSandbox(body.default_sandbox, { configPath });
-            return send(req, res, result.status, result);
+          const wantsSandbox = has('default_sandbox');
+          const wantsEffort = has('auto_effort') || has('tier_effort');
+          if (!wantsSandbox && !wantsEffort) {
+            return send(req, res, 400, { ok: false, error: '未提供有效设置项。' });
           }
-          return send(req, res, 400, { ok: false, error: '未提供有效设置项。' });
+
+          let combined = { ok: true, status: 200 };
+          if (wantsSandbox) {
+            const sbxRes = setDefaultSandbox(body.default_sandbox, { configPath });
+            if (!sbxRes.ok) return send(req, res, sbxRes.status, sbxRes);
+            combined = { ...combined, ...sbxRes };
+          }
+          if (wantsEffort) {
+            const effRes = setEffortSettings(
+              {
+                autoEffort: has('auto_effort') ? body.auto_effort : undefined,
+                tierEffort: has('tier_effort') ? body.tier_effort : undefined,
+                tier: has('tier') ? body.tier : undefined,
+              },
+              { configPath },
+            );
+            if (!effRes.ok) return send(req, res, effRes.status, effRes);
+            combined = { ...combined, ...effRes };
+          }
+          return send(req, res, 200, combined);
         }
         return send(req, res, 404, { error: 'not found' });
       }

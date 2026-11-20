@@ -69,13 +69,14 @@ def default_config_template() -> dict[str, Any]:
         "routing_policy": {
             "default_tier": "sonnet",
             "failover_mode": "subscription_only",
+            "auto_effort": False,
             "magpie_group_strategy": "order",
             "excluded_models": [],
         },
         "tiers": {
             "sonnet": {
                 "label": "Sonnet · 日常高频",
-                "when_to_use": "80% 日常写代码、加小功能、改 UI、写脚本",
+                "when_to_use": "约 75% 日常开发、UI/前端、单测与常规修改",
                 "consult_model": "codex/gpt-6.2-sol",
                 "exec_model": "",
                 "reasoning_effort": "medium",
@@ -86,12 +87,12 @@ def default_config_template() -> dict[str, Any]:
             },
             "opus": {
                 "label": "Opus · 复杂工程",
-                "when_to_use": "跨文件重构、读大仓库、复杂逻辑设计与排查（常规 Sol + 疑难 Astra）",
+                "when_to_use": "约 20% 跨文件重构、复杂排查与架构设计（Sol @ high + 疑难 @ xhigh 升 Astra）",
                 "consult_model": "codex/gpt-6.2-sol",
                 "exec_model": "",
                 "escalate_model": "codex/gpt-6.2-astra",
-                "escalate_effort_threshold": "high",
-                "reasoning_effort": "medium",
+                "escalate_effort_threshold": "xhigh",
+                "reasoning_effort": "high",
                 "api_mode": "responses",
                 "max_output_tokens": 24576,
                 "fallback_models": [],
@@ -99,10 +100,10 @@ def default_config_template() -> dict[str, Any]:
             },
             "fable": {
                 "label": "Fable · 顶配攻坚",
-                "when_to_use": "极难 Bug、核心算法/数学推导、长程架构设计",
+                "when_to_use": "约 5% 极难 Bug、核心算法/数学推导、长程架构攻坚",
                 "consult_model": "codex/gpt-6.2-astra",
                 "exec_model": "",
-                "reasoning_effort": "high",
+                "reasoning_effort": "xhigh",
                 "api_mode": "responses",
                 "max_output_tokens": 32768,
                 "fallback_models": [],
@@ -227,6 +228,9 @@ def validate_config(cfg: dict[str, Any]) -> None:
         effort = str(tier.get("reasoning_effort") or "medium").strip()
         if effort and effort not in VALID_EFFORTS:
             raise ConfigError(f"Config error: tiers.{tier_name}.reasoning_effort '{effort}' not in {VALID_EFFORTS}")
+        threshold = str(tier.get("escalate_effort_threshold") or "").strip()
+        if threshold and threshold not in VALID_EFFORTS:
+            raise ConfigError(f"Config error: tiers.{tier_name}.escalate_effort_threshold '{threshold}' not in {VALID_EFFORTS}")
         api_mode = str(tier.get("api_mode") or "responses").strip()
         if api_mode not in {"responses", "chat"}:
             raise ConfigError(f"Config error: tiers.{tier_name}.api_mode must be 'responses' or 'chat'")
@@ -252,6 +256,8 @@ def validate_config(cfg: dict[str, Any]) -> None:
     if excluded is not None:
         if not isinstance(excluded, list) or not all(isinstance(item, str) for item in excluded):
             raise ConfigError("Config error: routing_policy.excluded_models must be a list of strings")
+    if "auto_effort" in policy and policy.get("auto_effort") is not None and not isinstance(policy.get("auto_effort"), bool):
+        raise ConfigError("Config error: routing_policy.auto_effort must be a boolean")
 
     codex_cfg = cfg.get("codex") or {}
     sandbox = str(codex_cfg.get("default_sandbox") or "workspace-write")

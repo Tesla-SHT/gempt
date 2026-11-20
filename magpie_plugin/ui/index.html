@@ -138,6 +138,29 @@
               <span id="sandbox-hint" class="control-hint">仅允许修改当前工作区内的文件</span>
             </fieldset>
 
+            <fieldset id="effort-control-group" class="control-fieldset">
+              <legend class="control-legend">思考强度（当前档）</legend>
+              <div class="seg-control">
+                <span class="seg-option">
+                  <input id="eff-medium" class="seg-radio sr-only" type="radio" name="active_effort" value="medium">
+                  <label class="seg-label" for="eff-medium">中</label>
+                </span>
+                <span class="seg-option">
+                  <input id="eff-high" class="seg-radio sr-only" type="radio" name="active_effort" value="high">
+                  <label class="seg-label" for="eff-high">高</label>
+                </span>
+                <span class="seg-option">
+                  <input id="eff-xhigh" class="seg-radio sr-only" type="radio" name="active_effort" value="xhigh">
+                  <label class="seg-label" for="eff-xhigh">极高</label>
+                </span>
+                <span class="seg-option">
+                  <input id="eff-auto" class="seg-radio sr-only" type="radio" name="active_effort" value="auto">
+                  <label class="seg-label" for="eff-auto">智能</label>
+                </span>
+              </div>
+              <span id="effort-hint" class="control-hint">当前档位思考深度；选「智能」按复杂度自动定档</span>
+            </fieldset>
+
             <fieldset id="failover-control-group" class="control-fieldset" hidden>
               <legend class="control-legend">容灾模式</legend>
               <div class="seg-control">
@@ -186,7 +209,7 @@
                 <span class="tier-line-sub" data-field="chain_summary">GPT-6.2-Sol</span>
               </span>
               <span class="tier-tail">
-                <span class="tier-when" data-field="role_desc">日常高频</span>
+                <span class="tier-when" data-field="role_desc">日常高频 · ~75%</span>
                 <span class="tier-effort-chip" data-field="effort_tag">思考：中</span>
                 <svg class="tier-check" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                   <path d="M3.5 8.5L6.5 11.5L12.5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
@@ -205,8 +228,8 @@
                 <span class="tier-line-sub" data-field="chain_summary">GPT-6.2-Sol ↗ 升级 GPT-6.2-Astra</span>
               </span>
               <span class="tier-tail">
-                <span class="tier-when" data-field="role_desc">复杂工程</span>
-                <span class="tier-effort-chip" data-field="effort_tag">思考：中 → 高</span>
+                <span class="tier-when" data-field="role_desc">复杂工程 · ~20%</span>
+                <span class="tier-effort-chip" data-field="effort_tag">思考：高 → 极高</span>
                 <svg class="tier-check" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                   <path d="M3.5 8.5L6.5 11.5L12.5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>
@@ -224,8 +247,8 @@
                 <span class="tier-line-sub" data-field="chain_summary">GPT-6.2-Astra</span>
               </span>
               <span class="tier-tail">
-                <span class="tier-when" data-field="role_desc">顶配攻坚</span>
-                <span class="tier-effort-chip" data-field="effort_tag">思考：高</span>
+                <span class="tier-when" data-field="role_desc">顶配攻坚 · ~5%</span>
+                <span class="tier-effort-chip" data-field="effort_tag">思考：极高</span>
                 <svg class="tier-check" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                   <path d="M3.5 8.5L6.5 11.5L12.5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>

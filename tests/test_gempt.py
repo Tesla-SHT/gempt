@@ -39,7 +39,16 @@ from gempt.mcp_server import _handle_tool_call
 from gempt.presets import apply_native_presets, build_native_preset_commands, strip_model_modifiers
 from gempt.protocol import build_consult_prompt, build_exec_prompt, read_context_files
 from gempt.runs import recent_runs, verification_result
-from gempt.service import configure_gempt, set_default_sandbox, set_default_tier
+from gempt.routing import build_escalation_suggestion, classify_task_effort, effort_timeout_floor
+from gempt.service import (
+    configure_gempt,
+    run_consult,
+    run_exec,
+    set_auto_effort,
+    set_default_sandbox,
+    set_default_tier,
+    set_tier_effort,
+)
 from gempt.sessions import list_sessions, load_session, save_session
 
 
@@ -67,19 +76,28 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(sonnet["model"], "codex/gpt-6.2-sol")
             self.assertEqual(resolve_tier(loaded, "lite")["tier"], "sonnet")
 
-            # Opus normal vs escalation
+            # Opus normal vs escalation (sweet spot: Sol@high -> Astra@xhigh)
             opus_normal = resolve_tier(loaded, "opus")
             self.assertEqual(opus_normal["model"], "codex/gpt-6.2-sol")
+            self.assertEqual(opus_normal["reasoning_effort"], "high")
             self.assertFalse(opus_normal["escalated"])
 
             opus_esc = resolve_tier(loaded, "opus", escalate=True)
             self.assertEqual(opus_esc["model"], "codex/gpt-6.2-astra")
-            self.assertEqual(opus_esc["reasoning_effort"], "high")
+            self.assertEqual(opus_esc["reasoning_effort"], "xhigh")
             self.assertTrue(opus_esc["escalated"])
 
             opus_high = resolve_tier(loaded, "opus", effort_override="high")
-            self.assertEqual(opus_high["model"], "codex/gpt-6.2-astra")
-            self.assertTrue(opus_high["escalated"])
+            self.assertEqual(opus_high["model"], "codex/gpt-6.2-sol")
+            self.assertFalse(opus_high["escalated"])
+
+            opus_xhigh = resolve_tier(loaded, "opus", effort_override="xhigh")
+            self.assertEqual(opus_xhigh["model"], "codex/gpt-6.2-astra")
+            self.assertTrue(opus_xhigh["escalated"])
+
+            fable_default = resolve_tier(loaded, "fable")
+            self.assertEqual(fable_default["model"], "codex/gpt-6.2-astra")
+            self.assertEqual(fable_default["reasoning_effort"], "xhigh")
 
             # Chore consult allowed, chore exec disallowed
             chore = resolve_tier(loaded, "chore")
@@ -168,6 +186,29 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(rc4, 0)
             self.assertEqual(json.loads(buf4.getvalue())["default_sandbox"], "workspace-write")
 
+            with self.assertRaises(ConfigError):
+                set_tier_effort("low", tier="fable", config_path=cfg_path)
+            with self.assertRaises(ConfigError):
+                set_tier_effort("ultra", tier="opus", config_path=cfg_path)
+
+            eff_auto = set_auto_effort(True, config_path=cfg_path)
+            self.assertTrue(eff_auto["auto_effort"])
+
+            buf5 = io.StringIO()
+            with contextlib.redirect_stdout(buf5):
+                rc5 = cli_main(["effort", "high", "--tier", "opus", "--config", str(cfg_path), "--json"])
+            self.assertEqual(rc5, 0)
+            parsed_eff = json.loads(buf5.getvalue())
+            self.assertEqual(parsed_eff["tier"], "opus")
+            self.assertEqual(parsed_eff["reasoning_effort"], "high")
+            self.assertFalse(parsed_eff["auto_effort"])
+
+            buf6 = io.StringIO()
+            with contextlib.redirect_stdout(buf6):
+                rc6 = cli_main(["effort", "auto", "--config", str(cfg_path), "--json"])
+            self.assertEqual(rc6, 0)
+            self.assertTrue(json.loads(buf6.getvalue())["auto_effort"])
+
 
 class DiscoverTests(unittest.TestCase):
     def test_recommendations_exclude_forbidden_model_and_build_presets(self) -> None:
@@ -193,9 +234,13 @@ class DiscoverTests(unittest.TestCase):
         self.assertEqual(list(recs["presets"].keys()), ["subscription_only"])
         sub = recs["presets"]["subscription_only"]["tiers"]
         self.assertEqual(sub["sonnet"]["consult_model"], "codex/gpt-6.2-sol")
+        self.assertEqual(sub["sonnet"]["reasoning_effort"], "medium")
         self.assertEqual(sub["opus"]["consult_model"], "codex/gpt-6.2-sol")
         self.assertEqual(sub["opus"]["escalate_model"], "codex/gpt-6.2-astra")
+        self.assertEqual(sub["opus"]["reasoning_effort"], "high")
+        self.assertEqual(sub["opus"]["escalate_effort_threshold"], "xhigh")
         self.assertEqual(sub["fable"]["consult_model"], "codex/gpt-6.2-astra")
+        self.assertEqual(sub["fable"]["reasoning_effort"], "xhigh")
 
         api_only_recs = build_tier_recommendations({**catalog, "codex_subscription_models": []})
         self.assertFalse(api_only_recs["available"])
@@ -345,7 +390,7 @@ class MagpieClientAndCodexRunnerTests(unittest.TestCase):
 
         opus_cmds = [" ".join(c) for c in by_tier["opus"]["commands"]]
         self.assertTrue(any("group add gempt-harness-opus" in c for c in opus_cmds))
-        self.assertTrue(any("group rule add gempt-harness-opus use=codex/gpt-6.2-astra effort=high" in c for c in opus_cmds))
+        self.assertTrue(any("group rule add gempt-harness-opus use=codex/gpt-6.2-astra effort=xhigh" in c for c in opus_cmds))
 
     def test_codex_cmd_invocation_no_shell_interpolation(self) -> None:
         if sys.platform == "win32":
@@ -651,8 +696,158 @@ class BugfixRegressionTests(unittest.TestCase):
                     self.assertIsNone(mock_exec.call_args.kwargs["tier"])
 
                 with mock.patch("gempt.mcp_server.configure_gempt", return_value={"saved": True}) as mock_cfg:
-                    _handle_tool_call("gempt_configure", {"default_tier": "opus"})
+                    _handle_tool_call("gempt_configure", {"default_tier": "opus", "auto_effort": True})
                     self.assertEqual(mock_cfg.call_args.kwargs["default_tier"], "opus")
+                    self.assertTrue(mock_cfg.call_args.kwargs["auto_effort"])
+
+    def test_auto_effort_classifier_timeout_floor_and_js_parity(self) -> None:
+        trivial = classify_task_effort(
+            tier="sonnet",
+            tier_default_effort="medium",
+            model_id="codex/gpt-6.2-sol",
+            goal="Rename variable and fix comment typo",
+        )
+        self.assertEqual(trivial["effort"], "low")
+        self.assertTrue(trivial["auto_applied"])
+
+        hard_opus = classify_task_effort(
+            tier="opus",
+            tier_default_effort="high",
+            model_id="codex/gpt-6.2-sol",
+            goal="Diagnose deadlock and race condition in distributed state machine",
+            file_count=5,
+        )
+        self.assertEqual(hard_opus["effort"], "xhigh")
+
+        astra_floor = classify_task_effort(
+            tier="fable",
+            tier_default_effort="xhigh",
+            model_id="codex/gpt-6.2-astra",
+            goal="Simple typo check in README comments",
+        )
+        self.assertEqual(astra_floor["effort"], "high")
+        self.assertFalse(astra_floor["clamped"])
+
+        astra_clamped = classify_task_effort(
+            tier="sonnet",
+            tier_default_effort="medium",
+            model_id="codex/gpt-6.2-astra",
+            goal="Simple typo check in README comments",
+        )
+        self.assertEqual(astra_clamped["effort"], "high")
+        self.assertTrue(astra_clamped["clamped"])
+
+        resumed = classify_task_effort(
+            tier="opus",
+            tier_default_effort="high",
+            model_id="codex/gpt-6.2-sol",
+            goal="Diagnose deadlock and race condition",
+            is_resume=True,
+        )
+        self.assertFalse(resumed["auto_applied"])
+        self.assertEqual(resumed["effort"], "high")
+
+        self.assertEqual(effort_timeout_floor("xhigh", mode="exec"), 1200)
+        self.assertEqual(effort_timeout_floor("high", mode="exec"), 900)
+        self.assertEqual(effort_timeout_floor("xhigh", mode="consult"), 300)
+
+        hint = build_escalation_suggestion(mode="exec", tier="sonnet", effort="medium", verification_status="failed")
+        self.assertIn("omit session_id", hint)
+
+        node_bin = shutil.which("node")
+        if node_bin:
+            samples = [
+                {"tier": "sonnet", "tierDefaultEffort": "medium", "modelId": "codex/gpt-6.2-sol", "goal": "Rename typo in comment"},
+                {"tier": "opus", "tierDefaultEffort": "high", "modelId": "codex/gpt-6.2-sol", "goal": "Diagnose race condition and deadlock", "fileCount": 5},
+                {"tier": "fable", "tierDefaultEffort": "xhigh", "modelId": "codex/gpt-6.2-astra", "goal": "Simple typo README fix"},
+                {"tier": "sonnet", "tierDefaultEffort": "medium", "modelId": "codex/gpt-6.2-astra", "goal": "Simple typo check in README comments"},
+                {"tier": "opus", "tierDefaultEffort": "high", "modelId": "codex/gpt-6.2-sol", "goal": "Deadlock", "isResume": True},
+            ]
+            js_script = (
+                "import { classifyTaskEffort } from './magpie_plugin/lib/routing.mjs';"
+                f"const items = {json.dumps(samples)};"
+                "console.log(JSON.stringify(items.map((x) => classifyTaskEffort(x))));"
+            )
+            proc = subprocess.run(
+                [node_bin, "--input-type=module", "-e", js_script],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            js_results = json.loads(proc.stdout)
+            for sample, js_out in zip(samples, js_results):
+                py_out = classify_task_effort(
+                    tier=sample["tier"],
+                    tier_default_effort=sample["tierDefaultEffort"],
+                    model_id=sample["modelId"],
+                    goal=sample["goal"],
+                    file_count=sample.get("fileCount", 0),
+                    is_resume=sample.get("isResume", False),
+                )
+                self.assertEqual(js_out["effort"], py_out["effort"])
+                self.assertEqual(js_out["score"], py_out["score"])
+                self.assertEqual(js_out["auto_applied"], py_out["auto_applied"])
+                self.assertEqual(js_out["clamped"], py_out["clamped"])
+
+    def test_service_auto_effort_timeout_floor_and_fresh_escalation_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conf = root / "cfg" / "config.json"
+            sess_dir = root / "sessions"
+            repo = root / "repo"
+            repo.mkdir(parents=True)
+            cfg = default_config_template()
+            cfg["routing_policy"]["default_tier"] = "opus"
+            cfg["routing_policy"]["auto_effort"] = True
+            save_config(cfg, conf)
+
+            with mock.patch.dict(os.environ, {"GEMPT_CONFIG": str(conf), "GEMPT_SESSIONS_DIR": str(sess_dir)}):
+                with mock.patch(
+                    "gempt.service.consult_with_fallback",
+                    return_value={"served_model": "codex/gpt-6.2-astra", "elapsed_sec": 0.2, "text": "ROOT_CAUSE", "usage": {}},
+                ) as mock_consult:
+                    c1 = run_consult(
+                        goal="Diagnose race condition and deadlock in scheduler state machine",
+                        cwd=repo,
+                        config_path=conf,
+                    )
+                    self.assertEqual(c1["reasoning_effort"], "xhigh")
+                    self.assertEqual(c1["requested_model"], "codex/gpt-6.2-astra")
+                    self.assertTrue(c1["escalated"])
+                    self.assertGreaterEqual(mock_consult.call_args.kwargs["timeout_sec"], 300)
+
+                    # Follow-up resume locks thread effort without auto_effort re-running
+                    c2 = run_consult(
+                        goal="Explain fix",
+                        session_id=c1["session_id"],
+                        cwd=repo,
+                        config_path=conf,
+                    )
+                    self.assertEqual(c2["reasoning_effort"], "xhigh")
+                    self.assertIsNone(c2["auto_effort"])
+
+                with mock.patch("gempt.service.find_codex_cli", return_value={"found": True, "path": str(root / "codex")}), \
+                     mock.patch("gempt.service.run_codex_exec") as mock_exec:
+                    mock_exec.return_value = {
+                        "codex_thread_id": "t_xhigh",
+                        "text": "ran check",
+                        "commands": [{"command": "python -m unittest", "exit_code": 1}],
+                        "observed_context": {"cwd": str(repo), "sandbox": "workspace-write"},
+                        "elapsed_sec": 1.0,
+                        "usage": {},
+                    }
+                    ex = run_exec(
+                        goal="Fix convergence math proof",
+                        cwd=repo,
+                        tier="fable",
+                        verification="python -m unittest",
+                        config_path=conf,
+                    )
+                    self.assertGreaterEqual(mock_exec.call_args.kwargs["timeout_sec"], 1200)
+                    self.assertIn("omit session_id", ex["escalation_suggestion"])
 
 
 if __name__ == "__main__":

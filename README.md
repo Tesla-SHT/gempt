@@ -98,16 +98,19 @@ Gemini 主控（Antigravity 官方原路 或 外部客户端经 Magpie 调 antig
 本地 Magpie 网关（127.0.0.1:3425）── 统一代理 GPT/Codex 订阅池、多号轮转与容灾
 ```
 
-### 3+1 编排档位与可选隔离组
+### 3+1 编排档位、甜点强度与领域分工
 
-| 编排档位 / 可选组 | 对标定位 | 执行 / 咨询模型（经 Magpie） | 免费打杂 / `compact` | 典型场景 |
+- **领域分工**：**Gemini** 专职人类需求沟通、方案拆解、前端/UI 审美实现、多模态核验与最终验收；**GPT/Codex**（经本地 Magpie 调度）专攻后端重构、硬核调试、算法数学与独立 Diff 审查（不自写自审）。
+- **甜点配置与思考强度纪律**：控制面板右侧提供 **`思考强度（当前档）`**（`中 | 高 | 极高 | 智能`）。选 **`智能`**（`auto_effort`）时，仅在新线程首轮按任务风险在 `low..xhigh` 间自动定档；`resume` 续跑强制锁定原强度，禁用 `ultra` 与高强度子代理扇出，也不将 `Astra` 降至 `low`。
+
+| 编排档位 / 推荐占比 | 对标定位 | 执行 / 咨询模型 × 甜点强度 | 免费旁路 (`compact`) | 典型场景 |
 | :--- | :--- | :--- | :--- | :--- |
-| `sonnet`（可选 `group/gempt-harness-sonnet`） | 日常高频（~80%） | `codex/gpt-6.2-sol`（默认 `medium`） | `DeepSeek-V4.1-Flash` | 单/少文件实现、加小功能、改 UI、写脚本 |
-| `opus`（可选 `group/gempt-harness-opus`） | 复杂工程 | 常规 `Sol` + 疑难（`high+` / `escalate=true`）升 `Astra` | `DeepSeek-V4.1-Flash` | 跨文件重构、读大仓库、复杂逻辑设计与排查 |
-| `fable`（可选 `group/gempt-harness-fable`） | 顶配攻坚 | `codex/gpt-6.2-astra`（默认 `high`） | `DeepSeek-V4.1-Flash` | 极难 Bug、核心算法/数学推导、长程架构设计 |
-| `chore`（仅 `consult`） | 免费打杂 / 压缩 / 分类 | `DeepSeek-V4.1-Flash` 等免费高速模型 | — | 日志提纯、大文本摘要、粗分类 |
+| `sonnet`（**~75%**） | 日常高频 | `codex/gpt-6.2-sol` @ **`medium`** | `DeepSeek-V4.1-Flash` | 单/少文件实现、UI 交互逻辑、常规单测 |
+| `opus`（**~20%**） | 复杂工程 | `codex/gpt-6.2-sol` @ **`high`**（疑难 / `xhigh` 升 **`Astra`**） | `DeepSeek-V4.1-Flash` | 跨文件重构、大仓库排查、独立审查、复杂设计 |
+| `fable`（**~5%**） | 顶配攻坚 | `codex/gpt-6.2-astra` @ **`xhigh`** | `DeepSeek-V4.1-Flash` | 极难 Bug、核心算法/数学推导、长程架构 |
+| `chore`（旁路 `consult`） | 免费打杂 | `DeepSeek-V4.1-Flash` 等免费高速模型 | — | 日志提纯、大文本摘要、粗分类 |
 
-> 日常默认直接调用 Magpie 中具体的 GPT/Codex 模型 ID 即可工作；仅当开启组同步时才会创建独立命名的 `group/gempt-harness-*`，与根目录 `install.sh` 的 `group/gempt-*` 完全独立、互不覆盖。
+> 日常默认直接调用 Magpie 中具体的 GPT/Codex 模型 ID 即可工作；仅当开启组同步时才会创建独立命名的 `group/gempt-harness-*`，与根目录 `install.sh` 的 `group/gempt-*` 完全独立、互不覆盖。`high` / `xhigh` 自动保障长思考超时下限（exec ≥ 900s/1200s）。
 
 ### 零依赖快速开始（Python 3.10+ 标准库）
 
@@ -140,6 +143,11 @@ PYTHONPATH=src python -m gempt sandbox workspace-write
 # 查看或切换默认委派档位（工具调用省略 --tier / tier 时自动生效）
 PYTHONPATH=src python -m gempt tier
 PYTHONPATH=src python -m gempt tier opus
+
+# 查看或切换思考强度（对当前或指定档位设为 low/medium/high/xhigh，或 auto 智能定档）
+PYTHONPATH=src python -m gempt effort
+PYTHONPATH=src python -m gempt effort auto
+PYTHONPATH=src python -m gempt effort high --tier opus
 
 # 查看当前配置（已脱敏）、Magpie/Codex 健康状态与近期会话
 PYTHONPATH=src python -m gempt status

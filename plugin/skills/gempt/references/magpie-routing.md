@@ -11,11 +11,11 @@
 
 ## 1. 三组与打杂组定位
 
-| 路由组 ID | 对标档位 | 主力执行模型 | 疑难升级 | 免费压缩 (`compact`) |
+| 路由组 ID | 对标档位（推荐占比） | 主力执行模型 × 甜点强度 | 疑难升级 | 免费压缩 (`compact`) |
 | :--- | :--- | :--- | :--- | :--- |
-| `group/gempt-harness-sonnet` | Sonnet（日常高频 80%） | `codex/gpt-6.2-sol` | — | `DeepSeek-V4.1-Flash` |
-| `group/gempt-harness-opus` | Opus（复杂工程） | `codex/gpt-6.2-sol` | `effort=high` 时自动转 `codex/gpt-6.2-astra` | `DeepSeek-V4.1-Flash` |
-| `group/gempt-harness-fable` | Fable（顶配攻坚） | `codex/gpt-6.2-astra` | — | `DeepSeek-V4.1-Flash` |
+| `group/gempt-harness-sonnet` | Sonnet（日常高频 ~75%） | `codex/gpt-6.2-sol` (`medium`) | — | `DeepSeek-V4.1-Flash` |
+| `group/gempt-harness-opus` | Opus（复杂工程 ~20%） | `codex/gpt-6.2-sol` (`high`) | `effort=xhigh` 时自动转 `codex/gpt-6.2-astra` | `DeepSeek-V4.1-Flash` |
+| `group/gempt-harness-fable` | Fable（顶配攻坚 ~5%） | `codex/gpt-6.2-astra` (`xhigh`) | — | `DeepSeek-V4.1-Flash` |
 
 ---
 
@@ -29,10 +29,10 @@ magpie group add gempt-harness-sonnet models=codex/gpt-6.2-sol,group/auto-deepse
 magpie group set gempt-harness-sonnet note="gempt sonnet (日常高频)"
 magpie group rule add gempt-harness-sonnet use=group/auto-deepseek-v4-1-flash compact
 
-# 2) Opus 档：常规 Sol + 高推理(high+)自动升级 Astra
+# 2) Opus 档：Sol @ high + 极高推理(xhigh+)自动升级 Astra
 magpie group add gempt-harness-opus models=codex/gpt-6.2-sol,codex/gpt-6.2-astra,group/auto-deepseek-v4-1-flash routing=order stays=session
 magpie group set gempt-harness-opus note="gempt opus (复杂工程)"
-magpie group rule add gempt-harness-opus use=codex/gpt-6.2-astra effort=high
+magpie group rule add gempt-harness-opus use=codex/gpt-6.2-astra effort=xhigh
 magpie group rule add gempt-harness-opus use=group/auto-deepseek-v4-1-flash compact
 
 # 3) Fable 档：顶配攻坚

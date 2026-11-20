@@ -246,8 +246,8 @@ test('backend readState detects multi-client state, native groups, MCP snippet, 
         },
         tiers: {
           sonnet: { consult_model: 'codex/gpt-6.2-sol', reasoning_effort: 'medium' },
-          opus: { consult_model: 'codex/gpt-6.2-sol', escalate_model: 'codex/gpt-6.2-astra', reasoning_effort: 'medium' },
-          fable: { consult_model: 'codex/gpt-6.2-astra', reasoning_effort: 'high' },
+          opus: { consult_model: 'codex/gpt-6.2-sol', escalate_model: 'codex/gpt-6.2-astra', escalate_effort_threshold: 'xhigh', reasoning_effort: 'high' },
+          fable: { consult_model: 'codex/gpt-6.2-astra', reasoning_effort: 'xhigh' },
         },
         utility: { model: 'auto/deepseek-v4.1-flash' },
       }),
@@ -401,6 +401,7 @@ test('page server supports init, native-groups idempotent creation, security che
     const html = pageRes.text;
     assert.match(html, /<meta name="color-scheme" content="light dark">/);
     assert.match(html, /id="create-native-btn"/);
+    assert.match(html, /id="effort-control-group"/);
     const key = html.match(/<meta name="gempt-key" content="([^"]+)">/)[1];
 
     const nativeRes = await fetch(`${origin}/api/native-groups`, {
@@ -445,6 +446,46 @@ test('page server supports init, native-groups idempotent creation, security che
       body: JSON.stringify({ failover_mode: 'api_fallback' }),
     });
     assert.equal(postFailoverRejected.status, 400);
+
+    const postAutoOn = await fetch(`${origin}/api/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'null', 'x-gempt-key': key },
+      body: JSON.stringify({ auto_effort: true }),
+    });
+    assert.equal(postAutoOn.status, 200);
+    assert.equal((await postAutoOn.json()).auto_effort, true);
+
+    const postEffortSet = await fetch(`${origin}/api/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'null', 'x-gempt-key': key },
+      body: JSON.stringify({ auto_effort: false, tier_effort: 'xhigh', tier: 'opus' }),
+    });
+    assert.equal(postEffortSet.status, 200);
+    const effSetJson = await postEffortSet.json();
+    assert.equal(effSetJson.auto_effort, false);
+    assert.equal(effSetJson.reasoning_effort, 'xhigh');
+
+    const postUltraRejected = await fetch(`${origin}/api/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'null', 'x-gempt-key': key },
+      body: JSON.stringify({ tier_effort: 'ultra', tier: 'opus' }),
+    });
+    assert.equal(postUltraRejected.status, 400);
+
+    const postAstraLowRejected = await fetch(`${origin}/api/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'null', 'x-gempt-key': key },
+      body: JSON.stringify({ tier_effort: 'low', tier: 'fable' }),
+    });
+    assert.equal(postAstraLowRejected.status, 400);
+
+    const stateRes = await fetch(`${origin}/api/state`, {
+      headers: { 'x-gempt-key': key },
+    });
+    assert.equal(stateRes.status, 200);
+    const stateJson = await stateRes.json();
+    assert.equal(stateJson.auto_effort, false);
+    assert.equal(stateJson.tiers.find((t) => t.id === 'opus').reasoning_effort, 'xhigh');
   } finally {
     if (prevMagpieAddr === undefined) delete process.env.MAGPIE_ADDR;
     else process.env.MAGPIE_ADDR = prevMagpieAddr;
@@ -546,10 +587,10 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     );
     assert.equal(c1.config_source, 'auto_subscription');
     assert.equal(c1.model, 'codex/gpt-6.2-astra');
-    assert.equal(c1.reasoning_effort, 'high');
+    assert.equal(c1.reasoning_effort, 'xhigh');
     assert.equal(c1.agent, 'zcode');
     assert.match(magpie.requests[0].body.input[0].content, /1: def solve\(\):/);
-    assert.equal(magpie.requests[0].body.reasoning.effort, 'high');
+    assert.equal(magpie.requests[0].body.reasoning.effort, 'xhigh');
 
     // Consult multi-turn resume & chore routing
     const c2 = await defaultTools.consult.execute({ goal: 'Follow up question', session_id: c1.session_id }, { agent: 'claude' });
@@ -599,11 +640,11 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
         version: 1,
         magpie: { base_url: magpie.url },
         codex: { default_sandbox: 'workspace-write', cli_path: mockCodex },
-        routing_policy: { default_tier: 'opus', failover_mode: 'subscription_only' },
+        routing_policy: { default_tier: 'opus', failover_mode: 'subscription_only', auto_effort: true },
         tiers: {
           sonnet: { consult_model: 'codex/gpt-6.2-sol', exec_model: 'codex/gpt-6.2-sol', reasoning_effort: 'medium' },
-          opus: { consult_model: 'codex/gpt-6.2-sol', exec_model: 'codex/gpt-6.2-sol', escalate_model: 'codex/gpt-6.2-astra', reasoning_effort: 'medium' },
-          fable: { consult_model: 'codex/gpt-6.2-astra', exec_model: 'codex/gpt-6.2-astra', reasoning_effort: 'high' },
+          opus: { consult_model: 'codex/gpt-6.2-sol', exec_model: 'codex/gpt-6.2-sol', escalate_model: 'codex/gpt-6.2-astra', escalate_effort_threshold: 'xhigh', reasoning_effort: 'high' },
+          fable: { consult_model: 'codex/gpt-6.2-astra', exec_model: 'codex/gpt-6.2-astra', reasoning_effort: 'xhigh' },
         },
         utility: { model: 'auto/deepseek-v4.1-flash', api_mode: 'chat' },
       }),
@@ -657,6 +698,23 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     assert.match(codexCalls[0].stdinPrompt, /## Goal\nInspect repo/);
     assert.ok(codexCalls[1].args.includes('resume'));
     assert.ok(codexCalls[1].args.includes('01900000-0000-7000-8000-000000000001'));
+
+    // Auto-effort escalates complex Opus consult to Astra@xhigh and preserves on resume
+    const autoHard = await enabledTools.consult.execute({
+      goal: 'Diagnose deadlock and race condition in distributed scheduler state machine',
+      tier: 'opus',
+    });
+    assert.equal(autoHard.model, 'codex/gpt-6.2-astra');
+    assert.equal(autoHard.reasoning_effort, 'xhigh');
+    assert.equal(autoHard.escalated, true);
+    assert.equal(autoHard.auto_effort?.effort, 'xhigh');
+
+    const autoResume = await enabledTools.consult.execute({
+      goal: 'Summarize root cause',
+      session_id: autoHard.session_id,
+    });
+    assert.equal(autoResume.reasoning_effort, 'xhigh');
+    assert.equal(autoResume.auto_effort, null);
   } finally {
     if (prevMagpieAddr === undefined) delete process.env.MAGPIE_ADDR;
     else process.env.MAGPIE_ADDR = prevMagpieAddr;

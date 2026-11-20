@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import DEFAULT_CONFIG_PATH, TIER_ORDER, VALID_SANDBOXES
+from . import DEFAULT_CONFIG_PATH, EFFORT_RANK, TIER_ORDER, VALID_EFFORTS, VALID_SANDBOXES
 from .runs import recent_runs, verification_result
 from .codex_runner import run_codex_exec
 from .config import (
@@ -26,13 +26,19 @@ from .config import (
     save_config,
 )
 from .discover import discover_environment, find_codex_cli, find_magpie_cli, probe_magpie_gateway
-from .magpie_client import consult_with_fallback, sync_magpie_groups
+from .magpie_client import MagpieRequestError, consult_with_fallback, sync_magpie_groups
 from .protocol import (
     CONSULT_SYSTEM_PROMPT,
     build_consult_prompt,
     build_exec_prompt,
     format_result_summary,
     read_context_files,
+)
+from .routing import (
+    build_escalation_suggestion,
+    classify_task_effort,
+    effort_timeout_floor,
+    is_astra_model,
 )
 from .sessions import list_sessions, load_session, new_session_id, save_session
 
@@ -75,6 +81,64 @@ def set_default_sandbox(sandbox: str, *, config_path: str | Path | None = None) 
     }
 
 
+def set_auto_effort(enabled: bool, *, config_path: str | Path | None = None) -> dict[str, Any]:
+    """Persist routing_policy.auto_effort atomically without re-running discovery."""
+    target = config_path or os.environ.get("GEMPT_CONFIG") or DEFAULT_CONFIG_PATH
+    cfg, resolved_path = load_config(explicit=target, require_exists=True)
+    cfg.setdefault("routing_policy", {})["auto_effort"] = bool(enabled)
+    saved_path = save_config(cfg, path=resolved_path)
+    tier_name = get_default_tier(cfg)
+    return {
+        "saved": True,
+        "auto_effort": bool(enabled),
+        "default_tier": tier_name,
+        "config_path": str(saved_path),
+        "resolved": resolve_tier(cfg, tier_name),
+    }
+
+
+def set_tier_effort(
+    effort: str,
+    *,
+    tier: str | None = None,
+    disable_auto: bool = True,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Persist tiers.<tier>.reasoning_effort (and optionally disable auto_effort) atomically."""
+    cleaned = str(effort or "").strip().lower()
+    if cleaned not in VALID_EFFORTS:
+        raise ConfigError(f"Reasoning effort must be one of: {', '.join(VALID_EFFORTS)}")
+    target = config_path or os.environ.get("GEMPT_CONFIG") or DEFAULT_CONFIG_PATH
+    cfg, resolved_path = load_config(explicit=target, require_exists=True)
+    target_tier = _normalize_default_tier(tier) if (tier is not None and str(tier).strip()) else get_default_tier(cfg)
+    tier_cfg = cfg.setdefault("tiers", {}).setdefault(target_tier, {})
+    primary_model = str(tier_cfg.get("consult_model") or "")
+    exec_model = str(tier_cfg.get("exec_model") or "")
+    group_members = [str(m) for m in (tier_cfg.get("magpie_group_members") or []) if m]
+    uses_astra = (
+        target_tier == "fable"
+        or is_astra_model(primary_model)
+        or is_astra_model(exec_model)
+        or any(is_astra_model(m) for m in group_members)
+    )
+    if uses_astra and EFFORT_RANK[cleaned] < EFFORT_RANK["medium"]:
+        raise ConfigError("Astra models should not be downgraded to low effort; use medium/high Sol or high/xhigh Astra.")
+    if cleaned == "ultra":
+        raise ConfigError("Default effort must not be set to 'ultra'; pass explicit override on a single run only if strictly needed.")
+    tier_cfg["reasoning_effort"] = cleaned
+    if disable_auto:
+        cfg.setdefault("routing_policy", {})["auto_effort"] = False
+    saved_path = save_config(cfg, path=resolved_path)
+    return {
+        "saved": True,
+        "tier": target_tier,
+        "reasoning_effort": cleaned,
+        "auto_effort": bool(cfg.get("routing_policy", {}).get("auto_effort", False)),
+        "config_path": str(saved_path),
+        "resolved": resolve_tier(cfg, target_tier),
+    }
+
+
 def configure_gempt(
     *,
     config_path: str | Path | None = None,
@@ -86,6 +150,7 @@ def configure_gempt(
     codex_model_provider: str | None = None,
     default_tier: str | None = None,
     failover_mode: str = "subscription_only",
+    auto_effort: bool | None = None,
     magpie_group_strategy: str = "order",
     utility_model: str | None = None,
     use_for_magpie_compact: bool | None = None,
@@ -133,6 +198,8 @@ def configure_gempt(
     if default_tier is not None and str(default_tier).strip():
         cfg["routing_policy"]["default_tier"] = _normalize_default_tier(default_tier)
     cfg["routing_policy"]["failover_mode"] = failover_mode
+    if auto_effort is not None:
+        cfg["routing_policy"]["auto_effort"] = bool(auto_effort)
     cfg["routing_policy"]["magpie_group_strategy"] = magpie_group_strategy
 
     discovery = discover_environment(
@@ -223,16 +290,67 @@ def run_consult(
         raise ConfigError("`goal` must not be empty.")
 
     cfg, _ = load_config(explicit=config_path, require_exists=True, cwd=Path(cwd) if cwd else None)
-    resolved = resolve_tier(
+    workspace = str(Path(cwd or ".").resolve())
+    history_messages: list[dict[str, str]] = []
+    session_record: dict[str, Any] | None = None
+    sid = (session_id or "").strip()
+    is_resume = bool(sid)
+    if sid:
+        session_record = load_session(sid)
+        if not session_record:
+            raise ConfigError(f"Consult session '{sid}' not found.")
+        if session_record.get("mode") != "consult":
+            raise ConfigError(f"Session '{sid}' is mode='{session_record.get('mode')}', not 'consult'.")
+        if session_record.get("cwd") != workspace or session_record.get("gateway") != cfg["magpie"]["base_url"]:
+            raise ConfigError("Consult session workspace or gateway differs or was never recorded.")
+        for turn in session_record.get("turns") or []:
+            role = turn.get("role")
+            content = turn.get("content")
+            if role in {"user", "assistant"} and isinstance(content, str):
+                history_messages.append({"role": role, "content": content})
+
+    effective_tier_arg = tier if (tier is not None and str(tier).strip()) else (session_record.get("tier") if session_record else None)
+    explicit_effort = (reasoning_effort or "").strip() or None
+    resume_effort = str(session_record.get("reasoning_effort") or "").strip() if (session_record and not explicit_effort) else ""
+
+    base_resolved = resolve_tier(
         cfg,
-        tier,
+        effective_tier_arg,
         model_override=model_override,
-        effort_override=reasoning_effort,
+        effort_override=explicit_effort or resume_effort or None,
         max_tokens_override=max_output_tokens,
         api_mode_override=api_mode,
         for_exec=False,
         escalate=escalate,
     )
+
+    policy = cfg.get("routing_policy") or {}
+    auto_effort_info: dict[str, Any] | None = None
+    if bool(policy.get("auto_effort", False)) and not explicit_effort and not is_resume and base_resolved["tier"] != "chore":
+        auto_effort_info = classify_task_effort(
+            tier=base_resolved["tier"],
+            tier_default_effort=base_resolved["reasoning_effort"],
+            model_id=base_resolved["model"],
+            escalate=escalate,
+            goal=goal,
+            context=context,
+            constraints=constraints,
+            file_count=len(file_paths or ()),
+            is_resume=False,
+        )
+        resolved = resolve_tier(
+            cfg,
+            effective_tier_arg,
+            model_override=model_override,
+            effort_override=auto_effort_info["effort"],
+            max_tokens_override=max_output_tokens,
+            api_mode_override=api_mode,
+            for_exec=False,
+            escalate=escalate,
+        )
+    else:
+        resolved = base_resolved
+
     limits = cfg.get("limits") or {}
     file_blocks, warnings = read_context_files(
         file_paths,
@@ -249,24 +367,7 @@ def run_consult(
         expected_output=expected_output,
     )
 
-    workspace = str(Path(cwd or ".").resolve())
-    history_messages: list[dict[str, str]] = []
-    session_record: dict[str, Any] | None = None
-    sid = (session_id or "").strip()
-    if sid:
-        session_record = load_session(sid)
-        if not session_record:
-            raise ConfigError(f"Consult session '{sid}' not found.")
-        if session_record.get("mode") != "consult":
-            raise ConfigError(f"Session '{sid}' is mode='{session_record.get('mode')}', not 'consult'.")
-        if session_record.get("cwd") != workspace or session_record.get("gateway") != cfg["magpie"]["base_url"]:
-            raise ConfigError("Consult session workspace or gateway differs or was never recorded.")
-        for turn in session_record.get("turns") or []:
-            role = turn.get("role")
-            content = turn.get("content")
-            if role in {"user", "assistant"} and isinstance(content, str):
-                history_messages.append({"role": role, "content": content})
-    else:
+    if not session_record:
         sid = new_session_id("consult")
         session_record = {
             "session_id": sid,
@@ -275,29 +376,43 @@ def run_consult(
             "gateway": cfg["magpie"]["base_url"],
             "tier": resolved["tier"],
             "model": resolved["model"],
+            "reasoning_effort": resolved["reasoning_effort"],
             "turns": [],
         }
 
     messages = [*history_messages, {"role": "user", "content": user_prompt}]
     api_key, _ = resolve_magpie_api_key(cfg)
     base_url = str(cfg["magpie"]["base_url"])
-    timeout_sec = int(limits.get("consult_timeout_sec") or 180)
-
-    res = consult_with_fallback(
-        base_url=base_url,
-        api_key=api_key,
-        primary_model=resolved["model"],
-        fallback_models=resolved["fallback_models"],
-        api_mode=resolved["api_mode"],
-        messages=messages,
-        reasoning_effort=resolved["reasoning_effort"],
-        instructions=CONSULT_SYSTEM_PROMPT,
-        max_output_tokens=resolved["max_output_tokens"],
-        timeout_sec=timeout_sec,
+    timeout_sec = max(
+        int(limits.get("consult_timeout_sec") or 180),
+        effort_timeout_floor(resolved["reasoning_effort"], mode="consult"),
     )
+
+    try:
+        res = consult_with_fallback(
+            base_url=base_url,
+            api_key=api_key,
+            primary_model=resolved["model"],
+            fallback_models=resolved["fallback_models"],
+            api_mode=resolved["api_mode"],
+            messages=messages,
+            reasoning_effort=resolved["reasoning_effort"],
+            instructions=CONSULT_SYSTEM_PROMPT,
+            max_output_tokens=resolved["max_output_tokens"],
+            timeout_sec=timeout_sec,
+        )
+    except MagpieRequestError as exc:
+        hint = build_escalation_suggestion(
+            mode="consult",
+            tier=resolved["tier"],
+            effort=resolved["reasoning_effort"],
+            error_message=str(exc),
+        )
+        raise MagpieRequestError(f"{exc} | {hint}" if hint else str(exc)) from exc
 
     session_record["tier"] = resolved["tier"]
     session_record["model"] = res["served_model"]
+    session_record["reasoning_effort"] = resolved["reasoning_effort"]
     session_record.setdefault("turns", []).extend(
         [
             {"role": "user", "content": user_prompt},
@@ -319,6 +434,7 @@ def run_consult(
         extra={
             "turn": turn_count,
             "escalated": "yes" if resolved.get("escalated") else "",
+            "auto_effort": f"{auto_effort_info['effort']}(score={auto_effort_info['score']})" if auto_effort_info else "",
             "fallback_used": "yes" if res.get("used_fallback") else "",
             "warnings": "; ".join(warnings) if warnings else "",
         },
@@ -330,6 +446,7 @@ def run_consult(
         "served_model": res["served_model"],
         "reasoning_effort": resolved["reasoning_effort"],
         "escalated": bool(resolved.get("escalated")),
+        "auto_effort": auto_effort_info,
         "elapsed_sec": round(float(res["elapsed_sec"]), 3),
         "usage": res.get("usage") or {},
         "turns": turn_count,
@@ -365,14 +482,6 @@ def run_exec(
         raise ConfigError(f"`cwd` does not exist or is not a directory: {workdir}")
 
     cfg, _ = load_config(explicit=config_path, require_exists=True, cwd=workdir)
-    resolved = resolve_tier(
-        cfg,
-        tier,
-        model_override=model_override,
-        effort_override=reasoning_effort,
-        for_exec=True,
-        escalate=escalate,
-    )
     codex_cfg = cfg.get("codex") or {}
     cli_path = str(codex_cfg.get("cli_path") or "").strip()
     if not cli_path or not Path(cli_path).is_file():
@@ -412,6 +521,45 @@ def run_exec(
             "turns": [],
         }
 
+    is_resume = bool(codex_thread_id)
+    effective_tier_arg = tier if (tier is not None and str(tier).strip()) else (session_record.get("tier") if is_resume else None)
+    explicit_effort = (reasoning_effort or "").strip() or None
+    resume_effort = str(session_record.get("reasoning_effort") or "").strip() if (is_resume and not explicit_effort) else ""
+
+    base_resolved = resolve_tier(
+        cfg,
+        effective_tier_arg,
+        model_override=model_override,
+        effort_override=explicit_effort or resume_effort or None,
+        for_exec=True,
+        escalate=escalate,
+    )
+
+    policy = cfg.get("routing_policy") or {}
+    auto_effort_info: dict[str, Any] | None = None
+    if bool(policy.get("auto_effort", False)) and not explicit_effort and not is_resume:
+        auto_effort_info = classify_task_effort(
+            tier=base_resolved["tier"],
+            tier_default_effort=base_resolved["reasoning_effort"],
+            model_id=base_resolved["model"],
+            escalate=escalate,
+            goal=goal,
+            context=context,
+            constraints=constraints,
+            file_count=len(file_paths or ()),
+            is_resume=False,
+        )
+        resolved = resolve_tier(
+            cfg,
+            effective_tier_arg,
+            model_override=model_override,
+            effort_override=auto_effort_info["effort"],
+            for_exec=True,
+            escalate=escalate,
+        )
+    else:
+        resolved = base_resolved
+
     prompt = build_exec_prompt(
         goal=goal,
         context=context,
@@ -419,7 +567,7 @@ def run_exec(
         constraints=constraints,
         verification=verification,
         expected_report=expected_report,
-        is_resume=bool(codex_thread_id),
+        is_resume=is_resume,
     )
 
     effective_sandbox = (sandbox or "").strip() or str(codex_cfg.get("default_sandbox") or "workspace-write")
@@ -438,23 +586,46 @@ def run_exec(
             raise ConfigError("Resume cannot increase sandbox permissions.")
     session_record["sandbox"] = effective_sandbox
     session_record["gateway"] = cfg["magpie"]["base_url"]
-    effective_timeout = int(timeout_sec or codex_cfg.get("timeout_sec") or 600)
+    if timeout_sec is not None:
+        effective_timeout = int(timeout_sec)
+    else:
+        effective_timeout = max(
+            int(codex_cfg.get("timeout_sec") or 600),
+            effort_timeout_floor(resolved["reasoning_effort"], mode="exec"),
+        )
     if codex_cfg.get("extra_args"):
         raise ConfigError("Unrestricted Codex extra_args conflict with gateway and sandbox enforcement.")
-    res = run_codex_exec(
-        cli_path=cli_path,
-        prompt=prompt,
-        cwd=workdir,
-        model=resolved["model"],
-        reasoning_effort=resolved["reasoning_effort"],
-        sandbox=effective_sandbox,
-        sandbox_explicit=True,
-        model_provider=str(codex_cfg.get("model_provider") or "").strip(),
-        codex_thread_id=codex_thread_id,
-        gateway_url=cfg["magpie"]["base_url"],
-        gateway_key=resolve_magpie_api_key(cfg)[0],
-        timeout_sec=effective_timeout,
-    )
+    try:
+        res = run_codex_exec(
+            cli_path=cli_path,
+            prompt=prompt,
+            cwd=workdir,
+            model=resolved["model"],
+            reasoning_effort=resolved["reasoning_effort"],
+            sandbox=effective_sandbox,
+            sandbox_explicit=True,
+            model_provider=str(codex_cfg.get("model_provider") or "").strip(),
+            codex_thread_id=codex_thread_id,
+            gateway_url=cfg["magpie"]["base_url"],
+            gateway_key=resolve_magpie_api_key(cfg)[0],
+            timeout_sec=effective_timeout,
+        )
+    except Exception as exc:
+        msg = str(exc)
+        hint = build_escalation_suggestion(
+            mode="exec",
+            tier=resolved["tier"],
+            effort=resolved["reasoning_effort"],
+            timed_out="timed out" in msg.lower(),
+            error_message=msg,
+        )
+        if hint and hint not in msg:
+            try:
+                new_exc = type(exc)(f"{msg} | {hint}")
+            except TypeError:
+                raise
+            raise new_exc from exc
+        raise
 
     observed = res.get("observed_context") or {}
     actual = observed.get("sandbox")
@@ -465,8 +636,15 @@ def run_exec(
         raise ConfigError("Observed Codex permissions exceeded the requested sandbox; inspect the run.")
     session_record["sandbox"] = actual
     acceptance = verification_result(verification, res["commands"])
+    escalation_hint = build_escalation_suggestion(
+        mode="exec",
+        tier=resolved["tier"],
+        effort=resolved["reasoning_effort"],
+        verification_status=str(acceptance.get("status") or ""),
+    )
     session_record["tier"] = resolved["tier"]
     session_record["model"] = resolved["model"]
+    session_record["reasoning_effort"] = resolved["reasoning_effort"]
     session_record["codex_thread_id"] = res["codex_thread_id"]
     session_record.setdefault("turns", []).append(
         {
@@ -495,6 +673,7 @@ def run_exec(
             "verification": acceptance["status"],
             "turn": turn_count,
             "escalated": "yes" if resolved.get("escalated") else "",
+            "auto_effort": f"{auto_effort_info['effort']}(score={auto_effort_info['score']})" if auto_effort_info else "",
             "warnings": "; ".join(warnings) if warnings else "",
         },
     )
@@ -506,6 +685,8 @@ def run_exec(
         "model": resolved["model"],
         "reasoning_effort": resolved["reasoning_effort"],
         "escalated": bool(resolved.get("escalated")),
+        "auto_effort": auto_effort_info,
+        "escalation_suggestion": escalation_hint,
         "sandbox": actual,
         "requested_sandbox": effective_sandbox,
         "elapsed_sec": round(float(res["elapsed_sec"]), 3),
@@ -540,6 +721,7 @@ def get_status(*, workspace_root: Path | None = None, config_path: str | Path | 
         "recent_runs": recent_runs(session_limit, workspace_root),
         "configured": exists,
         "default_tier": get_default_tier(cfg) if exists else "sonnet",
+        "auto_effort": bool((cfg.get("routing_policy") or {}).get("auto_effort", False)) if exists else False,
         "config_path": str(resolved_path),
         "api_key_source": key_source,
         "config": redacted,

@@ -73,6 +73,10 @@ TOOLS: list[dict[str, Any]] = [
                     "default": "subscription_only",
                     "description": "Subscription-only routing policy (Codex accounts via Magpie).",
                 },
+                "auto_effort": {
+                    "type": "boolean",
+                    "description": "If true, deterministically size reasoning effort (low..xhigh) per task complexity on fresh turns (never on resume).",
+                },
                 "magpie_group_strategy": {
                     "type": "string",
                     "enum": ["order", "smart", "rotate", "pace", "drain", "usage"],
@@ -116,8 +120,8 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Fast HTTP consultation via Magpie without Codex CLI ~50K tool-injection overhead. "
             "Use tier='chore' for free/fast summarization, log compression, or classification; "
-            "tier='sonnet' for routine review/small tasks; tier='opus' (with escalate=true for hard subproblems) for complex logic; "
-            "tier='fable' for deep math/algorithms/extreme bugs. Supports multi-turn dialogue via session_id."
+            "tier='sonnet' (~75% daily work, Sol@medium); tier='opus' (~20% complex engineering, Sol@high; escalate=true -> Astra@xhigh); "
+            "tier='fable' (~5% extreme bugs/math/algorithms, Astra@xhigh). Supports multi-turn dialogue via session_id; on failure retry in a fresh thread (omit session_id)."
         ),
         "inputSchema": {
             "type": "object",
@@ -159,9 +163,9 @@ TOOLS: list[dict[str, Any]] = [
         "name": "gempt_exec",
         "description": (
             "Delegate an autonomous coding, refactoring, or verification task to headless Codex CLI via Magpie. "
-            "Codex can read/edit files and run commands inside cwd. Tiers: sonnet (80% daily work), "
-            "opus (complex cross-file engineering; set escalate=true for hard turns), fable (top-tier debugging/architecture). "
-            "Supports multi-turn steering via session_id."
+            "Codex can read/edit files and run commands inside cwd. Tiers: sonnet (~75% daily work, Sol@medium), "
+            "opus (~20% complex cross-file engineering, Sol@high; escalate=true -> Astra@xhigh), fable (~5% top-tier debugging/architecture, Astra@xhigh). "
+            "Supports multi-turn steering via session_id; to escalate after failure, start a fresh thread without session_id."
         ),
         "inputSchema": {
             "type": "object",
@@ -277,6 +281,7 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             codex_model_provider=args.get("codex_model_provider"),
             default_tier=args.get("default_tier"),
             failover_mode=str(args.get("failover_mode") or "subscription_only"),
+            auto_effort=args.get("auto_effort"),
             magpie_group_strategy=str(args.get("magpie_group_strategy") or "order"),
             utility_model=args.get("utility_model"),
             use_for_magpie_compact=args.get("use_for_magpie_compact"),

@@ -22,7 +22,9 @@ import {
   DEFAULT_MAGPIE_URL,
   DEFAULT_TIERS,
   DEFAULT_UTILITY,
+  EFFORT_RANK,
   TIER_ORDER,
+  VALID_EFFORTS,
   VALID_SANDBOXES,
   defaultGatewayFromEnv,
   expandUser,
@@ -39,9 +41,14 @@ import {
   resolveSessionsDir,
   writeConfigAtomic,
 } from './backend.mjs';
+import {
+  buildEscalationSuggestion,
+  classifyTaskEffort,
+  effortTimeoutFloor,
+} from './routing.mjs';
 
 const CONSULT_TIERS = ['chore', ...TIER_ORDER];
-const VALID_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+const VALID_EFFORTS_SET = new Set(VALID_EFFORTS);
 const VALID_API_MODES = new Set(['responses', 'chat']);
 const SANDBOX_RANK = Object.freeze({ 'read-only': 0, 'workspace-write': 1, 'danger-full-access': 2 });
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,120}$/;
@@ -790,7 +797,7 @@ async function resolveRuntimeConfig({ configPath, tierForProbe, allowUtilityOnly
   };
 }
 
-function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = false } = {}) {
+function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = false, effortOverride = '' } = {}) {
   const policy = cfg?.routing_policy || {};
   const raw = String(requestedTier || '').trim().toLowerCase();
   const effectiveTier = raw ? (raw === 'chore' ? 'chore' : normalizeDefaultTier(raw)) : (normalizeDefaultTier(policy.default_tier) || 'sonnet');
@@ -805,21 +812,32 @@ function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = 
     return {
       tier: 'chore',
       model: String(util.model || DEFAULT_UTILITY.model),
-      effort: String(util.reasoning_effort || 'low'),
+      effort: effortOverride || String(util.reasoning_effort || 'low'),
       apiMode: String(util.api_mode || 'chat'),
       maxOutputTokens: Number(util.max_output_tokens || 4096),
       fallbackModels: Array.isArray(util.fallback_models) ? util.fallback_models.filter(Boolean).map(String) : [],
+      escalated: false,
     };
   }
 
   const tierCfg = { ...DEFAULT_TIERS[effectiveTier], ...(cfg?.tiers?.[effectiveTier] || {}) };
   let model = String(tierCfg.consult_model || DEFAULT_TIERS[effectiveTier].consult_model).trim();
-  let effort = String(tierCfg.reasoning_effort || 'medium').trim();
-  if (escalate && tierCfg.escalate_model) {
-    model = String(tierCfg.escalate_model).trim();
-    const rank = { none: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6, ultra: 7 };
-    const thresh = String(tierCfg.escalate_effort_threshold || 'high').trim();
-    if ((rank[thresh] ?? 4) > (rank[effort] ?? 3)) effort = thresh;
+  let effort = String(effortOverride || tierCfg.reasoning_effort || 'medium').trim();
+  const thresh = String(tierCfg.escalate_effort_threshold || DEFAULT_TIERS[effectiveTier].escalate_effort_threshold || 'high').trim();
+  const threshRank = EFFORT_RANK[thresh] ?? 4;
+  if (escalate && !effortOverride && (EFFORT_RANK[effort] ?? 3) < threshRank) {
+    effort = thresh;
+  }
+
+  let escalated = false;
+  const meetsThreshold = (EFFORT_RANK[effort] ?? 3) >= threshRank;
+  if ((escalate || meetsThreshold) && tierCfg.escalate_model) {
+    if (!model.startsWith('group/') && !model.startsWith('auto/')) {
+      model = String(tierCfg.escalate_model).trim();
+      escalated = true;
+    } else if (model.startsWith('group/gempt-harness-')) {
+      escalated = true;
+    }
   }
 
   if (!isCodexModelId(model)) {
@@ -829,11 +847,12 @@ function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = 
   return {
     tier: effectiveTier,
     model,
-    execModel: String(tierCfg.exec_model || '').trim() || model,
+    execModel: escalated ? model : (String(tierCfg.exec_model || '').trim() || model),
     effort,
     apiMode: String(tierCfg.api_mode || 'responses'),
     maxOutputTokens: Number(tierCfg.max_output_tokens || 16384),
     fallbackModels: [],
+    escalated,
   };
 }
 
@@ -922,7 +941,7 @@ export function createGemptTools({
 
     consult: {
       description:
-        'Consult GPT/Codex/DeepSeek via local Magpie without Codex CLI ~18K-50K token overhead. Use tier="chore" for free fast log summarization/cleanup, sonnet for routine checks, opus (with escalate=true for hard subproblems) for complex engineering, or fable for core algorithms/bugs.',
+        'Consult GPT/Codex/DeepSeek via local Magpie without Codex CLI ~18K-50K token overhead. Use tier="chore" for free fast log summarization/cleanup, sonnet (~75%, Sol@medium), opus (~20%, Sol@high; escalate=true -> Astra@xhigh), or fable (~5%, Astra@xhigh). On failure retry in a fresh thread without session_id.',
       args: {
         type: 'object',
         properties: {
@@ -935,7 +954,7 @@ export function createGemptTools({
           constraints: { type: 'string', description: 'Hard constraints, invariants, or non-goals.' },
           expected_output: { type: 'string', description: 'Required response structure.' },
           session_id: { type: 'string', description: 'Optional consult session_id to continue prior dialogue.' },
-          reasoning_effort: { type: 'string', enum: [...VALID_EFFORTS] },
+          reasoning_effort: { type: 'string', enum: [...VALID_EFFORTS_SET] },
           max_output_tokens: { type: 'number', description: 'Max output tokens (256-128000).' },
           api_mode: { type: 'string', enum: ['responses', 'chat'] },
         },
@@ -961,14 +980,40 @@ export function createGemptTools({
           probeTimeoutMs,
           env,
         });
-        const resolved = resolveTierTarget(runtime.cfg, args?.tier || priorSession?.tier, {
+        const explicitEffort = args?.reasoning_effort
+          ? (VALID_EFFORTS_SET.has(args.reasoning_effort) ? args.reasoning_effort : (() => { throw new Error(`Invalid reasoning_effort '${args.reasoning_effort}'.`); })())
+          : '';
+        const isResume = Boolean(priorSession);
+        const lockedResumeEffort = isResume && !explicitEffort ? String(priorSession?.reasoning_effort || '').trim() : '';
+        const baseResolved = resolveTierTarget(runtime.cfg, args?.tier || priorSession?.tier, {
           allowChore: true,
           escalate: Boolean(args?.escalate),
+          effortOverride: explicitEffort || lockedResumeEffort,
         });
 
-        const effort = args?.reasoning_effort
-          ? (VALID_EFFORTS.has(args.reasoning_effort) ? args.reasoning_effort : (() => { throw new Error(`Invalid reasoning_effort '${args.reasoning_effort}'.`); })())
-          : resolved.effort;
+        const fileList = Array.isArray(args?.file_paths) ? args.file_paths : [];
+        let autoEffortInfo = null;
+        let resolved = baseResolved;
+        if (Boolean(runtime.cfg?.routing_policy?.auto_effort) && !explicitEffort && !isResume && baseResolved.tier !== 'chore') {
+          autoEffortInfo = classifyTaskEffort({
+            tier: baseResolved.tier,
+            tierDefaultEffort: baseResolved.effort,
+            modelId: baseResolved.model,
+            escalate: Boolean(args?.escalate),
+            goal,
+            context: args?.context || '',
+            constraints: args?.constraints || '',
+            fileCount: fileList.length,
+            isResume: false,
+          });
+          resolved = resolveTierTarget(runtime.cfg, args?.tier || priorSession?.tier, {
+            allowChore: true,
+            escalate: Boolean(args?.escalate),
+            effortOverride: autoEffortInfo.effort,
+          });
+        }
+
+        const effort = resolved.effort;
         const apiMode = args?.api_mode
           ? (VALID_API_MODES.has(args.api_mode) ? args.api_mode : (() => { throw new Error(`Invalid api_mode '${args.api_mode}'.`); })())
           : resolved.apiMode;
@@ -976,7 +1021,6 @@ export function createGemptTools({
           ? Math.max(256, Math.min(128000, Number(args.max_output_tokens) || resolved.maxOutputTokens))
           : resolved.maxOutputTokens;
 
-        const fileList = Array.isArray(args?.file_paths) ? args.file_paths : [];
         let validatedCwd = '';
         if (args?.cwd || fileList.length) {
           validatedCwd = normalizeWorkspaceCwd(args?.cwd || priorSession?.cwd || '', {
@@ -1002,19 +1046,34 @@ export function createGemptTools({
 
         const priorTurns = Array.isArray(priorSession?.turns) ? priorSession.turns : [];
         const messages = [...priorTurns, { role: 'user', content: prompt }];
-        const timeoutMs = Math.max(10, Number(limits.consult_timeout_sec) || 180) * 1000;
+        const timeoutMs = Math.max(
+          10,
+          Number(limits.consult_timeout_sec) || 180,
+          effortTimeoutFloor(effort, { mode: 'consult' }),
+        ) * 1000;
         const caller = apiMode === 'chat' ? callChat : callResponses;
         const t0 = Date.now();
-        const reply = await caller({
-          baseUrl: runtime.baseUrl,
-          apiKey: runtime.apiKey,
-          model: resolved.model,
-          messages,
-          reasoningEffort: resolved.tier === 'chore' && !args?.reasoning_effort ? '' : effort,
-          instructions: resolved.tier === 'chore' ? 'Be concise, faithful to exact facts, and omit conversational filler.' : CONSULT_SYSTEM_PROMPT,
-          maxOutputTokens: maxTokens,
-          timeoutMs,
-        });
+        let reply;
+        try {
+          reply = await caller({
+            baseUrl: runtime.baseUrl,
+            apiKey: runtime.apiKey,
+            model: resolved.model,
+            messages,
+            reasoningEffort: resolved.tier === 'chore' && !args?.reasoning_effort ? '' : effort,
+            instructions: resolved.tier === 'chore' ? 'Be concise, faithful to exact facts, and omit conversational filler.' : CONSULT_SYSTEM_PROMPT,
+            maxOutputTokens: maxTokens,
+            timeoutMs,
+          });
+        } catch (err) {
+          const hint = buildEscalationSuggestion({
+            mode: 'consult',
+            tier: resolved.tier,
+            effort,
+            errorMessage: String(err?.message || err),
+          });
+          throw new Error(hint ? `${err.message} | ${hint}` : err.message);
+        }
         const elapsedSec = (Date.now() - t0) / 1000;
 
         const sessionId = priorSession?.session_id || generateSessionId('consult');
@@ -1039,6 +1098,10 @@ export function createGemptTools({
           sessionId,
           elapsedSec,
           usage: reply.usage,
+          extra: {
+            escalated: resolved.escalated ? 'yes' : '',
+            auto_effort: autoEffortInfo ? `${autoEffortInfo.effort}(score=${autoEffortInfo.score})` : '',
+          },
         });
         return {
           summary,
@@ -1048,6 +1111,8 @@ export function createGemptTools({
           model: resolved.model,
           served_model: reply.servedModel,
           reasoning_effort: effort,
+          escalated: resolved.escalated,
+          auto_effort: autoEffortInfo,
           elapsed_sec: Number(elapsedSec.toFixed(2)),
           usage: reply.usage,
           warnings,
@@ -1059,7 +1124,7 @@ export function createGemptTools({
 
     exec: {
       description:
-        'Delegate an autonomous coding, refactoring, or verification task to headless Codex CLI via Magpie inside cwd. Disabled by default until plugin option `exec: true` (or GEMPT_MAGPIE_TOOLS_EXEC=1) is enabled.',
+        'Delegate an autonomous coding, refactoring, or verification task to headless Codex CLI via Magpie inside cwd. Tiers: sonnet (~75%, Sol@medium), opus (~20%, Sol@high; escalate=true -> Astra@xhigh), fable (~5%, Astra@xhigh). Disabled by default until plugin option `exec: true` (or GEMPT_MAGPIE_TOOLS_EXEC=1) is enabled.',
       args: {
         type: 'object',
         properties: {
@@ -1074,7 +1139,7 @@ export function createGemptTools({
           expected_report: { type: 'string', description: 'Structure for Codex final report.' },
           session_id: { type: 'string', description: 'Optional exec session_id to resume.' },
           sandbox: { type: 'string', enum: VALID_SANDBOXES },
-          reasoning_effort: { type: 'string', enum: [...VALID_EFFORTS] },
+          reasoning_effort: { type: 'string', enum: [...VALID_EFFORTS_SET] },
           timeout_sec: { type: 'number', description: 'Execution timeout seconds (30-3600).' },
         },
         required: ['goal', 'cwd'],
@@ -1142,18 +1207,45 @@ export function createGemptTools({
           effectiveSandbox = reqSbx;
         }
 
-        const resolved = resolveTierTarget(runtime.cfg, args?.tier || priorSession?.tier, {
+        const explicitEffort = args?.reasoning_effort
+          ? (VALID_EFFORTS_SET.has(args.reasoning_effort) ? args.reasoning_effort : (() => { throw new Error(`Invalid reasoning_effort '${args.reasoning_effort}'.`); })())
+          : '';
+        const isResume = Boolean(priorSession);
+        const lockedResumeEffort = isResume && !explicitEffort ? String(priorSession?.reasoning_effort || '').trim() : '';
+        const baseResolved = resolveTierTarget(runtime.cfg, args?.tier || priorSession?.tier, {
           allowChore: false,
           escalate: Boolean(args?.escalate),
+          effortOverride: explicitEffort || lockedResumeEffort,
         });
+
+        const fileList = Array.isArray(args?.file_paths) ? args.file_paths : [];
+        let autoEffortInfo = null;
+        let resolved = baseResolved;
+        if (Boolean(runtime.cfg?.routing_policy?.auto_effort) && !explicitEffort && !isResume) {
+          autoEffortInfo = classifyTaskEffort({
+            tier: baseResolved.tier,
+            tierDefaultEffort: baseResolved.effort,
+            modelId: baseResolved.model,
+            escalate: Boolean(args?.escalate),
+            goal,
+            context: args?.context || '',
+            constraints: args?.constraints || '',
+            fileCount: fileList.length,
+            isResume: false,
+          });
+          resolved = resolveTierTarget(runtime.cfg, args?.tier || priorSession?.tier, {
+            allowChore: false,
+            escalate: Boolean(args?.escalate),
+            effortOverride: autoEffortInfo.effort,
+          });
+        }
+
         const targetModel = resolved.execModel || resolved.model;
         if (!isCodexModelId(targetModel)) {
           throw new Error(`Subscription-only exec requires a codex/* model, got '${targetModel}'.`);
         }
 
-        const effort = args?.reasoning_effort
-          ? (VALID_EFFORTS.has(args.reasoning_effort) ? args.reasoning_effort : (() => { throw new Error(`Invalid reasoning_effort '${args.reasoning_effort}'.`); })())
-          : resolved.effort;
+        const effort = resolved.effort;
 
         const limits = runtime.cfg?.limits || {};
         const { blocks, warnings } = readContextFiles(args?.file_paths, workdir, {
@@ -1168,29 +1260,45 @@ export function createGemptTools({
           constraints: args?.constraints || '',
           verification: args?.verification || '',
           expectedReport: args?.expected_report || '',
-          isResume: Boolean(priorSession),
+          isResume,
         });
 
         const cliPath = findCodexCli(codexCliPath || runtime.cfg?.codex?.cli_path || '', env);
         const timeoutSec = args?.timeout_sec !== undefined
           ? Math.max(30, Math.min(3600, Number(args.timeout_sec) || 600))
-          : (Number(runtime.cfg?.codex?.timeout_sec) || 600);
+          : Math.max(
+            Number(runtime.cfg?.codex?.timeout_sec) || 600,
+            effortTimeoutFloor(effort, { mode: 'exec' }),
+          );
 
-        const res = await runCodexExec({
-          cliPath,
-          prompt,
-          cwd: workdir,
-          model: targetModel,
-          reasoningEffort: effort,
-          sandbox: effectiveSandbox,
-          sandboxExplicit: Boolean(args?.sandbox),
-          modelProvider: String(runtime.cfg?.codex?.model_provider || ''),
-          codexThreadId: priorSession?.codex_thread_id || '',
-          gatewayUrl: runtime.baseUrl,
-          gatewayKey: runtime.apiKey,
-          timeoutSec,
-          env,
-        });
+        let res;
+        try {
+          res = await runCodexExec({
+            cliPath,
+            prompt,
+            cwd: workdir,
+            model: targetModel,
+            reasoningEffort: effort,
+            sandbox: effectiveSandbox,
+            sandboxExplicit: Boolean(args?.sandbox),
+            modelProvider: String(runtime.cfg?.codex?.model_provider || ''),
+            codexThreadId: priorSession?.codex_thread_id || '',
+            gatewayUrl: runtime.baseUrl,
+            gatewayKey: runtime.apiKey,
+            timeoutSec,
+            env,
+          });
+        } catch (err) {
+          const msg = String(err?.message || err);
+          const hint = buildEscalationSuggestion({
+            mode: 'exec',
+            tier: resolved.tier,
+            effort,
+            timedOut: msg.toLowerCase().includes('timed out'),
+            errorMessage: msg,
+          });
+          throw new Error(hint && !msg.includes(hint) ? `${msg} | ${hint}` : msg);
+        }
 
         const sessionId = priorSession?.session_id || generateSessionId('exec');
         const agent = callingAgent(callCtx) || priorSession?.agent || '';
@@ -1218,7 +1326,12 @@ export function createGemptTools({
           sessionId,
           elapsedSec: res.elapsedSec,
           usage: res.usage,
-          extra: { sandbox: effectiveSandbox, codex_thread: res.threadId },
+          extra: {
+            sandbox: effectiveSandbox,
+            codex_thread: res.threadId,
+            escalated: resolved.escalated ? 'yes' : '',
+            auto_effort: autoEffortInfo ? `${autoEffortInfo.effort}(score=${autoEffortInfo.score})` : '',
+          },
         });
         return {
           summary,
@@ -1228,6 +1341,8 @@ export function createGemptTools({
           tier: resolved.tier,
           model: targetModel,
           reasoning_effort: effort,
+          escalated: resolved.escalated,
+          auto_effort: autoEffortInfo,
           sandbox: effectiveSandbox,
           cwd: workdir,
           elapsed_sec: Number(res.elapsedSec.toFixed(2)),

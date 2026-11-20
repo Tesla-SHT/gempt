@@ -5,9 +5,9 @@ description: >-
   compression, summarization, or classification (gempt_consult only).
 ---
 
-# /gempt-chore — Chore 免费打杂/压缩/分类档
+# /gempt-chore — Chore 免费旁路打杂/压缩/分类档
 
-本回合使用 **`chore`** 档（免费/高速 Utility 模型，用于大日志提纯、长文摘要、粗分类或格式整理）：
+本回合使用 **`chore`** 档（免费/高速 Utility 旁路模型，不占用主配额，用于大日志提纯、长文摘要、粗分类或格式整理）：
 
 1. **严格边界**：
    - **只能调用 `gempt_consult(tier="chore", ...)`**，禁止调用 `gempt_exec`（`chore` 不支持 Codex 执行，也不能设置为 `routing_policy.default_tier`）。

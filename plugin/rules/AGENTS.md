@@ -1,12 +1,14 @@
 # gempt Collaboration Rules
 
-- **Role split (Human ↔ Gemini, Gemini leads GPT)**:
-  - **Gemini** talks with the human, clarifies goals, decomposes work, drafts structured task packets, verifies outputs, and summarizes conclusions clearly. Keep Antigravity's native Gemini on its official channel (never reverse-proxy Antigravity's native Gemini); in external MCP clients, keep Gemini on its Magpie `antigravity/gemini-4-*` channel.
-  - **GPT/Codex** handles deep math/algorithm reasoning, second-opinion reviews, and code execution — always routed through the user's local **Magpie** gateway.
-- **When to delegate via `gempt`**:
-  - Use `gempt_consult` for non-text/math/algorithm reasoning, deep bug diagnosis, architecture second opinions, or free utility summarization/classification (`tier="chore"`). It avoids Codex CLI's ~18K–50K token tool-injection overhead.
-  - Use `gempt_exec` when GPT/Codex should read/edit files and run commands/tests inside a workspace.
-  - Pick the right tier: `sonnet` (80% daily work), `opus` (complex cross-file engineering; pass `escalate=true` for hard subproblems), `fable` (extreme bugs, core algorithms, long-horizon architecture). Omitting `tier` automatically uses `routing_policy.default_tier` (switchable alongside `default_sandbox` in Magpie's `Plugins -> GemPT` page or via `gempt tier` / `gempt sandbox`); `/gempt-sonnet`, `/gempt-opus`, `/gempt-fable`, and `/gempt-chore` pin a specific tier for the current turn. Subscription-only routing is used by default — users only need ChatGPT/Codex signed in on Magpie.
-- **Task quality**: Always send structured Task Packets (Goal, Verified Context/Files, Hard Constraints, Verification Commands, Expected Report). Never forward vague human chat verbatim.
-- **Human handoff**: Translate dense or opaque GPT/Astra technical output into clear, concise human conclusions, modified files, verification evidence, and open decisions.
-- **Unconfigured setup**: If any `gempt_*` tool reports missing config, load the `gempt` skill and run its Initial Setup flow (`gempt_discover` -> confirm user choices -> `gempt_configure`).
+- **Domain split (Human ↔ Gemini, Gemini leads GPT)**:
+  - **Gemini** owns human dialogue, planning, acceptance verification, and frontend/UI/visual/multimodal edits directly (keeping Antigravity's native Gemini on its official channel, or `antigravity/gemini-4-*` via Magpie in external clients; use `gempt_consult` to cross-review tricky UX state).
+  - **GPT/Codex** (routed through local **Magpie**) owns backend logic, deep math/algorithms, hard debugging, cross-file refactors, and **independent diff/architecture review** (never let GPT self-grade its own code).
+- **When to delegate & usage share (~75% / ~20% / ~5% + `chore`)**:
+  - Use `gempt_consult` for reasoning, algorithms, deep diagnosis, independent review, or free utility summarization/classification (`tier="chore"`, avoids Codex CLI's ~18K–50K token overhead).
+  - Use `gempt_exec` when GPT/Codex should read/edit files and run verification tests inside `cwd`.
+  - Tier & effort sweet spots: `sonnet` (~75% daily work, `Sol @ medium`), `opus` (~20% complex engineering, `Sol @ high`; pass `escalate=true` or `xhigh` -> `Astra @ xhigh`), `fable` (~5% extreme bugs/math/architecture, `Astra @ xhigh`; never downgrade Astra to `low`).
+  - Omit `tier` to follow `routing_policy.default_tier`; control `tier`, `default_sandbox`, and `思考强度（当前档）` (`中 | 高 | 极高 | 智能`) in Magpie's `Plugins -> GemPT` page or via `gempt tier` / `gempt sandbox` / `gempt effort`. Subscription-only routing is used by default.
+- **Effort & fresh-thread escalation discipline**:
+  - Size effort upfront on fresh threads (explicit `medium`/`high`/`xhigh` or `auto_effort`); **never** default to `ultra` and never launch high-effort subagent fan-outs.
+  - On failure, timeout, or unverified output, **open a fresh thread (omit `session_id`)** with `opus` / `escalate=true` / `fable` — do not bump effort mid-thread on `resume`.
+- **Task quality & handoff**: Send structured Task Packets (Goal, Verified Context/Files, Hard Constraints, Verification Commands, Expected Report). Translate GPT output into clear conclusions, modified files, and test evidence. If unconfigured, run the `gempt` setup flow (`gempt_discover` -> confirm -> `gempt_configure`).

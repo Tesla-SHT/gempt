@@ -18,9 +18,9 @@
   const apiKey = document.querySelector('meta[name="gempt-key"]')?.getAttribute('content') || '';
 
   const ROLE_TEXT = {
-    sonnet: '日常高频',
-    opus: '复杂工程',
-    fable: '顶配攻坚',
+    sonnet: '日常高频 · ~75%',
+    opus: '复杂工程 · ~20%',
+    fable: '顶配攻坚 · ~5%',
   };
 
   const EFFORT_LABELS = {
@@ -55,6 +55,20 @@
     api_fallback: '优先用 Codex 订阅额度，限流或失败时自动切按量 API 兜底',
   };
 
+  const EFFORT_HINTS = {
+    medium: '当前档固定中等思考（适合日常开发、UI 与常规修改）',
+    high: '当前档固定高思考（适合跨文件排查与复杂工程；Opus 甜点档）',
+    xhigh: '当前档固定极高思考（适合算法/数学与核心攻坚；Opus 自动升 Astra）',
+    auto: '按任务风险自动定档（low..xhigh，Astra 兜底 ≥ 高；续跑锁档不中途加码）',
+  };
+
+  const EFFORT_NAMES = {
+    medium: '中',
+    high: '高',
+    xhigh: '极高',
+    auto: '智能定档',
+  };
+
   const SANDBOX_NAMES = {
     'read-only': '只读',
     'workspace-write': '工作区',
@@ -65,6 +79,8 @@
   let currentDefaultTier = 'sonnet';
   let currentDefaultSandbox = 'workspace-write';
   let currentFailoverMode = 'subscription_only';
+  let currentEffortChoice = 'high';
+  let currentAutoEffort = false;
   let currentViewMode = queryViewMode || readStoredMode();
   let toastTimer = null;
 
@@ -149,11 +165,19 @@
     return id.charAt(0).toUpperCase() + id.slice(1);
   }
 
-  function formatEffortLabel(effort, { detailed = true, escalated = false } = {}) {
+  function formatEffortLabel(effort, { detailed = true, escalated = false, threshold = 'high', auto = false } = {}) {
     const raw = String(effort || 'medium').trim().toLowerCase();
     const shortWord = (EFFORT_LABELS[raw] || `思考：${raw}`).replace(/^思考：/, '');
-    if (escalated) {
-      return detailed ? `思考深度：${shortWord} → 高` : `思考：${shortWord} → 高`;
+    const threshRaw = String(threshold || 'high').trim().toLowerCase();
+    const threshWord = (EFFORT_LABELS[threshRaw] || `思考：${threshRaw}`).replace(/^思考：/, '');
+    const showEscalation = Boolean(escalated && threshWord && threshWord !== shortWord);
+    if (auto) {
+      return showEscalation
+        ? `智能定档 · 基准${shortWord} → ${threshWord}`
+        : `智能定档 · 基准${shortWord}`;
+    }
+    if (showEscalation) {
+      return detailed ? `思考深度：${shortWord} → ${threshWord}` : `思考：${shortWord} → ${threshWord}`;
     }
     return detailed ? `思考深度：${shortWord}` : `思考：${shortWord}`;
   }
@@ -355,6 +379,26 @@
         : baseHint;
     }
 
+    const activeTier = (state.tiers || []).find((t) => t.id === currentDefaultTier) || state.tiers?.[0];
+    currentAutoEffort = Boolean(state.auto_effort);
+    const activeTierEffort = String(activeTier?.reasoning_effort || 'medium').trim().toLowerCase();
+    currentEffortChoice = currentAutoEffort ? 'auto' : activeTierEffort;
+    for (const radio of document.querySelectorAll('input[name="active_effort"]')) {
+      radio.checked = radio.value === currentEffortChoice;
+      radio.disabled = !configured;
+    }
+    const effHint = $('effort-hint');
+    if (effHint) {
+      if (!configured) {
+        effHint.textContent = '未初始化配置前默认按订阅甜点档执行';
+      } else if (currentAutoEffort) {
+        effHint.textContent = EFFORT_HINTS.auto;
+      } else {
+        effHint.textContent = EFFORT_HINTS[activeTierEffort]
+          || `当前 ${titleCaseTier(currentDefaultTier)} 档思考深度：${activeTierEffort}`;
+      }
+    }
+
     const failoverGroup = $('failover-control-group');
     const apiEnabled = Boolean(state.features?.api_fallback);
     currentFailoverMode = state.failover_mode || 'subscription_only';
@@ -520,6 +564,8 @@
       effortEl.textContent = formatEffortLabel(activeTier?.reasoning_effort, {
         detailed: true,
         escalated: Boolean(activeTier?.escalate_model),
+        threshold: activeTier?.escalate_effort_threshold || 'high',
+        auto: currentAutoEffort,
       });
     }
     if (sourceTitle) sourceTitle.textContent = 'MCP 客户端';
@@ -742,6 +788,7 @@
           effortEl.textContent = formatEffortLabel(info.reasoning_effort, {
             detailed: false,
             escalated: Boolean(info.escalate_model),
+            threshold: info.escalate_effort_threshold || 'high',
           });
         }
       }
@@ -961,6 +1008,15 @@
     } else if (target.name === 'default_sandbox') {
       const label = SANDBOX_NAMES[target.value] || target.value;
       updateSetting('default_sandbox', { default_sandbox: target.value }, currentDefaultSandbox, `Codex 执行权限已切为${label}`);
+    } else if (target.name === 'active_effort') {
+      const payload = target.value === 'auto'
+        ? { auto_effort: true }
+        : { auto_effort: false, tier_effort: target.value, tier: currentDefaultTier };
+      const label = EFFORT_NAMES[target.value] || target.value;
+      const toastMsg = target.value === 'auto'
+        ? '已开启智能定档（low..xhigh，续跑锁档）'
+        : `${titleCaseTier(currentDefaultTier)} 思考强度已切为${label}`;
+      updateSetting('active_effort', payload, currentEffortChoice, toastMsg);
     } else if (target.name === 'failover_mode') {
       const label = target.value === 'api_fallback' ? 'API 兜底' : '仅订阅';
       updateSetting('failover_mode', { failover_mode: target.value }, currentFailoverMode, `容灾模式已切为${label}`);

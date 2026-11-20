@@ -11,9 +11,9 @@ description: >-
 
 # gempt — Gemini × GPT 协作编排手册
 
-核心分工：**Human ↔ Gemini，Gemini lead GPT**。
-- **Gemini 负责对接人类与主控**：在 Antigravity 客户端走原生官方通道，或在 Claude Code / ZCode 等外部客户端经 Magpie 走 `antigravity/gemini-4-*` 额度；负责聊需求、写任务单、核验改动并翻译人话。
-- **GPT/Codex 统一经本地 Magpie 网关调度**（GPT 支持反代）：承接硬核推理、算法推演、代码审查与工程执行；人类不必自己啃生涩的 `GPT-6.2-Astra` 技术长文，也不必自己写大段上下文喂给 GPT。
+核心分工：**Human ↔ Gemini，Gemini lead GPT（按领域分工 + 甜点思考强度）**。
+- **Gemini 主理人类协同与视觉/前端/多模态**：在 Antigravity 走官方原路（外部客户端经 Magpie 走 `antigravity/gemini-4-*`）；直接承担需求沟通、方案拆解、前端/UI 审美实现、多模态看图读 PDF、最终 Diff/测试验收与人话翻译；棘手 UI 状态可用 `gempt_consult` 找 GPT 交叉复核。
+- **GPT/Codex 专攻后端与硬核推理**（经本地 Magpie 网关）：承接后端复杂工程、核心算法/数学推导、深层根因排查，以及**独立 Review** Gemini 或其他分支产出的 Diff（禁止自写自审）；人类不必直接啃 `GPT-6.2-Astra` 技术长文或手写冗长提示词。
 
 ---
 
@@ -25,12 +25,12 @@ description: >-
 2. **命令行 / 对话内探测与初始化**：调用 `gempt_discover`（不要让用户手工翻配置文件路径或模型 ID）。
    - 检查输出里的 `magpie.gateway.reachable`、`subscription_ready`、`codex_subscription_models`、`utility_candidates`、`codex` CLI 与 `recommendations`。
    - 如果 `magpie.gateway.reachable` 为 `false`，提示用户先启动本地 Magpie（默认 `127.0.0.1:3425`）；如果 `subscription_ready` 为 `false`，先在 Magpie 登录 ChatGPT/Codex 订阅账号再刷新重试。
-3. **确认三档映射与权限**：
-   - `sonnet`（日常高频 80%）：推荐 `Sol` 系列（如 `codex/gpt-6.2-sol`，`medium`）
-   - `opus`（复杂工程）：推荐常规 `Sol` + 疑难自动升级 `Astra`（如 `codex/gpt-6.2-sol` → `codex/gpt-6.2-astra`，`high`）
-   - `fable`（顶配攻坚）：推荐 `Astra` 系列（如 `codex/gpt-6.2-astra`，`high`）
+3. **确认三档甜点映射与权限**：
+   - `sonnet`（~75% 日常高频）：`Sol @ medium`（`codex/gpt-6.2-sol`，`medium`）
+   - `opus`（~20% 复杂工程）：`Sol @ high` 主力 + 疑难 `@ xhigh` 自动升 `Astra`（`codex/gpt-6.2-sol` → `codex/gpt-6.2-astra`）
+   - `fable`（~5% 顶配攻坚）：`Astra @ xhigh`（`codex/gpt-6.2-astra`，`xhigh`；**禁止把 Astra 降到 `low`**）
    - **免费打杂 / 压缩通道（`utility`）**：从 `utility_candidates` 推荐免费高速模型（如 `auto/deepseek-v4.1-flash`），用于 `tier="chore"` 与 Magpie `compact` 规则。
-   - **路由策略**：固定 `subscription_only`（纯 Codex 订阅直连，不扣按量 API 费用；多订阅号由 Magpie 自动轮转）。
+   - **路由策略**：固定 `subscription_only`（纯 Codex 订阅直连，不扣按量 API 费用；多订阅号由 Magpie 自动轮转）；可选开启 `auto_effort`（页面点选 **`智能`** 或 CLI 设 `gempt effort auto`）。
    - **可选：同步独立隔离路由组**：默认直接调用具体 `codex/*` 订阅模型 ID 即可工作。仅当用户需要在 Magpie 侧使用多号轮转、`effort=high` 自动切 Astra 或 `compact` 规则时，才开启 `sync_magpie_groups: true` 与 `use_magpie_group_ids: true`。
    - **默认 Codex 沙箱（`default_sandbox`）**：推荐 `workspace-write`（只在目标工作区可写），可在 Magpie `Plugins → GemPT` 页面随手切换 `只读 / 工作区 / 全权限`。
 4. **落盘并验收**：
@@ -49,16 +49,22 @@ description: >-
 
 **经验法则**：能用 `gempt_consult` 先把方案/根因审透，就不要一上来就开 `gempt_exec` 盲跑。
 
-### 档位选择：3 主档 + 1 打杂档
+### 档位甜点、占比与思考强度纪律
 
-| 档位 / 快捷命令 | 对标定位 | 典型场景 | 备注 |
+| 档位 / 快捷命令 | 推荐占比 | 默认甜点模型 × 强度 | 典型场景与升档约束 |
 | :--- | :--- | :--- | :--- |
-| **`chore`** (`/gempt-chore`) | 免费打杂/压缩/分类 | 日志提纯、大文本摘要、粗分类、格式整理 | 仅限 `gempt_consult`；走 `utility.model`（如 `DeepSeek-V4.1-Flash`） |
-| **`sonnet`** (`/gempt-sonnet`) | 日常高频（~80%） | 常规单/少文件实现、加小功能、改 UI、写脚本、常规审阅 | 初始默认档位（可在面板切换 `default_tier`） |
-| **`opus`** (`/gempt-opus`) | 复杂工程 | 跨文件重构、读大仓库、复杂逻辑设计与排查 | 常规用主模型；遇到硬骨头传 `escalate=true` 或 `reasoning_effort="high"` 自动升级到 `Astra` |
-| **`fable`** (`/gempt-fable`) | 顶配攻坚 | 极难 Bug、核心算法/数学推导、长程架构设计 | 直接上最强模型高推理深度；慎用 `ultra`，只在最难问题上手动指定 |
+| **`chore`** (`/gempt-chore`) | 旁路打杂 | `DeepSeek-V4.1-Flash` | 日志提纯、大文本摘要、粗分类（仅限 `gempt_consult`） |
+| **`sonnet`** (`/gempt-sonnet`) | **~75%** | `Sol @ medium` | 日常实现、单测、UI 交互逻辑与常规审阅 |
+| **`opus`** (`/gempt-opus`) | **~20%** | `Sol @ high` | 跨文件重构、大仓库排查、复杂设计；`escalate=true` 或 `xhigh` 自动升 `Astra` |
+| **`fable`** (`/gempt-fable`) | **~5%** | `Astra @ xhigh` | 极难 Bug、数学/算法推导、核心架构；禁止降级 `Astra` 到 `low` |
 
-> **控制面板与单回合快捷命令**：保持 Antigravity 原生 Gemini 官方登录不变（不反代原生 Gemini），日常在 **Magpie 左侧栏 `Plugins → GemPT` 独立子页面**（或终端运行 `gempt tier [sonnet|opus|fable]`）统一查看状态并切换 `routing_policy.default_tier`；在 Antigravity 对话输入框键入 `/` 可用 `/gempt-sonnet`、`/gempt-opus`、`/gempt-fable`、`/gempt-chore` 单回合锁定档位。工具调用省略 `tier` 时自动沿用当前 `default_tier`。
+- **思考强度纪律（防踩坑）**：
+  1. **新线程开局定好强度，严禁中途 `resume` 加码**：开启 `auto_effort`（页面「智能」）时，首轮按任务风险在 `low..xhigh` 间确定；`resume` 续跑强制锁定原强度（规避 Codex 中途改 effort 导致实际推理缩水的问题）。
+  2. **失败升级必开新线程（不传 `session_id`）**：首轮失败、超时或未验证通过，用 `opus`/`escalate=true`/`fable` 另起新线程，而不是在同一 `session_id` 上加档硬磨。
+  3. **禁用 `ultra` 与高强度子代理扇出**：默认配置与自动定档最高止步 `xhigh`，禁止并行扇出多个高思考 Codex 子代理以免配额雪崩。
+  4. **匹配思考超时下限**：未显式指定超时时，`high` 自动保护至少 `900s`（exec）/ `240s`（consult），`xhigh` 至少 `1200s` / `300s`。
+
+> **控制面板与单回合快捷命令**：保持 Antigravity 原生 Gemini 官方登录不变，在 **Magpie 左侧栏 `Plugins → GemPT`**（或终端 `gempt tier` / `gempt sandbox` / `gempt effort [medium|high|xhigh|auto]`）统一切换共享默认档位、沙箱与思考强度；`/gempt-sonnet`、`/gempt-opus`、`/gempt-fable`、`/gempt-chore` 可单回合锁定档位。
 
 ---
 

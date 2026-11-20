@@ -14,6 +14,7 @@ import { homedir } from 'node:os';
 import { basename, delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { isAstraModel } from './routing.mjs';
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
@@ -21,6 +22,8 @@ const REPO_ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 export const TIER_ORDER = ['sonnet', 'opus', 'fable'];
 export const TIER_ALIASES = { lite: 'sonnet', mid: 'opus', max: 'fable' };
 export const VALID_SANDBOXES = ['read-only', 'workspace-write', 'danger-full-access'];
+export const VALID_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+export const EFFORT_RANK = Object.freeze(Object.fromEntries(VALID_EFFORTS.map((name, idx) => [name, idx])));
 export const FEATURES = Object.freeze({ api_fallback: false });
 export const DEFAULT_MAGPIE_URL = 'http://127.0.0.1:3425';
 
@@ -51,7 +54,8 @@ const CLIENT_LABELS = {
 export const DEFAULT_TIERS = {
   sonnet: {
     label: 'Sonnet · 日常高频',
-    when_to_use: '80% 日常写代码、加小功能、改 UI、写脚本',
+    usage_share: '~75%',
+    when_to_use: '约 75% 日常开发、UI/前端、单测与常规修改',
     consult_model: 'codex/gpt-6.2-sol',
     exec_model: '',
     reasoning_effort: 'medium',
@@ -62,12 +66,13 @@ export const DEFAULT_TIERS = {
   },
   opus: {
     label: 'Opus · 复杂工程',
-    when_to_use: '跨文件重构、读大仓库、复杂逻辑设计与排查（常规 Sol + 疑难 Astra）',
+    usage_share: '~20%',
+    when_to_use: '约 20% 跨文件重构、复杂排查与架构设计（Sol @ high + 疑难 @ xhigh 升 Astra）',
     consult_model: 'codex/gpt-6.2-sol',
     exec_model: '',
     escalate_model: 'codex/gpt-6.2-astra',
-    escalate_effort_threshold: 'high',
-    reasoning_effort: 'medium',
+    escalate_effort_threshold: 'xhigh',
+    reasoning_effort: 'high',
     api_mode: 'responses',
     max_output_tokens: 24576,
     fallback_models: [],
@@ -75,10 +80,11 @@ export const DEFAULT_TIERS = {
   },
   fable: {
     label: 'Fable · 顶配攻坚',
-    when_to_use: '极难 Bug、核心算法/数学推导、长程架构设计',
+    usage_share: '~5%',
+    when_to_use: '约 5% 极难 Bug、核心算法/数学推导、长程架构攻坚',
     consult_model: 'codex/gpt-6.2-astra',
     exec_model: '',
-    reasoning_effort: 'high',
+    reasoning_effort: 'xhigh',
     api_mode: 'responses',
     max_output_tokens: 32768,
     fallback_models: [],
@@ -301,8 +307,8 @@ export function pickSubscriptionPlan(probe) {
         consult_model: sonnetModel,
         exec_model: sonnetModel,
         escalate_model: fableModel,
-        escalate_effort_threshold: 'high',
-        reasoning_effort: 'medium',
+        escalate_effort_threshold: 'xhigh',
+        reasoning_effort: 'high',
         fallback_models: [],
         magpie_group_members: dedupe([sonnetModel, fableModel]),
       },
@@ -310,7 +316,7 @@ export function pickSubscriptionPlan(probe) {
         ...DEFAULT_TIERS.fable,
         consult_model: fableModel,
         exec_model: fableModel,
-        reasoning_effort: 'high',
+        reasoning_effort: 'xhigh',
         fallback_models: [],
         magpie_group_members: [fableModel],
       },
@@ -596,10 +602,12 @@ function buildTierView(tierId, tierCfg, defaultTier, fallbackPreset) {
     id: tierId,
     slash: `/gempt-${tierId}`,
     label: String(merged.label || fallback.label),
+    usage_share: String(merged.usage_share || fallback.usage_share || ''),
     when_to_use: String(merged.when_to_use || fallback.when_to_use),
     consult_model: consultModel,
     exec_model: effectiveExec,
     escalate_model: String(merged.escalate_model || '').trim(),
+    escalate_effort_threshold: String(merged.escalate_effort_threshold || fallback.escalate_effort_threshold || 'high').trim(),
     reasoning_effort: String(merged.reasoning_effort || fallback.reasoning_effort),
     fallback_models: Array.isArray(merged.fallback_models) ? merged.fallback_models.filter(Boolean).map(String) : [],
     magpie_group_members: Array.isArray(merged.magpie_group_members)
@@ -717,14 +725,18 @@ export function buildRulesSnippet() {
   return [
     '# GemPT Collaboration Rules (Human <-> Gemini, Gemini leads GPT)',
     '',
-    '- Role split: Gemini talks with the human, clarifies goals, breaks work into structured packets, and reviews results. Delegate hard math/algorithms, architecture second opinions, deep bug diagnosis, and log summarization/classification to GPT/Codex/DeepSeek via GemPT MCP tools.',
-    '- When to call `gempt_consult`:',
-    '  - Complex reasoning, second opinions, or root-cause analysis (avoiding Codex CLI ~18K-50K token overhead).',
-    '  - Free fast summarization / log cleanup: pass `tier="chore"`.',
-    '- When to call `gempt_exec`:',
-    '  - Autonomous code edits and test verification inside a workspace (`cwd` required, opt-in via Magpie plugin option `exec: true`).',
-    '- Tiers: `sonnet` (80% daily work), `opus` (cross-file engineering; `escalate=true` for hard turns), `fable` (extreme bugs / core algorithms). Omit `tier` to follow the user\'s active GemPT panel setting (`subscription_only`).',
-    '- Task packet standard: pass explicit Goal, Verified Context (`file_paths` / `context`), Hard Constraints, and Verification Commands; translate Codex/GPT output into clear conclusions, modified files, and test evidence.',
+    '- Domain split:',
+    '  - **Gemini** owns human dialogue, planning, acceptance verification, and frontend/UI/visual/multimodal edits directly (cross-review tricky UX state via `gempt_consult`).',
+    '  - **GPT/Codex** (via Magpie gateway) owns backend architecture, hard debugging, algorithms/math, cross-file refactors, and independent diff review (never let GPT self-grade its own changes).',
+    '- Routing & usage share (Subscription-Only default):',
+    '  - `sonnet` (~75%): `codex/gpt-6.2-sol` @ `medium` for daily engineering & UI logic.',
+    '  - `opus` (~20%): `codex/gpt-6.2-sol` @ `high`; pass `escalate=true` or `xhigh` to escalate to `codex/gpt-6.2-astra`.',
+    '  - `fable` (~5%): `codex/gpt-6.2-astra` @ `xhigh` for extreme bugs, math, and core architecture. Never downgrade Astra to `low`.',
+    '  - `chore`: free utility model (`tier="chore"` on `gempt_consult` only) for log cleanup/summarization/classification.',
+    '- Effort & escalation discipline:',
+    '  - Size effort cleanly on fresh threads (`auto_effort` or explicit `medium`/`high`/`xhigh`); forbid `ultra` and forbid high-effort subagent fan-out.',
+    '  - On failure/timeout/unverified output, **open a fresh thread (omit `session_id`)** with `opus`/`escalate=true`/`fable` — never bump effort mid-thread on `resume`.',
+    '- Task packet standard: pass Goal, Verified Context (`file_paths`/`context`), Hard Constraints, Verification Commands (`gempt_exec`), and translate GPT output into clear human conclusions + test evidence.',
   ].join('\n');
 }
 
@@ -927,6 +939,7 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     config_path: resolvedConfigPath,
     default_tier: defaultTier,
     failover_mode: 'subscription_only',
+    auto_effort: Boolean(rawCfg?.routing_policy?.auto_effort),
     default_sandbox: String(rawCfg?.codex?.default_sandbox || 'workspace-write'),
     subscription: {
       connected: Boolean(magpie.codex_ready),
@@ -1067,6 +1080,92 @@ export function setDefaultSandbox(sandbox, { configPath } = {}) {
   };
 }
 
+export function setEffortSettings({ tierEffort, tier, autoEffort } = {}, { configPath } = {}) {
+  const loaded = readExistingConfigObject(configPath);
+  if (!loaded.ok) return loaded;
+
+  const existingPolicy = loaded.data.routing_policy && typeof loaded.data.routing_policy === 'object'
+    ? loaded.data.routing_policy
+    : {};
+  const existingTiers = loaded.data.tiers && typeof loaded.data.tiers === 'object'
+    ? loaded.data.tiers
+    : {};
+
+  const targetTier = normalizeDefaultTier(tier || existingPolicy.default_tier || 'sonnet');
+  if (!targetTier) {
+    return {
+      ok: false,
+      status: 400,
+      error: `Invalid target tier '${String(tier ?? '')}'. Expected one of: ${TIER_ORDER.join(', ')}.`,
+    };
+  }
+
+  let nextAutoEffort = Boolean(existingPolicy.auto_effort);
+  if (autoEffort !== undefined) {
+    if (typeof autoEffort !== 'boolean') {
+      return { ok: false, status: 400, error: 'auto_effort must be a boolean.' };
+    }
+    nextAutoEffort = autoEffort;
+  }
+
+  const nextTiers = { ...existingTiers };
+  const targetTierCfg = { ...DEFAULT_TIERS[targetTier], ...(existingTiers[targetTier] || {}) };
+
+  if (tierEffort !== undefined && tierEffort !== null && String(tierEffort).trim() !== '') {
+    const cleanEffort = String(tierEffort).trim().toLowerCase();
+    if (!VALID_EFFORTS.includes(cleanEffort)) {
+      return {
+        ok: false,
+        status: 400,
+        error: `Invalid reasoning_effort '${String(tierEffort)}'. Expected one of: ${VALID_EFFORTS.join(', ')}.`,
+      };
+    }
+    if (cleanEffort === 'ultra') {
+      return {
+        ok: false,
+        status: 400,
+        error: "默认档位禁止设为 ultra（避免高倍并发配额消耗），仅在极端个案单次手动传参。",
+      };
+    }
+    const usesAstra = targetTier === 'fable'
+      || isAstraModel(targetTierCfg.consult_model)
+      || isAstraModel(targetTierCfg.exec_model)
+      || (Array.isArray(targetTierCfg.magpie_group_members) && targetTierCfg.magpie_group_members.some((m) => isAstraModel(m)));
+    if (usesAstra && EFFORT_RANK[cleanEffort] < EFFORT_RANK.medium) {
+      return {
+        ok: false,
+        status: 400,
+        error: 'Astra 模型禁止降到 low 档思考，请保持 high / xhigh 或切换到 Sol 档。',
+      };
+    }
+    targetTierCfg.reasoning_effort = cleanEffort;
+    nextTiers[targetTier] = targetTierCfg;
+    if (autoEffort === undefined) {
+      nextAutoEffort = false;
+    }
+  }
+
+  const next = {
+    ...loaded.data,
+    routing_policy: {
+      ...existingPolicy,
+      auto_effort: nextAutoEffort,
+    },
+    tiers: nextTiers,
+  };
+  const written = writeConfigAtomic(loaded.path, next);
+  if (!written.ok) return written;
+
+  return {
+    ok: true,
+    status: 200,
+    auto_effort: nextAutoEffort,
+    tier: targetTier,
+    reasoning_effort: String(nextTiers[targetTier]?.reasoning_effort || targetTierCfg.reasoning_effort || 'medium'),
+    config_path: loaded.path,
+  };
+}
+
 export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000 } = {}) {
   const resolvedConfigPath = resolveConfigPath(configPath);
   const existing = readJsonSafe(resolvedConfigPath) || {};
@@ -1123,6 +1222,7 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
     routing_policy: {
       default_tier: defaultTier,
       failover_mode: 'subscription_only',
+      auto_effort: Boolean(existingPolicy.auto_effort),
       magpie_group_strategy: String(existingPolicy.magpie_group_strategy || 'order'),
       excluded_models: excludedList,
     },

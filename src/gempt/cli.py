@@ -24,7 +24,7 @@ from .discover import discover_environment
 from .presets import apply_native_presets
 from .runs import dispatch_exec, read_run
 from .mcp_server import serve_stdio
-from .service import configure_gempt, get_status, run_consult, set_default_sandbox, set_default_tier
+from .service import configure_gempt, get_status, run_consult, set_auto_effort, set_default_sandbox, set_default_tier, set_tier_effort
 
 _TIER_CHOICES = (*CONSULT_TIERS, *TIER_ALIASES.keys())
 
@@ -310,6 +310,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_sbx.add_argument("--config", default=None)
     p_sbx.add_argument("--json", action="store_true")
 
+    p_eff = sub.add_parser("effort", help="Show or switch reasoning effort (low/medium/high/xhigh/auto)")
+    p_eff.add_argument("value", nargs="?", choices=("low", "medium", "high", "xhigh", "auto"), default=None)
+    p_eff.add_argument("--tier", choices=TIER_ORDER, default=None)
+    p_eff.add_argument("--config", default=None)
+    p_eff.add_argument("--json", action="store_true")
+
     sub.add_parser("mcp", help="Run gempt stdio MCP server")
 
     p_inst = sub.add_parser("install-agy", help="Install gempt plugin into Antigravity config directory")
@@ -450,6 +456,40 @@ def main(argv: list[str] | None = None) -> int:
                     print(json.dumps(res, indent=2, ensure_ascii=False))
                 else:
                     print(f"default_sandbox: {sbx_val}")
+            return 0
+
+        if args.command == "effort":
+            if args.value == "auto":
+                res = set_auto_effort(True, config_path=args.config)
+                if args.json:
+                    print(json.dumps(res, indent=2, ensure_ascii=False))
+                else:
+                    print(f"auto_effort: true (default_tier={res['default_tier']})")
+            elif args.value is not None:
+                res = set_tier_effort(args.value, tier=args.tier, disable_auto=True, config_path=args.config)
+                if args.json:
+                    print(json.dumps(res, indent=2, ensure_ascii=False))
+                else:
+                    print(f"effort: {res['tier']}={res['reasoning_effort']} (auto_effort={res['auto_effort']})")
+            else:
+                cfg, cfg_path = load_config(explicit=args.config, require_exists=True)
+                tier_name = args.tier or get_default_tier(cfg)
+                resolved = resolve_tier(cfg, tier_name)
+                auto_flag = bool((cfg.get("routing_policy") or {}).get("auto_effort", False))
+                efforts = {t: str((cfg.get("tiers") or {}).get(t, {}).get("reasoning_effort") or "") for t in TIER_ORDER}
+                res = {
+                    "auto_effort": auto_flag,
+                    "default_tier": get_default_tier(cfg),
+                    "tier": tier_name,
+                    "reasoning_effort": resolved["reasoning_effort"],
+                    "efforts": efforts,
+                    "config_path": str(cfg_path),
+                }
+                if args.json:
+                    print(json.dumps(res, indent=2, ensure_ascii=False))
+                else:
+                    mode_lbl = "auto" if auto_flag else resolved["reasoning_effort"]
+                    print(f"effort: {mode_lbl} (tier={tier_name}, model={resolved['model']}, auto_effort={auto_flag})")
             return 0
 
         if args.command == "mcp":

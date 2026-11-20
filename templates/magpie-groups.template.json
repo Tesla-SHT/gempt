@@ -6,44 +6,41 @@
   "groups": {
     "gempt-harness-sonnet": {
       "group_id": "group/gempt-harness-sonnet",
-      "benchmark_tier": "Sonnet (日常高频)",
-      "use_cases": "80% 日常写代码、加小功能、改 UI、写脚本",
+      "benchmark_tier": "Sonnet (~75% 日常高频)",
+      "use_cases": "约 75% 日常写代码、UI/前端、单测与常规修改",
       "default_effort": "medium",
       "routing": "order",
       "stays": "session",
       "presets": {
         "subscription_only": ["codex/gpt-6.2-sol"],
-        "api_fallback": ["codex/gpt-6.2-sol", "openai/gpt-6.1-sol"],
-        "effort_only": ["codex/gpt-6.2-astra"]
+        "api_fallback": ["codex/gpt-6.2-sol", "openai/gpt-6.1-sol"]
       },
       "compact_rule": "magpie group rule add gempt-harness-sonnet use=<utility_model> compact"
     },
     "gempt-harness-opus": {
       "group_id": "group/gempt-harness-opus",
-      "benchmark_tier": "Opus (复杂工程)",
-      "use_cases": "跨文件重构、读大仓库、复杂逻辑设计与排查（常规 Sol + 疑难 Astra）",
-      "default_effort": "medium",
-      "routing": "order",
-      "stays": "session",
-      "presets": {
-        "subscription_only": ["codex/gpt-6.2-sol", "codex/gpt-6.2-astra"],
-        "api_fallback": ["codex/gpt-6.2-sol", "codex/gpt-6.2-astra", "openai/gpt-6.1-sol", "openai/gpt-6-astra"],
-        "effort_only": ["codex/gpt-6.2-astra"]
-      },
-      "escalation_rule": "magpie group rule add gempt-harness-opus use=codex/gpt-6.2-astra effort=high",
-      "compact_rule": "magpie group rule add gempt-harness-opus use=<utility_model> compact"
-    },
-    "gempt-harness-fable": {
-      "group_id": "group/gempt-harness-fable",
-      "benchmark_tier": "Fable (顶配攻坚)",
-      "use_cases": "极难 Bug、核心算法/数学推导、长程架构设计",
+      "benchmark_tier": "Opus (~20% 复杂工程)",
+      "use_cases": "约 20% 跨文件重构、复杂排查与架构设计（Sol @ high + 疑难 @ xhigh 升 Astra）",
       "default_effort": "high",
       "routing": "order",
       "stays": "session",
       "presets": {
+        "subscription_only": ["codex/gpt-6.2-sol", "codex/gpt-6.2-astra"],
+        "api_fallback": ["codex/gpt-6.2-sol", "codex/gpt-6.2-astra", "openai/gpt-6.1-sol", "openai/gpt-6-astra"]
+      },
+      "escalation_rule": "magpie group rule add gempt-harness-opus use=codex/gpt-6.2-astra effort=xhigh",
+      "compact_rule": "magpie group rule add gempt-harness-opus use=<utility_model> compact"
+    },
+    "gempt-harness-fable": {
+      "group_id": "group/gempt-harness-fable",
+      "benchmark_tier": "Fable (~5% 顶配攻坚)",
+      "use_cases": "约 5% 极难 Bug、核心算法/数学推导、长程架构攻坚",
+      "default_effort": "xhigh",
+      "routing": "order",
+      "stays": "session",
+      "presets": {
         "subscription_only": ["codex/gpt-6.2-astra"],
-        "api_fallback": ["codex/gpt-6.2-astra", "openai/gpt-6-astra"],
-        "effort_only": ["codex/gpt-6.2-astra"]
+        "api_fallback": ["codex/gpt-6.2-astra", "openai/gpt-6-astra"]
       },
       "compact_rule": "magpie group rule add gempt-harness-fable use=<utility_model> compact"
     }

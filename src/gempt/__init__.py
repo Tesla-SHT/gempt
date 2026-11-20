@@ -21,6 +21,7 @@ TIER_ALIASES = {
 }
 
 VALID_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+RECOMMENDED_EFFORTS = ("medium", "high", "xhigh")
 EFFORT_RANK = {name: idx for idx, name in enumerate(VALID_EFFORTS)}
 VALID_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
 VALID_FAILOVER_MODES = ("subscription_only",)
