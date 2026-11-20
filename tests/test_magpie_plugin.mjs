@@ -234,7 +234,7 @@ test('package.json Magpie manifest fields and single plugin factory export exist
     timeout: 10000,
     windowsHide: true,
   });
-  assert.deepEqual(JSON.parse(stdout.trim()), ['consult', 'discover', 'exec', 'status']);
+  assert.deepEqual(JSON.parse(stdout.trim()), ['consult', 'discover', 'dispatch', 'exec', 'status']);
 });
 
 test('backend readState exposes multi-client state, native groups, MCP snippet, usage tail, and api_fallback', async () => {
@@ -778,6 +778,30 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
       options: { exec: true },
     });
 
+    // Routing uses the current settings even for an already registered tool instance.
+    const dispatch = enabledTools.dispatch.execute;
+    const design = { goal: 'Design a form', kind: 'design', access: 'provided' };
+    const config = JSON.parse(readFileSync(cfgPath, 'utf8'));
+    for (const [profile, delegated] of [['gemini', false], ['balanced', false], ['gpt', true], ['gpt_first', true]]) {
+      config.routing_policy.work_split = profile;
+      writeFileSync(cfgPath, JSON.stringify(config));
+      const before = magpie.requests.length;
+      const reply = await dispatch(design);
+      assert.equal(reply.action, delegated ? 'consult' : 'gemini');
+      assert.equal(magpie.requests.length - before, Number(delegated));
+    }
+    config.routing_policy.swarm_split = 'gemini';
+    writeFileSync(cfgPath, JSON.stringify(config));
+    assert.equal((await dispatch({ ...design, role: 'coordinator' })).action, 'board');
+    assert.equal((await dispatch({ ...design, role: 'worker', assignment_id: '1'.repeat(32) })).action, 'gemini');
+    const revision = { ...design, role: 'worker', kind: 'specialist', assignment_id: '2'.repeat(32) };
+    const before = magpie.requests.length;
+    const pair = await Promise.all([dispatch(revision), dispatch(revision)]);
+    assert.deepEqual(pair.map(item => item.action).sort(), ['already_assigned', 'consult']);
+    assert.equal(magpie.requests.length, before + 1);
+    await assert.rejects(dispatch({ ...revision, role: 'verifier', access: 'change', cwd: repoDir }), /read-only/);
+    await assert.rejects(defaultTools.dispatch.execute({ ...design, access: 'change', cwd: repoDir }), /disabled/);
+
     // Reject widening sandbox above config host ceiling
     await assert.rejects(
       () => enabledTools.exec.execute({ goal: 'Widen', cwd: repoDir, sandbox: 'danger-full-access' }),
@@ -817,6 +841,20 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     assert.match(codexCalls[0].stdinPrompt, /## Goal\nInspect repo/);
     assert.ok(codexCalls[1].args.includes('resume'));
     assert.ok(codexCalls[1].args.includes('01900000-0000-7000-8000-000000000001'));
+
+    // A receipt survives a new tool instance and repeat delivery never launches a second worker.
+    const job = { goal: 'Edit one file', cwd: repoDir, run_id: '3'.repeat(32), background: true };
+    const first = await enabledTools.exec.execute(job);
+    assert.equal(first.run_id, job.run_id);
+    const reconnected = createGemptTools({ sessionsDir: sessDir, configPath: cfgPath, options: { exec: true } });
+    const finished = await reconnected.status.execute({ run_id: job.run_id, wait_sec: 5 });
+    assert.equal(finished.state, 'finished', finished.error);
+    assert.equal(finished.result.sandbox, 'workspace-write');
+    const replay = await reconnected.exec.execute(job);
+    assert.equal(replay.session_id, finished.result.session_id);
+    assert.equal(readFileSync(codexLog, 'utf8').trim().split(/\r?\n/).length, codexCalls.length + 1);
+    await assert.rejects(reconnected.exec.execute({ ...job, cwd: outsideDir }), /different workspace/);
+    await assert.rejects(reconnected.status.execute({ run_id: '../wrong' }), /Invalid run_id/);
 
     // Auto-effort escalates complex Opus consult to Astra@xhigh and preserves on resume
     const autoHard = await enabledTools.consult.execute({

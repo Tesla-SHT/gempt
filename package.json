@@ -37,8 +37,8 @@
   "magpie": {
     "name": "GemPT",
     "summary": {
-      "en": "Gemini-leads-GPT 3+1 orchestration tools (gempt_consult / gempt_exec / gempt_discover / gempt_status) and routing control panel for all Magpie clients.",
-      "zh": "为所有 Magpie 客户端提供 Gemini 主导 GPT 3+1 编排工具（gempt_consult / gempt_exec / gempt_discover / gempt_status）与订阅路由控制面板。"
+      "en": "Gemini-leads-GPT 3+1 orchestration tools (gempt_dispatch / gempt_consult / gempt_exec / gempt_discover / gempt_status) and routing control panel for all Magpie clients.",
+      "zh": "为所有 Magpie 客户端提供 Gemini 主导 GPT 四档工作分工与编排工具（gempt_dispatch / gempt_consult / gempt_exec / gempt_discover / gempt_status）与订阅路由控制面板。"
     },
     "page": {
       "title": "GemPT",

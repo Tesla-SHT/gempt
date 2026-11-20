@@ -24,6 +24,9 @@ from . import (
 )
 
 
+WORKLOAD = json.loads(Path(__file__).with_name("workload.json").read_text(encoding="utf-8"))
+
+
 class ConfigError(RuntimeError):
     """Raised when gempt configuration is missing or invalid."""
 
@@ -68,6 +71,8 @@ def default_config_template() -> dict[str, Any]:
         },
         "routing_policy": {
             "default_tier": "sonnet",
+            "work_split": "balanced",
+            "swarm_split": "inherit",
             "failover_mode": "subscription_only",
             "auto_effort": False,
             "magpie_group_strategy": "order",
@@ -246,6 +251,11 @@ def validate_config(cfg: dict[str, Any]) -> None:
 
     policy = cfg.get("routing_policy") or {}
     get_default_tier(cfg)
+    profiles = list(WORKLOAD["profiles"])
+    if policy.get("work_split", "balanced") not in profiles:
+        raise ConfigError("Invalid routing_policy.work_split")
+    if policy.get("swarm_split", "inherit") not in [*profiles, "inherit"]:
+        raise ConfigError("Invalid routing_policy.swarm_split")
     failover = str(policy.get("failover_mode") or "subscription_only")
     if failover not in VALID_FAILOVER_MODES:
         raise ConfigError(f"Config error: routing_policy.failover_mode '{failover}' not in {VALID_FAILOVER_MODES}")

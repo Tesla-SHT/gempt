@@ -1,0 +1,7 @@
+{
+  "gempt-work-split": {
+    "PreInvocation": [
+      { "type": "command", "command": "python -I ./work_split_hook.py", "timeout": 5 }
+    ]
+  }
+}

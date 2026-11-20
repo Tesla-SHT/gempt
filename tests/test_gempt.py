@@ -451,7 +451,7 @@ class McpStdioHandshakeTests(unittest.TestCase):
             tool_names = [t["name"] for t in lines[1]["result"]["tools"]]
             self.assertEqual(
                 tool_names,
-                ["gempt_discover", "gempt_configure", "gempt_consult", "gempt_exec", "gempt_status"],
+                ["gempt_discover", "gempt_configure", "gempt_consult", "gempt_exec", "gempt_status", "gempt_dispatch"],
             )
             status_payload = json.loads(lines[2]["result"]["content"][0]["text"])
             self.assertFalse(status_payload["configured"])
@@ -491,6 +491,9 @@ class CliPackagingTests(unittest.TestCase):
                 "skills/gempt-fable/SKILL.md",
                 "skills/gempt-chore/SKILL.md",
                 "runtime/gempt/__init__.py",
+                "runtime/gempt/workload.json",
+                "hooks.json",
+                "work_split_hook.py",
                 "mcp_config.json",
             ):
                 self.assertTrue((target / rel).is_file(), f"missing installed file: {rel}")
@@ -685,6 +688,29 @@ class BugfixRegressionTests(unittest.TestCase):
                 items = recent_runs(5, root=root)
             self.assertEqual(len(items), 1)
             self.assertEqual(items[0]["run_id"], "a" * 32)
+
+    def test_dispatch_honors_independent_swarm_profile_and_claims(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / "config.json"
+            cfg = default_config_template()
+            cfg["routing_policy"].update(work_split="gemini", swarm_split="gpt_first")
+            save_config(cfg, path=conf)
+            env = {"GEMPT_CONFIG": str(conf), "GEMPT_WORKSPACE_ROOT": tmp, "GEMPT_SESSIONS_DIR": tmp}
+            def dispatch(**overrides):
+                args = {"goal": "Explain the design", "kind": "design", "access": "provided", **overrides}
+                return json.loads(_handle_tool_call("gempt_dispatch", args)["content"][0]["text"])
+            with mock.patch.dict(os.environ, env), mock.patch("gempt.workload.dispatch_exec", return_value={"text": "done"}) as execute:
+                self.assertEqual(dispatch()["action"], "gemini")
+                self.assertEqual(dispatch(role="coordinator")["action"], "board")
+                item = dict(role="verifier", assignment_id="f" * 32, cwd=tmp, access="inspect")
+                self.assertEqual(dispatch(**item)["action"], "exec")
+                self.assertEqual(execute.call_args.kwargs["sandbox"], "read-only")
+                self.assertEqual(dispatch(**item)["action"], "already_assigned")
+                execute.assert_called_once()
+                with self.assertRaisesRegex(ValueError, "outside host"):
+                    dispatch(**{**item, "cwd": str(Path(tmp).parent)})
+                with self.assertRaisesRegex(ValueError, "verifier"):
+                    dispatch(**{**item, "access": "change"})
 
     def test_mcp_consult_and_exec_honor_configured_default_tier(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

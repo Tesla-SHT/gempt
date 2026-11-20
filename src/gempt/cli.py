@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shlex
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 from . import (
     CONSULT_TIERS,
+    DEFAULT_CONFIG_PATH,
     TIER_ALIASES,
     TIER_ORDER,
     VALID_EFFORTS,
@@ -24,6 +28,7 @@ from .discover import discover_environment
 from .presets import apply_native_presets
 from .runs import dispatch_exec, read_run
 from .mcp_server import serve_stdio
+from .workload import SCHEMA as DISPATCH_SCHEMA, dispatch_task
 from .service import configure_gempt, get_status, run_consult, set_auto_effort, set_default_sandbox, set_default_tier, set_tier_effort
 
 _TIER_CHOICES = (*CONSULT_TIERS, *TIER_ALIASES.keys())
@@ -185,7 +190,7 @@ def _cmd_install_agy(args: argparse.Namespace) -> int:
                 return 1
 
     target.mkdir(parents=True, exist_ok=True)
-    for rel in ("plugin.json", "README.md"):
+    for rel in ("plugin.json", "README.md", "hooks.json", "work_split_hook.py"):
         src_file = source_plugin / rel
         if not src_file.is_file() and rel == "README.md":
             parent_readme = source_plugin.parent / "README.md"
@@ -193,6 +198,15 @@ def _cmd_install_agy(args: argparse.Namespace) -> int:
                 src_file = parent_readme
         if src_file.is_file() and source_plugin != target:
             shutil.copy2(src_file, target / rel)
+
+    hooks_file = target / "hooks.json"
+    if (source_plugin / "hooks.json").is_file() and hooks_file.is_file():
+        hooks = json.loads(hooks_file.read_text(encoding="utf-8"))
+        command = [sys.executable, "-I", "./work_split_hook.py"]
+        hooks["gempt-work-split"]["PreInvocation"][0]["command"] = (
+            subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
+        )
+        hooks_file.write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
 
     for folder in ("rules", "skills", "assets"):
         src_sub = source_plugin / folder
@@ -273,6 +287,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--use-groups", action="store_true", help="Point gempt tiers to group/gempt-harness-{sonnet,opus,fable}")
     p_init.add_argument("--non-interactive", action="store_true", help="Use discovered preset defaults without prompts")
     p_init.add_argument("--dry-run", action="store_true", help="Preview changes without writing config or groups")
+
+    dispatch = sub.add_parser("dispatch", help="Apply the current ordinary or Swarm work split")
+    for name, prop in DISPATCH_SCHEMA["properties"].items():
+        dispatch.add_argument("--" + name.replace("_", "-"), choices=prop.get("enum"),
+                              required=name in DISPATCH_SCHEMA["required"], help=prop.get("description"))
+    dispatch.add_argument("--config")
 
     p_cons = sub.add_parser("consult", help="Consult GPT/utility via Magpie HTTP API (no Codex tool overhead)")
     p_cons.add_argument("--tier", choices=_TIER_CHOICES, default=None, help="Target tier (defaults to routing_policy.default_tier)")
@@ -379,6 +399,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(res, indent=2, ensure_ascii=False))
                 return 0
             return _interactive_init(args)
+
+        if args.command == "dispatch":
+            packet = {key: getattr(args, key) for key in DISPATCH_SCHEMA["properties"] if getattr(args, key) is not None}
+            result = dispatch_task(packet, args.config or os.environ.get("GEMPT_CONFIG") or DEFAULT_CONFIG_PATH)
+            print(json.dumps(result, ensure_ascii=False))
+            return int(result.get("verification", {}).get("status") in {"failed", "unverified"})
 
         if args.command == "consult":
             res = run_consult(

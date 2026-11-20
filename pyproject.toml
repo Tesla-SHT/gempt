@@ -13,5 +13,8 @@ dependencies = []
 [project.scripts]
 gempt = "gempt.cli:main"
 
+[tool.setuptools.package-data]
+gempt = ["workload.json"]
+
 [tool.setuptools.packages.find]
 where = ["src"]

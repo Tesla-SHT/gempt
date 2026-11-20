@@ -118,6 +118,18 @@
             </ul>
           </div>
 
+          <section id="work-controls" class="work-controls" aria-labelledby="work-label" hidden>
+            <fieldset class="control-fieldset">
+              <legend id="work-label" class="control-legend">普通对话 · 工作分工</legend>
+              <div id="work-options" class="work-options"></div>
+              <span id="work-detail" class="control-hint" aria-live="polite"></span>
+            </fieldset>
+            <div class="swarm-choice">
+              <label for="swarm-split" class="control-legend">Antigravity Swarm</label>
+              <select id="swarm-split" name="swarm_split" aria-describedby="swarm-detail"></select>
+              <span id="swarm-detail" class="control-hint"></span>
+            </div>
+          </section>
           <div id="mcp-controls-bar" class="route-controls">
             <fieldset id="sandbox-control-group" class="control-fieldset">
               <legend class="control-legend">Codex 执行权限</legend>
@@ -178,6 +190,7 @@
           </div>
 
           <div id="native-controls-bar" class="native-controls" hidden>
+            <p class="control-hint">直连组按回合选模型。需要 Gemini 解说 GPT 的工作结果时，请使用 MCP 编排与工作分工。</p>
             <p id="native-status-copy" class="native-copy">尚未在 Magpie 创建直连路由组，创建后可在任意客户端直接选 group/gempt-* 使用。</p>
             <div id="native-ready-pills" class="native-ready-pills" hidden>
               <button type="button" class="pill-copy-btn" data-copy="group/gempt-sonnet">group/gempt-sonnet</button>

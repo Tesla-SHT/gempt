@@ -21,7 +21,7 @@ magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/collab
   3. 聊设计时默认走首顺位 **Gemini**，明确派发写代码/修 Bug 时 Magpie 按回合意图与 `when=subagent` 自动分流到 **GPT-6.2-Sol / Astra**，压缩整理自动走 **DeepSeek Flash**。
 
 - **方案 B（全客户端内置 MCP 编排 · 完整主从协作）**：
-  1. **免手动装 Python / 免粘 MCP JSON**：安装插件后，Magpie 会自动向已接入客户端分发内置 HTTP 工具 `gempt_consult`、`gempt_exec`、`gempt_discover`、`gempt_status`（`http://127.0.0.1:3425/mcp/magpie/tools/gempt`），无需先跑 `init` 即可零配置使用 Codex 订阅直连；
+  1. **免手动装 Python / 免粘 MCP JSON**：安装插件后，Magpie 会自动向已接入客户端分发内置 HTTP 工具 `gempt_dispatch`、`gempt_consult`、`gempt_exec`、`gempt_discover`、`gempt_status`（`http://127.0.0.1:3425/mcp/magpie/tools/gempt`），无需先跑 `init` 即可零配置使用 Codex 订阅直连；
   2. **开启代码执行权（安全默认关闭）**：参照 `@magpie-community/tools-layerfs` 安全规范，`gempt_exec` 默认关闭；需要允许 Codex 改动工作区代码时，在 Magpie 插件选项中把 `exec` 设为 `true`：
      ```sh
      magpie plugin options gempt '{"exec":true}'
@@ -82,6 +82,14 @@ DeepSeek 的额度取决于你绑定的渠道。用 `magpie models` 查看本机
 
 ---
 
+## 插件页里的工作分工
+
+在 **Plugins → GemPT → MCP 编排** 选择普通对话的工作分工。Gemini 为主、按领域分工、GPT 为主、基本全由 GPT 做分别表示 GPT 承担约 20%、50%、80%、95% 工作量的倾向。实际决策按任务类别执行，百分比不计量订阅额度。旧配置沿用按领域分工。
+
+每个新实质任务先走 `gempt_dispatch`。最高档会立即把普通写作、方案、调研和工程交给 GPT。已有材料走咨询；需要读仓库或跑检查走只读 Codex；实现和测试走已授权的 Codex 工作区。Gemini 处理必要的原生视觉观察、澄清需求，并用通俗语言汇报结论和证据。执行权限关闭时会报告阻塞。外部 MCP 客户端首次接入或从旧版升级需复制新版协作规则；Antigravity 使用随插件安装的规则。只选择直连组的客户端仍按整回合路由。
+
+**Antigravity Swarm** 可以跟随普通对话，也可以独立选四档。协调者分配带唯一 ID 的公开任务单，worker 按单派发，verifier 独立核验，narrator 处理看板汇报。在同一 GemPT 会话存储内重复投递一个 ID 只会启动一次 GPT 工作。每个原生 Swarm 角色仍然消耗宿主的协调回合。参见 [Antigravity Swarm 官方说明](https://antigravity.google/docs/swarm)。
+
 ## 二、Gemini 主导 GPT 编排插件（`consult` / `exec`）
 
 ```text
@@ -101,7 +109,7 @@ Gemini 主控（Antigravity 官方原路 或 外部客户端经 Magpie 调 antig
 
 ### 3+1 编排档位、甜点强度与领域分工
 
-- **领域分工**：**Gemini** 专职人类需求沟通、方案拆解、前端/UI 审美实现、多模态核验与最终验收；**GPT/Codex**（经本地 Magpie 调度）专攻后端重构、硬核调试、算法数学与独立 Diff 审查（不自写自审）。
+- **「按领域分工」档**：**Gemini** 专职人类需求沟通、方案拆解、前端/UI 审美实现、多模态核验与最终验收；**GPT/Codex**（经本地 Magpie 调度）专攻后端重构、硬核调试、算法数学与独立 Diff 审查（不自写自审）。
 - **甜点配置与思考强度纪律**：控制面板右侧提供 **`思考强度（当前档）`**（`中 | 高 | 极高 | 智能`）。选 **`智能`**（`auto_effort`）时，仅在新线程首轮按任务风险在 `low..xhigh` 间自动定档；`resume` 续跑强制锁定原强度，禁用 `ultra` 与高强度子代理扇出，也不将 `Astra` 降至 `low`。
 
 | 编排档位 / 推荐占比 | 对标定位 | 执行 / 咨询模型 × 甜点强度 | 免费旁路 (`compact`) | 典型场景 |
@@ -122,7 +130,7 @@ PYTHONPATH=src python -m gempt discover
 ```
 
 2. **接入客户端与 Magpie 控制页**：
-   - **Magpie 原生 `tools + page` 插件**（控制中心 + 全客户端工具托管）：运行 `magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/api-fallback`（或公开纯订阅版 `#yizhang-dream/collab` / 本地 `magpie plugin add .`），即可在 Magpie 左侧栏 **`Plugins → GemPT`** 打开控制面板，并由 Magpie 自动将 `gempt_discover` / `gempt_status` / `gempt_consult` / `gempt_exec` 注册到 `/mcp/magpie/tools/gempt`。未初始化时页面内可**一键启用订阅配置**（不启用也可零配置直连 Codex 订阅），随时切换共享 **默认档位**、**Codex 执行权限**、**容灾模式（仅订阅 / API 兜底）** 或一键创建 **`group/gempt-*` 直连路由组**。
+   - **Magpie 原生 `tools + page` 插件**（控制中心 + 全客户端工具托管）：运行 `magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/api-fallback`（或公开纯订阅版 `#yizhang-dream/collab` / 本地 `magpie plugin add .`），即可在 Magpie 左侧栏 **`Plugins → GemPT`** 打开控制面板，并由 Magpie 自动将 `gempt_dispatch` / `gempt_discover` / `gempt_status` / `gempt_consult` / `gempt_exec` 注册到 `/mcp/magpie/tools/gempt`。未初始化时页面内可**一键启用订阅配置**（不启用也可零配置直连 Codex 订阅），随时切换共享 **默认档位**、**Codex 执行权限**、**容灾模式（仅订阅 / API 兜底）** 或一键创建 **`group/gempt-*` 直连路由组**。
    - **Antigravity 原生插件**：运行 `bash install.sh --plugin`（或 `PYTHONPATH=src python -m gempt install-agy`），把 `plugin/`（`plugin.json`、`rules/`、`skills/`）与独立包副本安装到 `~/.gemini/config/plugins/gempt/`。安装并重载插件后，保持原生 Gemini 官方登录即可在 `/` 菜单直接使用 `/gempt`、`/gempt-sonnet`、`/gempt-opus`、`/gempt-fable`、`/gempt-chore`。
    - **非 Magpie 托管的独立 MCP 客户端**：可在控制页点 **`复制 MCP 配置`**（或运行 `bash install.sh --print-mcp` / `PYTHONPATH=src python -m gempt print-mcp --installed`），并配合页内 **`复制协作规则`**（详版见 [plugin/skills/gempt/SKILL.md](plugin/skills/gempt/SKILL.md) 与 [plugin/rules/AGENTS.md](plugin/rules/AGENTS.md)）。
 
@@ -195,7 +203,9 @@ PYTHONPATH=src python -m gempt exec --background --cwd . --goal "修复解析器
 PYTHONPATH=src python -m gempt status --run-id <返回的32位ID>
 ```
 
-MCP 对应 `gempt_exec(background=true)` 与 `gempt_status(run_id=...)`。调用方可以预先生成 32 位小写十六进制 `run_id`，相同 ID 只派发一次。`verification` 填一条独立的 shell 命令；gempt 从 Codex 的命令事件匹配该命令（支持拆解 PowerShell / `cmd /c` / `bash -lc` 外壳，但拒绝 `echo` 或 `|| true` 伪造）及退出码，最近一次匹配决定 `passed` 或 `failed`，否则为 `unverified`。Git 工作区的 `before`/`after` 记录相对 `HEAD` 的 diff 与状态（每项最多 64 KiB）。
+Magpie 原生 MCP 对短任务直接返回结果，运行约 20 秒仍在执行时返回 `run_id`，可用 `gempt_status(run_id=..., wait_sec=20)` 等待并读取最终结果。原生调用可传 `background=true` 立即取得任务号，重复使用同一 `run_id` 只启动一次。
+
+Antigravity Python MCP 对应 `gempt_exec(background=true)` 与 `gempt_status(run_id=...)`。调用方可以预先生成 32 位小写十六进制 `run_id`，相同 ID 只派发一次。`verification` 填一条独立的 shell 命令；gempt 从 Codex 的命令事件匹配该命令（支持拆解 PowerShell / `cmd /c` / `bash -lc` 外壳，但拒绝 `echo` 或 `|| true` 伪造）及退出码，最近一次匹配决定 `passed` 或 `failed`，否则为 `unverified`。Git 工作区的 `before`/`after` 记录相对 `HEAD` 的 diff 与状态（每项最多 64 KiB）。
 
 ---
 

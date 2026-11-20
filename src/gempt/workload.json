@@ -1,0 +1,111 @@
+{
+  "profiles": {
+    "gemini": {
+      "label": "Gemini 为主",
+      "gpt_share": 20,
+      "kinds": [
+        "specialist"
+      ],
+      "detail": "Gemini 处理日常工作和实现，疑难推理与专家复核交给 GPT。"
+    },
+    "balanced": {
+      "label": "按领域分工",
+      "gpt_share": 50,
+      "kinds": [
+        "specialist",
+        "engineering"
+      ],
+      "detail": "Gemini 负责沟通和设计，GPT 负责工程实施、排错和专家复核。"
+    },
+    "gpt": {
+      "label": "GPT 为主",
+      "gpt_share": 80,
+      "kinds": [
+        "specialist",
+        "engineering",
+        "design"
+      ],
+      "detail": "GPT 接手设计、调查和实现，Gemini 处理日常问答与视觉判断。"
+    },
+    "gpt_first": {
+      "label": "基本全由 GPT 做",
+      "gpt_share": 95,
+      "kinds": [
+        "specialist",
+        "engineering",
+        "design",
+        "routine"
+      ],
+      "detail": "实质任务直接派给 GPT。Gemini 澄清需求、补充视觉观察，并用用户听得懂的话解释结果。"
+    }
+  },
+  "schema": {
+    "type": "object",
+    "properties": {
+      "goal": {
+        "type": "string",
+        "description": "User's objective with known constraints and acceptance criteria. Pass it before doing the work."
+      },
+      "kind": {
+        "type": "string",
+        "enum": [
+          "routine",
+          "design",
+          "engineering",
+          "specialist",
+          "visual"
+        ],
+        "description": "routine: everyday content or simple questions; design: planning or UX design; engineering: implementation, debugging, testing; specialist: difficult reasoning or independent expert review; visual: only the observation that requires native perception."
+      },
+      "access": {
+        "type": "string",
+        "enum": [
+          "provided",
+          "inspect",
+          "change"
+        ],
+        "description": "provided: solve from the supplied text; inspect: worker must inspect workspace or run read-only checks; change: implement and test in cwd."
+      },
+      "cwd": {
+        "type": "string",
+        "description": "Exact workspace for inspect or change."
+      },
+      "tier": {
+        "type": "string",
+        "enum": [
+          "sonnet",
+          "opus",
+          "fable"
+        ],
+        "description": "Optional GPT tier for this assignment."
+      },
+      "verification": {
+        "type": "string",
+        "description": "Known verification command if available."
+      },
+      "role": {
+        "type": "string",
+        "enum": [
+          "solo",
+          "coordinator",
+          "worker",
+          "verifier",
+          "narrator"
+        ],
+        "description": "Use actual Antigravity Swarm role, otherwise solo."
+      },
+      "assignment_id": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{32}$",
+        "description": "For Swarm workers and verifiers, the unique 32-hex assignment ID from the coordinator's board brief. Reuse for duplicate deliveries."
+      }
+    },
+    "required": [
+      "goal",
+      "kind",
+      "access"
+    ],
+    "additionalProperties": false
+  },
+  "report": "Answer in the user's language, leading with what the result means for them. Include observed evidence, checks and unresolved issues briefly. For workspace tasks discover the relevant files yourself and carry the assigned task through verification. Do not spawn a nested team or call GemPT again."
+}

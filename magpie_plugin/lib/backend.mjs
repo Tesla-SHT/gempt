@@ -19,6 +19,8 @@ import { isAstraModel } from './routing.mjs';
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 
+export const WORKLOAD = JSON.parse(readFileSync(join(REPO_ROOT, 'src', 'gempt', 'workload.json'), 'utf8'));
+
 export const TIER_ORDER = ['sonnet', 'opus', 'fable'];
 export const TIER_ALIASES = { lite: 'sonnet', mid: 'opus', max: 'fable' };
 export const VALID_SANDBOXES = ['read-only', 'workspace-write', 'danger-full-access'];
@@ -732,22 +734,7 @@ export function detectClients({ magpieConfigDir, antigravityPluginDir } = {}) {
 }
 
 export function buildRulesSnippet() {
-  return [
-    '# GemPT Collaboration Rules (Human <-> Gemini, Gemini leads GPT)',
-    '',
-    '- Domain split:',
-    '  - **Gemini** owns human dialogue, planning, acceptance verification, and frontend/UI/visual/multimodal edits directly (cross-review tricky UX state via `gempt_consult`).',
-    '  - **GPT/Codex** (via Magpie gateway) owns backend architecture, hard debugging, algorithms/math, cross-file refactors, and independent diff review (never let GPT self-grade its own changes).',
-    '- Routing & usage share (Subscription-Only default, or API Fallback when enabled):',
-    '  - `sonnet` (~75%): `codex/gpt-6.2-sol` @ `medium` for daily engineering & UI logic.',
-    '  - `opus` (~20%): `codex/gpt-6.2-sol` @ `high`; pass `escalate=true` or `xhigh` to escalate to `codex/gpt-6.2-astra`.',
-    '  - `fable` (~5%): `codex/gpt-6.2-astra` @ `xhigh` for extreme bugs, math, and core architecture. Never downgrade Astra to `low`.',
-    '  - `chore`: free utility model (`tier="chore"` on `gempt_consult` only) for log cleanup/summarization/classification.',
-    '- Effort & escalation discipline:',
-    '  - Size effort cleanly on fresh threads (`auto_effort` or explicit `medium`/`high`/`xhigh`); forbid `ultra` and forbid high-effort subagent fan-out.',
-    '  - On failure/timeout/unverified output, **open a fresh thread (omit `session_id`)** with `opus`/`escalate=true`/`fable` — never bump effort mid-thread on `resume`.',
-    '- Task packet standard: pass Goal, Verified Context (`file_paths`/`context`), Hard Constraints, Verification Commands (`gempt_exec`), and translate GPT output into clear human conclusions + test evidence.',
-  ].join('\n');
+  return readFileSync(join(REPO_ROOT, 'plugin', 'rules', 'AGENTS.md'), 'utf8');
 }
 
 function resolvePythonBin() {
@@ -953,6 +940,9 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     features: { ...FEATURES },
     configured,
     config_path: resolvedConfigPath,
+    work_split: policy.work_split ?? 'balanced',
+    swarm_split: policy.swarm_split ?? 'inherit',
+    work_profiles: WORKLOAD.profiles,
     default_tier: defaultTier,
     failover_mode: String(policy.failover_mode || 'subscription_only'),
     auto_effort: Boolean(rawCfg?.routing_policy?.auto_effort),
@@ -1068,6 +1058,17 @@ export function setDefaultTier(tier, { configPath } = {}) {
     default_tier: normalized,
     config_path: loaded.path,
   };
+}
+
+export function setWorkSplit(key, profile, { configPath } = {}) {
+  if (!['work_split', 'swarm_split'].includes(key) ||
+      !(Object.hasOwn(WORKLOAD.profiles, profile) || (key === 'swarm_split' && profile === 'inherit'))) {
+    return { ok: false, status: 400, error: '请选择有效的工作分工档位。' };
+  }
+  const config = readExistingConfigObject(configPath);
+  if (!config.ok) return config;
+  config.data.routing_policy = { ...config.data.routing_policy, [key]: profile };
+  return writeConfigAtomic(config.path, config.data);
 }
 
 export function setDefaultSandbox(sandbox, { configPath } = {}) {
@@ -1241,6 +1242,8 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
       timeout_sec: Number.isFinite(Number(existingCodex.timeout_sec)) ? Number(existingCodex.timeout_sec) : 600,
     },
     routing_policy: {
+      work_split: existingPolicy.work_split ?? 'balanced',
+      swarm_split: existingPolicy.swarm_split ?? 'inherit',
       default_tier: defaultTier,
       failover_mode: 'subscription_only',
       auto_effort: Boolean(existingPolicy.auto_effort),

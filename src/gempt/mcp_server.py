@@ -15,6 +15,8 @@ from . import CONSULT_TIERS, TIER_ORDER, __version__
 from .discover import discover_environment
 from .service import configure_gempt, get_status, run_consult
 
+from .workload import SCHEMA as DISPATCH_SCHEMA, dispatch_task
+
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "gempt_discover",
@@ -219,6 +221,10 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 
+TOOLS.append({"name": "gempt_dispatch",
+              "description": "First action for substantive tasks. Apply the live Magpie work split and run the selected GPT worker or return a Gemini/board assignment. Pass the original goal before investigation.",
+              "inputSchema": DISPATCH_SCHEMA})
+
 for tool in TOOLS:
     properties = tool["inputSchema"]["properties"]
     if tool["name"] in {"gempt_status", "gempt_exec"}:
@@ -234,6 +240,15 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if args.get("config_path") and Path(args["config_path"]).resolve() != trusted_config:
         raise ValueError("Config path is outside the host configuration")
     args["config_path"] = str(trusted_config)
+    if name == "gempt_dispatch":
+        if args.get("cwd"):
+            cwd = (root / args["cwd"]).resolve()
+            if not cwd.is_relative_to(root):
+                raise ValueError("cwd outside host workspace")
+            args["cwd"] = str(cwd)
+        data = dispatch_task(args, trusted_config)
+        return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
+                "isError": data.get("verification", {}).get("status") in {"failed", "unverified"}}
     if name in {"gempt_consult", "gempt_exec"}:
         cwd = (root / (args.get("cwd") or ".")).resolve()
         if not cwd.is_relative_to(root):

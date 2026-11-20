@@ -359,7 +359,48 @@
     }
   }
 
+  function renderWorkSplit(state, viewMode) {
+    const controls = $('work-controls');
+    controls.hidden = viewMode !== 'mcp';
+    const profiles = state.work_profiles;
+    if (!profiles) return;
+    const list = $('work-options');
+    const swarm = $('swarm-split');
+    if (!list.children.length) {
+      swarm.add(new Option('跟随普通对话', 'inherit'));
+      for (const [id, profile] of Object.entries(profiles)) {
+        const label = document.createElement('label');
+        label.className = 'work-option';
+        const radio = document.createElement('input');
+        radio.type = 'radio';
+        radio.name = 'work_split';
+        radio.value = id;
+        const title = document.createElement('strong');
+        title.textContent = profile.label;
+        const weight = document.createElement('small');
+        weight.textContent = 'GPT 约 ' + profile.gpt_share + '%';
+        label.append(radio, title, weight);
+        list.append(label);
+        swarm.add(new Option(profile.label + ' · GPT 约 ' + profile.gpt_share + '%', id));
+      }
+    }
+    for (const radio of list.querySelectorAll('input')) {
+      radio.checked = radio.value === state.work_split;
+      radio.disabled = !state.configured;
+    }
+    swarm.disabled = !state.configured;
+    swarm.value = state.swarm_split;
+    const ordinary = profiles[state.work_split];
+    const team = profiles[state.swarm_split] || ordinary;
+    $('work-detail').textContent = (ordinary?.detail || '') + ' 比例表示工作量倾向，实际额度随任务变化。';
+    if (state.tools?.exec_enabled === false) {
+      $('work-detail').textContent += ' Magpie 原生工具目前仅可咨询。需要 Codex 操作文件时，在 GemPT 插件选项开启 exec。';
+    }
+    $('swarm-detail').textContent = (team?.label || '') + ' · 协调者拆单和解说，成员按各自职责派单，核验者独立检查。';
+  }
+
   function renderControls(state, viewMode) {
+    renderWorkSplit(state, viewMode);
     const mcpBar = $('mcp-controls-bar');
     const nativeBar = $('native-controls-bar');
     if (mcpBar) mcpBar.hidden = viewMode !== 'mcp';
@@ -926,7 +967,7 @@
   }
 
   async function updateSetting(groupName, payloadBody, previousValue, successText) {
-    const radios = [...document.querySelectorAll(`input[name="${groupName}"]`)];
+    const radios = [...document.querySelectorAll(`[name="${groupName}"]`)];
     for (const r of radios) r.disabled = true;
     syncHasFallbackClasses();
 
@@ -943,7 +984,8 @@
       showToast(successText);
     } catch (err) {
       for (const r of radios) {
-        r.checked = r.value === previousValue;
+        if (r.tagName === 'SELECT') r.value = previousValue;
+        else r.checked = r.value === previousValue;
       }
       syncHasFallbackClasses();
       showToast(`设置失败: ${err.message}`, 'error');
@@ -998,13 +1040,15 @@
 
   document.addEventListener('change', (ev) => {
     const target = ev.target;
-    if (!(target instanceof HTMLInputElement)) return;
+    if (!(target instanceof HTMLInputElement || target instanceof HTMLSelectElement)) return;
     if (target.name === 'view_mode') {
       currentViewMode = target.value === 'native' ? 'native' : 'mcp';
       writeStoredMode(currentViewMode);
       renderState(latestState);
     } else if (target.name === 'default_tier') {
       switchDefaultTier(target.value);
+    } else if (target.name === 'work_split' || target.name === 'swarm_split') {
+      updateSetting(target.name, { [target.name]: target.value }, latestState[target.name], '工作分工已保存，下次派单生效');
     } else if (target.name === 'default_sandbox') {
       const label = SANDBOX_NAMES[target.value] || target.value;
       updateSetting('default_sandbox', { default_sandbox: target.value }, currentDefaultSandbox, `Codex 执行权限已切为${label}`);

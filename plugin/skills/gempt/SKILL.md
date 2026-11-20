@@ -11,9 +11,7 @@ description: >-
 
 # gempt — Gemini × GPT 协作编排手册
 
-核心分工：**Human ↔ Gemini，Gemini lead GPT（按领域分工 + 甜点思考强度）**。
-- **Gemini 主理人类协同与视觉/前端/多模态**：在 Antigravity 走官方原路（外部客户端经 Magpie 走 `antigravity/gemini-4-*`）；直接承担需求沟通、方案拆解、前端/UI 审美实现、多模态看图读 PDF、最终 Diff/测试验收与人话翻译；棘手 UI 状态可用 `gempt_consult` 找 GPT 交叉复核。
-- **GPT/Codex 专攻后端与硬核推理**（经本地 Magpie 网关）：承接后端复杂工程、核心算法/数学推导、深层根因排查，以及**独立 Review** Gemini 或其他分支产出的 Diff（禁止自写自审）；人类不必直接啃 `GPT-6.2-Astra` 技术长文或手写冗长提示词。
+当前工作分工由 Magpie 面板选择，可分别设置普通对话和 Antigravity Swarm。对新实质任务先调用 `gempt_dispatch(goal, kind, access, cwd?)`，工具会完成相应的 GPT 委派或明确把该部分留给 Gemini。Gemini 根据返回的证据向用户解释结果。Swarm 成员必须带上角色和公开 brief 的 assignment_id。详见插件协作规则。
 
 ---
 
@@ -51,7 +49,7 @@ description: >-
 | **`gempt_consult`** | 直连 Magpie HTTP (`/v1/responses` 或 `/v1/chat/completions`) | 极低（无 Codex 工具注入） | 架构评审、算法/数学推导、定位复杂 bug 根因、对指定文件做深度 code review、免费摘要/分类 |
 | **`gempt_exec`** | 调本机 `codex exec`（经 Magpie 路由） | 较高（每次约 18K–50K tok 工具上下文） | 跨文件改代码、重构、需要 GPT 自己跑测试并修到通过的完整任务 |
 
-**经验法则**：能用 `gempt_consult` 先把方案/根因审透，就不要一上来就开 `gempt_exec` 盲跑。
+派单时按所需能力选 access。材料齐备可直接咨询；需要调查或改代码时，让 Codex 从查找入口做到验证。
 
 ### 档位甜点、占比与思考强度纪律
 
@@ -74,7 +72,7 @@ description: >-
 
 ## 3. Gemini → GPT Task Packet Protocol（给 GPT 下任务单规范）
 
-不要把用户的口语碎片直接转发给 GPT。每次调用 `gempt_consult` 或 `gempt_exec` 前，Gemini 必须自己先读清相关文件并整理成五要素：
+直接调用底层工具时，提供已经知道的目标和约束。下列字段按需填写；尚未掌握的文件、根因和验证命令由执行者调查。
 
 1. **`goal`（唯一明确目标）**：一句话写清边界与完成定义（禁止“帮我看看顺便优化一下”）。
 2. **`context` + `file_paths`（已核实事实）**：给出实际文件绝对/相对路径、相关符号名、已观察到的报错或限制。
@@ -88,8 +86,8 @@ description: >-
 
 ## 4. AI-to-AI Steering & Review Loop（内部纠偏闭环）
 
-1. 收到 `gempt_consult` 或 `gempt_exec` 返回后，**先自己核验**：
-   - 对 `exec` 任务，亲自查看实际文件改动或跑一遍关键测试，不要只信 GPT 的口头报告。
+1. 收到 `gempt_consult` 或 `gempt_exec` 返回后，**检查返回的证据**：
+   - 对 `exec` 任务，核对执行者报告中的实际文件、命令和结果。证据不足时安排有针对性的独立复核。
 2. **发现漏项、逻辑漏洞或测试未过**：
    - 不要把半成品甩给人类；带着具体技术证据和返回的 `session_id` 继续追问/返工。
    - **硬上限**：同一子任务内部 AI-to-AI 拉扯不超过配置中的 `max_internal_rounds`（默认 3 轮）。超过上限仍未收敛，或出现需要产品/架构拍板的取舍、破坏性操作、渠道报错/额度耗尽，立即停下向人类汇报。

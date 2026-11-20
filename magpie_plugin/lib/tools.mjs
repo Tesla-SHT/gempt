@@ -11,6 +11,7 @@
  * - Workspace paths reject sensitive roots (~/.ssh, ~/.aws, ~/.gnupg, ~/.config/{magpie,gempt}, ~, /)
  *   and file attachments enforce realpath containment + secret-file filtering.
  */
+import { readNativeRun, startNativeRun, waitForNativeRun } from './native-runs.mjs';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync, unlinkSync, closeSync } from 'node:fs';
@@ -22,6 +23,7 @@ import {
   DEFAULT_MAGPIE_URL,
   DEFAULT_TIERS,
   DEFAULT_UTILITY,
+  WORKLOAD,
   EFFORT_RANK,
   TIER_ORDER,
   VALID_EFFORTS,
@@ -894,13 +896,68 @@ export function createGemptTools({
   antigravityPluginDir,
   codexCliPath,
   options = {},
+  inExecWorker = false,
   env = process.env,
   probeTimeoutMs = 2000,
 } = {}) {
   const resolvedMagpieDir = resolveMagpieConfigDir(magpieConfigDir);
   const resolvedSessionsDir = resolveSessionsDir(sessionsDir);
 
-  return {
+  const tools = {
+    dispatch: {
+      description: "First action for substantive work. Apply the live ordinary or Antigravity Swarm work split and perform the selected GPT consultation or execution. Supply the goal before investigation.",
+      args: WORKLOAD.schema,
+      async execute(args, callCtx) {
+        const { goal, kind, access, role = 'solo', assignment_id: assignment } = args;
+        if (typeof goal !== 'string' || !goal.trim()) throw new Error('A task goal is required.');
+        for (const [key, value] of Object.entries({ kind, access, role })) {
+          if (!WORKLOAD.schema.properties[key].enum.includes(value)) throw new Error('Invalid ' + key);
+        }
+        const path = resolveConfigPath(configPath);
+        const cfg = readJsonSafe(path);
+        if (!cfg && existsSync(path)) throw new Error('Cannot read GemPT work split from the host configuration.');
+        const policy = cfg?.routing_policy || {};
+        const ordinary = policy.work_split ?? 'balanced';
+        const profile = role !== 'solo' && policy.swarm_split && policy.swarm_split !== 'inherit'
+          ? policy.swarm_split : ordinary;
+        if (!Object.hasOwn(WORKLOAD.profiles, profile)) throw new Error('Invalid work split in host config.');
+        const result = { profile, role, kind };
+        if (role === 'coordinator' || role === 'narrator') {
+          return { ...result, action: 'board', text: 'Keep this role on the board. Give each task one owner and summarize the results.' };
+        }
+        if (kind === 'visual' && access === 'change') throw new Error('Separate visual observation from implementation.');
+        const delegated = WORKLOAD.profiles[profile].kinds.includes(kind);
+        const action = access === 'provided' ? 'consult' : 'exec';
+        if (delegated && action === 'exec' && !isExecEnabled(options, env)) {
+          throw new Error('Codex execution is disabled. Enable the Magpie GemPT exec option for workspace tasks. Report this blocker to the user.');
+        }
+        if (delegated && action === 'exec') normalizeWorkspaceCwd(args.cwd, { configPath, magpieConfigDir: resolvedMagpieDir, env });
+        if (role === 'verifier' && access === 'change') throw new Error('Verifier is read-only. Send fixes to the owner.');
+        if (role === 'worker' || role === 'verifier') {
+          if (typeof assignment !== 'string' || !/^[a-f0-9]{32}$/.test(assignment)) {
+            throw new Error('Use the unique 32-hex assignment_id from the board.');
+          }
+          const claims = join(resolvedSessionsDir, 'swarm-claims');
+          mkdirSync(claims, { recursive: true });
+          try { mkdirSync(join(claims, assignment)); } catch (err) {
+            if (err.code !== 'EEXIST') throw err;
+            return { ...result, action: 'already_assigned', text: 'Check the assignment on the board with its owner before retrying.' };
+          }
+        }
+        if (!delegated) {
+          return { ...result, action: 'gemini', text: 'Handle this part in Gemini. Report to the board if assigned there.' };
+        }
+        const task = { goal, cwd: args.cwd, tier: args.tier };
+        const reply = action === 'consult'
+          ? await tools.consult.execute({ ...task, expected_output: WORKLOAD.report }, callCtx)
+          : await tools.exec.execute({ ...task, run_id: role === 'worker' || role === 'verifier' ? assignment : undefined, verification: args.verification, expected_report: WORKLOAD.report,
+            sandbox: access === 'inspect' ? 'read-only' : undefined }, callCtx);
+        if (reply.run_id && reply.state !== 'finished') return { ...result, action, ...reply };
+        return { ...result, action, ...(reply.run_id ? { run_id: reply.run_id, state: reply.state } : {}), model: reply.served_model || reply.model, session_id: reply.session_id,
+          text: reply.text, usage: reply.usage, warnings: reply.warnings,
+          ...(reply.commands ? { commands: reply.commands.map(({ command, exit_code }) => ({ command, exit_code })) } : {}) };
+      },
+    },
     discover: {
       description:
         'Scan local Magpie gateway for available Codex subscription models, Gemini/utility models, native group/gempt-* routing groups, Codex CLI readiness, and active GemPT config.',
@@ -950,10 +1007,17 @@ export function createGemptTools({
       args: {
         type: 'object',
         properties: {
+          run_id: { type: 'string', pattern: '^[a-f0-9]{32}$', description: 'Retrieve the state and final result of an existing native Codex job.' },
+          wait_sec: { type: 'number', minimum: 0, maximum: 20, description: 'Wait up to 20 seconds for a terminal result when polling a run.' },
           session_limit: { type: 'number', description: 'Max recent items to return (1-20, default 6).' },
         },
       },
       async execute(args = {}) {
+        if (args.run_id !== undefined) {
+          const record = readNativeRun(resolvedSessionsDir, args.run_id);
+          normalizeWorkspaceCwd(record.cwd, { configPath, magpieConfigDir: resolvedMagpieDir, env });
+          return args.wait_sec ? waitForNativeRun(resolvedSessionsDir, args.run_id, args.wait_sec) : record;
+        }
         const execEnabled = isExecEnabled(options, env);
         const state = await readState({
           configPath,
@@ -1188,6 +1252,8 @@ export function createGemptTools({
           session_id: { type: 'string', description: 'Optional exec session_id to resume.' },
           sandbox: { type: 'string', enum: VALID_SANDBOXES },
           reasoning_effort: { type: 'string', enum: [...VALID_EFFORTS_SET] },
+          background: { type: 'boolean', description: 'Return a run_id immediately. Long jobs return a run_id automatically; poll gempt_status.' },
+          run_id: { type: 'string', pattern: '^[a-f0-9]{32}$', description: 'Optional caller-generated ID; repeat delivery of the same job will not start another worker.' },
           timeout_sec: { type: 'number', description: 'Execution timeout seconds (30-3600).' },
         },
         required: ['goal', 'cwd'],
@@ -1202,6 +1268,15 @@ export function createGemptTools({
 
         const goal = typeof args?.goal === 'string' ? args.goal.trim() : '';
         if (!goal) throw new Error('goal is required and must be a non-empty string.');
+
+        if (!inExecWorker) {
+          const cwd = normalizeWorkspaceCwd(args.cwd, { configPath, magpieConfigDir: resolvedMagpieDir, env });
+          return startNativeRun({
+            args: { ...args, cwd }, agent: callingAgent(callCtx), env,
+            host: { configPath: resolveConfigPath(configPath), sessionsDir: resolvedSessionsDir,
+              magpieConfigDir: resolvedMagpieDir, codexCliPath, options: { exec: true }, probeTimeoutMs },
+          });
+        }
 
         const runtime = await resolveRuntimeConfig({
           configPath,
@@ -1406,4 +1481,5 @@ export function createGemptTools({
       },
     },
   };
+  return tools;
 }
