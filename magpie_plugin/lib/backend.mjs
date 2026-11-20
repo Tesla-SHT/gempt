@@ -371,19 +371,20 @@ export function pickNativeGroupPlan(probe) {
   const hydrogen = pickGeminiSlot(geminiIds, 'hydrogen');
   const neon = pickGeminiSlot(geminiIds, 'neon');
   const argon = pickGeminiSlot(geminiIds, 'argon');
+  const terra = pickBest(codexIds, [['6.1-terra', 320], ['terra', 240], ['sol', 140]]);
   const sol = pickBest(codexIds, [['6.2-sol', 300], ['sol', 240], ['terra', 140], ['luna', 100]]);
   const astra = pickBest(codexIds, [['6.2-astra', 320], ['astra', 260], ['pro', 180], ['sol', 100]]);
   const flash = utilityIds[0] || '';
 
   return {
-    models: { hydrogen, neon, argon, sol, astra, flash },
+    models: { hydrogen, neon, argon, terra, sol, astra, flash },
     tiers: {
       sonnet: {
         group_id: 'group/gempt-sonnet',
-        members: dedupe([hydrogen, sol, flash]),
+        members: dedupe([hydrogen, terra, flash]),
         nodes: [
           { id: hydrogen, role: 'planner' },
-          { id: sol, role: 'coder' },
+          { id: terra, role: 'coder' },
           ...(flash ? [{ id: flash, role: 'utility' }] : []),
         ],
       },
@@ -943,6 +944,8 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     work_split: policy.work_split ?? 'balanced',
     swarm_split: policy.swarm_split ?? 'inherit',
     work_profiles: WORKLOAD.profiles,
+    pairings: Object.fromEntries(Object.entries(WORKLOAD.pairings).map(([family, model]) =>
+      [family, policy.pairings?.[family] ?? model])),
     default_tier: defaultTier,
     failover_mode: String(policy.failover_mode || 'subscription_only'),
     auto_effort: Boolean(rawCfg?.routing_policy?.auto_effort),
@@ -1058,6 +1061,18 @@ export function setDefaultTier(tier, { configPath } = {}) {
     default_tier: normalized,
     config_path: loaded.path,
   };
+}
+
+export function setPairing(family, model, { configPath } = {}) {
+  if (!Object.hasOwn(WORKLOAD.pairings, family) ||
+      (model !== 'default' && (typeof model !== 'string' || !isCodexModelId(model) || model.trim() !== model))) {
+    return { ok: false, status: 400, error: '请选择有效的 Gemini 档位和 Codex 订阅模型。' };
+  }
+  const config = readExistingConfigObject(configPath);
+  if (!config.ok) return config;
+  const policy = config.data.routing_policy ||= {};
+  policy.pairings = { ...policy.pairings, [family]: model };
+  return writeConfigAtomic(config.path, config.data);
 }
 
 export function setWorkSplit(key, profile, { configPath } = {}) {
@@ -1244,6 +1259,7 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
     routing_policy: {
       work_split: existingPolicy.work_split ?? 'balanced',
       swarm_split: existingPolicy.swarm_split ?? 'inherit',
+      pairings: existingPolicy.pairings ?? {},
       default_tier: defaultTier,
       failover_mode: 'subscription_only',
       auto_effort: Boolean(existingPolicy.auto_effort),
@@ -1407,19 +1423,20 @@ export async function createNativeGroups({ configPath, magpieConfigDir, magpieCl
   const h = normalizeGroupMember(plan.models.hydrogen);
   const n = normalizeGroupMember(plan.models.neon);
   const a = normalizeGroupMember(plan.models.argon);
+  const terra = normalizeGroupMember(plan.models.terra);
   const s = normalizeGroupMember(plan.models.sol);
   const t = normalizeGroupMember(plan.models.astra);
   const f = plan.models.flash ? normalizeGroupMember(plan.models.flash) : '';
 
   const tierCommands = {
     'gempt-sonnet': [
-      ['group', 'add', 'gempt-sonnet', `models=${dedupe([h, s, f]).join(',')}`, 'routing=order', 'stays=turn'],
+      ['group', 'add', 'gempt-sonnet', `models=${dedupe([h, terra, f]).join(',')}`, 'routing=order', 'stays=turn'],
       ...(f ? [
         ['group', 'rule', 'add', 'gempt-sonnet', `use=${f}`, 'compact'],
         ['group', 'rule', 'add', 'gempt-sonnet', `use=${f}`, `classifier=${f}`, 'intent=simple formatting, adding comments, renaming, translating, writing boilerplate, or trivial quick questions'],
       ] : []),
-      ['group', 'rule', 'add', 'gempt-sonnet', `use=${s}`, 'when=subagent'],
-      ['group', 'rule', 'add', 'gempt-sonnet', `use=${s}`, 'intent=writing code, editing files, running tests, or fixing bugs'],
+      ['group', 'rule', 'add', 'gempt-sonnet', `use=${terra}`, 'when=subagent'],
+      ['group', 'rule', 'add', 'gempt-sonnet', `use=${terra}`, 'intent=writing code, editing files, running tests, or fixing bugs'],
     ],
     'gempt-opus': [
       ['group', 'add', 'gempt-opus', `models=${dedupe([n, s, t, f]).join(',')}`, 'routing=order', 'stays=turn'],

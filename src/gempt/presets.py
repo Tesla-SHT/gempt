@@ -24,6 +24,7 @@ DEFAULT_PRESET_MODELS: dict[str, tuple[str, str]] = {
     "hydrogen": ("GEMPT_HYDROGEN", "antigravity/gemini-4-hydrogen"),
     "neon": ("GEMPT_NEON", "antigravity/gemini-4-neon"),
     "argon": ("GEMPT_ARGON", "antigravity/gemini-4-argon"),
+    "terra": ("GEMPT_TERRA", "codex/gpt-6.1-terra"),
     "sol": ("GEMPT_SOL", "codex/gpt-6.2-sol"),
     "astra": ("GEMPT_ASTRA", "codex/gpt-6.2-astra"),
     "flash": ("DEEPSEEK_FLASH", "workbuddy/deepseek-v4.1-flash"),
@@ -33,10 +34,13 @@ DEFAULT_PRESET_MODELS: dict[str, tuple[str, str]] = {
 def resolve_native_preset_models(env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Resolve preset model IDs from environment overrides or defaults."""
     source = os.environ if env is None else env
-    return {
+    models = {
         key: (source.get(env_var) or "").strip() or default
         for key, (env_var, default) in DEFAULT_PRESET_MODELS.items()
     }
+    if not source.get("GEMPT_TERRA") and source.get("GEMPT_SOL"):
+        models["terra"] = models["sol"]
+    return models
 
 
 def strip_model_modifiers(model_id: str) -> str:
@@ -60,12 +64,13 @@ def build_native_preset_commands(
     hydrogen_m = _normalize_group_member(resolved["hydrogen"])
     neon_m = _normalize_group_member(resolved["neon"])
     argon_m = _normalize_group_member(resolved["argon"])
+    terra_m = _normalize_group_member(resolved.get("terra", resolved["sol"]))
     sol_m = _normalize_group_member(resolved["sol"])
     astra_m = _normalize_group_member(resolved["astra"])
     flash_m = _normalize_group_member(resolved["flash"])
 
     return [
-        [magpie_bin, "group", "add", "gempt-sonnet", f"models={hydrogen_m},{sol_m},{flash_m}", "routing=order", "stays=turn"],
+        [magpie_bin, "group", "add", "gempt-sonnet", f"models={hydrogen_m},{terra_m},{flash_m}", "routing=order", "stays=turn"],
         [magpie_bin, "group", "rule", "add", "gempt-sonnet", f"use={flash_m}", "compact"],
         [
             magpie_bin,
@@ -77,14 +82,14 @@ def build_native_preset_commands(
             f"classifier={flash_m}",
             "intent=simple formatting, adding comments, renaming, translating, writing boilerplate, or trivial quick questions",
         ],
-        [magpie_bin, "group", "rule", "add", "gempt-sonnet", f"use={sol_m}", "when=subagent"],
+        [magpie_bin, "group", "rule", "add", "gempt-sonnet", f"use={terra_m}", "when=subagent"],
         [
             magpie_bin,
             "group",
             "rule",
             "add",
             "gempt-sonnet",
-            f"use={sol_m}",
+            f"use={terra_m}",
             "intent=writing code, editing files, running tests, or fixing bugs",
         ],
         [magpie_bin, "group", "add", "gempt-opus", f"models={neon_m},{sol_m},{astra_m},{flash_m}", "routing=order", "stays=turn"],
@@ -217,6 +222,8 @@ def _resolve_catalog_models(
         picked = ""
         if slot in {"hydrogen", "neon", "argon"}:
             picked = _pick_gemini_slot(catalog_ids, slot, excluded)
+        elif slot == "terra":
+            picked = _pick_best(codex_cands, [("6.1-terra", 320), ("terra", 240), ("sol", 140)])
         elif slot == "sol":
             picked = _pick_best(codex_cands, [("6.2-sol", 300), ("sol", 240), ("terra", 140), ("luna", 100)])
         elif slot == "astra":

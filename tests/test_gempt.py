@@ -498,6 +498,20 @@ class CliPackagingTests(unittest.TestCase):
             ):
                 self.assertTrue((target / rel).is_file(), f"missing installed file: {rel}")
 
+            hook = target / "work_split_hook.py"
+            def native_hook(payload):
+                out = subprocess.check_output([sys.executable, "-I", str(hook)], input=json.dumps(payload),
+                                              text=True, cwd=tmp)
+                return json.loads(out)
+            packet = {"modelName": "gemini-4-hydrogen-high", "toolCall": {"name": "call_mcp_tool", "args": {
+                "ServerName": "gempt_gempt", "ToolName": "gempt_dispatch", "Arguments": {"goal": "review"}}}}
+            self.assertEqual(native_hook(packet)["overwrite"]["Arguments"], {"goal": "review", "gemini_family": "hydrogen"})
+            packet["toolCall"]["args"]["Arguments"].update(role="worker", gemini_family="neon")
+            self.assertNotIn("overwrite", native_hook(packet))
+            packet["toolCall"]["args"]["Arguments"] = {"goal": "other"}
+            packet["modelName"] = "future"
+            self.assertNotIn("overwrite", native_hook(packet))
+
             self.assertFalse((target / "sidecars" / "gempt_panel").exists())
             self.assertFalse((target / "sidecars").exists())
 
@@ -532,7 +546,7 @@ class PresetsParityTests(unittest.TestCase):
         if not bash:
             self.skipTest("bash not available")
 
-        for extra_env in ({}, {"DEEPSEEK_FLASH": "auto/deepseek-v4.1-flash"}):
+        for extra_env in ({}, {"GEMPT_SOL": "codex/custom"}, {"GEMPT_TERRA": "codex/custom", "DEEPSEEK_FLASH": "auto/deepseek-v4.1-flash"}):
             env = dict(os.environ, MAGPIE_BIN="magpie", **extra_env)
             kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if sys.platform == "win32" else {}
             proc = subprocess.run(
@@ -731,6 +745,17 @@ class BugfixRegressionTests(unittest.TestCase):
                     res = _handle_tool_call("gempt_consult", {"goal": "check default tier"})
                     self.assertIn("codex/gpt-6.2-astra", res["content"][0]["text"])
                     self.assertEqual(mock_consult.call_args.kwargs["primary_model"], "codex/gpt-6.2-astra")
+
+                    _handle_tool_call("gempt_dispatch", {"goal": "Review", "kind": "specialist", "access": "provided",
+                                                         "gemini_family": "hydrogen"})
+                    self.assertEqual(mock_consult.call_args.kwargs["primary_model"], "codex/gpt-6.1-terra")
+                    self.assertEqual(mock_consult.call_args.kwargs["fallback_models"], [])
+                    cfg["routing_policy"]["pairings"]["hydrogen"] = "codex/gpt-6-luna"
+                    save_config(cfg, conf)
+                    _handle_tool_call("gempt_consult", {"goal": "Review", "gemini_family": "hydrogen"})
+                    self.assertEqual(mock_consult.call_args.kwargs["primary_model"], "codex/gpt-6-luna")
+                    _handle_tool_call("gempt_consult", {"goal": "Review", "gemini_family": "hydrogen", "tier": "sonnet"})
+                    self.assertEqual(mock_consult.call_args.kwargs["primary_model"], "codex/gpt-6.2-sol")
 
                 with mock.patch("gempt.mcp_server.dispatch_exec", return_value={"ok": True, "verification": {}}) as mock_exec:
                     _handle_tool_call("gempt_exec", {"goal": "run check", "cwd": tmp})

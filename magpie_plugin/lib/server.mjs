@@ -21,6 +21,7 @@ import {
   setDefaultSandbox,
   setDefaultTier,
   setWorkSplit,
+  setPairing,
   setEffortSettings,
   setFailoverMode,
 } from './backend.mjs';
@@ -203,6 +204,11 @@ export async function startServer({
             return send(req, res, 400, { ok: false, error: '未提供有效设置项。' });
           }
           const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
+          if (has('pairing')) {
+            if (Object.keys(body).length !== 1) return send(req, res, 400, { ok: false, error: '每次请选择一个配对设置。' });
+            const result = setPairing(body.pairing?.family, body.pairing?.model, { configPath });
+            return send(req, res, result.status, result);
+          }
           if (has('work_split') || has('swarm_split')) {
             if (Object.keys(body).length !== 1) {
               return send(req, res, 400, { ok: false, error: '每次请选择一个分工设置。' });

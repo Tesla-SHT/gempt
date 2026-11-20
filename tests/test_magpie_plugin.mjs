@@ -790,15 +790,27 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
       assert.equal(reply.action, delegated ? 'consult' : 'gemini');
       assert.equal(magpie.requests.length - before, Number(delegated));
     }
+    const hydrogenTask = { ...design, gemini_family: 'hydrogen' };
+    const initial = await dispatch(hydrogenTask);
+    assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6.1-terra');
+    config.routing_policy.pairings = { hydrogen: 'codex/gpt-6-luna' };
+    writeFileSync(cfgPath, JSON.stringify(config));
+    await enabledTools.consult.execute({ goal: 'Continue', session_id: initial.session_id });
+    assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6.1-terra');
+    await dispatch(hydrogenTask);
+    assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6-luna');
+    await dispatch({ ...hydrogenTask, tier: 'fable' });
+    assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6.2-astra');
     config.routing_policy.swarm_split = 'gemini';
     writeFileSync(cfgPath, JSON.stringify(config));
     assert.equal((await dispatch({ ...design, role: 'coordinator' })).action, 'board');
     assert.equal((await dispatch({ ...design, role: 'worker', assignment_id: '1'.repeat(32) })).action, 'gemini');
-    const revision = { ...design, role: 'worker', kind: 'specialist', assignment_id: '2'.repeat(32) };
+    const revision = { ...hydrogenTask, role: 'worker', kind: 'specialist', assignment_id: '2'.repeat(32) };
     const before = magpie.requests.length;
     const pair = await Promise.all([dispatch(revision), dispatch(revision)]);
     assert.deepEqual(pair.map(item => item.action).sort(), ['already_assigned', 'consult']);
     assert.equal(magpie.requests.length, before + 1);
+    assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6-luna');
     await assert.rejects(dispatch({ ...revision, role: 'verifier', access: 'change', cwd: repoDir }), /read-only/);
     await assert.rejects(defaultTools.dispatch.execute({ ...design, access: 'change', cwd: repoDir }), /disabled/);
 
@@ -855,6 +867,11 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     assert.equal(readFileSync(codexLog, 'utf8').trim().split(/\r?\n/).length, codexCalls.length + 1);
     await assert.rejects(reconnected.exec.execute({ ...job, cwd: outsideDir }), /different workspace/);
     await assert.rejects(reconnected.status.execute({ run_id: '../wrong' }), /Invalid run_id/);
+
+    const pairedExec = await dispatch({ ...hydrogenTask, kind: 'engineering', access: 'inspect', cwd: repoDir });
+    assert.equal(pairedExec.model, 'codex/gpt-6-luna');
+    const pairedArgs = JSON.parse(readFileSync(codexLog, 'utf8').trim().split('\n').at(-1)).args;
+    assert.ok(pairedArgs.includes('codex/gpt-6-luna'));
 
     // Auto-effort escalates complex Opus consult to Astra@xhigh and preserves on resume
     const autoHard = await enabledTools.consult.execute({

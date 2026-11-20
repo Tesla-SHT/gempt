@@ -52,7 +52,7 @@
 
   const FAILOVER_HINTS = {
     subscription_only: '仅用 ChatGPT/Codex 订阅额度，不走按量付费 API',
-    api_fallback: '优先用 Codex 订阅额度，限流或失败时自动切按量 API 兜底',
+    api_fallback: '按档位路由时，订阅失败可转按量 API。指定配对的任务只用所选订阅模型。',
   };
 
   const EFFORT_HINTS = {
@@ -197,6 +197,7 @@
       .replace(/\bsol\b/gi, 'Sol')
       .replace(/\bastra\b/gi, 'Astra')
       .replace(/\bterra\b/gi, 'Terra')
+      .replace(/\bluna\b/gi, 'Luna')
       .replace(/\bdeepseek\b/gi, 'DeepSeek')
       .replace(/-?flash\b/gi, ' Flash')
       .replace(/-v(\d)/gi, ' V$1');
@@ -390,6 +391,7 @@
     }
     swarm.disabled = !state.configured;
     swarm.value = state.swarm_split;
+    renderPairings(state);
     const ordinary = profiles[state.work_split];
     const team = profiles[state.swarm_split] || ordinary;
     $('work-detail').textContent = (ordinary?.detail || '') + ' 比例表示工作量倾向，实际额度随任务变化。';
@@ -397,6 +399,31 @@
       $('work-detail').textContent += ' Magpie 原生工具目前仅可咨询。需要 Codex 操作文件时，在 GemPT 插件选项开启 exec。';
     }
     $('swarm-detail').textContent = (team?.label || '') + ' · 协调者拆单和解说，成员按各自职责派单，核验者独立检查。';
+  }
+
+  function renderPairings(state) {
+    const list = $('pairing-options');
+    const models = state.magpie?.codex_models || [];
+    for (const [family, current] of Object.entries(state.pairings || {})) {
+      let select = list.querySelector(`[name="pair-${family}"]`);
+      if (!select) {
+        const label = document.createElement('label');
+        label.textContent = family.charAt(0).toUpperCase() + family.slice(1);
+        select = document.createElement('select');
+        select.name = 'pair-' + family;
+        select.dataset.family = family;
+        label.append(select);
+        list.append(label);
+      }
+      const choices = [new Option('沿用默认档位', 'default')];
+      for (const id of models) choices.push(new Option(humanizeModel(id), id));
+      if (current !== 'default' && !models.includes(current)) {
+        choices.push(new Option(humanizeModel(current) + '（未检测到）', current));
+      }
+      select.replaceChildren(...choices);
+      select.value = current;
+      select.disabled = !state.configured;
+    }
   }
 
   function renderControls(state, viewMode) {
@@ -1049,6 +1076,9 @@
       switchDefaultTier(target.value);
     } else if (target.name === 'work_split' || target.name === 'swarm_split') {
       updateSetting(target.name, { [target.name]: target.value }, latestState[target.name], '工作分工已保存，下次派单生效');
+    } else if (target.dataset.family) {
+      const family = target.dataset.family;
+      updateSetting(target.name, { pairing: { family, model: target.value } }, latestState.pairings[family], '配对已保存，下个新任务生效');
     } else if (target.name === 'default_sandbox') {
       const label = SANDBOX_NAMES[target.value] || target.value;
       updateSetting('default_sandbox', { default_sandbox: target.value }, currentDefaultSandbox, `Codex 执行权限已切为${label}`);

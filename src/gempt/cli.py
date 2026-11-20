@@ -202,10 +202,11 @@ def _cmd_install_agy(args: argparse.Namespace) -> int:
     hooks_file = target / "hooks.json"
     if (source_plugin / "hooks.json").is_file() and hooks_file.is_file():
         hooks = json.loads(hooks_file.read_text(encoding="utf-8"))
-        command = [sys.executable, "-I", "./work_split_hook.py"]
-        hooks["gempt-work-split"]["PreInvocation"][0]["command"] = (
-            subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
-        )
+        command = [sys.executable, "-I", str(target / "work_split_hook.py")]
+        encoded = subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
+        handlers = hooks["gempt-work-split"]
+        handlers["PreInvocation"][0]["command"] = encoded
+        handlers["PreToolUse"][0]["hooks"][0]["command"] = encoded
         hooks_file.write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
 
     for folder in ("rules", "skills", "assets"):

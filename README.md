@@ -18,7 +18,7 @@ magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/collab
 - **方案 A（零规则懒人直连 · 最快上手）**：
   1. 在 `Plugins → GemPT` 右上角切换到 **`路由组直连`** → 点击 **`一键创建直连路由组`**；
   2. 在任意接入 Magpie 的客户端（Claude Code / ZCode / Codex CLI / OpenCode / Cursor 等）模型栏直接选用 `group/gempt-sonnet`、`group/gempt-opus` 或 `group/gempt-fable`；
-  3. 聊设计时默认走首顺位 **Gemini**，明确派发写代码/修 Bug 时 Magpie 按回合意图与 `when=subagent` 自动分流到 **GPT-6.2-Sol / Astra**，压缩整理自动走 **DeepSeek Flash**。
+  3. 聊设计时默认走首顺位 **Gemini**，明确派发写代码/修 Bug 时 Magpie 按回合意图与 `when=subagent` 自动分流到 **Terra / Sol / Astra**，压缩整理自动走 **DeepSeek Flash**。
 
 - **方案 B（全客户端内置 MCP 编排 · 完整主从协作）**：
   1. **免手动装 Python / 免粘 MCP JSON**：安装插件后，Magpie 会自动向已接入客户端分发内置 HTTP 工具 `gempt_dispatch`、`gempt_consult`、`gempt_exec`、`gempt_discover`、`gempt_status`（`http://127.0.0.1:3425/mcp/magpie/tools/gempt`），无需先跑 `init` 即可零配置使用 Codex 订阅直连；
@@ -39,7 +39,7 @@ magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/collab
 
 | 路由组 | 默认对话 | 执行 | 适用场景 |
 | --- | --- | --- | --- |
-| `group/gempt-sonnet` | Gemini 4 Hydrogen | GPT-6.2 Sol | 日常修改、脚本、小功能。简单意图也可交给 DeepSeek |
+| `group/gempt-sonnet` | Gemini 4 Hydrogen | GPT-6.1 Terra | 日常修改、脚本、小功能。简单意图也可交给 DeepSeek |
 | `group/gempt-opus` | Gemini 4 Neon | GPT-6.2 Sol，疑难意图优先 GPT-6.2 Astra | 跨文件重构、难 Bug、复杂设计 |
 | `group/gempt-fable` | Gemini 4 Argon | GPT-6.2 Astra | 核心算法和长程攻坚。DeepSeek 的显式任务规则只有压缩 |
 
@@ -85,6 +85,8 @@ DeepSeek 的额度取决于你绑定的渠道。用 `magpie models` 查看本机
 ## 插件页里的工作分工
 
 在 **Plugins → GemPT → MCP 编排** 选择普通对话的工作分工。Gemini 为主、按领域分工、GPT 为主、基本全由 GPT 做分别表示 GPT 承担约 20%、50%、80%、95% 工作量的倾向。实际决策按任务类别执行，百分比不计量订阅额度。旧配置沿用按领域分工。
+
+在同一页的 **Gemini 与 GPT 配对** 中，每个 Gemini 系列可以独立选择本机 Magpie 已接入的 Codex 订阅模型。初始组合为 Hydrogen → Terra、Neon → Sol、Carbon → Astra。选择后，下个新任务的咨询和代码执行都会使用该 GPT，配对调用仅走所选订阅模型；续接同一任务保留原搭档。Gemini 仍在 Antigravity 原生界面选择，Swarm 成员从协调者的任务单继承系列。选“沿用默认档位”、宿主未报告系列或用户显式指定档位时，使用原档位路由及其兜底设置。
 
 每个新实质任务先走 `gempt_dispatch`。最高档会立即把普通写作、方案、调研和工程交给 GPT。已有材料走咨询；需要读仓库或跑检查走只读 Codex；实现和测试走已授权的 Codex 工作区。Gemini 处理必要的原生视觉观察、澄清需求，并用通俗语言汇报结论和证据。执行权限关闭时会报告阻塞。外部 MCP 客户端首次接入或从旧版升级需复制新版协作规则；Antigravity 使用随插件安装的规则。只选择直连组的客户端仍按整回合路由。
 

@@ -73,6 +73,7 @@ def default_config_template() -> dict[str, Any]:
             "default_tier": "sonnet",
             "work_split": "balanced",
             "swarm_split": "inherit",
+            "pairings": {},
             "failover_mode": "subscription_only",
             "auto_effort": False,
             "magpie_group_strategy": "order",
@@ -256,6 +257,14 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise ConfigError("Invalid routing_policy.work_split")
     if policy.get("swarm_split", "inherit") not in [*profiles, "inherit"]:
         raise ConfigError("Invalid routing_policy.swarm_split")
+    pairings = policy.get("pairings", {})
+    if not isinstance(pairings, dict) or any(key not in WORKLOAD["pairings"] for key in pairings):
+        raise ConfigError("Invalid routing_policy.pairings")
+    for model in pairings.values():
+        if model != "default":
+            if not isinstance(model, str):
+                raise ConfigError("Invalid paired model")
+            require_subscription([model])
     failover = str(policy.get("failover_mode") or "subscription_only")
     if failover not in VALID_FAILOVER_MODES:
         raise ConfigError(f"Config error: routing_policy.failover_mode '{failover}' not in {VALID_FAILOVER_MODES}")
@@ -348,6 +357,24 @@ def require_subscription(models: list[str]) -> None:
     for model in models:
         if not re.fullmatch(r"codex/[A-Za-z0-9_.-]+(?:#[A-Za-z0-9_.-]+)?", model):
             raise ConfigError(f"subscription_only requires a concrete Codex subscription model: {model}")
+
+
+def paired_model(cfg, family, tier, session):
+    if tier:
+        return None
+    if session:
+        model = session.get("paired_model")
+    elif family in WORKLOAD["pairings"]:
+        model = cfg["routing_policy"]["pairings"].get(family, WORKLOAD["pairings"][family])
+    else:
+        return None
+    if not model or model == "default":
+        return None
+    require_subscription([model])
+    from .discover import _is_excluded_model, _resolve_excluded_models
+    if _is_excluded_model(model, _resolve_excluded_models(cfg["routing_policy"].get("excluded_models"))):
+        raise ConfigError("The paired Codex model is excluded. Change the pairing in GemPT.")
+    return model
 
 
 def resolve_tier(

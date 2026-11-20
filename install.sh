@@ -136,6 +136,7 @@ model_exists() {
 hydrogen=${GEMPT_HYDROGEN:-antigravity/gemini-4-hydrogen}
 neon=${GEMPT_NEON:-antigravity/gemini-4-neon}
 argon=${GEMPT_ARGON:-antigravity/gemini-4-argon}
+terra=${GEMPT_TERRA:-${GEMPT_SOL:-codex/gpt-6.1-terra}}
 sol=${GEMPT_SOL:-codex/gpt-6.2-sol}
 astra=${GEMPT_ASTRA:-codex/gpt-6.2-astra}
 flash=${DEEPSEEK_FLASH:-workbuddy/deepseek-v4.1-flash}
@@ -144,6 +145,7 @@ tiers=(gempt-sonnet gempt-opus gempt-fable)
 hydrogen_m=$(normalize_group_member "$hydrogen")
 neon_m=$(normalize_group_member "$neon")
 argon_m=$(normalize_group_member "$argon")
+terra_m=$(normalize_group_member "$terra")
 sol_m=$(normalize_group_member "$sol")
 astra_m=$(normalize_group_member "$astra")
 flash_m=$(normalize_group_member "$flash")
@@ -152,7 +154,11 @@ apply=no
 if [[ $mode == --apply || $mode == --all ]]; then
     apply=yes
     catalog=$(exec_magpie models | tr -d '\r')
-    for model in "$hydrogen" "$neon" "$argon" "$sol" "$astra" "$flash"; do
+    if [[ -z ${GEMPT_TERRA:-} ]] && ! model_exists "$terra"; then
+        terra=$sol
+        terra_m=$sol_m
+    fi
+    for model in "$hydrogen" "$neon" "$argon" "$terra" "$sol" "$astra" "$flash"; do
         if ! model_exists "$model"; then
             printf 'Model not found in Magpie: %s\n' "$model" >&2
             exit 1
@@ -176,12 +182,12 @@ run_magpie() {
     fi
 }
 
-run_magpie group add gempt-sonnet "models=$hydrogen_m,$sol_m,$flash_m" routing=order stays=turn
+run_magpie group add gempt-sonnet "models=$hydrogen_m,$terra_m,$flash_m" routing=order stays=turn
 run_magpie group rule add gempt-sonnet "use=$flash_m" compact
 run_magpie group rule add gempt-sonnet "use=$flash_m" "classifier=$flash_m" \
     'intent=simple formatting, adding comments, renaming, translating, writing boilerplate, or trivial quick questions'
-run_magpie group rule add gempt-sonnet "use=$sol_m" when=subagent
-run_magpie group rule add gempt-sonnet "use=$sol_m" \
+run_magpie group rule add gempt-sonnet "use=$terra_m" when=subagent
+run_magpie group rule add gempt-sonnet "use=$terra_m" \
     'intent=writing code, editing files, running tests, or fixing bugs'
 
 run_magpie group add gempt-opus "models=$neon_m,$sol_m,$astra_m,$flash_m" routing=order stays=turn

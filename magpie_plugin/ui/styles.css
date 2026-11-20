@@ -1388,5 +1388,12 @@ button.status-chip:focus-visible {
 .work-option:has(:checked) { border-color: var(--gp-fg); background: var(--gp-subtle); }
 .work-option:focus-within { outline: 2px solid var(--gp-focus); }
 .swarm-choice { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 9px; }
-.swarm-choice select { font: inherit; font-size: 12px; border: 1px solid var(--gp-border); border-radius: 6px; padding: 4px; background: var(--gp-card); color: var(--gp-fg); }
+.pairing-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.pairing-options label { display: grid; gap: 4px; font-size: 12px; }
+.pairing-options select { width: 100%; min-width: 0; }
+@media (max-width: 540px) {
+  .pairing-options { grid-template-columns: 1fr; }
+  .pairing-options label { grid-template-columns: 6em minmax(0, 1fr); align-items: center; }
+}
+.pairing-options select, .swarm-choice select { font: inherit; font-size: 12px; border: 1px solid var(--gp-border); border-radius: 6px; padding: 4px; background: var(--gp-card); color: var(--gp-fg); }
 @media (max-width: 540px) { .work-options { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

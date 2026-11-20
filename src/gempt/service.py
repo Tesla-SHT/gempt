@@ -12,6 +12,7 @@ from . import DEFAULT_CONFIG_PATH, EFFORT_RANK, TIER_ORDER, VALID_EFFORTS, VALID
 from .runs import recent_runs, verification_result
 from .codex_runner import run_codex_exec
 from .config import (
+    paired_model,
     ConfigError,
     config_exists,
     default_config_template,
@@ -280,6 +281,7 @@ def run_consult(
     reasoning_effort: str | None = None,
     escalate: bool = False,
     model_override: str | None = None,
+    gemini_family: str | None = None,
     max_output_tokens: int | None = None,
     api_mode: str | None = None,
     cwd: str | Path | None = None,
@@ -313,6 +315,8 @@ def run_consult(
     explicit_effort = (reasoning_effort or "").strip() or None
     resume_effort = str(session_record.get("reasoning_effort") or "").strip() if (session_record and not explicit_effort) else ""
 
+    paired = None if model_override else paired_model(cfg, gemini_family, tier, session_record if is_resume else None)
+    model_override = model_override or paired
     base_resolved = resolve_tier(
         cfg,
         effective_tier_arg,
@@ -410,6 +414,7 @@ def run_consult(
         )
         raise MagpieRequestError(f"{exc} | {hint}" if hint else str(exc)) from exc
 
+    session_record["paired_model"] = paired
     session_record["tier"] = resolved["tier"]
     session_record["model"] = res["served_model"]
     session_record["reasoning_effort"] = resolved["reasoning_effort"]
@@ -471,6 +476,7 @@ def run_exec(
     reasoning_effort: str | None = None,
     escalate: bool = False,
     model_override: str | None = None,
+    gemini_family: str | None = None,
     timeout_sec: int | None = None,
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
@@ -526,6 +532,8 @@ def run_exec(
     explicit_effort = (reasoning_effort or "").strip() or None
     resume_effort = str(session_record.get("reasoning_effort") or "").strip() if (is_resume and not explicit_effort) else ""
 
+    paired = None if model_override else paired_model(cfg, gemini_family, tier, session_record if is_resume else None)
+    model_override = model_override or paired
     base_resolved = resolve_tier(
         cfg,
         effective_tier_arg,
@@ -642,6 +650,7 @@ def run_exec(
         effort=resolved["reasoning_effort"],
         verification_status=str(acceptance.get("status") or ""),
     )
+    session_record["paired_model"] = paired
     session_record["tier"] = resolved["tier"]
     session_record["model"] = resolved["model"]
     session_record["reasoning_effort"] = resolved["reasoning_effort"]

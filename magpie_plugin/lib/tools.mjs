@@ -812,7 +812,21 @@ function shouldRetryFallback(err) {
   return !/redirect rejected/i.test(String(err?.message || ''));
 }
 
-function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = false, effortOverride = '' } = {}) {
+function pairedModel(cfg, args, session) {
+  if (args.tier) return '';
+  const family = args.gemini_family;
+  const saved = session?.paired_model;
+  if (!session && !Object.hasOwn(WORKLOAD.pairings, family)) return '';
+  const model = session ? saved : cfg.routing_policy?.pairings?.[family] ?? WORKLOAD.pairings[family];
+  if (!model || model === 'default') return '';
+  if (!isCodexModelId(model)) throw new Error('Gemini pairing requires a Codex subscription model.');
+  if (resolveExcludedTokens(cfg).some(token => model.toLowerCase().includes(token))) {
+    throw new Error('The paired Codex model is excluded. Change the pairing in GemPT.');
+  }
+  return model;
+}
+
+function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = false, effortOverride = '', paired = '' } = {}) {
   const policy = cfg?.routing_policy || {};
   const failoverMode = String(policy.failover_mode || 'subscription_only').trim() || 'subscription_only';
   const raw = String(requestedTier || '').trim().toLowerCase();
@@ -838,7 +852,7 @@ function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = 
   }
 
   const tierCfg = { ...DEFAULT_TIERS[effectiveTier], ...(cfg?.tiers?.[effectiveTier] || {}) };
-  let model = String(tierCfg.consult_model || DEFAULT_TIERS[effectiveTier].consult_model).trim();
+  let model = String(paired || tierCfg.consult_model || DEFAULT_TIERS[effectiveTier].consult_model).trim();
   let effort = String(effortOverride || tierCfg.reasoning_effort || 'medium').trim();
   const thresh = String(tierCfg.escalate_effort_threshold || DEFAULT_TIERS[effectiveTier].escalate_effort_threshold || 'high').trim();
   const threshRank = EFFORT_RANK[thresh] ?? 4;
@@ -848,7 +862,7 @@ function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = 
 
   let escalated = false;
   const meetsThreshold = (EFFORT_RANK[effort] ?? 3) >= threshRank;
-  if ((escalate || meetsThreshold) && tierCfg.escalate_model) {
+  if (!paired && (escalate || meetsThreshold) && tierCfg.escalate_model) {
     if (!model.startsWith('group/') && !model.startsWith('auto/')) {
       model = String(tierCfg.escalate_model).trim();
       escalated = true;
@@ -867,7 +881,7 @@ function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = 
 
   const seenFallbacks = new Set([model]);
   const fallbackModels = [];
-  if (failoverMode !== 'subscription_only' && Array.isArray(tierCfg.fallback_models)) {
+  if (!paired && failoverMode !== 'subscription_only' && Array.isArray(tierCfg.fallback_models)) {
     for (const item of tierCfg.fallback_models) {
       const fb = String(item || '').trim();
       if (!fb || seenFallbacks.has(fb)) continue;
@@ -880,7 +894,7 @@ function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = 
     tier: effectiveTier,
     failoverMode,
     model,
-    execModel: escalated ? model : (String(tierCfg.exec_model || '').trim() || model),
+    execModel: (paired || escalated) ? model : (String(tierCfg.exec_model || '').trim() || model),
     effort,
     apiMode: String(tierCfg.api_mode || 'responses'),
     maxOutputTokens: Number(tierCfg.max_output_tokens || 16384),
@@ -947,7 +961,7 @@ export function createGemptTools({
         if (!delegated) {
           return { ...result, action: 'gemini', text: 'Handle this part in Gemini. Report to the board if assigned there.' };
         }
-        const task = { goal, cwd: args.cwd, tier: args.tier };
+        const task = { goal, cwd: args.cwd, tier: args.tier, gemini_family: args.gemini_family };
         const reply = action === 'consult'
           ? await tools.consult.execute({ ...task, expected_output: WORKLOAD.report }, callCtx)
           : await tools.exec.execute({ ...task, run_id: role === 'worker' || role === 'verifier' ? assignment : undefined, verification: args.verification, expected_report: WORKLOAD.report,
@@ -1043,7 +1057,8 @@ export function createGemptTools({
         type: 'object',
         properties: {
           goal: { type: 'string', description: 'Clear statement of what the collaborator should solve, critique, summarize, or decide.' },
-          tier: { type: 'string', enum: CONSULT_TIERS, description: 'Target tier (chore, sonnet, opus, fable). Omit to follow configured default_tier.' },
+          gemini_family: WORKLOAD.schema.properties.gemini_family,
+          tier: { type: 'string', enum: CONSULT_TIERS, description: 'Target tier (chore, sonnet, opus, fable). Omit for the current Gemini pairing or configured default tier.' },
           escalate: { type: 'boolean', description: 'For opus tier: escalate from Sol to Astra and bump reasoning effort.' },
           context: { type: 'string', description: 'Verified facts, observations, error messages, and current state.' },
           file_paths: { type: 'array', items: { type: 'string' }, description: 'Optional workspace files to attach (requires cwd).' },
@@ -1082,9 +1097,11 @@ export function createGemptTools({
           : '';
         const isResume = Boolean(priorSession);
         const lockedResumeEffort = isResume && !explicitEffort ? String(priorSession?.reasoning_effort || '').trim() : '';
+        const paired = pairedModel(runtime.cfg, args, priorSession);
         const baseResolved = resolveTierTarget(runtime.cfg, args?.tier || priorSession?.tier, {
           allowChore: true,
           escalate: Boolean(args?.escalate),
+          paired,
           effortOverride: explicitEffort || lockedResumeEffort,
         });
 
@@ -1106,6 +1123,7 @@ export function createGemptTools({
           resolved = resolveTierTarget(runtime.cfg, args?.tier || priorSession?.tier, {
             allowChore: true,
             escalate: Boolean(args?.escalate),
+            paired,
             effortOverride: autoEffortInfo.effort,
           });
         }
@@ -1191,6 +1209,7 @@ export function createGemptTools({
         const agent = callingAgent(callCtx) || priorSession?.agent || '';
         saveSession(resolvedSessionsDir, {
           ...(priorSession || {}),
+          paired_model: paired,
           session_id: sessionId,
           mode: 'consult',
           tier: resolved.tier,
@@ -1242,7 +1261,8 @@ export function createGemptTools({
         properties: {
           goal: { type: 'string', description: 'Exact engineering task and scope for Codex to implement/verify.' },
           cwd: { type: 'string', description: 'Target workspace directory (cannot be /, ~, ~/.ssh, ~/.aws, ~/.gnupg, ~/.config/magpie, ~/.config/gempt).' },
-          tier: { type: 'string', enum: TIER_ORDER, description: 'Target tier (sonnet, opus, fable). Omit to follow configured default_tier.' },
+          gemini_family: WORKLOAD.schema.properties.gemini_family,
+          tier: { type: 'string', enum: TIER_ORDER, description: 'Target tier (sonnet, opus, fable). Omit for the current Gemini pairing or configured default tier.' },
           escalate: { type: 'boolean', description: 'For opus tier: escalate from Sol to Astra and bump reasoning effort.' },
           context: { type: 'string', description: 'Verified files, symbols, design choices, and current state.' },
           file_paths: { type: 'array', items: { type: 'string' }, description: 'Optional key workspace files to preload.' },
@@ -1335,9 +1355,11 @@ export function createGemptTools({
           : '';
         const isResume = Boolean(priorSession);
         const lockedResumeEffort = isResume && !explicitEffort ? String(priorSession?.reasoning_effort || '').trim() : '';
+        const paired = pairedModel(runtime.cfg, args, priorSession);
         const baseResolved = resolveTierTarget(runtime.cfg, args?.tier || priorSession?.tier, {
           allowChore: false,
           escalate: Boolean(args?.escalate),
+          paired,
           effortOverride: explicitEffort || lockedResumeEffort,
         });
 
@@ -1359,6 +1381,7 @@ export function createGemptTools({
           resolved = resolveTierTarget(runtime.cfg, args?.tier || priorSession?.tier, {
             allowChore: false,
             escalate: Boolean(args?.escalate),
+            paired,
             effortOverride: autoEffortInfo.effort,
           });
         }
@@ -1432,6 +1455,7 @@ export function createGemptTools({
         const priorTurns = Array.isArray(priorSession?.turns) ? priorSession.turns : [];
         saveSession(resolvedSessionsDir, {
           ...(priorSession || {}),
+          paired_model: paired,
           session_id: sessionId,
           mode: 'exec',
           tier: resolved.tier,

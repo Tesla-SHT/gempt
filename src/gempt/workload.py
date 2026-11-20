@@ -47,6 +47,8 @@ def dispatch_task(args, config_path):
         return {**result, "action": "gemini", "text": "Handle this part in Gemini. Report to the board if assigned there."}
 
     options = {"goal": goal, "config_path": config_path, "tier": args.get("tier"), "cwd": args.get("cwd")}
+    if args.get("gemini_family"):
+        options["gemini_family"] = args["gemini_family"]
     if action == "consult":
         reply = run_consult(**options, expected_output=WORKLOAD["report"])
     else:

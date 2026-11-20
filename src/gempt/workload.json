@@ -39,6 +39,11 @@
       "detail": "实质任务直接派给 GPT。Gemini 澄清需求、补充视觉观察，并用用户听得懂的话解释结果。"
     }
   },
+  "pairings": {
+    "hydrogen": "codex/gpt-6.1-terra",
+    "neon": "codex/gpt-6.2-sol",
+    "carbon": "codex/gpt-6.2-astra"
+  },
   "schema": {
     "type": "object",
     "properties": {
@@ -69,6 +74,11 @@
       "cwd": {
         "type": "string",
         "description": "Exact workspace for inspect or change."
+      },
+      "gemini_family": {
+        "type": "string",
+        "enum": ["hydrogen", "neon", "carbon"],
+        "description": "Current native Gemini family, or the coordinator family from the Swarm brief. Omit when unknown. An explicit tier overrides pairing."
       },
       "tier": {
         "type": "string",
