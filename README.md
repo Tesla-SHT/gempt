@@ -7,9 +7,10 @@
 先在 Magpie 登录 ChatGPT/Codex（及可选 Gemini）订阅账号，然后一条命令安装本插件：
 
 ```sh
+# 绝大多数纯订阅用户（推荐）：
 magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/collab
-# 合入 main 后可直接运行：
-# magpie plugin add github:Tesla-SHT/gempt
+# 如需 OpenAI 按量 API 兜底开关与预设，可使用个人增强分支：
+# magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/api-fallback
 ```
 
 装完后即可在 Magpie 左侧 **`Plugins → GemPT`** 打开控制面板，按需选择以下任一方式（两者可随时共用）：
@@ -121,7 +122,7 @@ PYTHONPATH=src python -m gempt discover
 ```
 
 2. **接入客户端与 Magpie 控制页**：
-   - **Magpie 原生 `tools + page` 插件**（控制中心 + 全客户端工具托管）：运行 `magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/collab`（或本地 `magpie plugin add .`），即可在 Magpie 左侧栏 **`Plugins → GemPT`** 打开控制面板，并由 Magpie 自动将 `gempt_discover` / `gempt_status` / `gempt_consult` / `gempt_exec` 注册到 `/mcp/magpie/tools/gempt`。未初始化时页面内可**一键启用订阅配置**（不启用也可零配置直连 Codex 订阅），随时切换共享 **默认档位**、**Codex 执行权限** 或一键创建 **`group/gempt-*` 直连路由组**。
+   - **Magpie 原生 `tools + page` 插件**（控制中心 + 全客户端工具托管）：运行 `magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/api-fallback`（或公开纯订阅版 `#yizhang-dream/collab` / 本地 `magpie plugin add .`），即可在 Magpie 左侧栏 **`Plugins → GemPT`** 打开控制面板，并由 Magpie 自动将 `gempt_discover` / `gempt_status` / `gempt_consult` / `gempt_exec` 注册到 `/mcp/magpie/tools/gempt`。未初始化时页面内可**一键启用订阅配置**（不启用也可零配置直连 Codex 订阅），随时切换共享 **默认档位**、**Codex 执行权限**、**容灾模式（仅订阅 / API 兜底）** 或一键创建 **`group/gempt-*` 直连路由组**。
    - **Antigravity 原生插件**：运行 `bash install.sh --plugin`（或 `PYTHONPATH=src python -m gempt install-agy`），把 `plugin/`（`plugin.json`、`rules/`、`skills/`）与独立包副本安装到 `~/.gemini/config/plugins/gempt/`。安装并重载插件后，保持原生 Gemini 官方登录即可在 `/` 菜单直接使用 `/gempt`、`/gempt-sonnet`、`/gempt-opus`、`/gempt-fable`、`/gempt-chore`。
    - **非 Magpie 托管的独立 MCP 客户端**：可在控制页点 **`复制 MCP 配置`**（或运行 `bash install.sh --print-mcp` / `PYTHONPATH=src python -m gempt print-mcp --installed`），并配合页内 **`复制协作规则`**（详版见 [plugin/skills/gempt/SKILL.md](plugin/skills/gempt/SKILL.md) 与 [plugin/rules/AGENTS.md](plugin/rules/AGENTS.md)）。
 
@@ -167,10 +168,13 @@ PYTHONPATH=src python -m gempt exec --tier opus --escalate --cwd /path/to/repo -
 
 ---
 
-## 三、配置、订阅直连与安全边界
+## 三、配置、容灾与安全边界
 
 - 配置文件查找顺序：`--config` 参数 → 环境变量 `GEMPT_CONFIG` → 当前及上级目录 `.gempt.json` → `~/.config/gempt/config.json`。
-- **纯订阅直连设计（面向绝大多数仅登录 ChatGPT/Codex 订阅的用户）**：只需在 Magpie 中登录 ChatGPT/Codex 订阅即可开箱即用，无需另配或付费购买 OpenAI API Key。多订阅账号在 Magpie 侧配 `#account` 或 `routing=drain/smart` 即可无感轮转；如需个人 API 兜底能力，可在独立分支 `yizhang-dream/api-fallback` 启用。
+- 基于面向大众用户的纯订阅基线（`yizhang-dream/collab` 分支），当前个人分支额外开启按量 API 兜底能力与 Magpie 页面内的 **`仅订阅 | API 兜底`** 实时切换开关：
+  1. `subscription_only`（推荐默认）：只用 Codex 订阅模型，不自动切换按量 API，避免意外扣费；多订阅号在 Magpie 侧配 `#account` 或 `routing=drain/smart` 即可无感切换。
+  2. `api_fallback`：订阅优先，限流或失败时按顺序降级到按量 `openai/*` API（支持页面内无损往返切换）。
+  3. `effort_only`：单模型（`Sol`）仅用 `reasoning_effort`（`medium` / `high` / `xhigh`，避免 Astra 降 `low`）区分三档。
 - 若要在 `discover` / `status` 推荐里隐藏特定模型，可设置环境变量 `GEMPT_EXCLUDED_MODELS`（逗号分隔子串）或在宿主配置 `routing_policy.excluded_models` 中填入字符串列表。
 - 参考模板见 [templates/gempt.config.example.json](templates/gempt.config.example.json) 与 [templates/magpie-groups.template.json](templates/magpie-groups.template.json)。
 

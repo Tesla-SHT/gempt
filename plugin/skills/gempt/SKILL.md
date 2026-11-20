@@ -19,19 +19,23 @@ description: >-
 
 ## 1. Initial Setup Wizard（首次使用或用户要求调整配置时）
 
-当 `~/.config/gempt/config.json` 尚未初始化，或用户说“初始化 gempt / 配一下 gempt / 换模型或权限”时，**主链路以 ChatGPT/Codex 订阅号直连（`subscription_only`）为准**，无需让普通用户准备或填写额外付费 API Key：
+当 `~/.config/gempt/config.json` 尚未初始化，或用户说“初始化 gempt / 配一下 gempt / 换模型或容灾策略”时，优先推荐无门槛的 **Codex 订阅直连（`subscription_only`）**，并在当前分支支持按需开启个人 **API 兜底（`api_fallback`）**：
 
-1. **最简一键开启**：如果用户已经打开 Magpie 客户端的 **`Plugins → GemPT`** 页面，只要 Magpie 里已登录 ChatGPT/Codex 订阅，页面会自动检测到 `codex/*` 模型，直接点 **“一键启用订阅配置”** 即可完成初始化。
+1. **最简一键开启**：如果用户已经打开 Magpie 客户端的 **`Plugins → GemPT`** 页面，只要 Magpie 里已登录 ChatGPT/Codex 订阅，页面会自动检测到 `codex/*` 模型，直接点 **“一键启用订阅配置”** 即可完成初始化；后续也可在页面里一键切换 `仅订阅 | API 兜底` 与 `Codex 执行权限`。
 2. **命令行 / 对话内探测与初始化**：调用 `gempt_discover`（不要让用户手工翻配置文件路径或模型 ID）。
-   - 检查输出里的 `magpie.gateway.reachable`、`subscription_ready`、`codex_subscription_models`、`utility_candidates`、`codex` CLI 与 `recommendations`。
-   - 如果 `magpie.gateway.reachable` 为 `false`，提示用户先启动本地 Magpie（默认 `127.0.0.1:3425`）；如果 `subscription_ready` 为 `false`，先在 Magpie 登录 ChatGPT/Codex 订阅账号再刷新重试。
-3. **确认三档甜点映射与权限**：
+   - 检查输出里的 `magpie.gateway.reachable`、`subscription_ready`、`codex_subscription_models`、`openai_api_models`、`utility_candidates`、`codex` CLI 与 `recommendations`。
+   - 如果 `magpie.gateway.reachable` 为 `false`，提示用户先启动本地 Magpie（默认 `127.0.0.1:3425`）。
+3. **确认三档甜点映射与容灾策略**：
    - `sonnet`（~75% 日常高频）：`Sol @ medium`（`codex/gpt-6.2-sol`，`medium`）
    - `opus`（~20% 复杂工程）：`Sol @ high` 主力 + 疑难 `@ xhigh` 自动升 `Astra`（`codex/gpt-6.2-sol` → `codex/gpt-6.2-astra`）
    - `fable`（~5% 顶配攻坚）：`Astra @ xhigh`（`codex/gpt-6.2-astra`，`xhigh`；**禁止把 Astra 降到 `low`**）
    - **免费打杂 / 压缩通道（`utility`）**：从 `utility_candidates` 推荐免费高速模型（如 `auto/deepseek-v4.1-flash`），用于 `tier="chore"` 与 Magpie `compact` 规则。
-   - **路由策略**：固定 `subscription_only`（纯 Codex 订阅直连，不扣按量 API 费用；多订阅号由 Magpie 自动轮转）；可选开启 `auto_effort`（页面点选 **`智能`** 或 CLI 设 `gempt effort auto`）。
-   - **可选：同步独立隔离路由组**：默认直接调用具体 `codex/*` 订阅模型 ID 即可工作。仅当用户需要在 Magpie 侧使用多号轮转、`effort=high` 自动切 Astra 或 `compact` 规则时，才开启 `sync_magpie_groups: true` 与 `use_magpie_group_ids: true`。
+   - **容灾策略（`failover_mode`）**：
+     1. `subscription_only`（推荐默认）：仅用 Codex 订阅号（不自动切按量 API，防意外扣费）；多订阅号由 Magpie 自动轮转。
+     2. `api_fallback`：订阅优先，限流或失败时自动切换按量 `openai/*` API 兜底（页面支持随时无损切换）。
+     3. `effort_only`：单模型 `Sol` 仅靠 `reasoning_effort`（`medium` / `high` / `xhigh`）区分三档（不降级使用 `Astra@low`）。
+   - **思考定档策略**：可选开启 `auto_effort`（页面点选 **`智能`** 或 CLI 设 `gempt effort auto`）。
+   - **可选：同步独立隔离路由组**：默认直接调用具体 GPT 模型 ID 即可工作。仅当用户需要在 Magpie 侧使用多号轮转、`effort=xhigh` 自动切 Astra 或 `compact` 规则时，才开启 `sync_magpie_groups: true` 与 `use_magpie_group_ids: true`。
    - **默认 Codex 沙箱（`default_sandbox`）**：推荐 `workspace-write`（只在目标工作区可写），可在 Magpie `Plugins → GemPT` 页面随手切换 `只读 / 工作区 / 全权限`。
 4. **落盘并验收**：
    - 调用 `gempt_configure` 保存配置，调用 `gempt_status` 验证生效；必要时用 `gempt_consult(tier="chore", goal="Reply with OK")` 或 `sonnet` 跑一次极短连通性测试后汇报。

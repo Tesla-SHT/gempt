@@ -24,7 +24,8 @@ export const TIER_ALIASES = { lite: 'sonnet', mid: 'opus', max: 'fable' };
 export const VALID_SANDBOXES = ['read-only', 'workspace-write', 'danger-full-access'];
 export const VALID_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 export const EFFORT_RANK = Object.freeze(Object.fromEntries(VALID_EFFORTS.map((name, idx) => [name, idx])));
-export const FEATURES = Object.freeze({ api_fallback: false });
+export const VALID_FAILOVER_MODES = ['subscription_only', 'api_fallback'];
+export const FEATURES = Object.freeze({ api_fallback: true });
 export const DEFAULT_MAGPIE_URL = 'http://127.0.0.1:3425';
 
 const NATIVE_GROUP_SPECS = [
@@ -109,8 +110,10 @@ export function expandUser(p) {
   return p;
 }
 
+const CODEX_MODEL_RE = /^codex\/[A-Za-z0-9_.-]+(?:#[A-Za-z0-9_.-]+)?$/;
+
 export function isCodexModelId(modelId) {
-  return String(modelId || '').trim().toLowerCase().startsWith('codex/');
+  return CODEX_MODEL_RE.test(String(modelId || '').trim());
 }
 
 export function resolveConfigPath(explicit) {
@@ -411,6 +414,7 @@ function emptyProbeResult(url, error) {
     url,
     total_models: 0,
     codex_models: [],
+    openai_models: [],
     gemini_models: [],
     codex_ready: false,
     utility_candidates: [],
@@ -470,6 +474,7 @@ export function probeMagpie(baseUrl = DEFAULT_MAGPIE_URL, apiKey = '', timeoutMs
             const models = Array.isArray(body?.data) ? body.data : [];
             const visibleIds = [];
             const codexSet = new Set();
+            const openaiSet = new Set();
             const geminiSet = new Set();
             const utilSet = new Set();
             const harnessGroups = [];
@@ -477,6 +482,7 @@ export function probeMagpie(baseUrl = DEFAULT_MAGPIE_URL, apiKey = '', timeoutMs
             for (const item of models) {
               const id = String(item?.id || '');
               if (!id || isExcludedModel(id, excludedTokens)) continue;
+              const owned = String(item?.owned_by || '').toLowerCase();
               const label = String(item?.magpie_label || '').toLowerCase();
               const isGroup = id.startsWith('group/') || id.startsWith('auto/') || label.includes('routing group');
               visibleIds.push(id);
@@ -491,11 +497,14 @@ export function probeMagpie(baseUrl = DEFAULT_MAGPIE_URL, apiKey = '', timeoutMs
                 if (isUtilityCandidate(item, excludedTokens)) utilSet.add(id);
               } else if (id.startsWith('codex/')) {
                 codexSet.add(id);
+              } else if (owned === 'openai' || id.startsWith('openai/')) {
+                openaiSet.add(id);
               } else if (isUtilityCandidate(item, excludedTokens)) {
                 utilSet.add(id);
               }
             }
             const codexModels = [...codexSet];
+            const openaiModels = [...openaiSet];
             const geminiModels = [...geminiSet];
             const utilityCandidates = [...utilSet].sort((a, b) => {
               const diff = utilityRankScore(b) - utilityRankScore(a);
@@ -507,6 +516,7 @@ export function probeMagpie(baseUrl = DEFAULT_MAGPIE_URL, apiKey = '', timeoutMs
               url: cleanedUrl,
               total_models: visibleIds.length,
               codex_models: codexModels,
+              openai_models: openaiModels,
               gemini_models: geminiModels,
               codex_ready: codexModels.length > 0,
               utility_candidates: utilityCandidates,
@@ -728,7 +738,7 @@ export function buildRulesSnippet() {
     '- Domain split:',
     '  - **Gemini** owns human dialogue, planning, acceptance verification, and frontend/UI/visual/multimodal edits directly (cross-review tricky UX state via `gempt_consult`).',
     '  - **GPT/Codex** (via Magpie gateway) owns backend architecture, hard debugging, algorithms/math, cross-file refactors, and independent diff review (never let GPT self-grade its own changes).',
-    '- Routing & usage share (Subscription-Only default):',
+    '- Routing & usage share (Subscription-Only default, or API Fallback when enabled):',
     '  - `sonnet` (~75%): `codex/gpt-6.2-sol` @ `medium` for daily engineering & UI logic.',
     '  - `opus` (~20%): `codex/gpt-6.2-sol` @ `high`; pass `escalate=true` or `xhigh` to escalate to `codex/gpt-6.2-astra`.',
     '  - `fable` (~5%): `codex/gpt-6.2-astra` @ `xhigh` for extreme bugs, math, and core architecture. Never downgrade Astra to `low`.',
@@ -858,6 +868,12 @@ function readPluginExecOption(magpieConfigDir) {
   return entry?.options?.exec === true;
 }
 
+function hasApiSnapshot(cfg) {
+  const snap = cfg?.routing_policy?.api_fallback_snapshot;
+  if (!snap || typeof snap !== 'object' || Array.isArray(snap)) return false;
+  return TIER_ORDER.some((t) => snap[t] && typeof snap[t] === 'object' && typeof snap[t].consult_model === 'string' && snap[t].consult_model.trim());
+}
+
 export async function readState({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, execEnabled, probeTimeoutMs = 2000 } = {}) {
   const resolvedConfigPath = resolveConfigPath(configPath);
   const resolvedSessionsDir = resolveSessionsDir(sessionsDir);
@@ -938,7 +954,7 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     configured,
     config_path: resolvedConfigPath,
     default_tier: defaultTier,
-    failover_mode: 'subscription_only',
+    failover_mode: String(policy.failover_mode || 'subscription_only'),
     auto_effort: Boolean(rawCfg?.routing_policy?.auto_effort),
     default_sandbox: String(rawCfg?.codex?.default_sandbox || 'workspace-write'),
     subscription: {
@@ -962,6 +978,11 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
       endpoint: `${baseUrl}/mcp/magpie/tools/gempt`,
     },
     recent_group_calls: recentGroupCalls,
+    api_fallback: {
+      available: (magpie.openai_models || []).length > 0 || hasApiSnapshot(rawCfg),
+      openai_count: (magpie.openai_models || []).length,
+      has_snapshot: hasApiSnapshot(rawCfg),
+    },
     magpie,
     tiers,
     utility,
@@ -1454,5 +1475,198 @@ export async function createNativeGroups({ configPath, magpieConfigDir, magpieCl
     skipped,
     groups: NATIVE_GROUP_SPECS.map((s) => s.group_id),
     models: plan.models,
+  };
+}
+
+function findApiBackup(subModel, openaiModels) {
+  if (!Array.isArray(openaiModels) || !openaiModels.length) return '';
+  const bare = String(subModel || '').split('/').pop().toLowerCase();
+  for (const oid of openaiModels) {
+    if (String(oid || '').split('/').pop().toLowerCase() === bare) return oid;
+  }
+  if (bare.includes('astra')) return pickBest(openaiModels, [['astra', 220], ['sol', 120]]);
+  if (bare.includes('sol')) return pickBest(openaiModels, [['sol', 220], ['terra', 120]]);
+  return pickBest(openaiModels, [['terra', 200], ['mini', 150], ['sol', 100]]);
+}
+
+export async function setFailoverMode(mode, { configPath, probeTimeoutMs = 2000 } = {}) {
+  const normalized = String(mode || '').trim();
+  if (!VALID_FAILOVER_MODES.includes(normalized)) {
+    return {
+      ok: false,
+      status: 400,
+      error: `Invalid failover_mode '${String(mode ?? '')}'. Expected one of: ${VALID_FAILOVER_MODES.join(', ')}.`,
+    };
+  }
+
+  const loaded = readExistingConfigObject(configPath);
+  if (!loaded.ok) return loaded;
+
+  const current = loaded.data;
+  const curPolicy = current.routing_policy && typeof current.routing_policy === 'object' ? current.routing_policy : {};
+  const curTiers = current.tiers && typeof current.tiers === 'object' ? current.tiers : {};
+  const nextPolicy = { ...curPolicy, failover_mode: normalized };
+  const nextTiers = { ...curTiers };
+
+  const baseUrl = String(current.magpie?.base_url || defaultGatewayFromEnv()).replace(/\/+$/, '');
+  const apiKey = resolveMagpieApiKey({ magpie: { ...(current.magpie || {}), base_url: baseUrl } });
+  const excludedTokens = resolveExcludedTokens(current);
+  let cachedProbe = null;
+  const ensureProbe = async () => {
+    if (!cachedProbe) {
+      cachedProbe = await probeMagpie(baseUrl, apiKey, probeTimeoutMs, excludedTokens);
+    }
+    return cachedProbe;
+  };
+
+  if (normalized === 'subscription_only') {
+    const usesGroupOrApi = TIER_ORDER.some((t) => {
+      const tier = curTiers[t] || {};
+      const c = String(tier.consult_model || '').trim();
+      const e = String(tier.exec_model || '').trim();
+      const fbs = Array.isArray(tier.fallback_models) ? tier.fallback_models : [];
+      const mems = Array.isArray(tier.magpie_group_members) ? tier.magpie_group_members : [];
+      return (
+        c.startsWith('group/')
+        || (c && !isCodexModelId(c))
+        || (e && !isCodexModelId(e))
+        || fbs.some((m) => !isCodexModelId(m))
+        || mems.some((m) => !isCodexModelId(m))
+      );
+    });
+
+    if (curPolicy.failover_mode === 'api_fallback' || usesGroupOrApi) {
+      const snapshot = {};
+      for (const t of TIER_ORDER) {
+        const tier = curTiers[t] || {};
+        snapshot[t] = {
+          consult_model: String(tier.consult_model || ''),
+          exec_model: String(tier.exec_model || ''),
+          escalate_model: String(tier.escalate_model || ''),
+          fallback_models: Array.isArray(tier.fallback_models) ? [...tier.fallback_models] : [],
+          magpie_group_members: Array.isArray(tier.magpie_group_members) ? [...tier.magpie_group_members] : [],
+        };
+      }
+      nextPolicy.api_fallback_snapshot = snapshot;
+    }
+
+    for (const t of TIER_ORDER) {
+      const baseTier = { ...DEFAULT_TIERS[t], ...(curTiers[t] && typeof curTiers[t] === 'object' ? curTiers[t] : {}) };
+      const members = Array.isArray(baseTier.magpie_group_members) ? baseTier.magpie_group_members : [];
+      let primary = members.find((m) => isCodexModelId(m))
+        || (isCodexModelId(baseTier.consult_model) ? String(baseTier.consult_model).trim() : '')
+        || (isCodexModelId(baseTier.exec_model) ? String(baseTier.exec_model).trim() : '');
+
+      let subPlan = null;
+      if (!primary) {
+        const probe = await ensureProbe();
+        subPlan = pickSubscriptionPlan(probe);
+        primary = subPlan?.tiers?.[t]?.consult_model || '';
+      }
+      if (!isCodexModelId(primary)) {
+        return {
+          ok: false,
+          status: 400,
+          error: '未找到可用的 Codex 订阅模型，无法切为仅订阅模式。',
+        };
+      }
+
+      let escalateModel = String(baseTier.escalate_model || '').trim();
+      if (t === 'opus') {
+        if (escalateModel && !isCodexModelId(escalateModel)) {
+          const memberEsc = members.find((m) => isCodexModelId(m) && m !== primary);
+          if (memberEsc) escalateModel = memberEsc;
+          else {
+            if (!subPlan) subPlan = pickSubscriptionPlan(await ensureProbe());
+            escalateModel = subPlan?.tiers?.opus?.escalate_model || '';
+          }
+        }
+      } else {
+        escalateModel = '';
+      }
+
+      const cleanTier = {
+        ...baseTier,
+        consult_model: primary,
+        exec_model: primary,
+        fallback_models: [],
+        magpie_group_members: t === 'opus' && escalateModel ? dedupe([primary, escalateModel]) : [primary],
+      };
+      if (t === 'opus') {
+        if (escalateModel) cleanTier.escalate_model = escalateModel;
+        else delete cleanTier.escalate_model;
+      }
+      nextTiers[t] = cleanTier;
+    }
+  } else {
+    const snap = curPolicy.api_fallback_snapshot;
+    if (hasApiSnapshot(current)) {
+      for (const t of TIER_ORDER) {
+        const baseTier = { ...DEFAULT_TIERS[t], ...(curTiers[t] && typeof curTiers[t] === 'object' ? curTiers[t] : {}) };
+        const savedTier = snap[t];
+        if (savedTier && typeof savedTier === 'object' && savedTier.consult_model) {
+          baseTier.consult_model = String(savedTier.consult_model);
+          baseTier.exec_model = savedTier.exec_model !== undefined ? String(savedTier.exec_model) : String(savedTier.consult_model);
+          if (savedTier.escalate_model) baseTier.escalate_model = String(savedTier.escalate_model);
+          else delete baseTier.escalate_model;
+          baseTier.fallback_models = Array.isArray(savedTier.fallback_models) ? [...savedTier.fallback_models] : [];
+          baseTier.magpie_group_members = Array.isArray(savedTier.magpie_group_members) ? [...savedTier.magpie_group_members] : [];
+        }
+        nextTiers[t] = baseTier;
+      }
+      delete nextPolicy.api_fallback_snapshot;
+    } else {
+      const probe = await ensureProbe();
+      if (!probe.reachable) {
+        return {
+          ok: false,
+          status: 503,
+          error: '无法连接本地 Magpie 网关，无法自动匹配按量 openai/* 备用模型。',
+        };
+      }
+      const openaiModels = probe.openai_models || [];
+      if (!openaiModels.length) {
+        return {
+          ok: false,
+          status: 400,
+          error: 'Magpie 中未检测到按量 openai/* 模型，请先在 Magpie 接入 OpenAI API 渠道。',
+        };
+      }
+      const subPlan = pickSubscriptionPlan(probe);
+      for (const t of TIER_ORDER) {
+        const baseTier = { ...DEFAULT_TIERS[t], ...(curTiers[t] && typeof curTiers[t] === 'object' ? curTiers[t] : {}) };
+        const primary = isCodexModelId(baseTier.consult_model)
+          ? String(baseTier.consult_model).trim()
+          : (subPlan?.tiers?.[t]?.consult_model || DEFAULT_TIERS[t].consult_model);
+        const backup = findApiBackup(primary, openaiModels);
+        const escalateModel = t === 'opus' ? String(baseTier.escalate_model || subPlan?.tiers?.opus?.escalate_model || '').trim() : '';
+        const escalateBackup = escalateModel && escalateModel !== primary ? findApiBackup(escalateModel, openaiModels) : '';
+        const fallbacks = dedupe([backup].filter((b) => b && b !== primary));
+        const members = dedupe([primary, escalateModel, backup, escalateBackup]);
+        nextTiers[t] = {
+          ...baseTier,
+          consult_model: primary,
+          exec_model: primary,
+          ...(t === 'opus' && escalateModel ? { escalate_model: escalateModel } : {}),
+          fallback_models: fallbacks,
+          magpie_group_members: members,
+        };
+      }
+    }
+  }
+
+  const next = {
+    ...current,
+    routing_policy: nextPolicy,
+    tiers: nextTiers,
+  };
+  const written = writeConfigAtomic(loaded.path, next);
+  if (!written.ok) return written;
+
+  return {
+    ok: true,
+    status: 200,
+    failover_mode: normalized,
+    config_path: loaded.path,
   };
 }

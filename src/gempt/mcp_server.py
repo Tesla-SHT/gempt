@@ -41,8 +41,8 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "gempt_configure",
         "description": (
-            "Create or update the user's gempt configuration (~/.config/gempt/config.json by default), setting "
-            "3-tier Codex subscription routing (sonnet/opus/fable) + utility/compact model, sandbox default, and optionally "
+            "Create or update the user's gempt configuration (~/.config/gempt/config.json by default), setting the "
+            "3-tier GPT routing (sonnet/opus/fable) + utility/compact model, failover mode, sandbox default, and optionally "
             "syncing Magpie routing groups (group/gempt-harness-sonnet, group/gempt-harness-opus, group/gempt-harness-fable)."
         ),
         "inputSchema": {
@@ -69,9 +69,9 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "failover_mode": {
                     "type": "string",
-                    "enum": ["subscription_only"],
+                    "enum": ["subscription_only", "api_fallback", "effort_only"],
                     "default": "subscription_only",
-                    "description": "Subscription-only routing policy (Codex accounts via Magpie).",
+                    "description": "Routing failover policy (subscription_only by default; api_fallback enables openai/* backup).",
                 },
                 "auto_effort": {
                     "type": "boolean",

@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import DEFAULT_CONFIG_PATH, EFFORT_RANK, TIER_ORDER, VALID_EFFORTS, VALID_SANDBOXES
+from . import DEFAULT_CONFIG_PATH, EFFORT_RANK, TIER_ORDER, VALID_EFFORTS, VALID_FAILOVER_MODES, VALID_SANDBOXES
 from .runs import recent_runs, verification_result
 from .codex_runner import run_codex_exec
 from .config import (
@@ -191,9 +191,9 @@ def configure_gempt(
         cfg["codex"]["model_provider"] = codex_model_provider.strip()
 
     cleaned_mode = str(failover_mode or "subscription_only").strip()
-    if cleaned_mode != "subscription_only":
-        raise ConfigError("当前纯订阅版本仅支持 subscription_only 模式。")
-    failover_mode = "subscription_only"
+    if cleaned_mode not in VALID_FAILOVER_MODES:
+        raise ConfigError(f"failover_mode must be one of: {', '.join(VALID_FAILOVER_MODES)}")
+    failover_mode = cleaned_mode
 
     if default_tier is not None and str(default_tier).strip():
         cfg["routing_policy"]["default_tier"] = _normalize_default_tier(default_tier)

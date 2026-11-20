@@ -117,12 +117,12 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 validate_config(bad_cfg)
 
-    def test_default_tier_sandbox_and_subscription_only(self) -> None:
+    def test_default_tier_sandbox_and_failover_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = Path(tmp) / "gempt.json"
             cfg = default_config_template()
             cfg["magpie"]["api_key"] = "sk-keep-me"
-            cfg["routing_policy"]["failover_mode"] = "subscription_only"
+            cfg["routing_policy"]["failover_mode"] = "api_fallback"
             cfg["routing_policy"]["default_tier"] = "max"
             save_config(cfg, path=cfg_path)
 
@@ -132,11 +132,11 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(resolve_tier(loaded, "")["tier"], "fable")
 
             bad_mode_cfg = default_config_template()
-            bad_mode_cfg["routing_policy"]["failover_mode"] = "api_fallback"
+            bad_mode_cfg["routing_policy"]["failover_mode"] = "invalid_mode"
             with self.assertRaises(ConfigError):
                 validate_config(bad_mode_cfg)
             with self.assertRaises(ConfigError):
-                configure_gempt(config_path=cfg_path, failover_mode="api_fallback")
+                configure_gempt(config_path=cfg_path, failover_mode="invalid_mode")
 
             for bad_default in ("chore", "unknown", 42):
                 bad_cfg = default_config_template()
@@ -231,7 +231,9 @@ class DiscoverTests(unittest.TestCase):
         recs = build_tier_recommendations(catalog)
         self.assertTrue(recs["available"])
         self.assertEqual(recs["utility_model"], "auto/deepseek-v4.1-flash")
-        self.assertEqual(list(recs["presets"].keys()), ["subscription_only"])
+        self.assertIn("subscription_only", recs["presets"])
+        self.assertIn("api_fallback", recs["presets"])
+        self.assertIn("effort_only", recs["presets"])
         sub = recs["presets"]["subscription_only"]["tiers"]
         self.assertEqual(sub["sonnet"]["consult_model"], "codex/gpt-6.2-sol")
         self.assertEqual(sub["sonnet"]["reasoning_effort"], "medium")
@@ -242,8 +244,19 @@ class DiscoverTests(unittest.TestCase):
         self.assertEqual(sub["fable"]["consult_model"], "codex/gpt-6.2-astra")
         self.assertEqual(sub["fable"]["reasoning_effort"], "xhigh")
 
+        api_fb = recs["presets"]["api_fallback"]["tiers"]
+        self.assertIn("openai/gpt-6-astra", api_fb["fable"]["fallback_models"])
+
+        effort_only = recs["presets"]["effort_only"]["tiers"]
+        self.assertEqual(effort_only["sonnet"]["consult_model"], "codex/gpt-6.2-sol")
+        self.assertEqual(effort_only["sonnet"]["reasoning_effort"], "medium")
+        self.assertEqual(effort_only["opus"]["consult_model"], "codex/gpt-6.2-sol")
+        self.assertEqual(effort_only["opus"]["reasoning_effort"], "high")
+        self.assertEqual(effort_only["fable"]["consult_model"], "codex/gpt-6.2-sol")
+        self.assertEqual(effort_only["fable"]["reasoning_effort"], "xhigh")
+
         api_only_recs = build_tier_recommendations({**catalog, "codex_subscription_models": []})
-        self.assertFalse(api_only_recs["available"])
+        self.assertTrue(api_only_recs["available"])
         self.assertFalse(api_only_recs["presets"]["subscription_only"]["tiers"])
 
     def test_probe_filters_forbidden_model(self) -> None:
@@ -382,15 +395,17 @@ class MagpieClientAndCodexRunnerTests(unittest.TestCase):
 
     def test_sync_magpie_groups_dry_run_commands(self) -> None:
         cfg = default_config_template()
+        cfg["routing_policy"]["failover_mode"] = "api_fallback"
         res = sync_magpie_groups(cfg, cli_path="magpie", dry_run=True)
         self.assertEqual(len(res), 3)
         by_tier = {item["tier"]: item for item in res}
         self.assertEqual(by_tier["sonnet"]["group"], "group/gempt-harness-sonnet")
-        self.assertEqual(by_tier["sonnet"]["members"], ["codex/gpt-6.2-sol"])
+        self.assertIn("group/auto-deepseek-v4-1-flash", by_tier["sonnet"]["members"])
 
         opus_cmds = [" ".join(c) for c in by_tier["opus"]["commands"]]
         self.assertTrue(any("group add gempt-harness-opus" in c for c in opus_cmds))
         self.assertTrue(any("group rule add gempt-harness-opus use=codex/gpt-6.2-astra effort=xhigh" in c for c in opus_cmds))
+        self.assertTrue(any("group rule add gempt-harness-opus use=group/auto-deepseek-v4-1-flash compact" in c for c in opus_cmds))
 
     def test_codex_cmd_invocation_no_shell_interpolation(self) -> None:
         if sys.platform == "win32":

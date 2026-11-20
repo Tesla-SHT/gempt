@@ -21,6 +21,7 @@ import {
   setDefaultSandbox,
   setDefaultTier,
   setEffortSettings,
+  setFailoverMode,
 } from './backend.mjs';
 
 export const DEFAULT_PORT = 3498;
@@ -197,26 +198,28 @@ export async function startServer({
         }
         if (req.method === 'POST' && pathname === '/api/settings') {
           const body = await readJsonBody(req);
-          const has = (k) => Boolean(body && Object.prototype.hasOwnProperty.call(body, k));
-          if (has('failover_mode')) {
-            return send(req, res, 400, {
-              ok: false,
-              error: '当前纯订阅版本不支持切换 API 兜底模式。',
-            });
-          }
-          const wantsSandbox = has('default_sandbox');
-          const wantsEffort = has('auto_effort') || has('tier_effort');
-          if (!wantsSandbox && !wantsEffort) {
+          if (!body || typeof body !== 'object') {
             return send(req, res, 400, { ok: false, error: '未提供有效设置项。' });
           }
-
-          let combined = { ok: true, status: 200 };
-          if (wantsSandbox) {
+          const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
+          const hasSbx = has('default_sandbox');
+          const hasMode = has('failover_mode');
+          const hasEffort = has('auto_effort') || has('tier_effort');
+          if (!hasSbx && !hasMode && !hasEffort) {
+            return send(req, res, 400, { ok: false, error: '未提供有效设置项。' });
+          }
+          let out = { ok: true, status: 200 };
+          if (hasSbx) {
             const sbxRes = setDefaultSandbox(body.default_sandbox, { configPath });
             if (!sbxRes.ok) return send(req, res, sbxRes.status, sbxRes);
-            combined = { ...combined, ...sbxRes };
+            out = { ...out, ...sbxRes };
           }
-          if (wantsEffort) {
+          if (hasMode) {
+            const fmRes = await setFailoverMode(body.failover_mode, { configPath, probeTimeoutMs });
+            if (!fmRes.ok) return send(req, res, fmRes.status, fmRes);
+            out = { ...out, ...fmRes };
+          }
+          if (hasEffort) {
             const effRes = setEffortSettings(
               {
                 autoEffort: has('auto_effort') ? body.auto_effort : undefined,
@@ -226,9 +229,9 @@ export async function startServer({
               { configPath },
             );
             if (!effRes.ok) return send(req, res, effRes.status, effRes);
-            combined = { ...combined, ...effRes };
+            out = { ...out, ...effRes };
           }
-          return send(req, res, 200, combined);
+          return send(req, res, out.status || 200, out);
         }
         return send(req, res, 404, { error: 'not found' });
       }

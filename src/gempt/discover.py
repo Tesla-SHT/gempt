@@ -269,6 +269,10 @@ def probe_magpie_gateway(
                 utility_candidates.append(compact)
         elif mid.startswith("codex/"):
             codex_models.append(compact)
+        elif owned == "openai" or mid.startswith("openai/"):
+            openai_models.append(compact)
+        elif _is_gpt_or_codex_model(item):
+            other_gpt_models.append(compact)
         elif _is_utility_candidate(item, excluded):
             utility_candidates.append(compact)
 
@@ -326,28 +330,44 @@ def build_tier_recommendations(
     *,
     excluded_models: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    """Build portable sonnet/opus/fable + utility recommendations from Codex subscription models."""
+    """Build portable sonnet/opus/fable + utility recommendations with subscription_only & api_fallback presets."""
     excluded = _resolve_excluded_models(excluded_models)
     codex_ids = [m["id"] for m in catalog.get("codex_subscription_models") or [] if not _is_excluded_model(m["id"], excluded)]
+    openai_ids = [m["id"] for m in catalog.get("openai_api_models") or [] if not _is_excluded_model(m["id"], excluded)]
+    other_ids = [m["id"] for m in catalog.get("other_gpt_models") or [] if not _is_excluded_model(m["id"], excluded)]
     utility_ids = [m["id"] for m in catalog.get("utility_candidates") or [] if not _is_excluded_model(m["id"], excluded)]
-    utility_pick = utility_ids[0] if utility_ids else ""
 
-    if not codex_ids:
+    primary_pool = codex_ids or openai_ids or other_ids
+    utility_pick = utility_ids[0] if utility_ids else ""
+    if not primary_pool:
         return {
             "available": False,
             "utility_model": utility_pick,
-            "reason": "未检测到 Codex 订阅模型，请先在 Magpie 中登录 ChatGPT/Codex 订阅账号。",
+            "reason": "No GPT or Codex models currently exposed in Magpie /v1/models.",
             "presets": {
                 "subscription_only": {
-                    "description": "Codex 订阅直连：Sonnet=Sol, Opus=Sol+Astra(疑难升级), Fable=Astra",
+                    "description": "仅用订阅号（不自动切按量 API，防意外扣费）：Sonnet=Sol, Opus=Sol+Astra(疑难升级), Fable=Astra",
                     "available": False,
                     "tiers": {},
                 },
             },
         }
 
-    sonnet_pick = _pick_best(codex_ids, [("6.2-sol", 300), ("sol", 240), ("terra", 140), ("luna", 100)])
-    fable_pick = _pick_best(codex_ids, [("6.2-astra", 320), ("astra", 260), ("pro", 180), ("sol", 100)])
+    sonnet_pick = _pick_best(primary_pool, [("6.2-sol", 300), ("sol", 240), ("terra", 140), ("luna", 100)])
+    fable_pick = _pick_best(primary_pool, [("6.2-astra", 320), ("astra", 260), ("pro", 180), ("sol", 100)])
+
+    def _find_api_backup(sub_model: str) -> str:
+        if not openai_ids:
+            return ""
+        bare = sub_model.split("/", 1)[-1].lower()
+        for oid in openai_ids:
+            if oid.split("/", 1)[-1].lower() == bare:
+                return oid
+        if "astra" in bare:
+            return _pick_best(openai_ids, [("astra", 220), ("sol", 120)])
+        if "sol" in bare:
+            return _pick_best(openai_ids, [("sol", 220), ("terra", 120)])
+        return _pick_best(openai_ids, [("terra", 200), ("mini", 150), ("sol", 100)])
 
     sub_tiers = {
         "sonnet": {
@@ -375,14 +395,68 @@ def build_tier_recommendations(
         },
     }
 
+    api_fallback_tiers: dict[str, Any] = {}
+    for t_name, t_data in sub_tiers.items():
+        primary = t_data["consult_model"]
+        backup = _find_api_backup(primary)
+        escalate_m = str(t_data.get("escalate_model") or "")
+        escalate_backup = _find_api_backup(escalate_m) if escalate_m and escalate_m != primary else ""
+        fallbacks = _dedupe([b for b in (backup,) if b and b != primary])
+        members = _dedupe([primary, escalate_m, backup, escalate_backup])
+        entry = {
+            "consult_model": primary,
+            "exec_model": primary,
+            "reasoning_effort": t_data["reasoning_effort"],
+            "fallback_models": fallbacks,
+            "magpie_group_members": members,
+        }
+        if escalate_m:
+            entry["escalate_model"] = escalate_m
+            entry["escalate_effort_threshold"] = t_data["escalate_effort_threshold"]
+        api_fallback_tiers[t_name] = entry
+
+    effort_only_tiers = {
+        "sonnet": {
+            "consult_model": sonnet_pick,
+            "exec_model": sonnet_pick,
+            "reasoning_effort": "medium",
+            "fallback_models": [],
+            "magpie_group_members": [sonnet_pick],
+        },
+        "opus": {
+            "consult_model": sonnet_pick,
+            "exec_model": sonnet_pick,
+            "escalate_model": sonnet_pick,
+            "escalate_effort_threshold": "xhigh",
+            "reasoning_effort": "high",
+            "fallback_models": [],
+            "magpie_group_members": [sonnet_pick],
+        },
+        "fable": {
+            "consult_model": sonnet_pick,
+            "exec_model": sonnet_pick,
+            "reasoning_effort": "xhigh",
+            "fallback_models": [],
+            "magpie_group_members": [sonnet_pick],
+        },
+    }
+
     return {
         "available": True,
         "utility_model": utility_pick,
         "presets": {
             "subscription_only": {
-                "description": "Codex 订阅直连：Sonnet=Sol, Opus=Sol+Astra(疑难升级), Fable=Astra",
-                "available": True,
-                "tiers": sub_tiers,
+                "description": "仅用订阅号（不自动切按量 API，防意外扣费）：Sonnet=Sol@medium, Opus=Sol@high+Astra@xhigh, Fable=Astra@xhigh",
+                "available": bool(codex_ids),
+                "tiers": sub_tiers if codex_ids else {},
+            },
+            "api_fallback": {
+                "description": "订阅优先，失效/限流时按顺序切到按量 openai API 兜底",
+                "tiers": api_fallback_tiers,
+            },
+            "effort_only": {
+                "description": "单模型（Sol）仅靠 reasoning_effort 区分三档（medium / high / xhigh，避免 Astra@low）",
+                "tiers": effort_only_tiers,
             },
         },
     }

@@ -94,17 +94,33 @@ def _interactive_init(args: argparse.Namespace) -> int:
 
     recs = info.get("recommendations") or {}
     presets = recs.get("presets") or {}
-    chosen_preset = (presets.get("subscription_only") or {}).get("tiers") or {}
-    if not chosen_preset:
-        print("Error: 未检测到 Codex 订阅模型，请先在 Magpie 中登录 ChatGPT/Codex 订阅账号。", file=sys.stderr)
+    if not recs.get("available"):
+        print("Error: No GPT/Codex models found in Magpie /v1/models. Add/expose GPT models in Magpie first.", file=sys.stderr)
         return 1
 
-    print("\nDiscovered Codex subscription 3-tier routing (subscription_only):")
-    for t in TIER_ORDER:
-        rec = chosen_preset[t]
-        esc_note = f" -> escalate {rec['escalate_model']}" if rec.get("escalate_model") else ""
-        print(f"  - {t}: {rec['consult_model']} (effort={rec['reasoning_effort']}{esc_note})")
+    print("\nRouting presets:")
+    mode_list = list(VALID_FAILOVER_MODES)
+    sub_available = bool((presets.get("subscription_only") or {}).get("tiers"))
+    default_idx = "1" if sub_available else "2"
+    default_mode = mode_list[int(default_idx) - 1]
+    for idx, mode in enumerate(mode_list, start=1):
+        p = presets.get(mode) or {}
+        tiers = p.get("tiers") or {}
+        summary = ", ".join(
+            f"{t}={tiers[t]['consult_model']}:{tiers[t]['reasoning_effort']}"
+            for t in TIER_ORDER
+            if t in tiers
+        ) or "unavailable (no matching models)"
+        print(f"  [{idx}] {mode}: {p.get('description', '')}")
+        print(f"      {summary}")
 
+    choice = input(f"\nSelect preset [1-3, default {default_idx}]: ").strip() or default_idx
+    failover_mode = mode_list[int(choice) - 1] if choice in {"1", "2", "3"} else default_mode
+
+    chosen_preset = (presets.get(failover_mode) or {}).get("tiers") or {}
+    if not chosen_preset:
+        print(f"Error: Preset '{failover_mode}' has no available models in Magpie /v1/models.", file=sys.stderr)
+        return 1
     tiers_override: dict[str, dict[str, Any]] = {}
     for t in TIER_ORDER:
         rec = chosen_preset[t]
@@ -132,7 +148,7 @@ def _interactive_init(args: argparse.Namespace) -> int:
         config_path=args.config,
         magpie_url=args.magpie_url,
         default_sandbox=sbx,
-        failover_mode="subscription_only",
+        failover_mode=failover_mode,
         magpie_group_strategy=args.strategy,
         utility_model=util_val,
         tiers_override=tiers_override,

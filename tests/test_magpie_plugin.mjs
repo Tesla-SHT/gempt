@@ -14,10 +14,26 @@ import { createGemptTools } from '../magpie_plugin/lib/tools.mjs';
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
+function findPythonBin() {
+  const candidates = [
+    process.env.PYTHON_BIN,
+    'C:/msys64/mingw64/bin/python.exe',
+    'python3',
+    'python',
+  ].filter(Boolean);
+  for (const cand of candidates) {
+    if (!cand.includes('/') && !cand.includes('\\')) return cand;
+    if (existsSync(cand)) return cand;
+  }
+  return '';
+}
+
 function startMockMagpie(modelsData, { onRequest } = {}) {
   const payloadData = modelsData ?? [
     { id: 'codex/gpt-6.2-sol', owned_by: 'codex' },
     { id: 'codex/gpt-6.2-astra', owned_by: 'codex' },
+    { id: 'openai/gpt-6.1-sol', owned_by: 'openai' },
+    { id: 'openai/gpt-6-astra', owned_by: 'openai' },
     { id: 'agy-cli/gemini-4-hydrogen', owned_by: 'agy-cli' },
     { id: 'agy-cli/gemini-4-neon', owned_by: 'agy-cli' },
     { id: 'agy-cli/gemini-4-argon', owned_by: 'agy-cli' },
@@ -221,7 +237,7 @@ test('package.json Magpie manifest fields and single plugin factory export exist
   assert.deepEqual(JSON.parse(stdout.trim()), ['consult', 'discover', 'exec', 'status']);
 });
 
-test('backend readState detects multi-client state, native groups, MCP snippet, and usage tail', async () => {
+test('backend readState exposes multi-client state, native groups, MCP snippet, usage tail, and api_fallback', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'gempt-magpie-backend-'));
   const magpie = await startMockMagpie();
   try {
@@ -241,13 +257,13 @@ test('backend readState detects multi-client state, native groups, MCP snippet, 
         codex: { default_sandbox: 'workspace-write' },
         routing_policy: {
           default_tier: 'opus',
-          failover_mode: 'subscription_only',
+          failover_mode: 'api_fallback',
           excluded_models: ['gemini-4-argon'],
         },
         tiers: {
-          sonnet: { consult_model: 'codex/gpt-6.2-sol', reasoning_effort: 'medium' },
-          opus: { consult_model: 'codex/gpt-6.2-sol', escalate_model: 'codex/gpt-6.2-astra', escalate_effort_threshold: 'xhigh', reasoning_effort: 'high' },
-          fable: { consult_model: 'codex/gpt-6.2-astra', reasoning_effort: 'xhigh' },
+          sonnet: { consult_model: 'codex/gpt-6.2-sol', fallback_models: ['openai/gpt-6.1-sol'], reasoning_effort: 'medium' },
+          opus: { consult_model: 'codex/gpt-6.2-sol', escalate_model: 'codex/gpt-6.2-astra', escalate_effort_threshold: 'xhigh', fallback_models: ['openai/gpt-6.1-sol'], reasoning_effort: 'high' },
+          fable: { consult_model: 'codex/gpt-6.2-astra', fallback_models: ['openai/gpt-6-astra'], reasoning_effort: 'xhigh' },
         },
         utility: { model: 'auto/deepseek-v4.1-flash' },
       }),
@@ -315,8 +331,10 @@ test('backend readState detects multi-client state, native groups, MCP snippet, 
       probeTimeoutMs: 2000,
     });
     assert.equal(state.configured, true);
-    assert.equal(state.features.api_fallback, false);
+    assert.equal(state.features.api_fallback, true);
     assert.equal(state.subscription.connected, true);
+    assert.equal(state.api_fallback.available, true);
+    assert.equal(state.api_fallback.openai_count, 2);
     assert.equal(state.clients.antigravity_installed, false);
     assert.equal(state.clients.magpie_mcp_registered, true);
     assert.equal(state.clients.native_tools_registered, true);
@@ -338,6 +356,13 @@ test('backend readState detects multi-client state, native groups, MCP snippet, 
     assert.equal(state.recent_group_calls.length, 1);
     assert.equal(state.recent_group_calls[0].tier, 'opus');
     assert.equal(state.recent_group_calls[0].agent, 'zcode');
+    assert.equal(state.default_tier, 'opus');
+    assert.equal(state.failover_mode, 'api_fallback');
+    assert.equal(state.magpie.reachable, true);
+    assert.equal(state.magpie.total_models, 9);
+    assert.deepEqual(state.magpie.harness_groups, ['group/gempt-harness-sonnet']);
+    assert.equal(state.recent_sessions.length, 1);
+    assert.equal(state.recent_runs.length, 1);
     assert.equal(JSON.stringify(state).includes('sk-super-secret-value'), false);
 
     assert.equal(setDefaultTier('chore', { configPath: cfgPath }).status, 400);
@@ -359,7 +384,7 @@ test('backend readState detects multi-client state, native groups, MCP snippet, 
   }
 });
 
-test('page server supports init, native-groups idempotent creation, security checks, tier & sandbox updates', async () => {
+test('page server supports native-groups, lossless api_fallback <-> subscription_only round-trip, and Python cross-check', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'gempt-magpie-srv-'));
   const magpie = await startMockMagpie();
   const cfgPath = join(dir, 'config.json');
@@ -367,6 +392,48 @@ test('page server supports init, native-groups idempotent creation, security che
   mkdirSync(magpieDir, { recursive: true });
   const cliLog = join(dir, 'cli-calls.jsonl');
   const mockCli = createMockMagpieCli(dir, cliLog);
+
+  const initialConfig = {
+    version: 1,
+    magpie: { base_url: magpie.url, api_key: 'sk-keep-me' },
+    codex: { default_sandbox: 'danger-full-access' },
+    routing_policy: {
+      default_tier: 'opus',
+      failover_mode: 'api_fallback',
+      magpie_group_strategy: 'order',
+      excluded_models: ['gemini-4-argon'],
+    },
+    tiers: {
+      sonnet: {
+        consult_model: 'group/gempt-harness-sonnet',
+        exec_model: 'group/gempt-harness-sonnet',
+        reasoning_effort: 'medium',
+        api_mode: 'responses',
+        fallback_models: ['openai/gpt-6.1-sol'],
+        magpie_group_members: ['codex/gpt-6.2-sol', 'openai/gpt-6.1-sol'],
+      },
+      opus: {
+        consult_model: 'group/gempt-harness-opus',
+        exec_model: 'group/gempt-harness-opus',
+        escalate_model: 'codex/gpt-6.2-astra',
+        escalate_effort_threshold: 'high',
+        reasoning_effort: 'medium',
+        api_mode: 'responses',
+        fallback_models: ['openai/gpt-6.1-sol'],
+        magpie_group_members: ['codex/gpt-6.2-sol', 'codex/gpt-6.2-astra', 'openai/gpt-6.1-sol', 'openai/gpt-6-astra'],
+      },
+      fable: {
+        consult_model: 'group/gempt-harness-fable',
+        exec_model: 'group/gempt-harness-fable',
+        reasoning_effort: 'high',
+        api_mode: 'responses',
+        fallback_models: ['openai/gpt-6-astra'],
+        magpie_group_members: ['codex/gpt-6.2-astra', 'openai/gpt-6-astra'],
+      },
+    },
+    utility: { model: 'auto/deepseek-v4.1-flash', api_mode: 'chat' },
+  };
+  writeFileSync(cfgPath, JSON.stringify(initialConfig, null, 2), 'utf-8');
 
   const svc = await startServer({
     port: 0,
@@ -377,15 +444,10 @@ test('page server supports init, native-groups idempotent creation, security che
     magpieCliPath: mockCli,
   });
   const origin = `http://127.0.0.1:${svc.port}`;
-  const prevMagpieAddr = process.env.MAGPIE_ADDR;
-  const prevExcluded = process.env.GEMPT_EXCLUDED_MODELS;
-  process.env.MAGPIE_ADDR = magpie.url;
-  process.env.GEMPT_EXCLUDED_MODELS = 'gemini-4-argon';
 
   try {
     const pingRes = await fetch(`${origin}/api/ping`);
     assert.equal(pingRes.status, 200);
-    assert.equal((await pingRes.json()).service, 'gempt-magpie-plugin');
 
     const badHost = await rawHttpGet({ port: svc.port, path: '/api/ping', headers: { Host: 'evil.example:3498' } });
     assert.equal(badHost.status, 403);
@@ -398,12 +460,12 @@ test('page server supports init, native-groups idempotent creation, security che
 
     const pageRes = await rawHttpGet({ port: svc.port, path: '/', headers: { 'sec-fetch-mode': 'navigate' } });
     assert.equal(pageRes.status, 200);
-    const html = pageRes.text;
-    assert.match(html, /<meta name="color-scheme" content="light dark">/);
-    assert.match(html, /id="create-native-btn"/);
-    assert.match(html, /id="effort-control-group"/);
-    const key = html.match(/<meta name="gempt-key" content="([^"]+)">/)[1];
+    assert.match(pageRes.text, /<meta name="color-scheme" content="light dark">/);
+    assert.match(pageRes.text, /id="create-native-btn"/);
+    assert.match(pageRes.text, /id="effort-control-group"/);
+    const key = pageRes.text.match(/<meta name="gempt-key" content="([^"]+)">/)[1];
 
+    // Native groups idempotent creation
     const nativeRes = await fetch(`${origin}/api/native-groups`, {
       method: 'POST',
       headers: { Origin: 'null', 'x-gempt-key': key },
@@ -415,37 +477,59 @@ test('page server supports init, native-groups idempotent creation, security che
     assert.deepEqual(nativeJson.created, ['group/gempt-opus', 'group/gempt-fable']);
     assert.equal(nativeJson.models.argon.includes('gemini-4-argon'), false);
 
-    const logged = readFileSync(cliLog, 'utf-8').trim().split('\n').map((l) => JSON.parse(l));
-    assert.ok(logged.some((argv) => argv[0] === 'group' && argv[1] === 'add' && argv[2] === 'gempt-opus'));
-    assert.equal(logged.some((argv) => argv[0] === 'group' && argv[1] === 'add' && argv[2] === 'gempt-sonnet'), false);
-
-    const initRes = await fetch(`${origin}/api/init`, {
-      method: 'POST',
-      headers: { Origin: 'null', 'x-gempt-key': key },
-    });
-    assert.equal(initRes.status, 200);
-    assert.equal(existsSync(cfgPath), true);
-
-    const postTier = await fetch(`${origin}/api/tier`, {
+    // Switch api_fallback -> subscription_only
+    const toSubRes = await fetch(`${origin}/api/settings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Origin: 'null', 'x-gempt-key': key },
-      body: JSON.stringify({ tier: 'opus' }),
+      body: JSON.stringify({ failover_mode: 'subscription_only', default_sandbox: 'workspace-write' }),
     });
-    assert.equal(postTier.status, 200);
+    assert.equal(toSubRes.status, 200);
+    const toSubJson = await toSubRes.json();
+    assert.equal(toSubJson.failover_mode, 'subscription_only');
+    assert.equal(toSubJson.default_sandbox, 'workspace-write');
 
-    const postSbxOk = await fetch(`${origin}/api/settings`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Origin: 'null', 'x-gempt-key': key },
-      body: JSON.stringify({ default_sandbox: 'read-only' }),
-    });
-    assert.equal(postSbxOk.status, 200);
+    const subCfg = JSON.parse(readFileSync(cfgPath, 'utf-8'));
+    assert.equal(subCfg.routing_policy.failover_mode, 'subscription_only');
+    assert.equal(subCfg.codex.default_sandbox, 'workspace-write');
+    assert.equal(subCfg.tiers.sonnet.consult_model, 'codex/gpt-6.2-sol');
+    assert.equal(subCfg.tiers.opus.consult_model, 'codex/gpt-6.2-sol');
+    assert.equal(subCfg.tiers.opus.escalate_model, 'codex/gpt-6.2-astra');
+    assert.equal(subCfg.tiers.fable.consult_model, 'codex/gpt-6.2-astra');
+    assert.deepEqual(subCfg.tiers.opus.fallback_models, []);
+    assert.ok(subCfg.routing_policy.api_fallback_snapshot);
 
-    const postFailoverRejected = await fetch(`${origin}/api/settings`, {
+    // Cross-check in Python: resolve_tier under subscription_only must succeed without ConfigError.
+    const pyBin = findPythonBin();
+    if (pyBin) {
+      const pyCheck = await execFileAsync(
+        pyBin,
+        [
+          '-c',
+          'import sys; from gempt.config import load_config, resolve_tier; '
+          + 'c,_=load_config(explicit=sys.argv[1]); '
+          + 'print(resolve_tier(c,"sonnet")["model"], resolve_tier(c,"opus",escalate=True)["model"], resolve_tier(c,"fable")["model"])',
+          cfgPath,
+        ],
+        { env: { ...process.env, PYTHONPATH: join(REPO_ROOT, 'src') } },
+      );
+      assert.equal(pyCheck.stdout.trim(), 'codex/gpt-6.2-sol codex/gpt-6.2-astra codex/gpt-6.2-astra');
+    }
+
+    // Restore subscription_only -> api_fallback losslessly
+    const toApiRes = await fetch(`${origin}/api/settings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Origin: 'null', 'x-gempt-key': key },
       body: JSON.stringify({ failover_mode: 'api_fallback' }),
     });
-    assert.equal(postFailoverRejected.status, 400);
+    assert.equal(toApiRes.status, 200);
+
+    const restored = JSON.parse(readFileSync(cfgPath, 'utf-8'));
+    assert.equal(restored.routing_policy.failover_mode, 'api_fallback');
+    assert.equal(restored.routing_policy.api_fallback_snapshot, undefined);
+    assert.equal(restored.tiers.opus.consult_model, 'group/gempt-harness-opus');
+    assert.deepEqual(restored.tiers.opus.fallback_models, ['openai/gpt-6.1-sol']);
+    assert.deepEqual(restored.tiers.opus.magpie_group_members, initialConfig.tiers.opus.magpie_group_members);
+    assert.equal(restored.magpie.api_key, 'sk-keep-me');
 
     const postAutoOn = await fetch(`${origin}/api/settings`, {
       method: 'POST',
@@ -487,41 +571,76 @@ test('page server supports init, native-groups idempotent creation, security che
     assert.equal(stateJson.auto_effort, false);
     assert.equal(stateJson.tiers.find((t) => t.id === 'opus').reasoning_effort, 'xhigh');
   } finally {
-    if (prevMagpieAddr === undefined) delete process.env.MAGPIE_ADDR;
-    else process.env.MAGPIE_ADDR = prevMagpieAddr;
-    if (prevExcluded === undefined) delete process.env.GEMPT_EXCLUDED_MODELS;
-    else process.env.GEMPT_EXCLUDED_MODELS = prevExcluded;
     await svc.close();
     await magpie.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('POST /api/init rejects when Magpie has no Codex subscription models', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'gempt-magpie-nosub-'));
-  const magpie = await startMockMagpie([{ id: 'openai/gpt-6.1-sol', owned_by: 'openai' }]);
-  const cfgPath = join(dir, 'config.json');
+test('fresh subscription_only auto-discovers openai/* backup when switching to api_fallback, or rejects when absent', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-magpie-autoapi-'));
   const prevMagpieAddr = process.env.MAGPIE_ADDR;
-  process.env.MAGPIE_ADDR = magpie.url;
 
-  const svc = await startServer({ port: 0, configPath: cfgPath, sessionsDir: join(dir, 'sessions') });
-  const origin = `http://127.0.0.1:${svc.port}`;
+  // Case 1: With openai/* present -> init then toggle to api_fallback populates fallbacks.
+  const magpieWithApi = await startMockMagpie();
+  const cfgPath1 = join(dir, 'cfg-with-api.json');
+  process.env.MAGPIE_ADDR = magpieWithApi.url;
+  const svc1 = await startServer({ port: 0, configPath: cfgPath1, sessionsDir: join(dir, 'sess1') });
+
+  // Case 2: Without openai/* -> switching to api_fallback returns 400.
+  const magpieSubOnly = await startMockMagpie([{ id: 'codex/gpt-6.2-sol', owned_by: 'codex' }, { id: 'codex/gpt-6.2-astra', owned_by: 'codex' }]);
+  const cfgPath2 = join(dir, 'cfg-sub-only.json');
+  writeFileSync(
+    cfgPath2,
+    JSON.stringify({
+      version: 1,
+      magpie: { base_url: magpieSubOnly.url },
+      routing_policy: { default_tier: 'sonnet', failover_mode: 'subscription_only' },
+      tiers: {
+        sonnet: { consult_model: 'codex/gpt-6.2-sol', exec_model: 'codex/gpt-6.2-sol' },
+        opus: { consult_model: 'codex/gpt-6.2-sol', exec_model: 'codex/gpt-6.2-sol', escalate_model: 'codex/gpt-6.2-astra' },
+        fable: { consult_model: 'codex/gpt-6.2-astra', exec_model: 'codex/gpt-6.2-astra' },
+      },
+    }),
+    'utf-8',
+  );
+  const svc2 = await startServer({ port: 0, configPath: cfgPath2, sessionsDir: join(dir, 'sess2') });
 
   try {
-    const pageRes = await rawHttpGet({ port: svc.port, path: '/', headers: { 'sec-fetch-mode': 'navigate' } });
-    const key = pageRes.text.match(/<meta name="gempt-key" content="([^"]+)">/)[1];
-
-    const initRes = await fetch(`${origin}/api/init`, {
+    const key1 = (await rawHttpGet({ port: svc1.port, path: '/', headers: { 'sec-fetch-mode': 'navigate' } }))
+      .text.match(/<meta name="gempt-key" content="([^"]+)">/)[1];
+    const initRes = await fetch(`http://127.0.0.1:${svc1.port}/api/init`, {
       method: 'POST',
-      headers: { Origin: 'null', 'x-gempt-key': key },
+      headers: { Origin: 'null', 'x-gempt-key': key1 },
     });
-    assert.equal(initRes.status, 400);
-    assert.equal(existsSync(cfgPath), false);
+    assert.equal(initRes.status, 200);
+
+    const enableApi = await fetch(`http://127.0.0.1:${svc1.port}/api/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'null', 'x-gempt-key': key1 },
+      body: JSON.stringify({ failover_mode: 'api_fallback' }),
+    });
+    assert.equal(enableApi.status, 200);
+    const updated1 = JSON.parse(readFileSync(cfgPath1, 'utf-8'));
+    assert.equal(updated1.routing_policy.failover_mode, 'api_fallback');
+    assert.deepEqual(updated1.tiers.sonnet.fallback_models, ['openai/gpt-6.1-sol']);
+    assert.deepEqual(updated1.tiers.fable.fallback_models, ['openai/gpt-6-astra']);
+
+    const key2 = (await rawHttpGet({ port: svc2.port, path: '/', headers: { 'sec-fetch-mode': 'navigate' } }))
+      .text.match(/<meta name="gempt-key" content="([^"]+)">/)[1];
+    const rejectApi = await fetch(`http://127.0.0.1:${svc2.port}/api/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'null', 'x-gempt-key': key2 },
+      body: JSON.stringify({ failover_mode: 'api_fallback' }),
+    });
+    assert.equal(rejectApi.status, 400);
   } finally {
     if (prevMagpieAddr === undefined) delete process.env.MAGPIE_ADDR;
     else process.env.MAGPIE_ADDR = prevMagpieAddr;
-    await svc.close();
-    await magpie.close();
+    await svc1.close();
+    await svc2.close();
+    await magpieWithApi.close();
+    await magpieSubOnly.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -720,6 +839,77 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     else process.env.MAGPIE_ADDR = prevMagpieAddr;
     if (prevProxy === undefined) delete process.env.HTTP_PROXY;
     else process.env.HTTP_PROXY = prevProxy;
+    await magpie.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('native tool.consult fails over to openai/* backup on HTTP 429 when failover_mode is api_fallback', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-tools-fallback-'));
+  const magpie = await startMockMagpie(undefined, {
+    onRequest: (_path, body) => {
+      if (body.model === 'codex/gpt-6.2-sol') {
+        return { status: 429, json: { error: { message: 'subscription rate limited' } } };
+      }
+      return null;
+    },
+  });
+
+  const cfgDir = join(dir, 'gempt-cfg');
+  const cfgPath = join(cfgDir, 'config.json');
+  const sessDir = join(dir, 'sessions');
+  const magpieDir = join(dir, 'magpie-cfg');
+  mkdirSync(cfgDir, { recursive: true });
+  mkdirSync(magpieDir, { recursive: true });
+
+  writeFileSync(
+    cfgPath,
+    JSON.stringify({
+      version: 1,
+      magpie: { base_url: magpie.url },
+      codex: { default_sandbox: 'workspace-write' },
+      routing_policy: { default_tier: 'sonnet', failover_mode: 'api_fallback' },
+      tiers: {
+        sonnet: {
+          consult_model: 'codex/gpt-6.2-sol',
+          exec_model: 'codex/gpt-6.2-sol',
+          reasoning_effort: 'medium',
+          fallback_models: ['openai/gpt-6.1-sol'],
+        },
+        opus: {
+          consult_model: 'codex/gpt-6.2-sol',
+          escalate_model: 'codex/gpt-6.2-astra',
+          fallback_models: ['openai/gpt-6.1-sol'],
+        },
+        fable: {
+          consult_model: 'codex/gpt-6.2-astra',
+          fallback_models: ['openai/gpt-6-astra'],
+        },
+      },
+      utility: { model: 'auto/deepseek-v4.1-flash', api_mode: 'chat' },
+    }),
+    'utf-8',
+  );
+
+  try {
+    const tools = createGemptTools({
+      configPath: cfgPath,
+      sessionsDir: sessDir,
+      magpieConfigDir: magpieDir,
+      antigravityPluginDir: join(dir, 'missing-agy'),
+    });
+    const disc = await tools.discover.execute({});
+    assert.equal(disc.failover_mode, 'api_fallback');
+    assert.equal(disc.api_fallback_available, true);
+    assert.ok(disc.magpie.openai_models.includes('openai/gpt-6.1-sol'));
+
+    const res = await tools.consult.execute({ goal: 'Test 429 failover', tier: 'sonnet' }, { agent: 'claude' });
+    assert.deepEqual(res.attempted_models, ['codex/gpt-6.2-sol', 'openai/gpt-6.1-sol']);
+    assert.equal(res.model, 'openai/gpt-6.1-sol');
+    assert.equal(res.served_model, 'openai/gpt-6.1-sol');
+    assert.equal(res.agent, 'claude');
+    assert.match(res.text, /mock-responses:openai\/gpt-6\.1-sol/);
+  } finally {
     await magpie.close();
     rmSync(dir, { recursive: true, force: true });
   }

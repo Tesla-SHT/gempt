@@ -797,8 +797,22 @@ async function resolveRuntimeConfig({ configPath, tierForProbe, allowUtilityOnly
   };
 }
 
+function isAllowedFallbackTarget(modelId) {
+  const m = String(modelId || '').trim();
+  return isCodexModelId(m) || m.startsWith('openai/') || m.startsWith('group/gempt-harness-');
+}
+
+function shouldRetryFallback(err) {
+  const code = err?.statusCode;
+  if (code === 429) return true;
+  if (Number.isFinite(code) && code >= 500) return true;
+  if (code !== undefined) return false;
+  return !/redirect rejected/i.test(String(err?.message || ''));
+}
+
 function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = false, effortOverride = '' } = {}) {
   const policy = cfg?.routing_policy || {};
+  const failoverMode = String(policy.failover_mode || 'subscription_only').trim() || 'subscription_only';
   const raw = String(requestedTier || '').trim().toLowerCase();
   const effectiveTier = raw ? (raw === 'chore' ? 'chore' : normalizeDefaultTier(raw)) : (normalizeDefaultTier(policy.default_tier) || 'sonnet');
 
@@ -811,6 +825,7 @@ function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = 
     const util = cfg?.utility || DEFAULT_UTILITY;
     return {
       tier: 'chore',
+      failoverMode,
       model: String(util.model || DEFAULT_UTILITY.model),
       effort: effortOverride || String(util.reasoning_effort || 'low'),
       apiMode: String(util.api_mode || 'chat'),
@@ -840,18 +855,34 @@ function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = 
     }
   }
 
-  if (!isCodexModelId(model)) {
-    throw new Error(`Subscription-only mode requires a codex/* model for tier '${effectiveTier}', got '${model}'.`);
+  if (failoverMode === 'subscription_only') {
+    if (!isCodexModelId(model)) {
+      throw new Error(`Subscription-only mode requires a codex/* model for tier '${effectiveTier}', got '${model}'.`);
+    }
+  } else if (!isAllowedFallbackTarget(model)) {
+    throw new Error(`Unsupported target model '${model}' for tier '${effectiveTier}'.`);
+  }
+
+  const seenFallbacks = new Set([model]);
+  const fallbackModels = [];
+  if (failoverMode !== 'subscription_only' && Array.isArray(tierCfg.fallback_models)) {
+    for (const item of tierCfg.fallback_models) {
+      const fb = String(item || '').trim();
+      if (!fb || seenFallbacks.has(fb)) continue;
+      seenFallbacks.add(fb);
+      fallbackModels.push(fb);
+    }
   }
 
   return {
     tier: effectiveTier,
+    failoverMode,
     model,
     execModel: escalated ? model : (String(tierCfg.exec_model || '').trim() || model),
     effort,
     apiMode: String(tierCfg.api_mode || 'responses'),
     maxOutputTokens: Number(tierCfg.max_output_tokens || 16384),
-    fallbackModels: [],
+    fallbackModels,
     escalated,
   };
 }
@@ -891,13 +922,15 @@ export function createGemptTools({
         return {
           configured: Boolean(rawCfg),
           config_path: resolveConfigPath(configPath),
-          failover_mode: 'subscription_only',
+          failover_mode: String(rawCfg?.routing_policy?.failover_mode || 'subscription_only'),
+          api_fallback_available: (probe.openai_models || []).length > 0,
           exec_enabled: isExecEnabled(options, env),
           magpie: {
             reachable: probe.reachable,
             url: probe.url,
             total_models: probe.total_models,
             codex_models: probe.codex_models,
+            openai_models: probe.openai_models || [],
             gemini_models: probe.gemini_models,
             utility_candidates: probe.utility_candidates,
             native_groups: probe.native_groups,
@@ -1052,28 +1085,42 @@ export function createGemptTools({
           effortTimeoutFloor(effort, { mode: 'consult' }),
         ) * 1000;
         const caller = apiMode === 'chat' ? callChat : callResponses;
+        const candidates = [resolved.model, ...(resolved.fallbackModels || [])];
+        const attemptedModels = [];
         const t0 = Date.now();
-        let reply;
-        try {
-          reply = await caller({
-            baseUrl: runtime.baseUrl,
-            apiKey: runtime.apiKey,
-            model: resolved.model,
-            messages,
-            reasoningEffort: resolved.tier === 'chore' && !args?.reasoning_effort ? '' : effort,
-            instructions: resolved.tier === 'chore' ? 'Be concise, faithful to exact facts, and omit conversational filler.' : CONSULT_SYSTEM_PROMPT,
-            maxOutputTokens: maxTokens,
-            timeoutMs,
-          });
-        } catch (err) {
-          const hint = buildEscalationSuggestion({
-            mode: 'consult',
-            tier: resolved.tier,
-            effort,
-            errorMessage: String(err?.message || err),
-          });
-          throw new Error(hint ? `${err.message} | ${hint}` : err.message);
+        let reply = null;
+        let usedModel = resolved.model;
+        let lastErr = null;
+        for (let idx = 0; idx < candidates.length; idx += 1) {
+          const cand = candidates[idx];
+          attemptedModels.push(cand);
+          try {
+            reply = await caller({
+              baseUrl: runtime.baseUrl,
+              apiKey: runtime.apiKey,
+              model: cand,
+              messages,
+              reasoningEffort: resolved.tier === 'chore' && !args?.reasoning_effort ? '' : effort,
+              instructions: resolved.tier === 'chore' ? 'Be concise, faithful to exact facts, and omit conversational filler.' : CONSULT_SYSTEM_PROMPT,
+              maxOutputTokens: maxTokens,
+              timeoutMs,
+            });
+            usedModel = cand;
+            break;
+          } catch (err) {
+            lastErr = err;
+            if (idx + 1 >= candidates.length || !shouldRetryFallback(err)) {
+              const hint = buildEscalationSuggestion({
+                mode: 'consult',
+                tier: resolved.tier,
+                effort,
+                errorMessage: String(err?.message || err),
+              });
+              throw new Error(hint ? `${err.message} | ${hint}` : err.message);
+            }
+          }
         }
+        if (!reply) throw lastErr || new Error('All consult candidates failed.');
         const elapsedSec = (Date.now() - t0) / 1000;
 
         const sessionId = priorSession?.session_id || generateSessionId('consult');
@@ -1083,7 +1130,7 @@ export function createGemptTools({
           session_id: sessionId,
           mode: 'consult',
           tier: resolved.tier,
-          model: reply.servedModel || resolved.model,
+          model: reply.servedModel || usedModel,
           reasoning_effort: effort,
           cwd: validatedCwd || priorSession?.cwd || '',
           agent,
@@ -1093,7 +1140,7 @@ export function createGemptTools({
         const summary = formatSummaryHeader({
           mode: 'consult',
           tier: resolved.tier,
-          model: reply.servedModel || resolved.model,
+          model: reply.servedModel || usedModel,
           effort,
           sessionId,
           elapsedSec,
@@ -1108,7 +1155,8 @@ export function createGemptTools({
           text: `${summary}\n\n${reply.text}`,
           session_id: sessionId,
           tier: resolved.tier,
-          model: resolved.model,
+          model: usedModel,
+          attempted_models: attemptedModels,
           served_model: reply.servedModel,
           reasoning_effort: effort,
           escalated: resolved.escalated,
@@ -1241,8 +1289,12 @@ export function createGemptTools({
         }
 
         const targetModel = resolved.execModel || resolved.model;
-        if (!isCodexModelId(targetModel)) {
-          throw new Error(`Subscription-only exec requires a codex/* model, got '${targetModel}'.`);
+        if (resolved.failoverMode === 'subscription_only') {
+          if (!isCodexModelId(targetModel)) {
+            throw new Error(`Subscription-only exec requires a codex/* model, got '${targetModel}'.`);
+          }
+        } else if (!isAllowedFallbackTarget(targetModel)) {
+          throw new Error(`Unsupported exec model '${targetModel}' for tier '${resolved.tier}'.`);
         }
 
         const effort = resolved.effort;

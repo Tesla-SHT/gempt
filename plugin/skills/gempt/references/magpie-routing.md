@@ -11,11 +11,11 @@
 
 ## 1. 三组与打杂组定位
 
-| 路由组 ID | 对标档位（推荐占比） | 主力执行模型 × 甜点强度 | 疑难升级 | 免费压缩 (`compact`) |
+| 路由组 ID | 对标档位（推荐占比） | 主力执行模型 × 甜点强度 | 疑难升级 / 兜底 | 免费压缩 (`compact`) |
 | :--- | :--- | :--- | :--- | :--- |
-| `group/gempt-harness-sonnet` | Sonnet（日常高频 ~75%） | `codex/gpt-6.2-sol` (`medium`) | — | `DeepSeek-V4.1-Flash` |
-| `group/gempt-harness-opus` | Opus（复杂工程 ~20%） | `codex/gpt-6.2-sol` (`high`) | `effort=xhigh` 时自动转 `codex/gpt-6.2-astra` | `DeepSeek-V4.1-Flash` |
-| `group/gempt-harness-fable` | Fable（顶配攻坚 ~5%） | `codex/gpt-6.2-astra` (`xhigh`) | — | `DeepSeek-V4.1-Flash` |
+| `group/gempt-harness-sonnet` | Sonnet（日常高频 ~75%） | `codex/gpt-6.2-sol` (`medium`) | 可选 `openai/gpt-6.1-sol` | `DeepSeek-V4.1-Flash` |
+| `group/gempt-harness-opus` | Opus（复杂工程 ~20%） | `codex/gpt-6.2-sol` (`high`) | `effort=xhigh` 转 `codex/gpt-6.2-astra` | `DeepSeek-V4.1-Flash` |
+| `group/gempt-harness-fable` | Fable（顶配攻坚 ~5%） | `codex/gpt-6.2-astra` (`xhigh`) | 可选 `openai/gpt-6-astra` | `DeepSeek-V4.1-Flash` |
 
 ---
 
@@ -46,6 +46,7 @@ magpie group rule add gempt-harness-fable use=group/auto-deepseek-v4-1-flash com
 如果在 Magpie 中挂了多个 ChatGPT/Codex 账号：
 - 可以按账号钉选并按顺序切换：`models=codex/gpt-6.2-astra#primary,codex/gpt-6.2-astra#backup`
 - 或把对应 provider / 路由组的策略改成 `routing=drain`（把一个号额度吃完再切下一个）或 `routing=smart`（剩余时间窗最合适优先）。
+- 如果使用 `api_fallback` 模式，可在 `models=` 后追加按量 API 模型（如 `openai/gpt-6.1-sol`、`openai/gpt-6-astra`），这样订阅挂掉才会跌落到按量 API。
 
 ---
 
