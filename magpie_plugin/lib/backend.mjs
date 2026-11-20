@@ -97,10 +97,14 @@ export const DEFAULT_UTILITY = {
   use_as_classifier: false,
 };
 
-function expandUser(p) {
+export function expandUser(p) {
   if (p === '~') return homedir();
   if (p.startsWith('~/') || p.startsWith('~\\')) return join(homedir(), p.slice(2));
   return p;
+}
+
+export function isCodexModelId(modelId) {
+  return String(modelId || '').trim().toLowerCase().startsWith('codex/');
 }
 
 export function resolveConfigPath(explicit) {
@@ -133,7 +137,7 @@ export function normalizeDefaultTier(value) {
   return TIER_ORDER.includes(mapped) ? mapped : '';
 }
 
-function defaultGatewayFromEnv() {
+export function defaultGatewayFromEnv() {
   let raw = String(process.env.MAGPIE_ADDR || process.env.MAGPIE_GATEWAY || '').trim();
   if (!raw) return DEFAULT_MAGPIE_URL;
   if (!/^https?:\/\//i.test(raw)) raw = `http://${raw}`;
@@ -144,7 +148,7 @@ function defaultGatewayFromEnv() {
   }
 }
 
-function readJsonSafe(filePath) {
+export function readJsonSafe(filePath) {
   try {
     const parsed = JSON.parse(readFileSync(filePath, 'utf-8'));
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
@@ -166,9 +170,13 @@ function discoverLocalMagpieClientKey() {
   return '';
 }
 
-function resolveMagpieApiKey(cfg) {
+export function resolveMagpieApiKey(cfg, targetUrl = '') {
   const magpieCfg = cfg?.magpie || {};
   const endpoint = String(magpieCfg.base_url || DEFAULT_MAGPIE_URL).replace(/\/+$/, '');
+  const cleanTarget = String(targetUrl || '').replace(/\/+$/, '');
+  if (cleanTarget && cleanTarget !== endpoint) {
+    return '';
+  }
   const trusted = String(process.env.GEMPT_TRUSTED_GATEWAY || DEFAULT_MAGPIE_URL).replace(/\/+$/, '');
   if (endpoint !== trusted) {
     return String(magpieCfg.api_key || '').trim();
@@ -184,7 +192,7 @@ function resolveMagpieApiKey(cfg) {
   return discoverLocalMagpieClientKey() || 'magpie';
 }
 
-function resolveExcludedTokens(cfg) {
+export function resolveExcludedTokens(cfg) {
   const tokens = new Set();
   for (const part of String(process.env.GEMPT_EXCLUDED_MODELS || '').split(',')) {
     const t = part.trim().toLowerCase();
@@ -544,6 +552,7 @@ export function readRecentActivity(sessionsDir, limit = 6) {
       mode: String(rec.mode || 'consult'),
       tier: String(rec.tier || ''),
       model: String(rec.model || ''),
+      agent: String(rec.agent || ''),
       turns: Array.isArray(rec.turns) ? rec.turns.length : 0,
       cwd_name: rec.cwd ? basename(String(rec.cwd)) : '',
       updated_at: String(rec.updated_at || ''),
@@ -657,18 +666,66 @@ export function detectClients({ magpieConfigDir, antigravityPluginDir } = {}) {
 
   const library = readJsonSafe(join(magpieConfigDir, 'library.json'));
   const mcpList = Array.isArray(library?.mcp) ? library.mcp : [];
-  const magpie_mcp_registered = mcpList.some((entry) => {
-    if (!entry || typeof entry !== 'object') return false;
-    const text = `${entry.name || ''} ${entry.id || ''} ${entry.command || ''} ${JSON.stringify(entry.args || [])}`.toLowerCase();
-    return text.includes('gempt');
-  });
+  let magpie_mcp_registered = false;
+  let nativeToolsLibEntry = null;
+  for (const entry of mcpList) {
+    if (!entry || typeof entry !== 'object') continue;
+    const text = `${entry.name || ''} ${entry.id || ''} ${entry.plugin || ''} ${entry.url || ''} ${entry.command || ''} ${JSON.stringify(entry.args || [])}`.toLowerCase();
+    if (text.includes('gempt')) {
+      magpie_mcp_registered = true;
+    }
+    const url = String(entry.url || '').toLowerCase();
+    const pluginRef = String(entry.plugin || '').toLowerCase();
+    if (url.includes('/mcp/magpie/tools/gempt') || pluginRef.includes('gempt')) {
+      nativeToolsLibEntry = entry;
+    }
+  }
+
+  const pluginTools = readJsonSafe(join(magpieConfigDir, 'plugin-tools.json'));
+  const nativeToolsSet = new Set();
+  let pluginToolsRegistered = false;
+  if (pluginTools) {
+    for (const [specKey, list] of Object.entries(pluginTools)) {
+      if (!String(specKey || '').toLowerCase().includes('gempt')) continue;
+      pluginToolsRegistered = true;
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          const name = String(item || '').trim();
+          if (name) nativeToolsSet.add(name.startsWith('gempt_') ? name : `gempt_${name}`);
+        }
+      }
+    }
+  }
+
+  const native_tools_registered = Boolean(nativeToolsLibEntry || pluginToolsRegistered);
+  const native_tools_agents = Array.isArray(nativeToolsLibEntry?.agents)
+    ? [...new Set(nativeToolsLibEntry.agents.map((k) => CLIENT_LABELS[k] || String(k)).filter(Boolean))]
+    : [];
 
   return {
     antigravity_installed,
     magpie_clients: [...magpieSet],
     external_clients: [...externalSet],
     magpie_mcp_registered,
+    native_tools_registered,
+    native_tools_agents,
+    native_tools_list: [...nativeToolsSet],
   };
+}
+
+export function buildRulesSnippet() {
+  return [
+    '# GemPT Collaboration Rules (Human <-> Gemini, Gemini leads GPT)',
+    '',
+    '- Role split: Gemini talks with the human, clarifies goals, breaks work into structured packets, and reviews results. Delegate hard math/algorithms, architecture second opinions, deep bug diagnosis, and log summarization/classification to GPT/Codex/DeepSeek via GemPT MCP tools.',
+    '- When to call `gempt_consult`:',
+    '  - Complex reasoning, second opinions, or root-cause analysis (avoiding Codex CLI ~18K-50K token overhead).',
+    '  - Free fast summarization / log cleanup: pass `tier="chore"`.',
+    '- When to call `gempt_exec`:',
+    '  - Autonomous code edits and test verification inside a workspace (`cwd` required, opt-in via Magpie plugin option `exec: true`).',
+    '- Tiers: `sonnet` (80% daily work), `opus` (cross-file engineering; `escalate=true` for hard turns), `fable` (extreme bugs / core algorithms). Omit `tier` to follow the user\'s active GemPT panel setting (`subscription_only`).',
+    '- Task packet standard: pass explicit Goal, Verified Context (`file_paths` / `context`), Hard Constraints, and Verification Commands; translate Codex/GPT output into clear conclusions, modified files, and test evidence.',
+  ].join('\n');
 }
 
 function resolvePythonBin() {
@@ -781,7 +838,15 @@ export function readExternalGroupUsage(magpieConfigDir, limit = 6) {
   return out;
 }
 
-export async function readState({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, probeTimeoutMs = 2000 } = {}) {
+function readPluginExecOption(magpieConfigDir) {
+  if (String(process.env.GEMPT_MAGPIE_TOOLS_EXEC || '') === '1') return true;
+  const plugins = readJsonSafe(join(magpieConfigDir, 'plugins.json'));
+  const list = Array.isArray(plugins?.plugins) ? plugins.plugins : [];
+  const entry = list.find((item) => String(item?.spec || '').toLowerCase().includes('gempt'));
+  return entry?.options?.exec === true;
+}
+
+export async function readState({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, execEnabled, probeTimeoutMs = 2000 } = {}) {
   const resolvedConfigPath = resolveConfigPath(configPath);
   const resolvedSessionsDir = resolveSessionsDir(sessionsDir);
   const resolvedMagpieDir = resolveMagpieConfigDir(magpieConfigDir);
@@ -877,6 +942,12 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
       tiers: nativeTiers,
     },
     mcp_snippet: mcpSnippet,
+    rules_snippet: buildRulesSnippet(),
+    tools: {
+      enabled: true,
+      exec_enabled: typeof execEnabled === 'boolean' ? execEnabled : readPluginExecOption(resolvedMagpieDir),
+      endpoint: `${baseUrl}/mcp/magpie/tools/gempt`,
+    },
     recent_group_calls: recentGroupCalls,
     magpie,
     tiers,
@@ -916,7 +987,7 @@ function readExistingConfigObject(configPath) {
   return { ok: true, status: 200, path: resolvedConfigPath, data: current };
 }
 
-function writeConfigAtomic(resolvedConfigPath, nextObj) {
+export function writeConfigAtomic(resolvedConfigPath, nextObj) {
   const parentDir = dirname(resolvedConfigPath);
   mkdirSync(parentDir, { recursive: true });
   const tmpFile = join(parentDir, `.config.json.tmp.${process.pid}.${Date.now()}`);
@@ -1092,7 +1163,7 @@ function normalizeGroupMember(modelId) {
   return m;
 }
 
-function buildMagpieCliEnv() {
+export function buildMagpieCliEnv() {
   const env = { ...process.env };
   for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']) {
     delete env[key];

@@ -42,6 +42,10 @@ const PKG = (() => {
 
 const BUILD_ID = `${PKG.version || '0.1.0'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
 const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+const sleepUnref = (ms) => new Promise((resolveSleep) => {
+  const timer = setTimeout(resolveSleep, ms);
+  timer.unref?.();
+});
 
 function readJsonBody(req) {
   return new Promise((resolveBody, rejectBody) => {
@@ -79,6 +83,7 @@ export async function startServer({
   magpieConfigDir,
   antigravityPluginDir,
   magpieCliPath,
+  execEnabled = false,
   probeTimeoutMs = 2000,
 } = {}) {
   const KEY = randomBytes(24).toString('base64url');
@@ -160,6 +165,7 @@ export async function startServer({
             sessionsDir,
             magpieConfigDir,
             antigravityPluginDir,
+            execEnabled,
             probeTimeoutMs,
           });
           return send(req, res, 200, state);
@@ -284,7 +290,7 @@ export async function startServer({
   const takeover = (p) => {
     (async () => {
       while (!closed) {
-        await sleep(1000);
+        await sleepUnref(1000);
         if (closed) return;
         try {
           if (await bindOnce(p)) {

@@ -349,7 +349,10 @@
     }
     const sbxHint = $('sandbox-hint');
     if (sbxHint) {
-      sbxHint.textContent = SANDBOX_HINTS[currentDefaultSandbox] || currentDefaultSandbox;
+      const baseHint = SANDBOX_HINTS[currentDefaultSandbox] || currentDefaultSandbox;
+      sbxHint.textContent = state.tools?.exec_enabled === false
+        ? `${baseHint} · gempt_exec 默认关闭（插件选项设 exec: true 后生效）`
+        : baseHint;
     }
 
     const failoverGroup = $('failover-control-group');
@@ -464,6 +467,7 @@
     const sourceTitle = $('source-title');
     const sourceSub = $('source-sub');
     const copyMcpBtn = $('copy-mcp-btn');
+    const copyRulesBtn = $('copy-rules-btn');
     const slashBtn = $('active-slash-btn');
     const hubBox = $('flow-hub-box');
     const hubModeText = $('hub-mode-text');
@@ -491,6 +495,7 @@
       if (sourceTitle) sourceTitle.textContent = '外部客户端直连';
       if (sourceSub) sourceSub.textContent = formatNativeClientSubtitle(state.clients);
       if (copyMcpBtn) copyMcpBtn.hidden = true;
+      if (copyRulesBtn) copyRulesBtn.hidden = true;
       if (slashBtn) {
         slashBtn.hidden = false;
         slashBtn.textContent = groupId;
@@ -520,6 +525,7 @@
     if (sourceTitle) sourceTitle.textContent = 'MCP 客户端';
     if (sourceSub) sourceSub.textContent = formatMcpClientSubtitle(state.clients);
     if (copyMcpBtn) copyMcpBtn.hidden = false;
+    if (copyRulesBtn) copyRulesBtn.hidden = false;
     if (slashBtn) {
       const hasAgy = Boolean(state.clients?.antigravity_installed);
       slashBtn.hidden = !hasAgy;
@@ -557,8 +563,17 @@
     const chipMcp = $('chip-mcp');
     const chipMcpVal = $('chip-mcp-val');
     if (chipMcp && chipMcpVal) {
-      chipMcp.dataset.tone = clients.magpie_mcp_registered ? 'ok' : 'neutral';
-      chipMcpVal.textContent = clients.magpie_mcp_registered ? 'Magpie MCP 已接入' : '复制配置';
+      if (clients.native_tools_registered) {
+        chipMcp.dataset.tone = 'ok';
+        const agentCount = Array.isArray(clients.native_tools_agents) ? clients.native_tools_agents.length : 0;
+        chipMcpVal.textContent = agentCount > 0 ? `已自动同步 ${agentCount} 端` : 'Magpie 自动托管';
+      } else if (clients.magpie_mcp_registered) {
+        chipMcp.dataset.tone = 'ok';
+        chipMcpVal.textContent = 'Magpie MCP 已接入';
+      } else {
+        chipMcp.dataset.tone = 'neutral';
+        chipMcpVal.textContent = '复制独立配置';
+      }
     }
 
     const chipAgy = $('chip-agy');
@@ -595,11 +610,14 @@
       text: `执行 · ${titleCaseTier(run.tier || 'exec')} · ${run.cwd_name || run.run_id.slice(0, 8)}`,
       meta: formatRunMeta(run),
     }));
-    const sessions = (state.recent_sessions || []).map((sess) => ({
-      tone: 'ok',
-      text: `${sess.mode === 'exec' ? '执行' : '咨询'} · ${titleCaseTier(sess.tier || 'sonnet')} (${humanizeModel(sess.model || sess.cwd_name)})`,
-      meta: `${Math.max(1, Math.floor((sess.turns || 0) / 2))} 轮`,
-    }));
+    const sessions = (state.recent_sessions || []).map((sess) => {
+      const agentTag = sess.agent ? ` · ${sess.agent}` : '';
+      return {
+        tone: 'ok',
+        text: `${sess.mode === 'exec' ? '执行' : '咨询'} · ${titleCaseTier(sess.tier || 'sonnet')}${agentTag} (${humanizeModel(sess.model || sess.cwd_name)})`,
+        meta: `${Math.max(1, Math.floor((sess.turns || 0) / 2))} 轮`,
+      };
+    });
     const groupCalls = (state.recent_group_calls || []).map((call) => {
       const status = Number(call.status || 0);
       const tone = status >= 200 && status < 400 ? 'ok' : (status >= 400 ? 'err' : 'neutral');
@@ -919,7 +937,16 @@
       showToast('MCP 配置尚未就绪，请先刷新状态', 'error');
       return;
     }
-    copyText(jsonText, '已复制通用 MCP JSON 配置（粘贴到客户端或 Magpie Library）');
+    copyText(jsonText, '已复制独立 MCP JSON 配置（仅非 Magpie 托管客户端需要）');
+  }
+
+  function copyRulesConfig() {
+    const rulesText = latestState?.rules_snippet;
+    if (!rulesText) {
+      showToast('协作规则尚未就绪，请先刷新状态', 'error');
+      return;
+    }
+    copyText(rulesText, '已复制协作规则（贴入 CLAUDE.md / AGENTS.md 等全局规则）');
   }
 
   document.addEventListener('change', (ev) => {
@@ -957,6 +984,10 @@
     }
     if (btn.id === 'copy-mcp-btn' || btn.id === 'chip-mcp') {
       copyMcpConfig();
+      return;
+    }
+    if (btn.id === 'copy-rules-btn') {
+      copyRulesConfig();
       return;
     }
     if (btn.id === 'chip-native') {

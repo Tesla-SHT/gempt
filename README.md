@@ -1,13 +1,36 @@
 # GemPT
 
-一套围绕 **Human ↔ Gemini，Gemini lead GPT** 模式的可共享、可审查 Magpie 协作路由与编排方案：人类只和 Gemini 对话与拍板，Gemini 负责规划、拆单与验收，GPT/Codex（统一经本地 Magpie 网关调度）负责硬核推理与工程执行，DeepSeek Flash 负责意图分类、打杂摘要与上下文压缩。
+一套围绕 **Human ↔ Gemini，Gemini lead GPT** 模式的可共享、可审查 Magpie 原生 **`tools + page` 插件** 与编排方案：人类只和 Gemini 对话与拍板，Gemini 负责规划、拆单与验收，GPT/Codex（统一经本地 Magpie 网关调度，纯订阅即可使用）负责硬核推理与工程执行，DeepSeek Flash 负责意图分类、打杂摘要与上下文压缩。
 
-由于 GPT 支持通过 Magpie 反代，而 Gemini 会随客户端形态走不同路径，本仓库同时覆盖两类主流用法，共享同一套档位心智且互不冲突：
+## 1 分钟上手（任意 Magpie 客户端）
+
+先在 Magpie 登录 ChatGPT/Codex（及可选 Gemini）订阅账号，然后一条命令安装本插件：
+
+```sh
+magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/collab
+# 合入 main 后可直接运行：
+# magpie plugin add github:Tesla-SHT/gempt
+```
+
+装完后即可在 Magpie 左侧 **`Plugins → GemPT`** 打开控制面板，按需选择以下任一方式（两者可随时共用）：
+
+- **方案 A（零规则懒人直连 · 最快上手）**：
+  1. 在 `Plugins → GemPT` 右上角切换到 **`路由组直连`** → 点击 **`一键创建直连路由组`**；
+  2. 在任意接入 Magpie 的客户端（Claude Code / ZCode / Codex CLI / OpenCode / Cursor 等）模型栏直接选用 `group/gempt-sonnet`、`group/gempt-opus` 或 `group/gempt-fable`；
+  3. 聊设计时默认走首顺位 **Gemini**，明确派发写代码/修 Bug 时 Magpie 按回合意图与 `when=subagent` 自动分流到 **GPT-6.2-Sol / Astra**，压缩整理自动走 **DeepSeek Flash**。
+
+- **方案 B（全客户端内置 MCP 编排 · 完整主从协作）**：
+  1. **免手动装 Python / 免粘 MCP JSON**：安装插件后，Magpie 会自动向已接入客户端分发内置 HTTP 工具 `gempt_consult`、`gempt_exec`、`gempt_discover`、`gempt_status`（`http://127.0.0.1:3425/mcp/magpie/tools/gempt`），无需先跑 `init` 即可零配置使用 Codex 订阅直连；
+  2. **开启代码执行权（安全默认关闭）**：参照 `@magpie-community/tools-layerfs` 安全规范，`gempt_exec` 默认关闭；需要允许 Codex 改动工作区代码时，在 Magpie 插件选项中把 `exec` 设为 `true`：
+     ```sh
+     magpie plugin options gempt '{"exec":true}'
+     ```
+  3. 在页面点 **`复制协作规则`**，粘贴到常用客户端的全局指令（如 `CLAUDE.md`、`AGENTS.md` 或 ZCode / Cursor 规则）并保持主模型为 Gemini 即可（Antigravity 用户也可用 `bash install.sh --plugin` 一并安装官方通道规则与 `/gempt-*` 快捷技能）。
 
 | 受众 / Gemini 来源 | 推荐接入方式 | 工作机制 |
 | :--- | :--- | :--- |
-| **外部客户端经 Magpie 调用 `antigravity/gemini-4-*`**（Claude Code、ZCode、OpenCode 等） | `bash install.sh --apply`（创建 `group/gempt-*`）<br>可选叠加 `gempt` MCP（`--print-mcp`） | 零插件按回合意图切模型；如需同一回合内由 Gemini 主动向 GPT 咨询或派发并按退出码验收 `codex exec`，可挂接 MCP |
-| **Antigravity 原生客户端**（原生 Gemini 走官方通道，不经过 Magpie 反代） | `bash install.sh --plugin`（或 `PYTHONPATH=src python -m gempt install-agy`） | 保留原生 Gemini 官方通道，通过 MCP + 协作规则让原生 Gemini 调度本地 Magpie 中的 GPT/Codex |
+| **所有接入 Magpie 的外部客户端**（Claude Code、ZCode、OpenCode、Cursor 等） | `magpie plugin add ...` 后页面选 **路由组直连** 或直接使用 Magpie 自动托管的 **`gempt_*` MCP 工具 + 复制协作规则** | 路由组按回合/子代理自动切模型；内置 MCP 工具可在同一回合由 Gemini 主动向 GPT 咨询（`gempt_consult`）或调用 `codex exec`（`gempt_exec`） |
+| **Antigravity 原生客户端**（原生 Gemini 走官方通道） | `bash install.sh --plugin`（或 `PYTHONPATH=src python -m gempt install-agy`） | 保留原生 Gemini 官方通道，同时共享 `~/.config/gempt/config.json` 档位与权限 |
 
 ---
 
@@ -94,10 +117,10 @@ Gemini 主控（Antigravity 官方原路 或 外部客户端经 Magpie 调 antig
 PYTHONPATH=src python -m gempt discover
 ```
 
-2. **接入客户端与 Magpie 独立控制页**：
-   - **Magpie 独立子页面插件**（控制中心）：运行 `magpie plugin add .`（或安装后从仓库链接安装 `magpie plugin add github:Tesla-SHT/gempt`），即可在 Magpie 窗口左侧栏 **`Plugins → GemPT`** 看到独立子页面。只要在 Magpie 里登好了 ChatGPT/Codex 订阅账号，未初始化时可在页面内**一键启用订阅配置**，平时可随时切换共享的 **默认委派档位（Sonnet / Opus / Fable）** 与 **Codex 执行权限（只读 / 工作区 / 全权限）**，并复制 `/gempt-*` 单轮指令。
+2. **接入客户端与 Magpie 控制页**：
+   - **Magpie 原生 `tools + page` 插件**（控制中心 + 全客户端工具托管）：运行 `magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/collab`（或本地 `magpie plugin add .`），即可在 Magpie 左侧栏 **`Plugins → GemPT`** 打开控制面板，并由 Magpie 自动将 `gempt_discover` / `gempt_status` / `gempt_consult` / `gempt_exec` 注册到 `/mcp/magpie/tools/gempt`。未初始化时页面内可**一键启用订阅配置**（不启用也可零配置直连 Codex 订阅），随时切换共享 **默认档位**、**Codex 执行权限** 或一键创建 **`group/gempt-*` 直连路由组**。
    - **Antigravity 原生插件**：运行 `bash install.sh --plugin`（或 `PYTHONPATH=src python -m gempt install-agy`），把 `plugin/`（`plugin.json`、`rules/`、`skills/`）与独立包副本安装到 `~/.gemini/config/plugins/gempt/`。安装并重载插件后，保持原生 Gemini 官方登录即可在 `/` 菜单直接使用 `/gempt`、`/gempt-sonnet`、`/gempt-opus`、`/gempt-fable`、`/gempt-chore`。
-   - **外部 Magpie 客户端（Claude Code / ZCode / Codex 等）**：运行 `bash install.sh --print-mcp`（或 `PYTHONPATH=src python -m gempt print-mcp --installed`），把输出粘贴进 Magpie `Library -> MCP` 或客户端配置；协作规范见 [plugin/skills/gempt/SKILL.md](plugin/skills/gempt/SKILL.md) 与 [plugin/rules/AGENTS.md](plugin/rules/AGENTS.md)。
+   - **非 Magpie 托管的独立 MCP 客户端**：可在控制页点 **`复制 MCP 配置`**（或运行 `bash install.sh --print-mcp` / `PYTHONPATH=src python -m gempt print-mcp --installed`），并配合页内 **`复制协作规则`**（详版见 [plugin/skills/gempt/SKILL.md](plugin/skills/gempt/SKILL.md) 与 [plugin/rules/AGENTS.md](plugin/rules/AGENTS.md)）。
 
 3. **首次初始化**：在客户端直接说“初始化 gempt”（Gemini 会调 `gempt_discover` + `gempt_configure`），或命令行运行：
 

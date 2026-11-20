@@ -1,13 +1,24 @@
 {
-  "name": "gempt-magpie-plugin",
+  "name": "gempt",
   "version": "0.1.0",
-  "description": "Control panel for Gemini-leads-GPT 3+1 routing tiers (Sonnet / Opus / Fable + Chore), shared with Antigravity.",
+  "description": "Magpie tools + control page plugin for Gemini-leads-GPT 3+1 routing tiers (Sonnet / Opus / Fable + Chore) across every Magpie client.",
   "type": "module",
   "main": "./magpie_plugin/index.mjs",
+  "exports": {
+    ".": "./magpie_plugin/index.mjs"
+  },
   "files": [
     "magpie_plugin",
+    "src",
+    "plugin",
+    "templates",
+    "install.sh",
     "README.md"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Tesla-SHT/gempt.git"
+  },
   "engines": {
     "magpie": ">=0.1.1340"
   },
@@ -15,6 +26,10 @@
     "magpie",
     "magpie-page",
     "magpie-plugin",
+    "magpie-tools",
+    "mcp",
+    "opencode",
+    "opencode-plugin",
     "gempt",
     "routing"
   ],
@@ -22,8 +37,8 @@
   "magpie": {
     "name": "GemPT",
     "summary": {
-      "en": "Control panel for Gemini-leads-GPT 3+1 routing tiers (Sonnet / Opus / Fable + Chore), shared with Antigravity.",
-      "zh": "控制 Gemini 主导 GPT 的 3+1 协作路由档位（Sonnet / Opus / Fable + Chore），与 Antigravity 实时共享配置。"
+      "en": "Gemini-leads-GPT 3+1 orchestration tools (gempt_consult / gempt_exec / gempt_discover / gempt_status) and routing control panel for all Magpie clients.",
+      "zh": "为所有 Magpie 客户端提供 Gemini 主导 GPT 3+1 编排工具（gempt_consult / gempt_exec / gempt_discover / gempt_status）与订阅路由控制面板。"
     },
     "page": {
       "title": "GemPT",
@@ -40,7 +55,8 @@
       }
     },
     "options": {
-      "port": 3498
+      "port": 3498,
+      "exec": false
     },
     "permissions": [],
     "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTYiIGZpbGw9IiMxODE4MWIiLz48cGF0aCBkPSJNMTYgNDRMMjggMjBMMzYgMzNMNDYgMjNMNDAgNDRIMTZaIiBmaWxsPSJub25lIiBzdHJva2U9IiNmZmZmZmYiIHN0cm9rZS13aWR0aD0iMy41IiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+PGNpcmNsZSBjeD0iNDYuNSIgY3k9IjE4LjUiIHI9IjMuNSIgZmlsbD0iIzM0ZDM5OSIvPjwvc3ZnPg=="
