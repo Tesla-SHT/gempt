@@ -935,12 +935,17 @@ export function createGemptTools({
         const profile = role !== 'solo' && policy.swarm_split && policy.swarm_split !== 'inherit'
           ? policy.swarm_split : ordinary;
         if (!Object.hasOwn(WORKLOAD.profiles, profile)) throw new Error('Invalid work split in host config.');
+        const plan = WORKLOAD.profiles[profile];
         const result = { profile, role, kind };
+        if (!plan.kinds.length) {
+          return { ...result, action: 'gemini', disabled: true,
+            text: 'GemPT automatic delegation is off. Handle this task directly in Gemini.' };
+        }
         if (role === 'coordinator' || role === 'narrator') {
           return { ...result, action: 'board', text: 'Keep this role on the board. Give each task one owner and summarize the results.' };
         }
         if (kind === 'visual' && access === 'change') throw new Error('Separate visual observation from implementation.');
-        const delegated = WORKLOAD.profiles[profile].kinds.includes(kind);
+        const delegated = plan.kinds.includes(kind);
         const action = access === 'provided' ? 'consult' : 'exec';
         if (delegated && action === 'exec' && !isExecEnabled(options, env)) {
           throw new Error('Codex execution is disabled. Enable the Magpie GemPT exec option for workspace tasks. Report this blocker to the user.');

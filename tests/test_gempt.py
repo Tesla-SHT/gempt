@@ -476,6 +476,113 @@ class McpStdioHandshakeTests(unittest.TestCase):
             self.assertFalse(status_payload["configured"])
 
 
+class McpWorkspaceTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enter_tempdir()).resolve()
+        self.project = self.root / "projects" / "repo"
+        self.project.mkdir(parents=True)
+        self.host = self.root / "host"
+        self.host.mkdir()
+        self.config = self.root / "settings" / "gempt" / "config.json"
+        save_config(default_config_template(), self.config)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.sessions = self.root / "sessions"
+        env = mock.patch.dict(os.environ, GEMPT_CONFIG=str(self.config),
+                              GEMPT_SESSIONS_DIR=str(self.sessions), MAGPIE_CONFIG_DIR="")
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("GEMPT_WORKSPACE_ROOT", None)
+        home = mock.patch.object(Path, "home", return_value=self.home)
+        home.start()
+        self.addCleanup(home.stop)
+        self.addCleanup(os.chdir, Path.cwd())
+        os.chdir(self.host)
+
+    def enter_tempdir(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return tmp.name
+
+    def test_unset_root_allows_projects_outside_server_directory(self):
+        cwd = str(self.project / ".." / "repo")
+        self.assertFalse(self.project.is_relative_to(Path.cwd()))
+        with mock.patch("gempt.mcp_server.dispatch_exec", return_value={}) as execute, \
+             mock.patch("gempt.mcp_server.run_consult", return_value={"formatted": "OK"}) as consult, \
+             mock.patch("gempt.workload.dispatch_exec", return_value={"text": "OK"}) as dispatch:
+            _handle_tool_call("gempt_exec", {"goal": "Execute", "cwd": cwd})
+            _handle_tool_call("gempt_consult", {"goal": "Consult", "cwd": cwd, "file_paths": ["notes.md"]})
+            _handle_tool_call("gempt_dispatch", {"goal": "Dispatch", "kind": "engineering",
+                                                 "access": "inspect", "cwd": cwd})
+            for backend in (execute, consult, dispatch):
+                self.assertEqual(backend.call_args.kwargs["cwd"], str(self.project))
+
+    def test_unset_root_handles_omitted_cwd_by_tool(self):
+        with mock.patch("gempt.mcp_server.run_consult", return_value={"formatted": "OK"}) as consult, \
+             mock.patch("gempt.mcp_server.dispatch_task", return_value={"action": "gemini"}) as dispatch:
+            _handle_tool_call("gempt_consult", {"goal": "Consult"})
+            self.assertIsNone(consult.call_args.kwargs["cwd"])
+            _handle_tool_call("gempt_dispatch", {"goal": "Dispatch", "kind": "specialist", "access": "provided"})
+            self.assertNotIn("cwd", dispatch.call_args.args[0])
+        for tool, args in (("gempt_consult", {"file_paths": ["notes.md"]}),
+                           ("gempt_exec", {}), ("gempt_exec", {"cwd": "  "})):
+            with self.subTest(tool=tool, args=args), self.assertRaisesRegex(ValueError, "cwd is required"):
+                _handle_tool_call(tool, {"goal": "Blocked", **args})
+
+    def test_unset_root_rejects_sensitive_workspaces(self):
+        ssh = self.home / ".ssh"
+        aws = self.home / ".aws"
+        gnupg = self.home / ".gnupg"
+        magpie = self.home / ".config" / "magpie"
+        for directory in (ssh / "nested", aws, gnupg, magpie):
+            directory.mkdir(parents=True)
+        blocked = (Path(self.root.anchor), self.home)
+        sensitive = (ssh, ssh / "nested", aws, gnupg, magpie, magpie.parent,
+                     self.config.parent, self.config.parent.parent)
+        for tool in ("gempt_dispatch", "gempt_consult", "gempt_exec"):
+            for cwd in (*blocked, *sensitive):
+                error = "blocked workspace root" if cwd in blocked else "sensitive directory"
+                with self.subTest(tool=tool, cwd=cwd), self.assertRaisesRegex(ValueError, error):
+                    _handle_tool_call(tool, {"goal": "Blocked", "cwd": str(cwd)})
+
+    def test_blank_root_checks_magpie_override_and_requires_existing_directory(self):
+        magpie = self.home / "magpie-settings"
+        magpie.mkdir()
+        file = self.project / "notes.md"
+        file.touch()
+        with mock.patch.dict(os.environ, GEMPT_WORKSPACE_ROOT="  ", MAGPIE_CONFIG_DIR=" ~/magpie-settings "):
+            with self.assertRaisesRegex(ValueError, "sensitive directory"):
+                _handle_tool_call("gempt_exec", {"goal": "Blocked", "cwd": str(magpie)})
+            for invalid in (file, self.project / "missing"):
+                with self.subTest(cwd=invalid), self.assertRaisesRegex(ValueError, "existing directory"):
+                    _handle_tool_call("gempt_exec", {"goal": "Blocked", "cwd": str(invalid)})
+
+    def test_explicit_root_keeps_confinement_and_resolves_relative_cwd(self):
+        with mock.patch.dict(os.environ, GEMPT_WORKSPACE_ROOT=f" {self.project.parent} "):
+            for tool in ("gempt_dispatch", "gempt_consult", "gempt_exec"):
+                with self.subTest(tool=tool), self.assertRaisesRegex(ValueError, "cwd outside host workspace"):
+                    _handle_tool_call(tool, {"goal": "Blocked", "cwd": str(self.host)})
+            with mock.patch("gempt.mcp_server.dispatch_exec", return_value={}) as execute:
+                _handle_tool_call("gempt_exec", {"goal": "Execute", "cwd": "repo"})
+                self.assertEqual(execute.call_args.kwargs["cwd"], str(self.project))
+
+    def test_status_reads_run_outside_server_directory_only_without_confinement(self):
+        run_id = "a" * 32
+        state_file = self.sessions / "runs" / run_id / "state.json"
+        state_file.parent.mkdir(parents=True)
+        run = {"run_id": run_id, "cwd": str(self.project), "state": "finished"}
+        state_file.write_text(json.dumps(run), encoding="utf-8")
+        args = {"run_id": run_id}
+        result = _handle_tool_call("gempt_status", args)
+        self.assertEqual(json.loads(result["content"][0]["text"]), run)
+        with mock.patch("gempt.mcp_server.get_status", return_value={}) as status:
+            _handle_tool_call("gempt_status", {})
+            self.assertIsNone(status.call_args.kwargs["workspace_root"])
+        with mock.patch.dict(os.environ, GEMPT_WORKSPACE_ROOT=str(self.host)):
+            with self.assertRaisesRegex(ValueError, "Run outside host workspace"):
+                _handle_tool_call("gempt_status", args)
+
+
 class CliPackagingTests(unittest.TestCase):
     def test_install_agy_uses_packaged_resources_and_base_python(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1025,6 +1132,70 @@ class BugfixRegressionTests(unittest.TestCase):
                     )
                     self.assertGreaterEqual(mock_exec.call_args.kwargs["timeout_sec"], 1200)
                     self.assertIn("omit session_id", ex["escalation_suggestion"])
+
+    def test_off_switch_reuses_gemini_slot_across_dispatch_and_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conf = root / "config.json"
+            target = root / "agy-plugin"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli_main(["install-agy", "--target", str(target)]), 0)
+            hook = target / "work_split_hook.py"
+
+            def run_hook(work_split: str, swarm_split: str) -> str:
+                cfg = default_config_template()
+                cfg["routing_policy"]["work_split"] = work_split
+                cfg["routing_policy"]["swarm_split"] = swarm_split
+                save_config(cfg, conf)
+                env = {**os.environ, "GEMPT_CONFIG": str(conf)}
+                proc = subprocess.run(
+                    [sys.executable, "-I", "-X", "utf8", "-B", str(hook)],
+                    input=json.dumps({"modelName": "gemini-4-neon-high"}),
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                    check=True,
+                    env=env,
+                    timeout=20,
+                )
+                return json.loads(proc.stdout)["injectSteps"][0]["ephemeralMessage"]
+
+            both_off = run_hook("gemini", "inherit")
+            self.assertIn("GemPT is OFF for ordinary conversations and Swarm", both_off)
+            self.assertNotIn("first call gempt_dispatch", both_off)
+
+            ord_off = run_hook("gemini", "gpt")
+            self.assertIn("GemPT is OFF for ordinary conversations", ord_off)
+            self.assertIn("In Swarm only:", ord_off)
+            self.assertIn("Current native gemini_family=neon.", ord_off)
+
+            swarm_off = run_hook("gpt", "gemini")
+            self.assertIn("GemPT is OFF for Swarm", swarm_off)
+            self.assertIn("In ordinary conversations only:", swarm_off)
+            self.assertIn("Current native gemini_family=neon.", swarm_off)
+
+            both_on = run_hook("balanced", "gpt")
+            self.assertIn("first call gempt_dispatch", both_on)
+            self.assertIn("Current native gemini_family=neon.", both_on)
+
+            # Dispatch short-circuits cleanly when leftmost slot ("gemini") is active
+            cfg = default_config_template()
+            cfg["routing_policy"]["work_split"] = "gemini"
+            cfg["routing_policy"]["swarm_split"] = "inherit"
+            save_config(cfg, conf)
+            with mock.patch.dict(os.environ, {"GEMPT_CONFIG": str(conf), "GEMPT_SESSIONS_DIR": str(root / "sess")}), \
+                 mock.patch("gempt.workload.run_consult") as consult_mock, \
+                 mock.patch("gempt.workload.dispatch_exec") as exec_mock:
+                for req in (
+                    {"goal": "Prove bound", "kind": "specialist", "access": "provided"},
+                    {"goal": "Edit file", "kind": "engineering", "access": "change"},
+                    {"goal": "Swarm work", "kind": "specialist", "access": "change", "role": "worker"},
+                ):
+                    reply = json.loads(_handle_tool_call("gempt_dispatch", req)["content"][0]["text"])
+                    self.assertEqual(reply["action"], "gemini")
+                    self.assertTrue(reply["disabled"])
+                consult_mock.assert_not_called()
+                exec_mock.assert_not_called()
 
 
 if __name__ == "__main__":

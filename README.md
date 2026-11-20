@@ -91,13 +91,13 @@ Magpie CLI 可通过 `--magpie-cli`、配置项 `magpie.cli_path` 或环境变�
 
 ## 插件页里的工作分工
 
-在 **Plugins → GemPT → MCP 编排** 选择普通对话的工作分工。Gemini 为主、按领域分工、GPT 为主、基本全由 GPT 做分别表示 GPT 承担约 20%、50%、80%、95% 工作量的倾向。实际决策按任务类别执行，百分比不计量订阅额度。旧配置沿用按领域分工。
+在 **Plugins → GemPT → MCP 编排** 选择普通对话的工作分工。最左档 **关闭 GemPT** 停止自动派单，从下一轮开始由 Gemini 直接完成任务，无需重启或卸载。已有 `gemini` 配置也会使用关闭档。按领域分工、GPT 为主、基本全由 GPT 做分别表示 GPT 承担约 50%、80%、95% 工作量的倾向。实际决策按任务类别执行，百分比不计量订阅额度。未设置工作分工时默认按领域分工。
 
 在同一页的 **Gemini 与 GPT 配对** 中，每个 Gemini 系列可以独立选择本机 Magpie 已接入的 Codex 订阅模型。初始组合为 Hydrogen → Terra、Neon → Sol、Carbon → Astra。选择后，下个新任务的咨询和代码执行都会使用该 GPT，配对调用仅走所选订阅模型；续接同一任务保留原搭档。Gemini 仍在 Antigravity 原生界面选择，Swarm 成员从协调者的任务单继承系列。选“沿用默认档位”、宿主未报告系列或用户显式指定档位时，使用原档位路由及其兜底设置。
 
-每个新实质任务先走 `gempt_dispatch`。最高档会立即把普通写作、方案、调研和工程交给 GPT。已有材料走咨询；需要读仓库或跑检查走只读 Codex；实现和测试走已授权的 Codex 工作区。Gemini 处理必要的原生视觉观察、澄清需求，并用通俗语言汇报结论和证据。执行权限关闭时会报告阻塞。外部 MCP 客户端首次接入或从旧版升级需复制新版协作规则；Antigravity 使用随插件安装的规则。只选择直连组的客户端仍按整回合路由。
+启用自动协作时，每个新实质任务先走 `gempt_dispatch`。最高档会立即把普通写作、方案、调研和工程交给 GPT。已有材料走咨询；需要读仓库或跑检查走只读 Codex；实现和测试走已授权的 Codex 工作区。关闭档由 Gemini 直接处理，用户明确要求时仍可单独调用 GPT。Gemini 处理必要的原生视觉观察、澄清需求，并用通俗语言汇报结论和证据。执行权限关闭时会报告阻塞。外部 MCP 客户端首次接入或从旧版升级需复制新版协作规则；Antigravity 使用随插件安装的规则。只选择直连组的客户端仍按整回合路由。
 
-**Antigravity Swarm** 可以跟随普通对话，也可以独立选四档。协调者分配带唯一 ID 的公开任务单，worker 按单派发，verifier 独立核验，narrator 处理看板汇报。在同一 GemPT 会话存储内重复投递一个 ID 只会启动一次 GPT 工作。每个原生 Swarm 角色仍然消耗宿主的协调回合。参见 [Antigravity Swarm 官方说明](https://antigravity.google/docs/swarm)。
+**Antigravity Swarm** 可以跟随普通对话，也可以独立关闭或选择其他档位。启用自动协作时，协调者分配带唯一 ID 的公开任务单，worker 按单派发，verifier 独立检查，narrator 处理看板汇报。在同一 GemPT 会话存储内重复投递一个 ID 只会启动一次 GPT 工作。每个原生 Swarm 角色仍然消耗宿主的协调回合。参见 [Antigravity Swarm 官方说明](https://antigravity.google/docs/swarm)。
 
 ## 二、Gemini 主导 GPT 编排插件（`consult` / `exec`）
 
@@ -198,7 +198,7 @@ gempt exec --tier opus --escalate --cwd /path/to/repo --goal "排查并发死锁
 
 初始化默认写入个人配置；写到其他位置须显式指定配置路径。CLI 自动发现的项目 `.gempt.json` 不能覆盖宿主的 `magpie`、`codex` 或 `routing_policy` 策略。
 
-MCP 宿主用 `GEMPT_WORKSPACE_ROOT` 指定授权工作区，默认采用服务启动目录。文件路径按真实路径检查（含符号链接和目录联接）。MCP 宿主可通过 `gempt_configure` 收紧 `default_sandbox`，但不能放宽沙箱、修改远端网关或替换 CLI 路径。纯订阅模式下，三个 GPT 档位只接受具体的 Codex 订阅模型，或可通过本地 Magpie CLI 核对成员的本机 `group/gempt-harness-*` 组。
+MCP 宿主可用 `GEMPT_WORKSPACE_ROOT` 将工作区限制在指定目录。未设置时，Python MCP 可接收服务启动目录之外的现有项目目录，并拒绝文件系统根目录、用户主目录和与敏感配置目录重叠的目录。文件路径按真实路径检查（含符号链接和目录联接）。MCP 宿主可通过 `gempt_configure` 收紧 `default_sandbox`，但不能放宽沙箱、修改远端网关或替换 CLI 路径。纯订阅模式下，三个 GPT 档位只接受具体的 Codex 订阅模型，或可通过本地 Magpie CLI 核对成员的本机 `group/gempt-harness-*` 组。
 
 默认本机网关可使用本机调用凭据；其他地址使用专用配置中的密钥，通过环境提供远端密钥时须用 `GEMPT_TRUSTED_GATEWAY` 绑定目标。HTTP 请求拒绝重定向。Codex 子进程使用本次网关的专用 provider，并在指向回环网关时自动绕过 `HTTP_PROXY`/`HTTPS_PROXY`（补全 `NO_PROXY`），同时禁止可覆盖路由和沙箱的任意 `extra_args`。
 

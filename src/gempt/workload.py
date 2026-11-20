@@ -24,6 +24,9 @@ def dispatch_task(args, config_path):
         profile = policy["swarm_split"]
     plan = WORKLOAD["profiles"][profile]
     result = {"profile": profile, "role": role, "kind": kind}
+    if not plan["kinds"]:
+        return {**result, "action": "gemini", "disabled": True,
+                "text": "GemPT automatic delegation is off. Handle this task directly in Gemini."}
     if role in ("coordinator", "narrator"):
         return {**result, "action": "board", "text": "Keep this role on the Swarm board. Assign each work item to one named owner. Summarize board evidence for the user."}
     if kind == "visual" and access == "change":

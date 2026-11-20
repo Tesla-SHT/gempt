@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import json
-import sys
 import os
-from pathlib import Path
-from .runs import dispatch_exec, read_run
-from . import DEFAULT_CONFIG_PATH
+import sys
 import traceback
+from pathlib import Path
 from typing import Any
 
-from . import CONSULT_TIERS, TIER_ORDER, __version__
+from . import CONSULT_TIERS, DEFAULT_CONFIG_PATH, TIER_ORDER, __version__
 from .discover import discover_environment
+from .runs import dispatch_exec, read_run
 from .service import configure_gempt, get_status, run_consult
-
 from .workload import SCHEMA as DISPATCH_SCHEMA, dispatch_task
 
 TOOLS: list[dict[str, Any]] = [
@@ -235,30 +233,67 @@ for tool in TOOLS:
         properties["background"] = {"type": "boolean", "description": "Return a durable run ID immediately."}
 
 
+def _resolve_magpie_config_dir(home: Path) -> Path:
+    raw = os.environ.get("MAGPIE_CONFIG_DIR", "").strip()
+    if not raw:
+        return home / ".config" / "magpie"
+    if raw == "~" or raw.startswith(("~/", "~\\")):
+        return home / raw[2:]
+    return Path(raw)
+
+
+def _normalize_workspace_cwd(
+    raw_cwd: str | None, *, workspace_root: Path | None, trusted_config: Path,
+) -> Path:
+    if workspace_root is not None:
+        cwd = (workspace_root / (raw_cwd or ".")).resolve()
+        if not cwd.is_relative_to(workspace_root):
+            raise ValueError("cwd outside host workspace")
+        return cwd
+
+    if not isinstance(raw_cwd, str) or not raw_cwd.strip():
+        raise ValueError("cwd is required and must be a non-empty directory path.")
+    cwd = Path(raw_cwd.strip()).resolve()
+    if not cwd.is_dir():
+        raise ValueError(f"Working directory must be an existing directory: {cwd}")
+    home = Path.home().resolve()
+    if cwd in (Path(cwd.anchor).resolve(), home):
+        raise ValueError(f"Refused blocked workspace root: {cwd}")
+
+    for directory in (trusted_config.parent, _resolve_magpie_config_dir(home),
+                      home / ".ssh", home / ".aws", home / ".gnupg"):
+        sensitive = directory.resolve()
+        if cwd.is_relative_to(sensitive) or sensitive.is_relative_to(cwd):
+            raise ValueError(f"Refused sensitive directory as workspace: {cwd}")
+    return cwd
+
+
 def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
     args = dict(args)
-    root = Path(os.environ.get("GEMPT_WORKSPACE_ROOT") or os.getcwd()).resolve()
+    env_root = os.environ.get("GEMPT_WORKSPACE_ROOT", "").strip()
+    workspace_root = Path(env_root).resolve() if env_root else None
     trusted_config = Path(os.environ.get("GEMPT_CONFIG") or DEFAULT_CONFIG_PATH).resolve()
     if args.get("config_path") and Path(args["config_path"]).resolve() != trusted_config:
         raise ValueError("Config path is outside the host configuration")
     args["config_path"] = str(trusted_config)
+    raw_cwd = args.get("cwd")
     if name == "gempt_dispatch":
-        if args.get("cwd"):
-            cwd = (root / args["cwd"]).resolve()
-            if not cwd.is_relative_to(root):
-                raise ValueError("cwd outside host workspace")
-            args["cwd"] = str(cwd)
+        if raw_cwd is not None:
+            args["cwd"] = str(_normalize_workspace_cwd(
+                raw_cwd, workspace_root=workspace_root, trusted_config=trusted_config,
+            ))
         data = dispatch_task(args, trusted_config)
         return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
                 "isError": data.get("verification", {}).get("status") in {"failed", "unverified"}}
-    if name in {"gempt_consult", "gempt_exec"}:
-        cwd = (root / (args.get("cwd") or ".")).resolve()
-        if not cwd.is_relative_to(root):
-            raise ValueError("cwd outside host workspace")
-        args["cwd"] = str(cwd)
+    if name == "gempt_exec" or (name == "gempt_consult" and (
+        workspace_root is not None or raw_cwd is not None or args.get("file_paths") is not None
+    )):
+        args["cwd"] = str(_normalize_workspace_cwd(
+            raw_cwd, workspace_root=workspace_root, trusted_config=trusted_config,
+        ))
     if name == "gempt_status" and args.get("run_id"):
         data = read_run(args["run_id"])
-        if not Path(data["cwd"]).resolve().is_relative_to(root):
+        if workspace_root is not None and not Path(data["cwd"]).resolve().is_relative_to(workspace_root):
             raise ValueError("Run outside host workspace")
         return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}]}
     if name == "gempt_discover" and args.get("magpie_url"):
@@ -353,7 +388,7 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
     if name == "gempt_status":
         data = get_status(
-            workspace_root=root,
+            workspace_root=workspace_root,
             config_path=args.get("config_path"),
             session_limit=int(args.get("session_limit") or 10),
         )

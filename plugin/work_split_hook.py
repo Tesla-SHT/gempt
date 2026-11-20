@@ -35,22 +35,42 @@ def tool_pairing(payload, family):
 
 def reminder(family):
     path = Path(os.environ.get("GEMPT_CONFIG") or Path.home() / ".config/gempt/config.json")
-    policy = json.loads(path.read_text(encoding="utf-8")).get("routing_policy", {}) if path.is_file() else {}
+    policy = json.loads(path.read_text(encoding="utf-8-sig")).get("routing_policy", {}) if path.is_file() else {}
     profiles_file = Path(__file__).parent / "runtime/gempt/workload.json"
     profiles = json.loads(profiles_file.read_text(encoding="utf-8"))["profiles"]
     ordinary = policy.get("work_split", "balanced")
     team = policy.get("swarm_split", "inherit")
     if team == "inherit":
         team = ordinary
-    message = (f"GemPT ordinary: {profiles[ordinary]['detail']}  Swarm: {profiles[team]['detail']} "
-               "For each new substantive assignment, first call gempt_dispatch with goal, kind and access. "
-               "Do not pre-solve or repeat completed work. In /swarm the coordinator briefs one owner per "
-               "32-hex assignment_id, workers and independent verifiers pass their role and that ID. "
-               "Coordinator and narrator stay on the board. Explain the result in the user's language.")
-    if family:
-        message += (f" Current native gemini_family={family}. Include that family in GemPT calls and in "
-                    "each coordinator brief. Workers and verifiers must use only the coordinator family from their brief, "
-                    "omitting gemini_family if the brief has none.")
+    ordinary_off = not profiles[ordinary]["kinds"]
+    swarm_off = not profiles[team]["kinds"]
+    dispatch = ("For each new substantive assignment, first call gempt_dispatch with goal, kind and access. "
+                "Do not pre-solve or repeat completed work.")
+    swarm_roles = ("In /swarm the coordinator briefs one owner per 32-hex assignment_id, workers and "
+                   "independent verifiers pass their role and that ID. Coordinator and narrator stay on the board.")
+    direct = "Handle tasks directly in Gemini unless the user explicitly asks to invoke GPT."
+    if ordinary_off and swarm_off:
+        message = ("GemPT is OFF for ordinary conversations and Swarm. Do not call gempt_dispatch "
+                   f"or automatically delegate to GPT. {direct}")
+    elif ordinary_off:
+        message = ("GemPT is OFF for ordinary conversations. Do not call gempt_dispatch in ordinary conversations. "
+                   f"{direct} GemPT remains active in Swarm: {profiles[team]['detail']} "
+                   f"In Swarm only: {dispatch} {swarm_roles} Explain the result in the user's language.")
+    elif swarm_off:
+        message = ("GemPT is OFF for Swarm. Do not call gempt_dispatch in Swarm. "
+                   f"{direct} GemPT remains active in ordinary conversations: {profiles[ordinary]['detail']} "
+                   f"In ordinary conversations only: {dispatch} Explain the result in the user's language.")
+    else:
+        message = (f"GemPT ordinary: {profiles[ordinary]['detail']}  Swarm: {profiles[team]['detail']} "
+                   f"{dispatch} {swarm_roles} Explain the result in the user's language.")
+    if family and not (ordinary_off and swarm_off):
+        message += f" Current native gemini_family={family}."
+        if swarm_off:
+            message += " Include that family in ordinary GemPT calls."
+        else:
+            scope = "Swarm GemPT calls" if ordinary_off else "GemPT calls"
+            message += (f" Include that family in {scope} and in each coordinator brief. Workers and verifiers "
+                        "must use only the coordinator family from their brief, omitting gemini_family if the brief has none.")
     return {"injectSteps": [{"ephemeralMessage": message}]}
 
 

@@ -370,8 +370,10 @@
     if (!list.children.length) {
       swarm.add(new Option('跟随普通对话', 'inherit'));
       for (const [id, profile] of Object.entries(profiles)) {
+        const isOff = profile.gpt_share === 0;
         const label = document.createElement('label');
         label.className = 'work-option';
+        label.classList.toggle('is-off', isOff);
         const radio = document.createElement('input');
         radio.type = 'radio';
         radio.name = 'work_split';
@@ -379,10 +381,10 @@
         const title = document.createElement('strong');
         title.textContent = profile.label;
         const weight = document.createElement('small');
-        weight.textContent = 'GPT 约 ' + profile.gpt_share + '%';
+        weight.textContent = isOff ? '纯 Gemini · 不派单' : 'GPT 约 ' + profile.gpt_share + '%';
         label.append(radio, title, weight);
         list.append(label);
-        swarm.add(new Option(profile.label + ' · GPT 约 ' + profile.gpt_share + '%', id));
+        swarm.add(new Option(isOff ? profile.label + ' · 纯 Gemini' : profile.label + ' · ' + weight.textContent, id));
       }
     }
     for (const radio of list.querySelectorAll('input')) {
@@ -394,11 +396,17 @@
     renderPairings(state);
     const ordinary = profiles[state.work_split];
     const team = profiles[state.swarm_split] || ordinary;
-    $('work-detail').textContent = (ordinary?.detail || '') + ' 比例表示工作量倾向，实际额度随任务变化。';
-    if (state.tools?.exec_enabled === false) {
-      $('work-detail').textContent += ' Magpie 原生工具目前仅可咨询。需要 Codex 操作文件时，在 GemPT 插件选项开启 exec。';
+    const workDetail = $('work-detail');
+    workDetail.textContent = ordinary?.detail || '';
+    if (ordinary?.gpt_share !== 0) {
+      workDetail.textContent += ' 比例表示工作量倾向，实际额度随任务变化。';
+      if (state.tools?.exec_enabled === false) {
+        workDetail.textContent += ' Magpie 原生工具目前仅可咨询。需要 Codex 操作文件时，在 GemPT 插件选项开启 exec。';
+      }
     }
-    $('swarm-detail').textContent = (team?.label || '') + ' · 协调者拆单和解说，成员按各自职责派单，核验者独立检查。';
+    $('swarm-detail').textContent = team?.gpt_share === 0
+      ? team.detail
+      : (team?.label || '') + ' · 协调者拆单和解说，成员按各自职责派单，核验者独立检查。';
   }
 
   function renderPairings(state) {

@@ -841,6 +841,20 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6.2-astra');
     config.routing_policy.swarm_split = 'gemini';
     writeFileSync(cfgPath, JSON.stringify(config));
+    const beforeOff = magpie.requests.length;
+    for (const payload of [
+      { ...design, role: 'coordinator' },
+      { ...design, role: 'worker', assignment_id: '1'.repeat(32) },
+      { ...hydrogenTask, role: 'worker', kind: 'specialist', access: 'change' },
+    ]) {
+      const offReply = await dispatch(payload);
+      assert.equal(offReply.action, 'gemini');
+      assert.equal(offReply.disabled, true);
+    }
+    assert.equal(magpie.requests.length, beforeOff);
+
+    config.routing_policy.swarm_split = 'balanced';
+    writeFileSync(cfgPath, JSON.stringify(config));
     assert.equal((await dispatch({ ...design, role: 'coordinator' })).action, 'board');
     assert.equal((await dispatch({ ...design, role: 'worker', assignment_id: '1'.repeat(32) })).action, 'gemini');
     const revision = { ...hydrogenTask, role: 'worker', kind: 'specialist', assignment_id: '2'.repeat(32) };

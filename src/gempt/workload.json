@@ -1,12 +1,10 @@
 {
   "profiles": {
     "gemini": {
-      "label": "Gemini 为主",
-      "gpt_share": 20,
-      "kinds": [
-        "specialist"
-      ],
-      "detail": "Gemini 处理日常工作和实现，疑难推理与专家复核交给 GPT。"
+      "label": "关闭 GemPT",
+      "gpt_share": 0,
+      "kinds": [],
+      "detail": "已关闭 GemPT 自动协作，全部任务直接由 Gemini 完成，不再派单给 GPT。"
     },
     "balanced": {
       "label": "按领域分工",
