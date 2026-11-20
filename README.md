@@ -7,10 +7,7 @@
 先在 Magpie 登录 ChatGPT/Codex（及可选 Gemini）订阅账号，然后一条命令安装本插件：
 
 ```sh
-# 绝大多数纯订阅用户（推荐）：
-magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/collab
-# 如需 OpenAI 按量 API 兜底开关与预设，可使用个人增强分支：
-# magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/api-fallback
+magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/api-fallback
 ```
 
 装完后即可在 Magpie 左侧 **`Plugins → GemPT`** 打开控制面板，按需选择以下任一方式（两者可随时共用）：
@@ -26,12 +23,27 @@ magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/collab
      ```sh
      magpie plugin options gempt '{"exec":true}'
      ```
-  3. 在页面点 **`复制协作规则`**，粘贴到常用客户端的全局指令（如 `CLAUDE.md`、`AGENTS.md` 或 ZCode / Cursor 规则）并保持主模型为 Gemini 即可（Antigravity 用户也可用 `bash install.sh --plugin` 一并安装官方通道规则与 `/gempt-*` 快捷技能）。
+  3. 在页面点 **`复制协作规则`**，粘贴到常用客户端的全局指令（如 `CLAUDE.md`、`AGENTS.md` 或 ZCode / Cursor 规则）并保持主模型为 Gemini 即可。
 
-| 受众 / Gemini 来源 | 推荐接入方式 | 工作机制 |
-| :--- | :--- | :--- |
-| **所有接入 Magpie 的外部客户端**（Claude Code、ZCode、OpenCode、Cursor 等） | `magpie plugin add ...` 后页面选 **路由组直连** 或直接使用 Magpie 自动托管的 **`gempt_*` MCP 工具 + 复制协作规则** | 路由组按回合/子代理自动切模型；内置 MCP 工具可在同一回合由 Gemini 主动向 GPT 咨询（`gempt_consult`）或调用 `codex exec`（`gempt_exec`） |
-| **Antigravity 原生客户端**（原生 Gemini 走官方通道） | `bash install.sh --plugin`（或 `PYTHONPATH=src python -m gempt install-agy`） | 保留原生 Gemini 官方通道，同时共享 `~/.config/gempt/config.json` 档位与权限 |
+## 1 分钟安装 Antigravity 插件
+
+Windows、macOS 和 Linux 都可以用 [uv](https://docs.astral.sh/uv/getting-started/installation/) 安装，无需提前克隆仓库：
+
+```sh
+uvx --from git+https://github.com/Tesla-SHT/gempt.git@yizhang-dream/api-fallback gempt install-agy
+```
+
+用 pip 安装时，在 wheel 所在目录运行 `python -m pip install ./gempt-0.1.0-py3-none-any.whl`，再运行 `gempt install-agy`。如果已下载分支源码，在源码目录运行对应的脚本。
+
+- Windows PowerShell 运行 `.\install.ps1`。如果本机执行策略阻止脚本，运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1`。
+- macOS / Linux 运行 `bash install.sh`。
+
+安装目录为 `~/.gemini/config/plugins/gempt/`。安装器先启动暂存的 MCP 和 hook 做检查，然后更新插件目录。若 Windows 报插件目录正在使用，退出 Antigravity 后重新运行安装器。重新打开或重载插件，在 Antigravity 中运行 `/gempt` 初始化。GPT 调用仍需本机 Magpie 及可用的 Codex 订阅模型。
+
+### MCP 接入方式
+
+- **Magpie HTTP MCP** 由 Magpie 托管，自动分发给接入的客户端。默认地址为 `http://127.0.0.1:3425/mcp/magpie/tools/gempt`，这一入口无需 Python。
+- **独立 Python stdio MCP** 由 Antigravity 或其他支持 stdio 的 MCP 客户端启动。Antigravity 插件已写好配置。其他独立客户端可运行 `gempt print-mcp --installed` 导出，或在源码目录运行 `.\install.ps1 -PrintMcp`（Windows）或 `bash install.sh --print-mcp`（macOS / Linux）。使用 `uvx` 安装时，可沿用上面的 `uvx --from … gempt` 命令前缀。
 
 ---
 
@@ -41,34 +53,29 @@ magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/collab
 | --- | --- | --- | --- |
 | `group/gempt-sonnet` | Gemini 4 Hydrogen | GPT-6.1 Terra | 日常修改、脚本、小功能。简单意图也可交给 DeepSeek |
 | `group/gempt-opus` | Gemini 4 Neon | GPT-6.2 Sol，疑难意图优先 GPT-6.2 Astra | 跨文件重构、难 Bug、复杂设计 |
-| `group/gempt-fable` | Gemini 4 Argon | GPT-6.2 Astra | 核心算法和长程攻坚。DeepSeek 的显式任务规则只有压缩 |
+| `group/gempt-fable` | 可用的高档 Gemini（如 Carbon 或 Neon） | GPT-6.2 Astra | 核心算法和长程攻坚。DeepSeek 的显式任务规则只有压缩 |
 
-### 安装（Shell / 跨平台 Python CLI）
+### 用命令行创建 Magpie 路由组
 
-先在 Magpie 中接好各模型渠道，再从仓库根目录运行：
+在 Magpie 接入 Gemini 和 Codex 订阅模型后，运行 `gempt presets --apply`。也可以从源码目录运行以下命令。
 
-```sh
-bash install.sh              # 预览命令（零 Python 依赖）
-bash install.sh --apply      # 创建 group/gempt-{sonnet,opus,fable}，保留当前客户端设置
-bash install.sh --plugin     # 仅安装 Antigravity 插件（MCP + rules + skills）
-bash install.sh --print-mcp  # 打印标准 MCP JSON，供 Magpie Library -> MCP 或外部客户端粘贴
-bash install.sh --all        # 同时执行 --apply 与 --plugin
+**Windows PowerShell**
+
+```powershell
+.\install.ps1 -Preview
+.\install.ps1 -Apply
 ```
 
-Windows / 无 Bash 环境也可以直接用标准库 Python CLI（与 `install.sh` 规则 1:1 一致）：
+**macOS / Linux**
 
-```sh
-PYTHONPATH=src python -m gempt presets          # 预览原生组命令
-PYTHONPATH=src python -m gempt presets --apply  # 创建 group/gempt-{sonnet,opus,fable}
+```bash
+bash install.sh --preview
+bash install.sh --apply
 ```
 
-如果 `magpie` 不在 `PATH`，可以设置 `MAGPIE_BIN` 为可执行文件（如 `magpie` / `magpie.com`）路径；脚本也会自动剥离本地代理环境变量，防止 `127.0.0.1` RPC 被系统代理卡住。默认模型 ID 见 `install.sh`（支持 `auto/*`、`group/*`、`#account` 与 `:effort` 后缀），可以通过同名环境变量覆盖。例如，用本机可用的 DeepSeek 渠道替换默认的 WorkBuddy：
+安装器读取 `magpie models`，应用 `GEMPT_EXCLUDED_MODELS` 和宿主配置中的 `routing_policy.excluded_models`。若没有可用的压缩模型，仍可创建直连组，有可用模型时才添加专门的压缩规则。安装器遇到同名组会停止。
 
-```sh
-DEEPSEEK_FLASH=your-provider/your-deepseek-flash bash install.sh --apply
-```
-
-DeepSeek 的额度取决于你绑定的渠道。用 `magpie models` 查看本机实际暴露的模型 ID。安装器遇到同名组会停止，以免覆盖本地改动。
+Magpie CLI 可通过 `--magpie-cli`、配置项 `magpie.cli_path` 或环境变量 `MAGPIE_BIN` 指定。用 `magpie models` 查看模型 ID。可用环境变量指定模型，例如在 PowerShell 运行 `$env:DEEPSEEK_FLASH = 'your-provider/your-deepseek-flash'`，然后再运行 `.\install.ps1 -Apply`。
 
 ### 使用与验证
 
@@ -76,7 +83,7 @@ DeepSeek 的额度取决于你绑定的渠道。用 `magpie models` 查看本机
 
 建议分别试一次纯规划、代码修改、支持的子代理请求和上下文压缩。`order` 和规则定义的是优先顺序。目标不可用时，同组其他模型仍可接手，所以 Fable 中的 DeepSeek 也可能作为最后的故障回退。分类器会收到用户消息的文字片段，压缩模型会接收要压缩的上下文。选渠道时请按项目的数据要求判断。
 
-协作时通过 PR 修改 `install.sh`（并同步 `src/gempt/presets.py`）里的路由规则，并附上不含提示词原文或账户信息的验证结果。仓库只共享规则、代码和文档，本地账号、日志、密钥和 Magpie 配置各自保管。
+协作时通过 PR 修改 `src/gempt/presets.py` 里的 CLI 路由规则，并附上不含提示词原文或账户信息的验证结果。仓库只共享规则、代码和文档，本地账号、日志、密钥和 Magpie 配置各自保管。
 
 参考 [Magpie 意图路由文档](https://usemagpie.ai/docs/intent) 和 [路由组文档](https://usemagpie.ai/docs/start)。
 
@@ -123,57 +130,56 @@ Gemini 主控（Antigravity 官方原路 或 外部客户端经 Magpie 调 antig
 
 > 日常默认直接调用 Magpie 中具体的 GPT/Codex 模型 ID 即可工作；仅当开启组同步时才会创建独立命名的 `group/gempt-harness-*`，与根目录 `install.sh` 的 `group/gempt-*` 完全独立、互不覆盖。`high` / `xhigh` 自动保障长思考超时下限（exec ≥ 900s/1200s）。
 
-### 零依赖快速开始（Python 3.10+ 标准库）
+### Python CLI 快速开始
+
+安装 wheel 后可直接运行以下 `gempt` 命令。只用 `uvx` 时可沿用上面的命令前缀。
 
 1. **环境探测**（同时检查原生 `group/gempt-*` 预设、GPT/Codex/Utility 模型与 Codex CLI）：
 
 ```bash
-PYTHONPATH=src python -m gempt discover
+gempt discover
 ```
 
-2. **接入客户端与 Magpie 控制页**：
-   - **Magpie 原生 `tools + page` 插件**（控制中心 + 全客户端工具托管）：运行 `magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/api-fallback`（或公开纯订阅版 `#yizhang-dream/collab` / 本地 `magpie plugin add .`），即可在 Magpie 左侧栏 **`Plugins → GemPT`** 打开控制面板，并由 Magpie 自动将 `gempt_dispatch` / `gempt_discover` / `gempt_status` / `gempt_consult` / `gempt_exec` 注册到 `/mcp/magpie/tools/gempt`。未初始化时页面内可**一键启用订阅配置**（不启用也可零配置直连 Codex 订阅），随时切换共享 **默认档位**、**Codex 执行权限**、**容灾模式（仅订阅 / API 兜底）** 或一键创建 **`group/gempt-*` 直连路由组**。
-   - **Antigravity 原生插件**：运行 `bash install.sh --plugin`（或 `PYTHONPATH=src python -m gempt install-agy`），把 `plugin/`（`plugin.json`、`rules/`、`skills/`）与独立包副本安装到 `~/.gemini/config/plugins/gempt/`。安装并重载插件后，保持原生 Gemini 官方登录即可在 `/` 菜单直接使用 `/gempt`、`/gempt-sonnet`、`/gempt-opus`、`/gempt-fable`、`/gempt-chore`。
-   - **非 Magpie 托管的独立 MCP 客户端**：可在控制页点 **`复制 MCP 配置`**（或运行 `bash install.sh --print-mcp` / `PYTHONPATH=src python -m gempt print-mcp --installed`），并配合页内 **`复制协作规则`**（详版见 [plugin/skills/gempt/SKILL.md](plugin/skills/gempt/SKILL.md) 与 [plugin/rules/AGENTS.md](plugin/rules/AGENTS.md)）。
+2. **接入客户端**。按上面的安装说明启用 Magpie HTTP MCP 或 Antigravity 的独立 Python stdio MCP。接入后复制协作规则，Antigravity 插件自带规则。
 
 3. **首次初始化**：在客户端直接说“初始化 gempt”（Gemini 会调 `gempt_discover` + `gempt_configure`），或命令行运行：
 
 ```bash
-PYTHONPATH=src python -m gempt init
+gempt init
 # 无交互预览（可选同步 group/gempt-harness-*）：
-PYTHONPATH=src python -m gempt init --non-interactive --sync-magpie --use-groups --dry-run
+gempt init --non-interactive --sync-magpie --use-groups --dry-run
 ```
 
 ### 常用 CLI 命令
 
 ```bash
 # 查看或切换 Codex 执行权限（只读 / 工作区 / 全权限）
-PYTHONPATH=src python -m gempt sandbox
-PYTHONPATH=src python -m gempt sandbox workspace-write
+gempt sandbox
+gempt sandbox workspace-write
 
 # 查看或切换默认委派档位（工具调用省略 --tier / tier 时自动生效）
-PYTHONPATH=src python -m gempt tier
-PYTHONPATH=src python -m gempt tier opus
+gempt tier
+gempt tier opus
 
 # 查看或切换思考强度（对当前或指定档位设为 low/medium/high/xhigh，或 auto 智能定档）
-PYTHONPATH=src python -m gempt effort
-PYTHONPATH=src python -m gempt effort auto
-PYTHONPATH=src python -m gempt effort high --tier opus
+gempt effort
+gempt effort auto
+gempt effort high --tier opus
 
 # 查看当前配置（已脱敏）、Magpie/Codex 健康状态与近期会话
-PYTHONPATH=src python -m gempt status
+gempt status
 
 # 纯推理/审查咨询（不触发 Codex 固定上下文开销）
-PYTHONPATH=src python -m gempt consult --tier fable --file src/algo.py --goal "找出收敛震荡根因并给修复 diff"
+gempt consult --tier fable --file src/algo.py --goal "找出收敛震荡根因并给修复 diff"
 
 # 免费打杂档做日志压缩/分类
-PYTHONPATH=src python -m gempt consult --tier chore --file logs/build.log --goal "提取前 5 类报错和首次出现行号"
+gempt consult --tier chore --file logs/build.log --goal "提取前 5 类报错和首次出现行号"
 
 # 派给 Codex CLI 动手改代码并自测
-PYTHONPATH=src python -m gempt exec --tier opus --cwd /path/to/repo --goal "修复重试退避" --verification "python -m unittest -v"
+gempt exec --tier opus --cwd /path/to/repo --goal "修复重试退避" --verification "python -m unittest -v"
 
 # 疑难问题手动升级到 Astra（或直接传 --tier fable）
-PYTHONPATH=src python -m gempt exec --tier opus --escalate --cwd /path/to/repo --goal "排查并发死锁"
+gempt exec --tier opus --escalate --cwd /path/to/repo --goal "排查并发死锁"
 ```
 
 ---
@@ -201,8 +207,8 @@ MCP 宿主用 `GEMPT_WORKSPACE_ROOT` 指定授权工作区，默认采用服务�
 ### 断线后检查任务与退出码验收
 
 ```sh
-PYTHONPATH=src python -m gempt exec --background --cwd . --goal "修复解析器并运行单测" --verification "python -m unittest"
-PYTHONPATH=src python -m gempt status --run-id <返回的32位ID>
+gempt exec --background --cwd . --goal "修复解析器并运行单测" --verification "python -m unittest"
+gempt status --run-id <返回的32位ID>
 ```
 
 Magpie 原生 MCP 对短任务直接返回结果，运行约 20 秒仍在执行时返回 `run_id`，可用 `gempt_status(run_id=..., wait_sec=20)` 等待并读取最终结果。原生调用可传 `background=true` 立即取得任务号，重复使用同一 `run_id` 只启动一次。
@@ -217,4 +223,4 @@ Antigravity Python MCP 对应 `gempt_exec(background=true)` 与 `gempt_status(ru
 2. **思考型模型返回空内容**：`max_output_tokens` 过小时会被 reasoning tokens 占满；`gempt` 默认按档位设 `8192`~`32768`，如遇报错可用 `--max-tokens` 调大。
 3. **Windows 下无弹窗与 `.cmd` 转义**：`gempt` 在 Windows 调用子进程一律传 `CREATE_NO_WINDOW`，并通过 `stdin` 传长文本 prompt、直接用 Node 启动 npm 版 Codex 包，不经过 `cmd.exe` 二次转义。
 4. **Codex 沙箱若报 `cap_sid` 错误**：清理陈旧的 `~/.codex/cap_sid` 后重试即可。
-5. **运行自检**：`PYTHONPATH=src python -m unittest discover -s tests -v`（隔离真 Magpie CLI 集成测试可设 `GEMPT_TEST_MAGPIE_CLI=/path/to/magpie`）。
+5. **运行自检**。在源码目录先运行 `python -m pip install -e .`，再运行 `python -m unittest discover -s tests -v`。要启用隔离的 Magpie CLI 集成测试，把 `GEMPT_TEST_MAGPIE_CLI` 设为 Magpie 可执行文件路径。

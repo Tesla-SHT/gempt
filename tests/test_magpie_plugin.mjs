@@ -1,13 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { execFile } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
-import { readState, setDefaultSandbox, setDefaultTier } from '../magpie_plugin/lib/backend.mjs';
+import { buildMcpSnippet, findMagpieCli, readState, setDefaultSandbox, setDefaultTier } from '../magpie_plugin/lib/backend.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
 import { createGemptTools } from '../magpie_plugin/lib/tools.mjs';
 
@@ -17,13 +17,11 @@ const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 function findPythonBin() {
   const candidates = [
     process.env.PYTHON_BIN,
-    'C:/msys64/mingw64/bin/python.exe',
-    'python3',
-    'python',
+    ...(process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python']),
   ].filter(Boolean);
   for (const cand of candidates) {
-    if (!cand.includes('/') && !cand.includes('\\')) return cand;
-    if (existsSync(cand)) return cand;
+    const run = spawnSync(cand, ['-I', '-c', 'import sys; sys.exit(sys.version_info < (3, 10))'], { windowsHide: true });
+    if (run.status === 0) return cand;
   }
   return '';
 }
@@ -203,7 +201,7 @@ test('package.json Magpie manifest fields and single plugin factory export exist
   assert.equal(pkg.name, 'gempt');
   assert.equal(pkg.type, 'module');
   assert.equal(pkg.exports['.'], './magpie_plugin/index.mjs');
-  for (const item of ['magpie_plugin', 'src', 'plugin', 'templates', 'install.sh', 'README.md']) {
+  for (const item of [pkg.main.slice(2), 'src/gempt/workload.json', 'plugin/rules/AGENTS.md', 'install.sh', 'install.ps1', 'README.md']) {
     assert.ok(pkg.files.includes(item), `files missing ${item}`);
   }
   assert.ok(existsSync(join(REPO_ROOT, pkg.main)));
@@ -235,6 +233,46 @@ test('package.json Magpie manifest fields and single plugin factory export exist
     windowsHide: true,
   });
   assert.deepEqual(JSON.parse(stdout.trim()), ['consult', 'discover', 'dispatch', 'exec', 'status']);
+});
+
+test('backend discovery uses overrides, PATH and installed MCP configuration', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gempt-paths-'));
+  const before = { ...process.env };
+  try {
+    const bin = join(root, 'bin');
+    const win = process.platform === 'win32';
+    const python = join(bin, win ? 'python.exe' : 'python3');
+    const magpie = join(bin, win ? 'magpie.com' : 'magpie');
+    const override = join(root, 'custom-magpie');
+    mkdirSync(bin);
+    for (const path of [python, magpie, override]) {
+      writeFileSync(path, '');
+      chmodSync(path, 0o755);
+    }
+    process.env.PATH = [bin, before.PATH].filter(Boolean).join(delimiter);
+    process.env.MAGPIE_BIN = override;
+    process.env.PYTHON_BIN = python;
+    assert.equal(findMagpieCli(magpie), magpie);
+    assert.equal(findMagpieCli(), override);
+    assert.equal(buildMcpSnippet({ antigravityPluginDir: root }).config.mcpServers.gempt.command, python);
+    delete process.env.MAGPIE_BIN;
+    delete process.env.PYTHON_BIN;
+    assert.equal(findMagpieCli(), magpie);
+    assert.equal(buildMcpSnippet({ antigravityPluginDir: root }).config.mcpServers.gempt.command, python);
+
+    const runtime = join(root, 'runtime', 'gempt');
+    mkdirSync(runtime, { recursive: true });
+    writeFileSync(join(runtime, 'mcp_server.py'), '');
+    const config = { mcpServers: { gempt: { command: 'installed-python', args: ['-m', 'gempt.mcp_server'] } } };
+    writeFileSync(join(root, 'mcp_config.json'), JSON.stringify(config));
+    assert.deepEqual(buildMcpSnippet({ antigravityPluginDir: root }).config, config);
+  } finally {
+    for (const key of ['PATH', 'MAGPIE_BIN', 'PYTHON_BIN']) {
+      if (before[key] === undefined) delete process.env[key];
+      else process.env[key] = before[key];
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('backend readState exposes multi-client state, native groups, MCP snippet, usage tail, and api_fallback', async () => {

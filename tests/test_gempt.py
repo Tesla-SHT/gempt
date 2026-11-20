@@ -33,7 +33,7 @@ from gempt.config import (
     save_config,
     validate_config,
 )
-from gempt.discover import build_tier_recommendations, probe_magpie_gateway
+from gempt.discover import build_tier_recommendations, find_magpie_cli, probe_magpie_gateway
 from gempt.magpie_client import MagpieRequestError, _group_members, consult_with_fallback, sync_magpie_groups
 from gempt.mcp_server import _handle_tool_call
 from gempt.presets import apply_native_presets, build_native_preset_commands, strip_model_modifiers
@@ -211,6 +211,25 @@ class ConfigTests(unittest.TestCase):
 
 
 class DiscoverTests(unittest.TestCase):
+    def test_magpie_cli_prefers_override_then_path_then_os_install(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            name = "magpie.com" if os.name == "nt" else "magpie"
+            standard = root / ("Programs/magpie" if os.name == "nt" else ".local/bin")
+            explicit, env_cli, path_cli, os_cli = (p / name for p in (root / "explicit", root / "env", root / "bin", standard))
+            for candidate in (explicit, env_cli, path_cli, os_cli):
+                candidate.parent.mkdir(parents=True)
+                candidate.touch(mode=0o755)
+
+            with mock.patch.dict(os.environ, {"PATH": str(path_cli.parent), "MAGPIE_BIN": str(env_cli),
+                                               "LOCALAPPDATA": tmp}), mock.patch("gempt.discover.Path.home", return_value=root):
+                self.assertEqual(find_magpie_cli(str(explicit)), str(explicit))
+                self.assertEqual(find_magpie_cli(), str(env_cli))
+                os.environ["MAGPIE_BIN"] = ""
+                self.assertEqual(find_magpie_cli(), str(path_cli))
+                os.environ["PATH"] = ""
+                self.assertEqual(find_magpie_cli(), str(os_cli))
+
     def test_recommendations_exclude_forbidden_model_and_build_presets(self) -> None:
         catalog = {
             "codex_subscription_models": [
@@ -458,6 +477,73 @@ class McpStdioHandshakeTests(unittest.TestCase):
 
 
 class CliPackagingTests(unittest.TestCase):
+    def test_install_agy_uses_packaged_resources_and_base_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = root / "disposable uvx env" / "site-packages" / "gempt"
+            package.mkdir(parents=True)
+            for asset in (*((SRC_ROOT / "gempt").glob("*.py")), SRC_ROOT / "gempt" / "workload.json"):
+                shutil.copyfile(asset, package / asset.name)
+            shutil.copytree(REPO_ROOT / "plugin", package / "plugin_data")
+            shutil.copytree(REPO_ROOT / "templates", package / "plugin_data" / "templates")
+            target = root / "plugin outside checkout"
+            base_python = Path(sys._base_executable).resolve()
+
+            with mock.patch("gempt.agy_install.files", return_value=package), \
+                 mock.patch("gempt.agy_install.__file__", str(package / "agy_install.py")), \
+                 mock.patch.object(sys, "executable", str(root / "disposable uvx env" / "python")), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli_main(["install-agy", "--target", str(target)]), 0)
+            shutil.rmtree(package.parent.parent)
+
+            entry = json.loads((target / "mcp_config.json").read_text(encoding="utf-8"))["mcpServers"]["gempt"]
+            self.assertEqual(Path(entry["command"]), base_python)
+            self.assertEqual(Path(entry["args"][-1]), target / "runtime")
+            self.assertTrue((target / "templates" / "gempt.config.example.json").is_file())
+            self.assertTrue((target / "skills" / "gempt" / "references" / "magpie-routing.md").is_file())
+            hooks = json.loads((target / "hooks.json").read_text(encoding="utf-8"))["gempt-work-split"]
+            hook_command = hooks["PreInvocation"][0]["command"]
+            self.assertEqual(hooks["PreToolUse"][0]["hooks"][0]["command"], hook_command)
+            self.assertIn(str(base_python), hook_command)
+            self.assertIn(str(target / "work_split_hook.py"), hook_command)
+            request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+            proc = subprocess.run([entry["command"], *entry["args"]], cwd=root,
+                                  input=json.dumps(request) + "\n", encoding="utf-8",
+                                  capture_output=True, check=True, timeout=20)
+            self.assertIn("gempt_dispatch", [tool["name"] for tool in json.loads(proc.stdout)["result"]["tools"]])
+
+    def test_failed_staged_validation_keeps_existing_plugin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target, source = Path(tmp) / "installed", Path(tmp) / "source"
+            shutil.copytree(REPO_ROOT / "plugin", target)
+            shutil.copytree(REPO_ROOT / "plugin", source)
+            (source / "work_split_hook.py").write_text("raise SystemExit(9)\n", encoding="utf-8")
+            old_hook = (target / "work_split_hook.py").read_bytes()
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(cli_main(["install-agy", "--source", str(source), "--target", str(target)]), 1)
+            self.assertIn("Staged Antigravity hook failed", stderr.getvalue())
+            self.assertEqual((target / "work_split_hook.py").read_bytes(), old_hook)
+            self.assertFalse((target / "runtime").exists())
+
+    def test_failed_staged_placement_restores_existing_plugin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "installed"
+            shutil.copytree(REPO_ROOT / "plugin", target)
+            old_hook = target / "work_split_hook.py"
+            old_hook.write_bytes(b"# previous hook\n")
+            replace_path = Path.replace
+
+            def fail_placement(path, destination):
+                if path.name == "plugin" and destination == target:
+                    raise OSError("simulated placement failure")
+                return replace_path(path, destination)
+
+            with mock.patch.object(Path, "replace", fail_placement), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(cli_main(["install-agy", "--target", str(target)]), 1)
+            self.assertEqual(old_hook.read_bytes(), b"# previous hook\n")
+            self.assertFalse((target / "runtime").exists())
+
     def test_print_mcp_and_install_agy_from_flat_plugin(self) -> None:
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -547,10 +633,10 @@ class PresetsParityTests(unittest.TestCase):
             self.skipTest("bash not available")
 
         for extra_env in ({}, {"GEMPT_SOL": "codex/custom"}, {"GEMPT_TERRA": "codex/custom", "DEEPSEEK_FLASH": "auto/deepseek-v4.1-flash"}):
-            env = dict(os.environ, MAGPIE_BIN="magpie", **extra_env)
+            env = dict(os.environ, MAGPIE_BIN="magpie", PYTHON_BIN=sys.executable, **extra_env)
             kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if sys.platform == "win32" else {}
             proc = subprocess.run(
-                [bash, str(REPO_ROOT / "install.sh")],
+                [bash, str(REPO_ROOT / "install.sh"), "--preview"],
                 cwd=REPO_ROOT,
                 env=env,
                 capture_output=True,
@@ -610,6 +696,31 @@ class PresetsParityTests(unittest.TestCase):
             self.assertEqual(res["models"]["astra"], "codex/gpt-6.2-astra")
             self.assertEqual(res["models"]["flash"], "auto/deepseek-v4.1-flash")
             self.assertTrue(any("gempt-fable" in " ".join(c) and "agy-cli/gemini-4-neon" in " ".join(c) for c in seen_cmds))
+
+    def test_apply_without_allowed_utility_and_reject_excluded_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            save_config(default_config_template(), path=config)
+            catalog = "agy-cli/gemini-4-neon\ncodex/gpt-6.2-sol\nworkbuddy/deepseek-v4.1-flash"
+
+            def group_command(argv, *, missing=""):
+                if argv[1:] == ["models"]:
+                    return catalog
+                return None if missing else ""
+
+            with mock.patch.dict(os.environ, {"GEMPT_CONFIG": str(config), "GEMPT_SESSIONS_DIR": tmp,
+                                               "GEMPT_EXCLUDED_MODELS": "workbuddy"}), \
+                 mock.patch("gempt.presets.find_magpie_cli", return_value="magpie"), \
+                 mock.patch("gempt.presets._group_command", side_effect=group_command):
+                result = apply_native_presets(apply=True, env={})
+                with self.assertRaisesRegex(MagpieRequestError, "selects an excluded model"):
+                    apply_native_presets(apply=True, env={"DEEPSEEK_FLASH": "workbuddy/deepseek-v4.1-flash"})
+
+            self.assertEqual(result["models"]["flash"], "")
+            self.assertEqual(result["models"]["argon"], "agy-cli/gemini-4-neon")
+            self.assertFalse(any("compact" in command or any("workbuddy" in arg for arg in command)
+                                 for command in result["commands"]))
+            self.assertIn("models=agy-cli/gemini-4-neon,codex/gpt-6.2-sol", result["commands"][0])
 
 
 class BugfixRegressionTests(unittest.TestCase):

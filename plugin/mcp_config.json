@@ -2,11 +2,7 @@
   "mcpServers": {
     "gempt": {
       "command": "python",
-      "args": ["-m", "gempt.mcp_server"],
-      "env": {
-        "PYTHONPATH": "src",
-        "PYTHONUTF8": "1"
-      }
+      "args": ["-X", "utf8", "-m", "gempt.mcp_server"]
     }
   }
 }

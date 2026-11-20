@@ -7,7 +7,7 @@
  * atomically persists default_tier and default_sandbox changes.
  */
 import { execFile } from 'node:child_process';
-import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { accessSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import { homedir } from 'node:os';
@@ -741,19 +741,20 @@ export function buildRulesSnippet() {
 function resolvePythonBin() {
   const envBin = String(process.env.PYTHON_BIN || '').trim();
   if (envBin) return envBin;
-  if (process.platform === 'win32') {
-    const msysPy = 'C:\\msys64\\mingw64\\bin\\python.exe';
-    if (existsSync(msysPy)) return msysPy;
-    for (const dir of String(process.env.PATH || '').split(delimiter)) {
-      if (!dir || dir.toLowerCase().includes('windowsapps')) continue;
-      for (const name of ['python3.exe', 'python.exe']) {
-        const cand = join(dir, name);
-        if (existsSync(cand)) return cand;
-      }
+  const windows = process.platform === 'win32';
+  const names = windows ? ['python.exe', 'python3.exe'] : ['python3', 'python'];
+  const dirs = executablePathDirs().filter((dir) => !windows || !/[/\\]WindowsApps(?:[/\\]|$)/i.test(dir));
+  if (windows && process.env.LOCALAPPDATA) {
+    const base = join(process.env.LOCALAPPDATA, 'Programs', 'Python');
+    try {
+      const installs = readdirSync(base).filter((name) => /^Python3\d+$/i.test(name));
+      installs.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+      dirs.push(...installs.map((name) => join(base, name)));
+    } catch {
+      // The per-user Python installation directory may be absent.
     }
-    return 'python';
   }
-  return 'python3';
+  return findExecutable(dirs.flatMap((dir) => names.map((name) => join(dir, name)))) || names[0];
 }
 
 export function buildMcpSnippet({ antigravityPluginDir, repoRoot = REPO_ROOT } = {}) {
@@ -764,6 +765,10 @@ export function buildMcpSnippet({ antigravityPluginDir, repoRoot = REPO_ROOT } =
   const targetRoot = existsSync(join(installedRuntime, 'gempt', 'mcp_server.py'))
     ? installedRuntime
     : resolve(join(repoRoot, 'src'));
+  const installedConfig = targetRoot === installedRuntime ? readJsonSafe(join(agyDir, 'mcp_config.json')) : null;
+  if (installedConfig?.mcpServers?.gempt?.command) {
+    return { target_root: targetRoot, config: installedConfig, json: JSON.stringify(installedConfig, null, 2) };
+  }
 
   const pythonBin = resolvePythonBin();
   const config = {
@@ -772,6 +777,8 @@ export function buildMcpSnippet({ antigravityPluginDir, repoRoot = REPO_ROOT } =
         command: pythonBin,
         args: [
           '-I',
+          '-X',
+          'utf8',
           '-c',
           "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_module('gempt.mcp_server',run_name='__main__')",
           targetRoot,
@@ -1313,56 +1320,49 @@ export function buildMagpieCliEnv() {
   return env;
 }
 
-export function findMagpieCli(configuredPath = '') {
-  const candidates = [];
-  if (configuredPath && String(configuredPath).trim()) {
-    candidates.push(expandUser(String(configuredPath).trim()));
-  }
-  const envBin = String(process.env.MAGPIE_BIN || '').trim();
-  if (envBin) candidates.push(expandUser(envBin));
+function executablePathDirs() {
+  return String(process.env.PATH || '').split(delimiter).filter(Boolean);
+}
 
-  const names = process.platform === 'win32' ? ['magpie.com', 'magpie.exe', 'magpie.cmd', 'magpie'] : ['magpie'];
-  for (const dir of String(process.env.PATH || '').split(delimiter)) {
-    if (!dir) continue;
-    for (const name of names) {
-      candidates.push(join(dir, name));
-    }
-  }
-
-  if (process.platform === 'win32') {
-    const localApp = String(process.env.LOCALAPPDATA || '').trim();
-    candidates.push(
-      join(homedir(), 'apps', 'magpie', 'magpie.com'),
-      join(homedir(), 'apps', 'magpie', 'magpie.exe'),
-      'D:\\apps\\magpie\\magpie.com',
-      'D:\\apps\\magpie\\magpie.exe',
-    );
-    if (localApp) {
-      candidates.push(
-        join(localApp, 'Programs', 'magpie', 'magpie.com'),
-        join(localApp, 'Programs', 'magpie', 'magpie.exe'),
-      );
-    }
-  } else {
-    candidates.push(
-      join(homedir(), '.local', 'opt', 'magpie', 'magpie'),
-      join(homedir(), 'apps', 'magpie', 'magpie'),
-      join(homedir(), '.local', 'bin', 'magpie'),
-      '/Applications/magpie.app/Contents/MacOS/magpie',
-      '/usr/local/bin/magpie',
-    );
-  }
-
-  for (const cand of candidates) {
+function findExecutable(candidates) {
+  for (const candidate of candidates) {
     try {
-      if (cand && existsSync(cand) && statSync(cand).isFile()) {
-        return cand;
+      if (statSync(candidate).isFile()) {
+        accessSync(candidate, constants.X_OK);
+        return resolve(candidate);
       }
     } catch {
-      // Ignore invalid or inaccessible candidate path.
+      // The candidate may be missing or inaccessible.
     }
   }
   return '';
+}
+
+export function findMagpieCli(configuredPath = '') {
+  const candidates = [];
+  const dirs = executablePathDirs();
+  for (const override of [configuredPath, process.env.MAGPIE_BIN]) {
+    const raw = String(override || '').trim();
+    if (raw) {
+      candidates.push(expandUser(raw));
+      if (basename(raw) === raw) candidates.push(...dirs.map((dir) => join(dir, raw)));
+    }
+  }
+
+  const windows = process.platform === 'win32';
+  const names = windows ? ['magpie.com', 'magpie.exe', 'magpie.cmd', 'magpie'] : ['magpie'];
+  if (windows) {
+    if (process.env.LOCALAPPDATA) dirs.push(join(process.env.LOCALAPPDATA, 'Programs', 'magpie'));
+    for (const variable of ['ProgramFiles', 'ProgramFiles(x86)']) {
+      if (process.env[variable]) dirs.push(join(process.env[variable], 'magpie'));
+    }
+  } else {
+    dirs.push(join(homedir(), '.local', 'bin'), join(homedir(), '.local', 'opt', 'magpie'), '/usr/local/bin');
+    if (process.platform === 'darwin') {
+      dirs.push('/Applications/Magpie.app/Contents/MacOS', '/Applications/magpie.app/Contents/MacOS');
+    }
+  }
+  return findExecutable([...candidates, ...dirs.flatMap((dir) => names.map((name) => join(dir, name)))]);
 }
 
 async function execMagpieCli(cliPath, args, { timeoutMs = 20000 } = {}) {

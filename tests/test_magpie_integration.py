@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -50,7 +51,8 @@ class GroupSyncTests(unittest.TestCase):
                     self.assertTrue(bash, "Set GEMPT_TEST_BASH to Git Bash")
                     repo = Path(__file__).resolve().parents[1]
                     native_env = magpie_client.build_magpie_cli_env()
-                    native_env.update(MAGPIE_BIN=exe, GEMPT_HYDROGEN="fixture/hydrogen",
+                    native_env.pop("PYTHONHOME", None)
+                    native_env.update(PYTHON_BIN=sys.executable, MAGPIE_BIN=exe, GEMPT_HYDROGEN="fixture/hydrogen",
                                       GEMPT_NEON="fixture/neon", GEMPT_ARGON="fixture/frontier",
                                       GEMPT_SOL="fixture/gpt-small", GEMPT_ASTRA="fixture/gpt-large",
                                       DEEPSEEK_FLASH="fixture/gpt-flash")

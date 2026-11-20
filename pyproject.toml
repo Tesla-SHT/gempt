@@ -13,8 +13,12 @@ dependencies = []
 [project.scripts]
 gempt = "gempt.cli:main"
 
+[tool.setuptools]
+packages = ["gempt", "gempt.plugin_data", "gempt.plugin_data.templates"]
+package-dir = {gempt = "src/gempt", "gempt.plugin_data" = "plugin", "gempt.plugin_data.templates" = "templates"}
+include-package-data = false
+
 [tool.setuptools.package-data]
 gempt = ["workload.json"]
-
-[tool.setuptools.packages.find]
-where = ["src"]
+"gempt.plugin_data" = ["plugin.json", "mcp_config.json", "hooks.json", "work_split_hook.py", "rules/*.md", "skills/*/SKILL.md", "skills/*/references/*.md"]
+"gempt.plugin_data.templates" = ["gempt.config.example.json", "magpie-groups.template.json"]

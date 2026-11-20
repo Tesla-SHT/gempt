@@ -45,57 +45,35 @@ def _is_excluded_model(model_id: str, excluded: set[str] | None = None) -> bool:
 
 
 def find_magpie_cli(configured_path: str = "") -> str | None:
-    """Locate local Magpie CLI executable if installed."""
+    """Locate Magpie via explicit configuration, PATH, or standard install directories."""
+    windows = sys.platform == "win32"
+    names = ("magpie.com", "magpie.exe", "magpie.cmd", "magpie") if windows else ("magpie",)
+    path_dirs = [Path(part) for part in os.get_exec_path() if part]
     candidates: list[Path] = []
-    if configured_path:
-        candidates.append(Path(configured_path).expanduser())
-    env_magpie = os.environ.get("MAGPIE_BIN", "").strip()
-    if env_magpie:
-        candidates.append(Path(env_magpie).expanduser())
-        found_env = shutil.which(env_magpie)
-        if found_env:
-            candidates.append(Path(found_env))
-    for name in ("magpie.com", "magpie"):
-        found = shutil.which(name)
-        if found:
-            candidates.append(Path(found))
+    for override in (configured_path.strip(), os.environ.get("MAGPIE_BIN", "").strip()):
+        if override:
+            path = Path(override).expanduser()
+            candidates.append(path)
+            if path.name == override:
+                candidates.extend(directory / path for directory in path_dirs)
 
-    if sys.platform == "win32":
-        candidates.extend(
-            [
-                Path.home() / "apps" / "magpie" / "magpie.com",
-                Path.home() / "apps" / "magpie" / "magpie.exe",
-            ]
-        )
-        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
-        if local_appdata:
-            candidates.extend(
-                [
-                    Path(local_appdata) / "Programs" / "magpie" / "magpie.com",
-                    Path(local_appdata) / "Programs" / "magpie" / "magpie.exe",
-                ]
-            )
-        candidates.extend(
-            [
-                Path("D:/apps/magpie/magpie.com"),
-                Path("D:/apps/magpie/magpie.exe"),
-            ]
-        )
+    standard_dirs: list[Path] = []
+    if windows:
+        for variable, suffix in (("LOCALAPPDATA", "Programs/magpie"), ("ProgramFiles", "magpie"),
+                                 ("ProgramFiles(x86)", "magpie")):
+            if base := os.environ.get(variable):
+                standard_dirs.append(Path(base) / suffix)
     else:
-        candidates.extend(
-            [
-                Path.home() / ".local" / "opt" / "magpie" / "magpie",
-                Path.home() / "apps" / "magpie" / "magpie",
-                Path.home() / ".local" / "bin" / "magpie",
-                Path("/Applications/magpie.app/Contents/MacOS/magpie"),
-                Path("/usr/local/bin/magpie"),
-            ]
-        )
+        standard_dirs.extend((Path.home() / ".local/bin", Path.home() / ".local/opt/magpie", Path("/usr/local/bin")))
+        if sys.platform == "darwin":
+            standard_dirs.extend(Path("/Applications") / app / "Contents/MacOS"
+                                 for app in ("Magpie.app", "magpie.app"))
+    candidates.extend(directory / name for directory in (*path_dirs, *standard_dirs) for name in names)
 
     for candidate in candidates:
         try:
-            if candidate and candidate.is_file():
-                return str(candidate)
+            if candidate.is_file() and (windows or os.access(candidate, os.X_OK)):
+                return str(candidate.absolute())
         except OSError:
             continue
     return None
@@ -112,10 +90,10 @@ def find_codex_cli(configured_path: str = "") -> dict[str, Any]:
             candidates.append(found)
 
     if sys.platform == "win32":
-        npm_global = Path.home() / ".npm-global"
-        c_home_npm = Path(f"C:/home/{os.environ.get('USERNAME', '')}/.npm-global")
-        appdata_npm = Path(os.environ.get("APPDATA", "")) / "npm"
-        for base in (npm_global, c_home_npm, appdata_npm):
+        npm_dirs = [Path.home() / ".npm-global"]
+        if appdata := os.environ.get("APPDATA"):
+            npm_dirs.append(Path(appdata) / "npm")
+        for base in npm_dirs:
             for fname in ("codex.cmd", "codex.exe"):
                 p = base / fname
                 if p.is_file() and str(p) not in candidates:

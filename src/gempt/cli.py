@@ -6,8 +6,6 @@ import argparse
 import json
 import os
 import shlex
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -23,6 +21,7 @@ from . import (
     VALID_SANDBOXES,
     __version__,
 )
+from .agy_install import DEFAULT_AGY_TARGET, build_mcp_config, install_agy
 from .config import get_default_tier, load_config, resolve_tier
 from .discover import discover_environment
 from .presets import apply_native_presets
@@ -41,42 +40,6 @@ def _configure_stdio_utf8() -> None:
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
-
-
-def _find_repo_plugin_dir() -> Path:
-    pkg_dir = Path(__file__).resolve().parent
-    candidates = [
-        pkg_dir.parent.parent,
-        pkg_dir.parent.parent / "plugin",
-        Path.cwd(),
-        Path.cwd() / "plugin",
-    ]
-    for cand in candidates:
-        if (cand / "plugin.json").is_file():
-            return cand
-    raise FileNotFoundError("Could not locate source `plugin/` directory next to gempt package.")
-
-
-def _build_mcp_config(src_root: Path) -> dict[str, Any]:
-    resolved_root = str(src_root.expanduser().resolve())
-    return {
-        "mcpServers": {
-            "gempt": {
-                "command": sys.executable,
-                "args": [
-                    "-I",
-                    "-c",
-                    "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));"
-                    "runpy.run_module('gempt.mcp_server',run_name='__main__')",
-                    resolved_root,
-                ],
-                "env": {
-                    "PYTHONPATH": resolved_root,
-                    "PYTHONUTF8": "1",
-                },
-            }
-        }
-    }
 
 
 def _interactive_init(args: argparse.Namespace) -> int:
@@ -166,103 +129,40 @@ def _interactive_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_install_agy(args: argparse.Namespace) -> int:
-    source_plugin = Path(args.source).expanduser().resolve() if args.source else _find_repo_plugin_dir()
     target = Path(args.target).expanduser().resolve()
-    src_root = target / "runtime"
-
-    if target.exists():
-        if not args.force:
-            existing_json = target / "plugin.json"
-            if existing_json.is_file():
-                try:
-                    data = json.loads(existing_json.read_text(encoding="utf-8"))
-                    if data.get("name") != "gempt":
-                        print(
-                            f"Refusing to overwrite unrelated plugin at {target} (name={data.get('name')!r}). Use --force or another --target.",
-                            file=sys.stderr,
-                        )
-                        return 1
-                except json.JSONDecodeError:
-                    print(f"Target {target} exists; pass --force to overwrite.", file=sys.stderr)
-                    return 1
-            else:
-                print(f"Target {target} exists; pass --force to overwrite.", file=sys.stderr)
-                return 1
-
-    target.mkdir(parents=True, exist_ok=True)
-    for rel in ("plugin.json", "README.md", "hooks.json", "work_split_hook.py"):
-        src_file = source_plugin / rel
-        if not src_file.is_file() and rel == "README.md":
-            parent_readme = source_plugin.parent / "README.md"
-            if parent_readme.is_file():
-                src_file = parent_readme
-        if src_file.is_file() and source_plugin != target:
-            shutil.copy2(src_file, target / rel)
-
-    hooks_file = target / "hooks.json"
-    if (source_plugin / "hooks.json").is_file() and hooks_file.is_file():
-        hooks = json.loads(hooks_file.read_text(encoding="utf-8"))
-        command = [sys.executable, "-I", str(target / "work_split_hook.py")]
-        encoded = subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
-        handlers = hooks["gempt-work-split"]
-        handlers["PreInvocation"][0]["command"] = encoded
-        handlers["PreToolUse"][0]["hooks"][0]["command"] = encoded
-        hooks_file.write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
-
-    for folder in ("rules", "skills", "assets"):
-        src_sub = source_plugin / folder
-        if src_sub.is_dir() and source_plugin != target:
-            dst_sub = target / folder
-            shutil.copytree(
-                src_sub,
-                dst_sub,
-                dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "node_modules", ".DS_Store"),
-            )
-
-    stale_sidecar = target / "sidecars" / "gempt_panel"
-    if stale_sidecar.exists():
-        shutil.rmtree(stale_sidecar, ignore_errors=True)
-    stale_sidecars_dir = target / "sidecars"
-    if stale_sidecars_dir.is_dir():
-        try:
-            stale_sidecars_dir.rmdir()
-        except OSError:
-            pass
-
-    package = Path(__file__).resolve().parent
-    if package != src_root / "gempt":
-        shutil.copytree(package, src_root / "gempt", dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    mcp_config = _build_mcp_config(src_root)
-    (target / "mcp_config.json").write_text(json.dumps(mcp_config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-    print(
-        json.dumps(
-            {
-                "installed": True,
-                "plugin_dir": str(target),
-                "mcp_config": mcp_config,
-                "next_steps": [
-                    "Antigravity loads plugins automatically on the next turn (or toggle/reload in Customizations).",
-                    "Tell Gemini: '初始化 gempt' (or /gempt) to run gempt_discover + setup.",
-                    "Use /gempt-sonnet, /gempt-opus, /gempt-fable, /gempt-chore in chat, and install the GemPT control page inside Magpie (`magpie plugin add <repo>`).",
-                    "For other clients (Claude Code / ZCode / Codex) using Magpie Gemini, run `gempt print-mcp --installed` and paste into Magpie Library -> MCP or your client config.",
-                ],
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-    )
+    source = Path(args.source).expanduser().resolve() if args.source else None
+    mcp_config = install_agy(target, source=source, force=args.force)
+    print(json.dumps({
+        "installed": True,
+        "plugin_dir": str(target),
+        "mcp_config": mcp_config,
+        "next_steps": [
+            "Reload the plugin in Antigravity and run /gempt to configure it.",
+            "For a standalone stdio MCP client, run gempt print-mcp --installed.",
+        ],
+    }, indent=2, ensure_ascii=False))
     return 0
 
 
 def _cmd_print_mcp(args: argparse.Namespace) -> int:
     if args.installed:
-        src_root = Path(args.target).expanduser().resolve() / "runtime"
+        config_file = Path(args.target).expanduser() / "mcp_config.json"
+        config = json.loads(config_file.read_text(encoding="utf-8"))
     else:
-        src_root = Path(__file__).resolve().parent.parent
-    print(json.dumps(_build_mcp_config(src_root), indent=2, ensure_ascii=False))
+        config = build_mcp_config(Path(__file__).resolve().parent.parent)
+    print(json.dumps(config, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _cmd_presets(apply: bool, cli_path: str = "", as_json: bool = False) -> int:
+    res = apply_native_presets(cli_path=cli_path, apply=apply)
+    if as_json:
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    else:
+        for command in res["commands"]:
+            print(shlex.join(command))
+        if res["applied"]:
+            print(f"Applied native Magpie groups: {', '.join(res['groups'])}")
     return 0
 
 
@@ -356,18 +256,34 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("mcp", help="Run gempt stdio MCP server")
 
     p_inst = sub.add_parser("install-agy", help="Install gempt plugin into Antigravity config directory")
-    p_inst.add_argument("--target", default=str(Path.home() / ".gemini" / "config" / "plugins" / "gempt"))
+    p_inst.add_argument("--target", default=str(DEFAULT_AGY_TARGET))
     p_inst.add_argument("--source", default=None, help="Path to source plugin/ folder")
     p_inst.add_argument("--force", action="store_true")
 
-    p_pmcp = sub.add_parser("print-mcp", help="Print standard MCP JSON config for Magpie/Claude/ZCode/etc.")
-    p_pmcp.add_argument("--installed", action="store_true", help="Point to installed Antigravity plugin runtime/ instead of current src/")
-    p_pmcp.add_argument("--target", default=str(Path.home() / ".gemini" / "config" / "plugins" / "gempt"))
+    p_pmcp = sub.add_parser("print-mcp", help="Print standalone stdio MCP client configuration")
+    p_pmcp.add_argument("--installed", action="store_true", help="Read the installed Antigravity MCP config")
+    p_pmcp.add_argument("--target", default=str(DEFAULT_AGY_TARGET))
 
     p_pres = sub.add_parser("presets", help="Preview or apply native Magpie groups group/gempt-{sonnet,opus,fable}")
     p_pres.add_argument("--apply", action="store_true", help="Create the native Magpie routing groups")
     p_pres.add_argument("--magpie-cli", default="", help="Optional path to magpie / magpie.com executable")
     p_pres.add_argument("--json", action="store_true", help="Print structured JSON output")
+
+    p_install = sub.add_parser("install", help="Install the Antigravity plugin or manage Magpie presets")
+    mode = p_install.add_mutually_exclusive_group()
+    for flag, description in (
+        ("plugin", "Install the Antigravity plugin (default)"),
+        ("preview", "Preview Magpie route group commands"),
+        ("apply", "Create the Magpie route groups"),
+        ("print-mcp", "Print standalone stdio MCP configuration from the installed plugin"),
+        ("all", "Create the Magpie route groups and install the Antigravity plugin"),
+    ):
+        mode.add_argument(f"--{flag}", action="store_const", const=flag, dest="mode", help=description)
+    p_install.set_defaults(mode="plugin")
+    p_install.add_argument("--target", default=str(DEFAULT_AGY_TARGET))
+    p_install.add_argument("--source", default=None, help="Path to source plugin/ folder")
+    p_install.add_argument("--force", action="store_true")
+    p_install.add_argument("--magpie-cli", default="", help="Optional path to the Magpie executable")
 
     return parser
 
@@ -545,16 +461,16 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_print_mcp(args)
 
         if args.command == "presets":
-            res = apply_native_presets(cli_path=args.magpie_cli, apply=args.apply)
-            if args.json:
-                print(json.dumps(res, indent=2, ensure_ascii=False))
-            else:
-                import shlex
-                for cmd in res["commands"]:
-                    print(" ".join(shlex.quote(part) for part in cmd))
-                if res.get("applied"):
-                    print(f"Applied native Magpie groups: {', '.join(res['groups'])}")
-            return 0
+            return _cmd_presets(args.apply, args.magpie_cli, args.json)
+
+        if args.command == "install":
+            if args.mode in {"preview", "apply", "all"}:
+                _cmd_presets(args.mode != "preview", args.magpie_cli)
+            if args.mode in {"plugin", "all"}:
+                return _cmd_install_agy(args)
+            if args.mode == "print-mcp":
+                args.installed = True
+                return _cmd_print_mcp(args)
 
     except Exception as exc:
         print(f"gempt error: {exc}", file=sys.stderr)

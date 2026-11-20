@@ -8,11 +8,24 @@
     ".": "./magpie_plugin/index.mjs"
   },
   "files": [
-    "magpie_plugin",
-    "src",
-    "plugin",
-    "templates",
+    "magpie_plugin/index.mjs",
+    "magpie_plugin/lib/*.mjs",
+    "magpie_plugin/page/*.{html,js,svg}",
+    "magpie_plugin/ui/*.{html,js,css}",
+    "src/gempt/*.py",
+    "src/gempt/workload.json",
+    "plugin/plugin.json",
+    "plugin/mcp_config.json",
+    "plugin/hooks.json",
+    "plugin/work_split_hook.py",
+    "plugin/rules/AGENTS.md",
+    "plugin/skills/*/SKILL.md",
+    "plugin/skills/*/references/*.md",
+    "templates/gempt.config.example.json",
+    "templates/magpie-groups.template.json",
+    "pyproject.toml",
     "install.sh",
+    "install.ps1",
     "README.md"
   ],
   "repository": {

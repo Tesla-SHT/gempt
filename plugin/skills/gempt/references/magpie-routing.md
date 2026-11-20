@@ -1,10 +1,10 @@
 # Magpie 三档路由组参考模板（`gempt`）
 
-本文件列出与仓库根目录 `templates/magpie-groups.template.json` 对应的本地 Magpie CLI 配置方法，供 `gempt_configure(..., sync_magpie_groups=True)` 或手工调整 Magpie 路由时参考。
+本文件列出与 `templates/magpie-groups.template.json` 对应的本地 Magpie CLI 配置方法，供 `gempt_configure(..., sync_magpie_groups=True)` 或手工调整 Magpie 路由时参考。模板随 Antigravity 插件一同安装。
 
 > 注意：
 > - **Antigravity 原生用户**：Antigravity 里的 Gemini 使用官方原路，不需要也不能通过 Magpie 反代；在 Antigravity UI 内自选 Gemini 档位即可。
-> - **外部客户端用户（通过 Magpie 用 Gemini）**：可用根目录 `install.sh --apply`（或 `gempt presets --apply`）一键创建原生预设 `group/gempt-{sonnet,opus,fable}`；若要在同一回合内主动调度 GPT/Codex，可通过 `install.sh --print-mcp`（或 `gempt print-mcp`）挂接本插件 MCP。
+> - **外部客户端用户（通过 Magpie 用 Gemini）**：运行 `gempt presets --apply` 可创建原生预设 `group/gempt-{sonnet,opus,fable}`。Magpie 原生插件通过 HTTP MCP 提供同回合的 GPT/Codex 调度。独立 stdio 客户端可从已安装的 Antigravity 插件导出配置，命令为 `gempt print-mcp --installed`。
 > - **命名隔离与共存**：本插件可选同步的 `group/gempt-harness-{sonnet,opus,fable}` 仅包含 GPT/Codex（及可选 `compact` 规则），与根目录 `install.sh` 的 `group/gempt-*`（含 Gemini + GPT + Flash）完全独立、互不冲突；日常默认不新建组也可直接使用具体 GPT 模型 ID。
 
 ---
