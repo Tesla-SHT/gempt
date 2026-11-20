@@ -490,6 +490,50 @@ class PresetsParityTests(unittest.TestCase):
             )
             self.assertEqual(shell_cmds, py_cmds)
 
+    def test_apply_native_presets_auto_resolves_catalog_and_respects_exclusions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / "config.json"
+            cfg = default_config_template()
+            cfg["routing_policy"]["excluded_models"] = ["gemini-4-argon"]
+            save_config(cfg, path=conf)
+
+            seen_cmds: list[list[str]] = []
+            catalog_text = "\n".join(
+                [
+                    "agy-cli/gemini-4-hydrogen",
+                    "agy-cli/gemini-4-neon",
+                    "agy-cli/gemini-4-argon",
+                    "codex/gpt-6.2-sol",
+                    "codex/gpt-6.2-astra",
+                    "auto/deepseek-v4.1-flash",
+                ]
+            )
+
+            def fake_group_cmd(argv, *, missing="", timeout=60):
+                seen_cmds.append(list(argv))
+                if argv[1:] == ["models"]:
+                    return catalog_text
+                if argv[1:] == ["groups"]:
+                    return ""
+                if len(argv) >= 3 and argv[1] == "group" and missing:
+                    return None
+                return ""
+
+            with mock.patch.dict(os.environ, {"GEMPT_CONFIG": str(conf), "GEMPT_SESSIONS_DIR": str(Path(tmp) / "sess"), "GEMPT_EXCLUDED_MODELS": ""}), \
+                 mock.patch("gempt.presets.find_magpie_cli", return_value="magpie"), \
+                 mock.patch("gempt.presets._group_command", side_effect=fake_group_cmd):
+                res = apply_native_presets(apply=True, env={})
+
+            self.assertTrue(res["applied"])
+            self.assertEqual(res["models"]["hydrogen"], "agy-cli/gemini-4-hydrogen")
+            self.assertEqual(res["models"]["neon"], "agy-cli/gemini-4-neon")
+            self.assertNotIn("gemini-4-argon", res["models"]["argon"])
+            self.assertEqual(res["models"]["argon"], "agy-cli/gemini-4-neon")
+            self.assertEqual(res["models"]["sol"], "codex/gpt-6.2-sol")
+            self.assertEqual(res["models"]["astra"], "codex/gpt-6.2-astra")
+            self.assertEqual(res["models"]["flash"], "auto/deepseek-v4.1-flash")
+            self.assertTrue(any("gempt-fable" in " ".join(c) and "agy-cli/gemini-4-neon" in " ".join(c) for c in seen_cmds))
+
 
 class BugfixRegressionTests(unittest.TestCase):
     def test_group_members_parses_not_served_and_nested_groups(self) -> None:

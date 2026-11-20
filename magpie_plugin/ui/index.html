@@ -23,7 +23,7 @@
         </span>
       </div>
       <div class="header-right">
-        <span class="role-caption">Antigravity 原生 Gemini → Magpie Codex</span>
+        <span class="role-caption">Gemini 主控 → Magpie Codex</span>
         <button id="refresh-btn" type="button" class="icon-btn" aria-label="刷新状态" title="刷新状态">
           <svg class="icon-svg" viewBox="0 0 16 16" fill="none" aria-hidden="true">
             <path d="M13.5 8A5.5 5.5 0 1 1 11.9 4.1M13.5 2.5V5.2H10.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
@@ -43,13 +43,27 @@
       <section class="section" aria-labelledby="route-section-label">
         <div class="section-head">
           <span id="route-section-label" class="section-eyebrow">当前路由</span>
+          <fieldset class="mode-fieldset">
+            <legend class="sr-only">接入方式</legend>
+            <div class="seg-control seg-compact">
+              <span class="seg-option">
+                <input id="mode-mcp" class="seg-radio sr-only" type="radio" name="view_mode" value="mcp" checked>
+                <label class="seg-label" for="mode-mcp">MCP 编排</label>
+              </span>
+              <span class="seg-option">
+                <input id="mode-native" class="seg-radio sr-only" type="radio" name="view_mode" value="native">
+                <label class="seg-label" for="mode-native">路由组直连</label>
+              </span>
+            </div>
+          </fieldset>
         </div>
 
         <article class="surface route-card">
           <div class="route-title-row">
             <div class="route-title-group">
               <strong id="active-tier-name" class="route-tier-name">Sonnet</strong>
-              <code id="active-tier-target" class="pill-code" hidden>group/gempt-harness-sonnet</code>
+              <button id="active-tier-target" type="button" class="pill-copy-btn" data-copy="group/gempt-sonnet" hidden>group/gempt-sonnet</button>
+              <span id="active-tier-ready-badge" class="inline-state-badge" hidden>未创建</span>
             </div>
             <span id="active-tier-effort" class="effort-tag">思考深度：中</span>
           </div>
@@ -59,10 +73,13 @@
               <div class="source-card">
                 <div class="source-top">
                   <span class="source-dot" aria-hidden="true"></span>
-                  <strong>Antigravity</strong>
+                  <strong id="source-title">MCP 客户端</strong>
                 </div>
-                <span class="source-sub">原生 Gemini · 官方通道</span>
-                <button id="active-slash-btn" type="button" class="pill-copy-btn" data-copy="/gempt-sonnet " title="点击复制单轮快捷指令">/gempt-sonnet</button>
+                <span id="source-sub" class="source-sub">Claude Code · ZCode · Cursor · CLI</span>
+                <div id="source-actions" class="source-actions">
+                  <button id="copy-mcp-btn" type="button" class="pill-copy-btn">复制 MCP 配置</button>
+                  <button id="active-slash-btn" type="button" class="pill-copy-btn" data-copy="/gempt-sonnet " hidden>/gempt-sonnet</button>
+                </div>
               </div>
             </div>
 
@@ -100,7 +117,7 @@
             </ul>
           </div>
 
-          <div class="route-controls">
+          <div id="mcp-controls-bar" class="route-controls">
             <fieldset id="sandbox-control-group" class="control-fieldset">
               <legend class="control-legend">Codex 执行权限</legend>
               <div class="seg-control">
@@ -135,17 +152,27 @@
               <span id="failover-hint" class="control-hint">仅用 ChatGPT/Codex 订阅额度，不走按量付费 API</span>
             </fieldset>
           </div>
+
+          <div id="native-controls-bar" class="native-controls" hidden>
+            <p id="native-status-copy" class="native-copy">尚未在 Magpie 创建直连路由组，创建后可在任意客户端直接选 group/gempt-* 使用。</p>
+            <div id="native-ready-pills" class="native-ready-pills" hidden>
+              <button type="button" class="pill-copy-btn" data-copy="group/gempt-sonnet">group/gempt-sonnet</button>
+              <button type="button" class="pill-copy-btn" data-copy="group/gempt-opus">group/gempt-opus</button>
+              <button type="button" class="pill-copy-btn" data-copy="group/gempt-fable">group/gempt-fable</button>
+            </div>
+            <button id="create-native-btn" type="button" class="primary-btn" hidden>一键创建直连路由组</button>
+          </div>
         </article>
       </section>
 
       <section class="section" aria-labelledby="tiers-section-label">
         <div class="section-head">
-          <span id="tiers-section-label" class="section-eyebrow">默认委派档位</span>
-          <span class="section-meta">与 Antigravity 同步 · 点击切换</span>
+          <span id="tiers-section-label" class="section-eyebrow">档位选择</span>
+          <span id="tiers-section-meta" class="section-meta">所有 MCP 客户端与 CLI 共享 · 点击切换</span>
         </div>
 
         <fieldset class="tier-fieldset">
-          <legend class="sr-only">默认委派档位</legend>
+          <legend class="sr-only">默认档位</legend>
           <div id="tier-list" class="tier-list">
             <label class="card tier-row" for="tier-sonnet" data-tier="sonnet">
               <input id="tier-sonnet" class="tier-radio sr-only" type="radio" name="default_tier" value="sonnet" checked>
@@ -211,10 +238,28 @@
         <article class="surface utility-card" aria-labelledby="utility-heading">
           <header class="card-head">
             <div class="card-head-left">
-              <span id="utility-heading" class="section-eyebrow">轻量杂活 &amp; 单轮指令</span>
+              <span id="utility-heading" class="section-eyebrow">客户端接入 &amp; 杂活通道</span>
             </div>
-            <span class="section-meta">仅本轮临时覆盖</span>
+            <span class="section-meta">全客户端通用</span>
           </header>
+
+          <div class="readiness-row" aria-label="各客户端就绪状态">
+            <button id="chip-native" type="button" class="status-chip" title="切换到路由组直连视图">
+              <span class="chip-dot" aria-hidden="true"></span>
+              <span class="chip-name">路由组直连</span>
+              <span id="chip-native-val" class="chip-val">0/3</span>
+            </button>
+            <button id="chip-mcp" type="button" class="status-chip" title="点击复制通用 MCP JSON 配置">
+              <span class="chip-dot" aria-hidden="true"></span>
+              <span class="chip-name">通用 MCP</span>
+              <span id="chip-mcp-val" class="chip-val">复制配置</span>
+            </button>
+            <span id="chip-agy" class="status-chip is-static">
+              <span class="chip-dot" aria-hidden="true"></span>
+              <span class="chip-name">Antigravity</span>
+              <span id="chip-agy-val" class="chip-val">未安装</span>
+            </span>
+          </div>
 
           <div class="utility-row">
             <div class="utility-left">
@@ -237,20 +282,31 @@
             </button>
           </div>
 
-          <div class="slash-strip" aria-label="Antigravity 斜杠快捷命令">
-            <span class="slash-label">单轮指令</span>
-            <div class="slash-buttons">
-              <button type="button" class="slash-btn" data-copy="/gempt-sonnet ">/gempt-sonnet</button>
-              <button type="button" class="slash-btn" data-copy="/gempt-opus ">/gempt-opus</button>
-              <button type="button" class="slash-btn" data-copy="/gempt-fable ">/gempt-fable</button>
-              <button type="button" class="slash-btn" data-copy="/gempt-chore ">/gempt-chore</button>
+          <div class="shortcut-stack">
+            <div id="strip-native-ids" class="slash-strip" aria-label="外部客户端直连模型 ID" hidden>
+              <span class="slash-label">直连模型 ID</span>
+              <div class="slash-buttons">
+                <button type="button" class="slash-btn" data-copy="group/gempt-sonnet">group/gempt-sonnet</button>
+                <button type="button" class="slash-btn" data-copy="group/gempt-opus">group/gempt-opus</button>
+                <button type="button" class="slash-btn" data-copy="group/gempt-fable">group/gempt-fable</button>
+              </div>
+            </div>
+
+            <div id="strip-agy-slash" class="slash-strip" aria-label="Antigravity 单轮快捷指令" hidden>
+              <span class="slash-label">Antigravity 单轮</span>
+              <div class="slash-buttons">
+                <button type="button" class="slash-btn" data-copy="/gempt-sonnet ">/gempt-sonnet</button>
+                <button type="button" class="slash-btn" data-copy="/gempt-opus ">/gempt-opus</button>
+                <button type="button" class="slash-btn" data-copy="/gempt-fable ">/gempt-fable</button>
+                <button type="button" class="slash-btn" data-copy="/gempt-chore ">/gempt-chore</button>
+              </div>
             </div>
           </div>
         </article>
 
         <article class="surface recent-card" aria-labelledby="recent-heading">
           <header class="card-head">
-            <span id="recent-heading" class="section-eyebrow">最近委派记录</span>
+            <span id="recent-heading" class="section-eyebrow">最近活动记录</span>
             <span id="activity-count" class="section-meta">0 条记录</span>
           </header>
           <ul id="activity-list" class="recent-list">

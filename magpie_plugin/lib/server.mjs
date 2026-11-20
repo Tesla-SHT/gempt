@@ -14,7 +14,7 @@ import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { initSubscriptionConfig, readState, setDefaultSandbox, setDefaultTier } from './backend.mjs';
+import { createNativeGroups, initSubscriptionConfig, readState, setDefaultSandbox, setDefaultTier } from './backend.mjs';
 
 export const DEFAULT_PORT = 3498;
 const MAX_POST_BYTES = 8192;
@@ -77,9 +77,10 @@ export async function startServer({
   configPath,
   sessionsDir,
   magpieConfigDir,
+  antigravityPluginDir,
+  magpieCliPath,
   probeTimeoutMs = 2000,
 } = {}) {
-  void magpieConfigDir;
   const KEY = randomBytes(24).toString('base64url');
   let actualPort = 0;
   let OWN = new Set();
@@ -154,11 +155,26 @@ export async function startServer({
           return send(req, res, 401, { error: 'unauthorized: send the x-gempt-key header' });
         }
         if (req.method === 'GET' && pathname === '/api/state') {
-          const state = await readState({ configPath, sessionsDir, probeTimeoutMs });
+          const state = await readState({
+            configPath,
+            sessionsDir,
+            magpieConfigDir,
+            antigravityPluginDir,
+            probeTimeoutMs,
+          });
           return send(req, res, 200, state);
         }
         if (req.method === 'POST' && pathname === '/api/init') {
           const result = await initSubscriptionConfig({ configPath, probeTimeoutMs });
+          return send(req, res, result.status, result);
+        }
+        if (req.method === 'POST' && pathname === '/api/native-groups') {
+          const result = await createNativeGroups({
+            configPath,
+            magpieConfigDir,
+            magpieCliPath,
+            probeTimeoutMs,
+          });
           return send(req, res, result.status, result);
         }
         if (req.method === 'POST' && pathname === '/api/tier') {

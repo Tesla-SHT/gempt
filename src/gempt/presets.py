@@ -6,7 +6,16 @@ import os
 from typing import Any, Mapping
 
 from . import VALID_EFFORTS
-from .discover import find_magpie_cli
+from .config import load_config
+from .discover import (
+    _is_excluded_model,
+    _is_utility_candidate,
+    _pick_best,
+    _resolve_excluded_models,
+    _score_model,
+    _utility_rank,
+    find_magpie_cli,
+)
 from .magpie_client import MagpieRequestError, _group_command, _normalize_group_member
 from .sessions import exclusive_operation, resolve_sessions_dir
 
@@ -135,6 +144,91 @@ def _model_exists(exe: str, raw_model: str, catalog_ids: set[str]) -> bool:
     return base != raw_model and base in catalog_ids
 
 
+def _load_host_excluded() -> set[str]:
+    cfg_excluded: list[str] | None = None
+    try:
+        cfg, _ = load_config(require_exists=False)
+        raw = (cfg.get("routing_policy") or {}).get("excluded_models")
+        if isinstance(raw, list):
+            cfg_excluded = [str(item) for item in raw if isinstance(item, str)]
+    except Exception:
+        cfg_excluded = None
+    return _resolve_excluded_models(cfg_excluded)
+
+
+def _pick_gemini_slot(catalog_ids: set[str], slot: str, excluded: set[str]) -> str:
+    patterns_by_slot: dict[str, list[tuple[str, int]]] = {
+        "hydrogen": [("gemini-4-hydrogen", 320), ("hydrogen", 240), ("flash", 140), ("neon", 80), ("carbon", 60)],
+        "neon": [("gemini-4-neon", 320), ("neon", 240), ("carbon", 160), ("pro", 100), ("hydrogen", 60)],
+        "argon": [("gemini-4-argon", 320), ("argon", 240), ("neon", 180), ("carbon", 140), ("pro", 100)],
+    }
+    blocked_kinds = ("embedding", "tts", "image", "imagen", "veo")
+    candidates = [
+        cid
+        for cid in sorted(catalog_ids)
+        if not _is_excluded_model(cid, excluded)
+        and not cid.startswith("group/gempt-")
+        and "gemini" in cid.lower()
+        and not any(bad in cid.lower() for bad in blocked_kinds)
+    ]
+    if not candidates:
+        return ""
+
+    slot_patterns = patterns_by_slot.get(slot, [])
+
+    def _rank(cid: str) -> tuple[int, str]:
+        lower = cid.lower()
+        provider_score = 100
+        if lower.startswith(("agy-cli/", "antigravity/", "google/", "gemini/")):
+            provider_score = 400
+        elif lower.startswith("auto/"):
+            provider_score = 220
+        return provider_score + _score_model(cid, slot_patterns), cid
+
+    return max(candidates, key=_rank)
+
+
+def _resolve_catalog_models(
+    exe: str,
+    base_models: Mapping[str, str],
+    catalog_ids: set[str],
+    env: Mapping[str, str] | None,
+) -> dict[str, str]:
+    source = os.environ if env is None else env
+    excluded = _load_host_excluded()
+    resolved = dict(base_models)
+
+    codex_cands = [
+        cid for cid in sorted(catalog_ids)
+        if cid.startswith("codex/") and not _is_excluded_model(cid, excluded)
+    ]
+    util_cands = sorted(
+        (cid for cid in catalog_ids if _is_utility_candidate({"id": cid}, excluded)),
+        key=lambda cid: _utility_rank({"id": cid}),
+        reverse=True,
+    )
+
+    for slot, (env_var, _) in DEFAULT_PRESET_MODELS.items():
+        if (source.get(env_var) or "").strip():
+            continue
+        current = resolved[slot]
+        if not _is_excluded_model(current, excluded) and _model_exists(exe, current, catalog_ids):
+            continue
+        picked = ""
+        if slot in {"hydrogen", "neon", "argon"}:
+            picked = _pick_gemini_slot(catalog_ids, slot, excluded)
+        elif slot == "sol":
+            picked = _pick_best(codex_cands, [("6.2-sol", 300), ("sol", 240), ("terra", 140), ("luna", 100)])
+        elif slot == "astra":
+            picked = _pick_best(codex_cands, [("6.2-astra", 320), ("astra", 260), ("pro", 180), ("sol", 100)])
+        elif slot == "flash":
+            picked = util_cands[0] if util_cands else ""
+        if picked:
+            resolved[slot] = picked
+
+    return resolved
+
+
 def apply_native_presets(
     *,
     cli_path: str = "",
@@ -158,6 +252,7 @@ def apply_native_presets(
     with exclusive_operation(resolve_sessions_dir() / ".groups.lock"):
         catalog_out = _group_command([exe, "models"]) or ""
         catalog_ids = _catalog_model_ids(catalog_out)
+        models = _resolve_catalog_models(exe, models, catalog_ids, env)
         for model in models.values():
             if not _model_exists(exe, model, catalog_ids):
                 raise MagpieRequestError(f"Model not found in Magpie: {model}", model=model)

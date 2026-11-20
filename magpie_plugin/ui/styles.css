@@ -391,12 +391,31 @@ code {
 
 .section-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
   gap: 8px;
   padding: 0 2px;
   min-width: 0;
+}
+
+.mode-fieldset {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+  min-inline-size: 0;
+}
+
+.seg-control.seg-compact {
+  padding: 2px;
+  border-radius: 8px;
+}
+
+.seg-control.seg-compact .seg-label {
+  min-height: 24px;
+  padding: 2px 10px;
+  font-size: 11.5px;
 }
 
 .section-eyebrow {
@@ -490,8 +509,29 @@ code {
 .route-title-group {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   min-width: 0;
+}
+
+.inline-state-badge {
+  font-size: 10.5px;
+  font-weight: 500;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--gp-border);
+  color: var(--gp-muted);
+  white-space: nowrap;
+}
+
+.inline-state-badge[data-tone="ok"] {
+  border-color: color-mix(in srgb, var(--gp-ok) 45%, transparent);
+  color: var(--gp-ok);
+}
+
+.inline-state-badge[data-tone="warn"] {
+  border-color: color-mix(in srgb, var(--gp-warn) 45%, transparent);
+  color: var(--gp-warn);
 }
 
 .route-tier-name {
@@ -549,6 +589,15 @@ code {
 .source-sub {
   font-size: 11px;
   color: var(--gp-muted);
+}
+
+.source-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  max-width: 100%;
 }
 
 .flow-arrow-h {
@@ -771,6 +820,37 @@ code {
   color: var(--gp-muted);
 }
 
+.native-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 14px;
+  padding-top: 13px;
+  border-top: 1px solid var(--gp-border);
+}
+
+.native-controls[hidden],
+.native-ready-pills[hidden],
+.slash-strip[hidden],
+.primary-btn[hidden] {
+  display: none;
+}
+
+.native-copy {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--gp-muted);
+  flex: 1 1 220px;
+}
+
+.native-ready-pills {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
 @container (max-width: 610px) {
   .flow-grid {
     grid-template-columns: minmax(0, 1fr);
@@ -791,16 +871,16 @@ code {
     flex: none;
   }
 
-  .seg-control {
+  .route-controls .seg-control {
     display: flex;
     width: 100%;
   }
 
-  .seg-option {
+  .route-controls .seg-option {
     flex: 1 1 0;
   }
 
-  .seg-label {
+  .route-controls .seg-label {
     width: 100%;
     padding: 5px 8px;
   }
@@ -1006,8 +1086,74 @@ code {
 .recent-card {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 11px;
   padding: 14px 16px;
+}
+
+.readiness-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--gp-border);
+  background: var(--gp-subtle);
+  color: var(--gp-fg);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.35;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+button.status-chip:hover {
+  background: var(--gp-hover);
+  border-color: var(--gp-active-border);
+}
+
+button.status-chip:focus-visible {
+  outline: 2px solid var(--gp-focus);
+  outline-offset: 1px;
+}
+
+.status-chip.is-static {
+  cursor: default;
+}
+
+.chip-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--gp-muted);
+}
+
+.status-chip[data-tone="ok"] .chip-dot {
+  background: var(--gp-ok);
+}
+
+.status-chip[data-tone="warn"] .chip-dot {
+  background: var(--gp-warn);
+}
+
+.chip-name {
+  font-weight: 500;
+}
+
+.chip-val {
+  color: var(--gp-muted);
+}
+
+.shortcut-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .card-head {
