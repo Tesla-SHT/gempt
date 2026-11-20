@@ -75,6 +75,8 @@ export async function startNativeRun({ args, host, agent, env }) {
     return receipt(prior);
   }
   const record = { source: 'magpie_exec', run_id: id, cwd: args.cwd, state: 'queued',
+    created_at: new Date().toISOString(), goal: args.goal, tier: args.tier, agent,
+    session_id: args.session_id, verification: args.verification,
     deadline: Date.now() / 1000 + 120 + (Number(args.timeout_sec) || 3600) };
   saveNativeRun(file, record);
   try {
@@ -89,7 +91,7 @@ export async function startNativeRun({ args, host, agent, env }) {
     });
     child.unref();
   } catch (err) {
-    saveNativeRun(file, { ...record, state: 'failed', error: err.message });
+    saveNativeRun(file, { ...record, state: 'failed', error: err.message, finished_at: new Date().toISOString() });
     throw err;
   }
   // Keep synchronous results for short jobs. Magpie ends a tool call after 55 seconds.

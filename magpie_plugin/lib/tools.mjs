@@ -486,9 +486,9 @@ function loadSession(sessionsDir, sessionId) {
 function saveSession(sessionsDir, record) {
   const file = sessionPath(sessionsDir, record.session_id);
   const stamped = {
+    ...record,
     created_at: record.created_at || nowIso(),
     updated_at: nowIso(),
-    ...record,
   };
   const written = writeConfigAtomic(file, stamped);
   if (!written.ok) throw new Error(written.error);
@@ -1212,6 +1212,7 @@ export function createGemptTools({
 
         const sessionId = priorSession?.session_id || generateSessionId('consult');
         const agent = callingAgent(callCtx) || priorSession?.agent || '';
+        const turn = Math.floor(messages.length / 2) + 1;
         saveSession(resolvedSessionsDir, {
           ...(priorSession || {}),
           paired_model: paired,
@@ -1223,6 +1224,15 @@ export function createGemptTools({
           cwd: validatedCwd || priorSession?.cwd || '',
           agent,
           turns: [...messages, { role: 'assistant', content: reply.text }],
+          turn_details: {
+            ...priorSession?.turn_details,
+            [turn]: {
+              goal, timestamp: nowIso(), cwd: validatedCwd || priorSession?.cwd || '', agent,
+              tier: resolved.tier, served_model: reply.servedModel || usedModel,
+              requested_model: resolved.model, sent_model: usedModel, reasoning_effort: effort,
+              attempted_models: attemptedModels, elapsed_sec: elapsedSec, usage: reply.usage,
+            },
+          },
         });
 
         const summary = formatSummaryHeader({
@@ -1458,6 +1468,8 @@ export function createGemptTools({
         const sessionId = priorSession?.session_id || generateSessionId('exec');
         const agent = callingAgent(callCtx) || priorSession?.agent || '';
         const priorTurns = Array.isArray(priorSession?.turns) ? priorSession.turns : [];
+        const turn = priorTurns.filter((entry) => !entry.role || entry.role === 'user').length + 1;
+        const timestamp = nowIso();
         saveSession(resolvedSessionsDir, {
           ...(priorSession || {}),
           paired_model: paired,
@@ -1472,6 +1484,14 @@ export function createGemptTools({
           codex_thread_id: res.threadId,
           agent,
           turns: [...priorTurns, { role: 'user', content: prompt }, { role: 'assistant', content: res.text }],
+          turn_details: {
+            ...priorSession?.turn_details,
+            [turn]: {
+              goal, timestamp, cwd: workdir, agent, tier: resolved.tier, model: targetModel,
+              reasoning_effort: effort, codex_thread_id: res.threadId, run_id: args.run_id,
+              elapsed_sec: res.elapsedSec, usage: res.usage, verification: args.verification, commands: res.commands,
+            },
+          },
         });
 
         const summary = formatSummaryHeader({
@@ -1493,6 +1513,8 @@ export function createGemptTools({
           summary,
           text: `${summary}\n\n${res.text}`,
           session_id: sessionId,
+          turns: turn,
+          timestamp,
           codex_thread_id: res.threadId,
           tier: resolved.tier,
           model: targetModel,

@@ -93,6 +93,9 @@ def dispatch_exec(*, background=False, run_id="", **options):
     if options.get("config_path"):
         options["config_path"] = str(Path(options["config_path"]).resolve())
     record = {"run_id": run_id, "state": "queued", "cwd": options["cwd"],
+              "goal": options.get("goal", ""), "tier": options.get("tier"),
+              "session_id": options.get("session_id"), "verification": options.get("verification"),
+              "created_at": time.time(),
               "deadline": time.time() + 120 + int(options.get("timeout_sec") or 3600)}
     atomic_json(directory / "state.json", record)
     try:
@@ -122,7 +125,7 @@ def dispatch_exec(*, background=False, run_id="", **options):
         if detach and proc.wait() != 0:
             raise RuntimeError("Could not launch independent background worker.")
     except Exception as exc:
-        record.update(state="failed", error=str(exc))
+        record.update(state="failed", error=str(exc), finished_at=time.time())
         atomic_json(directory / "state.json", record)
         raise
     if background:
@@ -156,20 +159,21 @@ def worker(run_id):
     try:
         options = json.loads(request.read_text(encoding="utf-8"))
         request.unlink()
-        record.update(state="running", pid=os.getpid(), before=git_evidence(record["cwd"]))
+        record.update(state="running", pid=os.getpid(), started_at=time.time(), before=git_evidence(record["cwd"]))
         atomic_json(directory / "state.json", record)
         lock = nullcontext()
         if options.get("session_id"):
             sid = validate_session_id(options["session_id"])
             lock = exclusive_operation(resolve_sessions_dir() / f"{sid}.lock")
         with lock:
-            result = run_exec(**options)
+            result = run_exec(**options, _run_id=run_id)
         result["run_id"] = run_id
         record.update(state="finished", result=result)
     except Exception as exc:
         record.update(state="failed", error=str(exc))
     finally:
         record["after"] = git_evidence(record["cwd"])
+        record["finished_at"] = time.time()
         atomic_json(directory / "state.json", record)
 
 

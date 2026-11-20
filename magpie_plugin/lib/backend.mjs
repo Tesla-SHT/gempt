@@ -7,7 +7,7 @@
  * atomically persists default_tier and default_sandbox changes.
  */
 import { execFile } from 'node:child_process';
-import { accessSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { accessSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import { homedir } from 'node:os';
@@ -605,6 +605,370 @@ export function readRecentActivity(sessionsDir, limit = 6) {
   return { recentSessions, recentRuns };
 }
 
+const ACTIVITY_SESSION_ID = /^(?:consult|exec)-[A-Za-z0-9_.-]{1,120}$/;
+const ACTIVITY_RUN_ID = /^[a-f0-9]{32}$/;
+const safeSessionId = (id) => typeof id === 'string' && ACTIVITY_SESSION_ID.test(id) && !id.includes('..');
+
+export function isActivityId(kind, id) {
+  if (kind === 'sessions') return safeSessionId(id);
+  if (/^run-[a-f0-9]{32}$/.test(id)) return true;
+  const [sid, turn, beyond] = id.split(':');
+  return beyond === undefined && safeSessionId(sid) && /^[1-9][0-9]{0,8}$/.test(turn);
+}
+
+function activityEntries(directory) {
+  try {
+    return readdirSync(directory, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+}
+
+function readActivityFile(file) {
+  try {
+    const stat = lstatSync(file);
+    if (stat.isFile()) {
+      const data = readJsonSafe(file);
+      if (data) return { data, modified: stat.mtime.toISOString() };
+    }
+  } catch {
+    // A worker may have replaced or removed the entry since enumeration.
+  }
+  return null;
+}
+
+function activityTime(...values) {
+  for (const value of values) {
+    const ms = typeof value === 'number' ? value * (value < 1e12 ? 1000 : 1)
+      : typeof value === 'string' ? Date.parse(value) : NaN;
+    if (Number.isFinite(ms) && Math.abs(ms) <= 8.64e15) return new Date(ms).toISOString();
+  }
+  return null;
+}
+
+const activityNumber = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+
+function activityUsage(usage) {
+  const input = activityNumber(usage?.input_tokens ?? usage?.prompt_tokens);
+  const output = activityNumber(usage?.output_tokens ?? usage?.completion_tokens);
+  const cached = activityNumber(usage?.cached_input_tokens ?? usage?.input_tokens_details?.cached_tokens
+    ?? usage?.prompt_tokens_details?.cached_tokens);
+  const read = cached ?? activityNumber(usage?.cache_read_input_tokens ?? usage?.cache_read_tokens);
+  const write = activityNumber(usage?.cache_creation_input_tokens ?? usage?.cache_write_tokens);
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    cache_read_tokens: read,
+    cache_write_tokens: write,
+    cache_hit_rate: read != null && input != null && input + (cached == null ? read + (write ?? 0) : 0) > 0
+      ? read / (input + (cached == null ? read + (write ?? 0) : 0)) : null,
+    reasoning_tokens: activityNumber(usage?.reasoning_tokens ?? usage?.output_tokens_details?.reasoning_tokens
+      ?? usage?.completion_tokens_details?.reasoning_tokens),
+    total_tokens: activityNumber(usage?.total_tokens) ?? ([input, output, read, write].some((n) => n != null)
+      ? (input ?? 0) + (output ?? 0) + (cached == null ? read ?? 0 : 0) + (write ?? 0) : null),
+  };
+}
+
+function promptSection(prompt, heading) {
+  const marker = `## ${heading}\n`;
+  const start = prompt.indexOf(marker);
+  return start < 0 ? '' : prompt.slice(start + marker.length).split(/\n\n## /, 1)[0].trim();
+}
+
+function activityRequest(source, context) {
+  const prompt = String(source.prompt || '').replaceAll('\r\n', '\n');
+  const verification = source.verification;
+  const requested = (typeof verification === 'string' ? verification : verification?.requested)
+    || promptSection(prompt, 'Required Verification');
+  return {
+    ...context,
+    timestamp: activityTime(source.timestamp, source.finished_at, source.updated_at, source.started_at, source.created_at),
+    cwd: String(source.cwd ?? context.cwd ?? ''),
+    agent: String(source.agent ?? context.agent ?? ''),
+    tier: String(source.tier ?? context.tier ?? ''),
+    model: String(source.served_model || source.model || context.model || ''),
+    requested_model: String(source.requested_model || ''),
+    sent_model: String(source.sent_model || ''),
+    provider: String(source.provider || ''),
+    account: String(source.account || ''),
+    reasoning_effort: String(source.reasoning_effort ?? context.reasoning_effort ?? ''),
+    codex_thread_id: String(source.codex_thread_id ?? context.codex_thread_id ?? ''),
+    goal: String(source.goal || promptSection(prompt, 'Goal') || prompt),
+    prompt,
+    reply: String(source.reply || source.reply_preview || ''),
+    reply_is_preview: !source.reply && Boolean(source.reply_preview),
+    status: String(source.status || 'succeeded'),
+    retried: Boolean(source.retried || source.attempted_models?.length > 1),
+    error: String(source.error || ''),
+    elapsed_sec: activityNumber(source.elapsed_sec),
+    ttft_ms: activityNumber(source.ttft_ms),
+    output_tokens_per_sec: activityNumber(source.output_tokens_per_sec),
+    cost: activityNumber(source.cost),
+    usage: activityUsage(source.usage),
+    verification: {
+      status: String(verification?.status || (requested ? 'unverified' : '')),
+      requested: String(requested || ''),
+      checks: Array.isArray(verification?.checks) ? verification.checks : [],
+    },
+    commands: Array.isArray(source.commands) ? source.commands : Array.isArray(verification?.commands) ? verification.commands : [],
+  };
+}
+
+function readActivitySession(dir, id) {
+  const file = readActivityFile(join(dir, `${id}.json`));
+  if (!file) return null;
+  const { data, modified } = file;
+  const mode = id.startsWith('exec-') ? 'exec' : 'consult';
+  if ((data.mode && data.mode !== mode) || (data.session_id && data.session_id !== id)) return null;
+
+  // Legacy consult and native exec files store alternating messages. Python
+  // exec files store one object per turn, with a reply preview in older files.
+  const turns = [];
+  for (const entry of Array.isArray(data.turns) ? data.turns : []) {
+    if (!entry || typeof entry !== 'object') continue;
+    if (entry.role === 'assistant') {
+      const prior = turns.at(-1);
+      if (prior?.role === 'user' && prior.reply === undefined) prior.reply = entry.content;
+    } else if (entry.role === 'user') {
+      turns.push({ ...entry, prompt: entry.prompt ?? entry.content });
+    } else if (!entry.role) {
+      turns.push(entry);
+    }
+  }
+  const created = activityTime(data.created_at);
+  const updated = activityTime(data.updated_at, modified);
+  const requests = turns.map((entry, index) => {
+    const turn = index + 1;
+    const source = { ...entry, ...data.turn_details?.[turn] };
+    return activityRequest({
+      ...source,
+      timestamp: activityTime(source.timestamp, source.finished_at, source.updated_at, source.created_at,
+        turn === turns.length ? updated : turn === 1 ? created : null),
+    }, {
+      id: `${id}:${turn}`, session_id: id, turn, mode,
+      run_id: ACTIVITY_RUN_ID.test(source.run_id ?? '') ? source.run_id : '',
+      cwd: data.cwd, agent: data.agent, model: data.model, tier: data.tier,
+      reasoning_effort: data.reasoning_effort, codex_thread_id: data.codex_thread_id,
+    });
+  });
+  return { id, mode, created_at: created, updated_at: updated, requests, runs: [],
+    title: String(data.title || ''), cwd: String(data.cwd || ''), model: String(data.model || ''), tier: String(data.tier || '') };
+}
+
+function readActivityRun(dir, id) {
+  const file = readActivityFile(join(dir, id, 'state.json'));
+  if (!file) return null;
+  const { data, modified } = file;
+  if ((data.run_id && data.run_id !== id) || !data.state) return null;
+  const result = data.result;
+  const sessionId = result?.session_id || data.session_id;
+  const pending = data.state === 'running' || data.state === 'queued';
+  const status = pending && Number.isFinite(data.deadline) && Date.now() / 1000 > data.deadline
+    ? 'outcome_unknown' : data.state === 'finished' ? 'succeeded' : data.state;
+  const reply = result?.reply ?? String(result?.text || '').replace(/^\[mode=exec \| [^\r\n]+\]\r?\n\r?\n/, '');
+  const request = activityRequest({
+    ...data, ...result, status, reply, error: data.error,
+    timestamp: activityTime(data.finished_at, result?.timestamp, data.updated_at, data.started_at, data.created_at, modified),
+  }, {
+    id: `run-${id}`, run_id: id, mode: 'exec',
+    session_id: safeSessionId(sessionId) && sessionId.startsWith('exec-') ? sessionId : '',
+    turn: null,
+  });
+  return { request, turn: result?.turn ?? result?.turns ?? data.turn };
+}
+
+function joinActivityRun(session, request, turn) {
+  // Old native receipts did not include a turn number. Match their full reply
+  // only if it identifies one turn in the same session.
+  let target = session.requests.find((item) => item.run_id === request.run_id);
+  if (!target && request.status === 'succeeded') {
+    const candidates = session.requests.filter((item) => !item.run_id);
+    if (Number.isSafeInteger(turn) && turn > 0) {
+      target = candidates.find((item) => item.turn === turn && (!request.reply || !item.reply
+        || (item.reply_is_preview ? request.reply.startsWith(item.reply) : request.reply === item.reply)));
+    } else if (request.reply) {
+      const matches = candidates.filter((item) => item.reply === request.reply && !item.reply_is_preview);
+      if (matches.length === 1) [target] = matches;
+    }
+  }
+  if (target) {
+    target.run_id = request.run_id;
+    if (request.status === 'succeeded' || request.status === 'failed') target.status = request.status;
+    target.retried ||= request.retried;
+    target.timestamp ||= request.timestamp;
+    for (const key of ['cwd', 'agent', 'tier', 'model', 'requested_model', 'sent_model', 'provider', 'account',
+      'reasoning_effort', 'codex_thread_id', 'goal', 'prompt', 'error']) {
+      if (request[key]) target[key] = request[key];
+    }
+    if (request.reply) {
+      target.reply = request.reply;
+      target.reply_is_preview = request.reply_is_preview;
+    }
+    for (const key of ['elapsed_sec', 'ttft_ms', 'output_tokens_per_sec', 'cost']) {
+      target[key] = request[key] ?? target[key];
+    }
+    for (const [key, value] of Object.entries(request.usage)) {
+      if (value != null) target.usage[key] = value;
+    }
+    if (request.verification.status && (request.verification.status !== 'unverified' || !target.verification.status)) {
+      target.verification = request.verification;
+    }
+    if (request.commands.length) target.commands = request.commands;
+  } else {
+    if (request.status === 'succeeded' && Number.isSafeInteger(turn) && turn > 0
+      && !session.requests.some((item) => item.turn === turn)) request.turn = turn;
+    session.requests.push(request);
+  }
+  session.runs.push({ run_id: request.run_id, request_id: (target || request).id, turn: (target || request).turn,
+    status: request.status, timestamp: request.timestamp });
+}
+
+function totalUsage(requests) {
+  const totals = activityUsage();
+  for (const request of requests) {
+    for (const key of Object.keys(totals)) {
+      if (key !== 'cache_hit_rate' && request.usage[key] != null) totals[key] = (totals[key] ?? 0) + request.usage[key];
+    }
+  }
+  return totals;
+}
+
+function readDispatchActivity(sessionsDir) {
+  const dir = resolveSessionsDir(sessionsDir);
+  const entries = activityEntries(dir);
+  const sessions = new Map();
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    const id = entry.name.slice(0, -5);
+    if (!safeSessionId(id)) continue;
+    const session = readActivitySession(dir, id);
+    if (session) sessions.set(id, session);
+  }
+
+  const sessionsByRun = new Map();
+  for (const session of sessions.values()) {
+    for (const request of session.requests) {
+      if (request.run_id) sessionsByRun.set(request.run_id, session.id);
+    }
+  }
+  const runsDir = join(dir, 'runs');
+  const runRecords = [];
+  if (entries.some((entry) => entry.name === 'runs' && entry.isDirectory())) {
+    for (const entry of activityEntries(runsDir)) {
+      if (!entry.isDirectory() || !ACTIVITY_RUN_ID.test(entry.name)) continue;
+      const run = readActivityRun(runsDir, entry.name);
+      if (!run) continue;
+      const { request } = run;
+      request.session_id = sessionsByRun.get(request.run_id) || request.session_id;
+      if (request.session_id && request.status === 'succeeded' && !sessions.has(request.session_id)) {
+        sessions.set(request.session_id, { id: request.session_id, mode: 'exec', requests: [], runs: [] });
+      }
+      runRecords.push(run);
+    }
+  }
+
+  const ledger = [];
+  for (const { request, turn } of runRecords) {
+    const session = sessions.get(request.session_id);
+    if (session) joinActivityRun(session, request, turn);
+    else {
+      request.session_id = '';
+      ledger.push(request);
+    }
+  }
+  for (const session of sessions.values()) {
+    session.requests.sort((a, b) => (a.turn ?? Infinity) - (b.turn ?? Infinity)
+      || (a.timestamp || '').localeCompare(b.timestamp || ''));
+    const first = session.requests[0];
+    const latestWith = (key) => session.requests.findLast((item) => item[key])?.[key] || '';
+    session.session_id = session.id;
+    session.title = first?.goal || session.title || '';
+    session.cwd = latestWith('cwd') || session.cwd || '';
+    session.model = latestWith('model') || session.model || '';
+    session.tier = latestWith('tier') || session.tier || '';
+    session.turn_count = session.requests.length;
+    session.created_at = session.created_at || first?.timestamp || null;
+    session.updated_at = activityTime([session.updated_at, ...session.requests.map((r) => r.timestamp)].filter(Boolean).sort().at(-1));
+    session.usage = totalUsage(session.requests);
+    session.elapsed_sec = session.requests.reduce((total, r) => r.elapsed_sec == null ? total : (total ?? 0) + r.elapsed_sec, null);
+    ledger.push(...session.requests);
+  }
+  ledger.sort((a, b) => {
+    const time = (item) => item.timestamp || sessions.get(item.session_id)?.updated_at || '';
+    return time(b).localeCompare(time(a)) || (b.turn ?? 0) - (a.turn ?? 0) || a.id.localeCompare(b.id);
+  });
+  const history = [...sessions.values()].sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || '') || a.id.localeCompare(b.id));
+  return { ledger, history, totals: { requests: ledger.length, sessions: history.length, runs: runRecords.length } };
+}
+
+function requestListItem(row) {
+  const { prompt, reply, error, verification, commands, ...item } = row;
+  return { ...item, goal: item.goal.slice(0, 320) };
+}
+
+function sessionListItem(row) {
+  const { requests, runs, ...item } = row;
+  return { ...item, title: item.title.slice(0, 320) };
+}
+
+export function listDispatchActivity(kind, params, sessionsDir) {
+  const { ledger, history } = readDispatchActivity(sessionsDir);
+  const isRequests = kind === 'requests';
+  const records = isRequests ? ledger : history;
+  const fields = { mode: 'mode', tier: 'tier', workspace: 'cwd', model: 'model', ...(isRequests ? { status: 'status' } : {}) };
+  const recordValues = (row, field) => {
+    if (field === 'status' && row.retried) return [row.status, 'retried'];
+    if (!isRequests && (field === 'tier' || field === 'model' || field === 'cwd')) {
+      return [...new Set([row[field], ...row.requests.map((request) => request[field])])];
+    }
+    return [row[field]];
+  };
+  const matches = (row, key, field) => !params.get(key) || recordValues(row, field).includes(params.get(key));
+  const query = (params.get('q') ?? params.get('search') ?? '').trim().toLowerCase();
+  const findText = (row) => [row.id, row.session_id, row.run_id, row.title, row.goal, row.prompt, row.reply, row.error, row.model,
+    row.tier, row.agent, row.cwd].some((value) => value?.toLowerCase().includes(query));
+  const searchable = query ? records.filter((row) => findText(row) || row.requests?.some(findText)) : records;
+  const filters = Object.entries(fields);
+  const filtered = searchable.filter((row) => filters.every(([key, field]) => matches(row, key, field)));
+  const facets = Object.fromEntries(filters.map(([key, field]) => {
+    const counts = new Map();
+    for (const row of searchable) {
+      if (!filters.every(([other, prop]) => other === key || matches(row, other, prop))) continue;
+      for (const value of recordValues(row, field)) {
+        if (value) counts.set(value, (counts.get(value) ?? 0) + 1);
+      }
+    }
+    return [key, [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([value, count]) => ({ value, count }))];
+  }));
+  const integer = (key, fallback) => {
+    const value = params.get(key);
+    return /^\d+$/.test(value ?? '') && Number.isSafeInteger(Number(value)) ? Number(value) : fallback;
+  };
+  const limit = Math.min(100, Math.max(1, integer('limit', 25)));
+  const offset = integer('offset', 0);
+  const requests = isRequests ? filtered : filtered.flatMap((session) => session.requests);
+  const summary = { requests: requests.length, ...totalUsage(requests), failed: 0, retried: 0, elapsed_sec: null,
+    workspaces: new Set(requests.map((row) => row.cwd).filter(Boolean)).size };
+  for (const row of requests) {
+    if (row.status === 'failed') summary.failed += 1;
+    if (row.retried) summary.retried += 1;
+    if (row.elapsed_sec != null) summary.elapsed_sec = (summary.elapsed_sec ?? 0) + row.elapsed_sec;
+  }
+  return { total: filtered.length, summary, items: filtered.slice(offset, offset + limit)
+    .map(isRequests ? requestListItem : sessionListItem), facets, limit, offset };
+}
+
+export function getDispatchActivity(kind, id, sessionsDir) {
+  if (!isActivityId(kind, id)) return null;
+  const { ledger, history } = readDispatchActivity(sessionsDir);
+  if (kind === 'requests') return ledger.find((row) => row.id === id) ?? null;
+  const session = history.find((row) => row.id === id);
+  if (!session) return null;
+  const { requests: turns, ...detail } = session;
+  return { ...detail, turns };
+}
+
 function buildTierView(tierId, tierCfg, defaultTier, fallbackPreset) {
   const fallback = fallbackPreset || DEFAULT_TIERS[tierId];
   const merged = { ...fallback, ...(tierCfg || {}) };
@@ -943,6 +1307,7 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
   };
 
   const { recentSessions, recentRuns } = readRecentActivity(resolvedSessionsDir, 6);
+  const { totals: activityTotals } = readDispatchActivity(resolvedSessionsDir);
 
   return {
     features: { ...FEATURES },
@@ -986,6 +1351,7 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     magpie,
     tiers,
     utility,
+    activity_totals: activityTotals,
     recent_sessions: recentSessions,
     recent_runs: recentRuns,
     checked_at: new Date().toISOString(),

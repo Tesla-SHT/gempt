@@ -753,7 +753,8 @@
     });
 
     const rows = [...runs, ...sessions, ...groupCalls].slice(0, 5);
-    count.textContent = `${rows.length} 条记录`;
+    const totals = state.activity_totals;
+    count.textContent = totals ? `${number(totals.requests)} 个请求 · ${number(totals.sessions)} 个会话 · ${number(totals.runs)} 次运行` : '—';
     list.replaceChildren();
 
     if (!rows.length) {
@@ -1073,6 +1074,516 @@
     copyText(rulesText, '已复制协作规则（贴入 CLAUDE.md / AGENTS.md 等全局规则）');
   }
 
+  // Ledger and session presentation adapted from Magpie's usage-page.js (MIT).
+  const activityTabs = ['overview', 'requests', 'sessions'];
+  const activityPageSize = 25;
+  const activityViews = Object.fromEntries(['requests', 'sessions'].map((kind) => {
+    const list = $(`${kind}-list`);
+    return [kind, {
+      kind, list, detail: $(`${kind}-detail`), results: list.querySelector('.activity-results'),
+      summary: list.querySelector('.activity-summary-line'), stats: list.querySelector('.activity-stats'),
+      offset: 0, items: [], status: '', total: 0, loaded: false, listFetch: null, open: null,
+    }];
+  }));
+  const modes = { consult: '咨询', exec: '执行' };
+  const statuses = {
+    succeeded: '成功', failed: '失败', retried: '重试', running: '进行中', queued: '排队中',
+    outcome_unknown: '状态未知', canceled: '已取消',
+  };
+  const checks = { passed: '已通过', failed: '失败', unverified: '未验证', not_requested: '未要求' };
+  const exactNumber = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 3 });
+  const compactNumber = new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 });
+  const dateTime = new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium', hour12: false });
+  let activeTab = 'overview';
+
+  function node(tag, cls = '', value = '') {
+    const el = document.createElement(tag);
+    if (cls) el.className = cls;
+    el.textContent = value;
+    return el;
+  }
+
+  function number(value, compact = false) {
+    return value == null ? '—' : (compact ? compactNumber : exactNumber).format(value);
+  }
+
+  function duration(sec) {
+    if (sec == null) return '—';
+    if (sec < 1) return `${number(Math.round(sec * 1000))} ms`;
+    if (sec < 60) return `${number(Math.round(sec * 10) / 10)} s`;
+    if (sec < 3600) return `${Math.floor(sec / 60)} 分 ${Math.floor(sec % 60)} 秒`;
+    return `${Math.floor(sec / 3600)} 小时 ${Math.floor(sec / 60) % 60} 分`;
+  }
+
+  function when(value) {
+    return value ? dateTime.format(new Date(value)) : '—';
+  }
+
+  function button(label, cls = 'activity-link') {
+    const el = node('button', cls, label);
+    el.type = 'button';
+    return el;
+  }
+
+  function filterLabel(key, value) {
+    if (key === 'mode') return modes[value] || value;
+    if (key === 'status') return statuses[value] || value;
+    if (key === 'tier') return value && titleCaseTier(value);
+    return value;
+  }
+
+  function setActivityFacets(view, facets) {
+    for (const select of view.list.querySelectorAll('[data-filter]')) {
+      const key = select.dataset.filter;
+      const picked = select.value;
+      const options = new Map((facets[key] || [])
+        .filter(({ value }) => key !== 'status' || !['failed', 'retried'].includes(value))
+        .map(({ value, count }) => [value, count]));
+      if (picked && !options.has(picked)) options.set(picked, 0);
+      select.replaceChildren(select.options[0], ...Array.from(options, ([value, count]) => {
+        const option = new Option(`${filterLabel(key, value)} · ${number(count)}`, value);
+        option.title = value;
+        return option;
+      }));
+      select.value = picked;
+      select.classList.toggle('is-set', Boolean(picked));
+    }
+  }
+
+  function activityTile(label, value, exact = '') {
+    const tile = node('div', 'activity-kpi');
+    const figure = node('b', '', value);
+    figure.title = exact || value;
+    tile.append(figure, node('span', '', label));
+    return tile;
+  }
+
+  function renderActivitySummary(view, data) {
+    const s = data.summary;
+    const tile = (label, value) => activityTile(label, number(value, true), number(value));
+    if (view.kind === 'requests') {
+      const labels = [
+        `${number(data.total)} 个请求`, `输入 ${number(s.input_tokens, true)}`, `输出 ${number(s.output_tokens, true)}`,
+        `缓存写入 ${number(s.cache_write_tokens, true)}`, `缓存读取 ${number(s.cache_read_tokens, true)}`,
+      ];
+      if (s.failed) labels.push(`失败 ${number(s.failed)}`);
+      if (s.retried) labels.push(`重试 ${number(s.retried)}`);
+      view.summary.textContent = labels.join(' · ');
+      view.stats.replaceChildren(tile('请求', data.total), tile('Token', s.total_tokens),
+        tile('缓存读取', s.cache_read_tokens), activityTile('耗时', duration(s.elapsed_sec)),
+        tile('失败', s.failed));
+    } else {
+      view.summary.textContent = view.items.length < data.total
+        ? `显示 ${number(data.total)} 个中的 ${number(view.items.length)} 个` : `${number(data.total)} 个会话`;
+      view.stats.replaceChildren(tile('会话', data.total), tile('Token', s.total_tokens), tile('轮次', s.requests),
+        tile('缓存读取', s.cache_read_tokens), activityTile('耗时', duration(s.elapsed_sec)), tile('项目', s.workspaces));
+    }
+  }
+
+  function statusBadge(request) {
+    const badge = node('span', 'activity-status', statuses[request.status] || request.status);
+    badge.dataset.status = request.status;
+    if (request.retried) badge.append(' · 重试');
+    return badge;
+  }
+
+  const ledgerColumns = [
+    ['时间', 'when'], ['Agent', 'agent'], ['请求模型', 'model mobile-extra'], ['供应商 · 账号', 'provider mobile-extra'],
+    ['发送模型', 'model optional'], ['响应模型', 'model'], ['推理强度', 'optional'], ['输入', 'num'],
+    ['输出', 'num'], ['缓存写入', 'num optional'], ['缓存读取', 'num optional'], ['缓存命中率', 'num wide'],
+    ['费用', 'num'], ['TTFT', 'num wide'], ['耗时', 'num'], ['速度', 'num'], ['状态', ''],
+  ];
+
+  function renderLedger(view) {
+    const table = node('table', 'activity-ledger');
+    const head = table.createTHead().insertRow();
+    for (const [label, cls] of ledgerColumns) {
+      const th = node('th', cls, label);
+      th.scope = 'col';
+      head.append(th);
+    }
+    const body = table.createTBody();
+    for (const r of view.items) {
+      const row = body.insertRow();
+      row.tabIndex = 0;
+      row.dataset.activityId = r.id;
+      row.title = r.goal;
+      row.onclick = () => { if (!String(window.getSelection())) openActivityDetail(view, r.id, row); };
+      row.onkeydown = (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        openActivityDetail(view, r.id, row);
+      };
+      const add = (value, title) => {
+        const td = row.insertCell();
+        td.className = ledgerColumns[row.cells.length - 1][1];
+        if (value instanceof Node) td.append(value);
+        else {
+          td.textContent = value || '—';
+          if (!value || value === '—') td.classList.add('faint');
+        }
+        if (title) td.title = title;
+        return td;
+      };
+      const token = (value) => add(number(value, true), number(value));
+      add(when(r.timestamp), r.timestamp);
+      const agent = node('span', 'ledger-agent', r.agent || 'GemPT');
+      agent.append(node('span', 'activity-badge', modes[r.mode]));
+      add(agent, r.goal);
+      add(r.requested_model, r.requested_model);
+      add([r.provider, r.account].filter(Boolean).join(' · '));
+      add(r.sent_model, r.sent_model);
+      const served = node('span', 'ledger-agent', r.model || '—');
+      if (r.tier) served.append(node('span', 'activity-badge', titleCaseTier(r.tier)));
+      add(served, r.model);
+      add(r.reasoning_effort);
+      token(r.usage.input_tokens);
+      token(r.usage.output_tokens);
+      token(r.usage.cache_write_tokens);
+      token(r.usage.cache_read_tokens);
+      add(r.usage.cache_hit_rate == null ? '—' : `${number(Math.round(r.usage.cache_hit_rate * 1000) / 10)}%`);
+      add(r.cost == null ? '—' : `$${number(r.cost)}`);
+      add(r.ttft_ms == null ? '—' : duration(r.ttft_ms / 1000));
+      const elapsed = add(duration(r.elapsed_sec), r.elapsed_sec == null ? '' : `${number(r.elapsed_sec)} s`);
+      if (r.elapsed_sec != null) {
+        elapsed.dataset.latency = r.elapsed_sec <= 10 ? 'fast' : r.elapsed_sec <= 30 ? 'slow' : 'long';
+      }
+      add(r.output_tokens_per_sec == null ? '—' : `${number(r.output_tokens_per_sec)} tok/s`);
+      add(statusBadge(r));
+    }
+    view.results.replaceChildren(table);
+  }
+
+  function sessionRow(view, session) {
+    const row = button('', 'activity-session-row');
+    row.dataset.activityId = session.id;
+    const icon = node('span', 'activity-session-icon', session.mode === 'exec' ? '>_' : '≡');
+    icon.setAttribute('aria-hidden', 'true');
+    const who = node('span', 'activity-session-who');
+    const title = node('strong', '', session.title || '（无提示词）');
+    title.title = session.title;
+    const meta = node('small', '', [session.model, filterLabel('tier', session.tier), when(session.updated_at)].filter(Boolean).join(' · '));
+    const folder = node('span', 'session-folder', session.cwd);
+    folder.title = session.cwd;
+    meta.title = meta.textContent;
+    if (session.cwd) meta.append(folder);
+    who.append(title, meta);
+    const tokens = node('span', 'activity-session-num');
+    tokens.append(node('b', '', number(session.usage.total_tokens, true)));
+    if (session.usage.total_tokens != null) {
+      tokens.title = `${number(session.usage.total_tokens)} token`;
+      tokens.append(node('small', '', `输入 ${number(session.usage.input_tokens, true)} · 输出 ${number(session.usage.output_tokens, true)}`));
+    }
+    const arrow = node('span', 'activity-session-go', '›');
+    arrow.setAttribute('aria-hidden', 'true');
+    row.append(icon, who, node('span', 'activity-badge', modes[session.mode]), tokens,
+      node('span', 'activity-session-turns', `${number(session.turn_count)} 轮`), arrow);
+    row.onclick = () => openActivityDetail(view, session.id, row);
+    return row;
+  }
+
+  function copyButton(value, label) {
+    const copy = button('复制');
+    copy.setAttribute('aria-label', `复制${label}`);
+    copy.onclick = () => copyText(value, `已复制${label}`);
+    return copy;
+  }
+
+  function detailLine(list, label, value, copy = false) {
+    if (value == null || value === '') return;
+    const body = node('dd');
+    if (value instanceof Node) body.append(value);
+    else body.textContent = value;
+    if (copy) body.append(' ', copyButton(value, label));
+    list.append(node('dt', '', label), body);
+  }
+
+  function detailText(parent, label, value) {
+    if (!value) return;
+    const section = node('section', 'activity-detail-text');
+    const head = node('header');
+    head.append(node('h4', '', label), copyButton(value, label));
+    section.append(head, node('pre', '', value));
+    parent.append(section);
+  }
+
+  function usageText(usage) {
+    return usage.total_tokens == null ? '—' : [
+      `${number(usage.total_tokens)} token`, `输入 ${number(usage.input_tokens)}`, `输出 ${number(usage.output_tokens)}`,
+      `缓存读取 ${number(usage.cache_read_tokens)}`, `缓存写入 ${number(usage.cache_write_tokens)}`,
+      ...(usage.reasoning_tokens == null ? [] : [`推理 ${number(usage.reasoning_tokens)}`]),
+    ].join(' · ');
+  }
+
+  function renderTurn(r, heading) {
+    const box = node('article', 'activity-detail-box');
+    if (heading) box.append(node('h3', '', heading));
+    const info = node('dl', 'activity-detail-info');
+    const add = (label, value, copy = false) => detailLine(info, label, value, copy);
+    add('时间', when(r.timestamp));
+    add('模式', modes[r.mode]);
+    add('状态', statusBadge(r));
+    add('Agent', r.agent);
+    add('请求模型', r.requested_model);
+    add('发送模型', r.sent_model);
+    add('响应模型', r.model);
+    add('供应商 · 账号', [r.provider, r.account].filter(Boolean).join(' · '));
+    add('档位', r.tier && titleCaseTier(r.tier));
+    add('推理强度', r.reasoning_effort);
+    add('耗时', duration(r.elapsed_sec));
+    add('TTFT', r.ttft_ms == null ? '' : duration(r.ttft_ms / 1000));
+    add('速度', r.output_tokens_per_sec == null ? '' : `${number(r.output_tokens_per_sec)} tok/s`);
+    add('费用', r.cost == null ? '' : `$${number(r.cost)}`);
+    add('Token', usageText(r.usage));
+    add('文件夹', r.cwd, true);
+    add('会话 ID', r.session_id, true);
+    add('运行 ID', r.run_id, true);
+    add('Codex 线程 ID', r.codex_thread_id, true);
+    add('验证', checks[r.verification.status] || r.verification.status);
+    box.append(info);
+    detailText(box, '目标', r.goal);
+    if (r.prompt !== r.goal) detailText(box, '提示词', r.prompt);
+    detailText(box, r.reply_is_preview ? '回复预览' : '回复', r.reply);
+    detailText(box, '错误', r.error);
+    detailText(box, '要求验证', r.verification.requested);
+    const commandText = (entries) => entries.map((entry) => typeof entry === 'string' ? entry : [
+      entry?.command, entry?.exit_code == null ? '' : `退出码 ${entry.exit_code}`, entry?.output,
+    ].filter(Boolean).join('\n')).join('\n\n');
+    detailText(box, '验证检查', commandText(r.verification.checks));
+    detailText(box, '执行的命令', commandText(r.commands));
+    return box;
+  }
+
+  function renderSessionDetail(session) {
+    const box = node('section', 'activity-detail-box');
+    const info = node('dl', 'activity-detail-info');
+    detailLine(info, '会话 ID', session.session_id, true);
+    detailLine(info, '文件夹', session.cwd, true);
+    detailLine(info, '模式', modes[session.mode]);
+    detailLine(info, '时间', session.created_at && session.created_at !== session.updated_at
+      ? `${when(session.created_at)} – ${when(session.updated_at)}` : when(session.updated_at));
+    detailLine(info, '轮次', number(session.turn_count));
+    detailLine(info, 'Token', usageText(session.usage));
+    detailLine(info, '耗时', duration(session.elapsed_sec));
+    box.append(info);
+    return [box, ...session.turns.map((turn) => renderTurn(turn, turn.turn == null
+      ? '执行记录' : `第 ${number(turn.turn)} 轮`))];
+  }
+
+  function closeActivityDetail(view) {
+    const open = view.open;
+    if (!open) return;
+    open.abort?.abort();
+    view.open = null;
+    view.detail.hidden = true;
+    view.detail.replaceChildren();
+    view.list.hidden = false;
+    open.row.focus({ preventScroll: true });
+    window.scrollTo(0, open.scroll);
+  }
+
+  async function loadActivityDetail(view) {
+    const open = view.open;
+    open.abort?.abort();
+    const abort = open.abort = new AbortController();
+    const body = view.detail.querySelector('.activity-detail-body');
+    body.setAttribute('aria-busy', 'true');
+    try {
+      const res = await apiFetch(`/api/${view.kind}/${encodeURIComponent(open.id)}`, { signal: abort.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (abort.signal.aborted) return;
+      const session = view.kind === 'sessions';
+      const head = node('header', 'activity-detail-head');
+      const rawTitle = String(session ? data.title || '（无提示词）' : data.model || data.goal || '请求详情')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const titleNode = node('h2', '', rawTitle.length > 140 ? `${rawTitle.slice(0, 140)}…` : rawTitle);
+      if (rawTitle.length > 140) titleNode.title = rawTitle;
+      head.append(titleNode);
+      if (!session) head.append(statusBadge(data));
+      body.replaceChildren(head, ...(session ? renderSessionDetail(data) : [renderTurn(data)]));
+    } catch (err) {
+      if (abort.signal.aborted) return;
+      const retry = button('重试');
+      retry.onclick = () => loadActivityDetail(view);
+      body.replaceChildren(node('p', 'activity-empty', `读取详情失败（${err.message}）`), retry);
+    } finally {
+      if (!abort.signal.aborted) body.removeAttribute('aria-busy');
+    }
+  }
+
+  function openActivityDetail(view, id, row) {
+    view.open = { id, row, scroll: window.scrollY };
+    const back = button(view.kind === 'requests' ? '‹ 请求' : '‹ 会话', 'activity-link activity-back');
+    back.onclick = () => closeActivityDetail(view);
+    const body = node('div', 'activity-detail-body');
+    body.append(node('p', 'activity-empty', view.kind === 'sessions' ? '正在读取会话…' : '正在读取请求…'));
+    view.detail.replaceChildren(back, body);
+    view.list.hidden = true;
+    view.detail.hidden = false;
+    window.scrollTo(0, 0);
+    back.focus({ preventScroll: true });
+    void loadActivityDetail(view);
+  }
+
+  async function loadActivityList(view, offset = 0, append = false) {
+    view.listFetch?.abort();
+    const abort = view.listFetch = new AbortController();
+    const search = view.list.querySelector('.activity-search').value.trim();
+    const query = new URLSearchParams({ q: search, offset, limit: activityPageSize });
+    for (const select of view.list.querySelectorAll('[data-filter]')) {
+      if (select.value) query.set(select.dataset.filter, select.value);
+    }
+    if (view.status) query.set('status', view.status);
+    const pagers = view.list.querySelectorAll('[data-page]');
+    for (const control of pagers) control.disabled = true;
+    view.results.setAttribute('aria-busy', 'true');
+    if (!view.loaded) view.results.replaceChildren(node('div', 'activity-empty', '正在读取记录…'));
+    try {
+      const res = await apiFetch(`/api/${view.kind}?${query}`, { signal: abort.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (abort.signal.aborted) return;
+      if (offset > 0 && data.total <= offset && !append) {
+        return loadActivityList(view, Math.max(0, Math.ceil(data.total / activityPageSize) - 1) * activityPageSize);
+      }
+      view.loaded = true;
+      view.offset = data.offset;
+      view.total = data.total;
+      if (append) {
+        const drawn = new Set(view.items.map((row) => row.id));
+        const next = data.items.filter((row) => !drawn.has(row.id));
+        view.items.push(...next);
+        view.results.append(...next.map((session) => sessionRow(view, session)));
+      } else {
+        view.items = data.items;
+        if (!data.items.length) {
+          const filtered = search || [...query.keys()].some((key) => !['q', 'offset', 'limit'].includes(key));
+          const message = view.kind === 'requests' ? (filtered ? '没有符合这些筛选条件的请求。' : '暂无请求。')
+            : (filtered ? '没有匹配的会话。' : '暂无会话。');
+          view.results.replaceChildren(node('div', 'activity-empty', message));
+        } else if (view.kind === 'requests') {
+          renderLedger(view);
+        } else {
+          view.results.replaceChildren(...view.items.map((session) => sessionRow(view, session)));
+        }
+      }
+      setActivityFacets(view, data.facets);
+      renderActivitySummary(view, data);
+      const end = view.offset + data.items.length;
+      if (view.kind === 'requests') {
+        const pager = view.list.querySelector('.activity-pager');
+        pager.hidden = data.total <= activityPageSize;
+        pager.querySelector('span').textContent = `第 ${number(view.offset + 1)}–${number(end)} 条，共 ${number(data.total)} 条`;
+        pagers[0].disabled = view.offset <= 0;
+        pagers[1].disabled = end >= data.total;
+      } else {
+        pagers[0].hidden = end >= data.total;
+        pagers[0].textContent = `显示另外 ${number(Math.min(data.total - end, activityPageSize))} 个`;
+        pagers[0].disabled = false;
+      }
+    } catch (err) {
+      if (abort.signal.aborted) return;
+      const retry = button('重试');
+      // Rebuild the first page if a failed load replaced its rows.
+      retry.onclick = () => loadActivityList(view);
+      const error = node('div', 'activity-empty', `读取记录失败（${err.message}） `);
+      error.append(retry);
+      view.results.replaceChildren(error);
+      view.loaded = false;
+    } finally {
+      if (!abort.signal.aborted) view.results.removeAttribute('aria-busy');
+    }
+  }
+
+  function selectActivityTab(tab, focus = false) {
+    if (!activityTabs.includes(tab)) tab = 'overview';
+    if (tab !== activeTab) window.scrollTo(0, 0);
+    activeTab = tab;
+    for (const name of activityTabs) {
+      const selected = name === tab;
+      $(name).hidden = !selected;
+      $(`tab-${name}`).tabIndex = selected ? 0 : -1;
+      $(`tab-${name}`).setAttribute('aria-selected', String(selected));
+    }
+    if (focus) $(`tab-${tab}`).focus();
+    const view = activityViews[tab];
+    if (view && !view.open && !view.loaded) void loadActivityList(view);
+  }
+
+  function navigateActivityTab(tab, focus = false) {
+    if (location.hash !== `#${tab}`) history.pushState(null, '', `#${tab}`);
+    selectActivityTab(tab, focus);
+  }
+
+  for (const tab of activityTabs) {
+    const control = $(`tab-${tab}`);
+    control.onclick = () => navigateActivityTab(tab);
+    control.onkeydown = (event) => {
+      const index = activityTabs.indexOf(tab);
+      const direction = { ArrowRight: 1, ArrowLeft: -1 }[event.key];
+      const next = direction ? activityTabs[(index + direction + activityTabs.length) % activityTabs.length]
+        : event.key === 'Home' ? activityTabs[0] : event.key === 'End' ? activityTabs.at(-1) : '';
+      if (!next) return;
+      event.preventDefault();
+      navigateActivityTab(next, true);
+    };
+  }
+  for (const link of document.querySelectorAll('[data-activity-tab]')) {
+    link.onclick = (event) => {
+      event.preventDefault();
+      navigateActivityTab(link.dataset.activityTab, true);
+    };
+  }
+  window.addEventListener('hashchange', () => selectActivityTab(location.hash.slice(1)));
+  document.addEventListener('keydown', (event) => {
+    const view = activityViews[activeTab];
+    if (event.key === 'Escape' && view?.open) closeActivityDetail(view);
+  });
+  for (const view of Object.values(activityViews)) {
+    const search = view.list.querySelector('.activity-search');
+    let debounce;
+    search.oninput = () => {
+      clearTimeout(debounce);
+      view.listFetch?.abort();
+      for (const control of view.list.querySelectorAll('[data-page]')) control.disabled = true;
+      debounce = setTimeout(() => loadActivityList(view), 180);
+    };
+    for (const select of view.list.querySelectorAll('[data-filter]')) {
+      select.onchange = () => {
+        clearTimeout(debounce);
+        if (select.dataset.filter === 'status') setStatus('');
+        void loadActivityList(view);
+      };
+    }
+    const statusControls = view.list.querySelectorAll('[data-status]');
+    const statusSelect = view.list.querySelector('[data-filter="status"]');
+    const setStatus = (status) => {
+      view.status = status;
+      for (const control of statusControls) {
+        control.setAttribute('aria-pressed', String(!statusSelect.value && control.dataset.status === status));
+      }
+    };
+    for (const control of statusControls) {
+      control.onclick = () => {
+        clearTimeout(debounce);
+        statusSelect.value = '';
+        setStatus(control.dataset.status);
+        void loadActivityList(view);
+      };
+    }
+    for (const control of view.list.querySelectorAll('[data-page]')) {
+      control.onclick = () => {
+        clearTimeout(debounce);
+        const page = control.dataset.page;
+        const offset = Math.max(0, view.offset + (page === 'newer' ? -1 : 1) * activityPageSize);
+        void loadActivityList(view, offset, page === 'more');
+      };
+    }
+  }
+  selectActivityTab(location.hash.slice(1));
+
   document.addEventListener('change', (ev) => {
     const target = ev.target;
     if (!(target instanceof HTMLInputElement || target instanceof HTMLSelectElement)) return;
@@ -1110,6 +1621,9 @@
     if (!btn) return;
     if (btn.id === 'refresh-btn') {
       refreshState({ manual: true });
+      const view = activityViews[activeTab];
+      if (view?.open) void loadActivityDetail(view);
+      else if (view) void loadActivityList(view, view.kind === 'requests' ? view.offset : 0);
       return;
     }
     if (btn.id === 'init-sub-btn') {

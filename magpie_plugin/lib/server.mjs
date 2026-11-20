@@ -16,7 +16,10 @@ import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   createNativeGroups,
+  getDispatchActivity,
   initSubscriptionConfig,
+  isActivityId,
+  listDispatchActivity,
   readState,
   setDefaultSandbox,
   setDefaultTier,
@@ -152,10 +155,23 @@ export async function startServer({
       return res.end();
     }
 
-    const url = new URL(req.url || '/', `http://127.0.0.1:${actualPort || DEFAULT_PORT}`);
-    const pathname = url.pathname;
-
     try {
+      const url = new URL(req.url || '/', `http://127.0.0.1:${actualPort || DEFAULT_PORT}`);
+      const pathname = url.pathname;
+      // Validate the raw segment before URL normalization can collapse dot paths.
+      const activity = /^\/api\/(requests|sessions)(?:\/(.*))?$/.exec((req.url || '/').split('?', 1)[0]);
+      if (activity && req.method === 'GET') {
+        if (!keyOK(req)) return send(req, res, 401, { error: 'unauthorized: send the x-gempt-key header' });
+        const [, kind, encodedId] = activity;
+        if (encodedId === undefined) {
+          return send(req, res, 200, listDispatchActivity(kind, url.searchParams, sessionsDir));
+        }
+        let id;
+        try { id = decodeURIComponent(encodedId); } catch { /* Invalid percent encoding. */ }
+        if (!id || !isActivityId(kind, id)) return send(req, res, 400, { error: 'invalid activity id' });
+        const result = getDispatchActivity(kind, id, sessionsDir);
+        return result ? send(req, res, 200, result) : send(req, res, 404, { error: 'not found' });
+      }
       if (pathname === '/api/ping') {
         return send(req, res, 200, {
           ok: true,

@@ -424,9 +424,20 @@ def run_consult(
             {"role": "assistant", "content": res["text"]},
         ]
     )
-    save_session(session_record)
-
     turn_count = len(session_record["turns"]) // 2
+    session_record.setdefault("turn_details", {})[str(turn_count)] = {
+        "goal": goal.strip(),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+        "cwd": workspace,
+        "tier": resolved["tier"],
+        "served_model": res["served_model"],
+        "requested_model": resolved["model"],
+        "reasoning_effort": resolved["reasoning_effort"],
+        "elapsed_sec": float(res["elapsed_sec"]),
+        "usage": res.get("usage") or {},
+        "retried": bool(res.get("used_fallback")),
+    }
+    save_session(session_record)
     formatted = format_result_summary(
         mode="consult",
         session_id=sid,
@@ -479,6 +490,7 @@ def run_exec(
     gemini_family: str | None = None,
     timeout_sec: int | None = None,
     config_path: str | Path | None = None,
+    _run_id: str = "",
 ) -> dict[str, Any]:
     """Delegate a coding/verification task to headless Codex CLI via Magpie."""
     if not goal or not goal.strip():
@@ -659,6 +671,13 @@ def run_exec(
         {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
             "goal": goal.strip(),
+            "prompt": prompt,
+            "reply": res["text"],
+            "run_id": _run_id,
+            "tier": resolved["tier"],
+            "model": resolved["model"],
+            "reasoning_effort": resolved["reasoning_effort"],
+            "verification": acceptance,
             "elapsed_sec": round(float(res["elapsed_sec"]), 3),
             "usage": res.get("usage") or {},
             "reply_preview": res["text"][:600],
@@ -666,7 +685,7 @@ def run_exec(
     )
     save_session(session_record)
 
-    turn_count = len(session_record["turns"])
+    turn_count = sum(1 for turn in session_record["turns"] if turn.get("role") in (None, "user"))
     formatted = format_result_summary(
         mode="exec",
         session_id=sid,

@@ -683,6 +683,214 @@ test('fresh subscription_only auto-discovers openai/* backup when switching to a
   }
 });
 
+test('history API paginates GemPT dispatches, correlates exec receipts and returns full transcripts', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-activity-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const sessionsDir = join(dir, 'sessions');
+  const magpieConfigDir = join(dir, 'magpie');
+  mkdirSync(sessionsDir);
+  mkdirSync(magpieConfigDir);
+  const configPath = join(dir, 'config.json');
+  writeFileSync(configPath, JSON.stringify({ magpie: { base_url: 'http://127.0.0.1:1' } }));
+  const saveSession = (id, session) => writeFileSync(join(sessionsDir, `${id}.json`), JSON.stringify({ session_id: id, ...session }));
+  const saveRun = (id, run) => {
+    const runDir = join(sessionsDir, 'runs', id);
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, 'state.json'), JSON.stringify({ run_id: id, ...run }));
+  };
+  const alpha = join(dir, 'project alpha');
+  const beta = join(dir, '项目 beta');
+  const stamp = (day) => `2026-11-${String(day).padStart(2, '0')}T10:00:00.000Z`;
+  const consult = 'consult-dispatch';
+  const exec = 'exec-dispatch';
+  const linked = 'a'.repeat(32);
+  const legacyNative = 'b'.repeat(32);
+  const runOnly = 'c'.repeat(32);
+  const failed = 'd'.repeat(32);
+  const expired = 'e'.repeat(32);
+  const queued = 'f'.repeat(32);
+  const running = '1'.repeat(32);
+  const resumed = '2'.repeat(32);
+  const saving = '3'.repeat(32);
+  const rawReply = '<img src=x> second reply';
+  saveSession(consult, {
+    mode: 'consult', cwd: alpha, tier: 'opus', model: 'codex/beta',
+    created_at: stamp(1), updated_at: stamp(7),
+    turns: [
+      { role: 'user', content: '## Goal\nfirst goal\n\n## Context\nfull context' },
+      { role: 'assistant', content: 'first reply' },
+      { role: 'user', content: 'followup' },
+      { role: 'assistant', content: rawReply },
+    ],
+    turn_details: {
+      1: { tier: 'sonnet', model: 'codex/alpha', reasoning_effort: 'medium', timestamp: stamp(1),
+        elapsed_sec: 1.5, usage: { prompt_tokens: 40, completion_tokens: 10, prompt_tokens_details: { cached_tokens: 8 } } },
+      2: { reasoning_effort: 'high', timestamp: stamp(7), attempted_models: ['codex/alpha', 'codex/beta'],
+        elapsed_sec: 3, usage: { input_tokens: 20, output_tokens: 5, total_tokens: 25 } },
+    },
+  });
+  saveSession('consult-legacy', {
+    updated_at: '2026-11-08T18:00:00+0800',
+    turns: [{ role: 'user', content: 'historic question' }, { role: 'assistant', content: 'historic answer' }],
+  });
+  const command = { command: 'node --test', exit_code: 0, output: 'PASS' };
+  saveSession(exec, {
+    mode: 'exec', cwd: beta, tier: 'opus', model: 'codex/exec', updated_at: stamp(10),
+    turns: [
+      { goal: 'check parser', timestamp: stamp(2), elapsed_sec: 12, usage: { input_tokens: 120, output_tokens: 30 }, reply_preview: 'full exec' },
+      { role: 'user', content: '## Goal\ncontinue work\n\n## Required Verification\nnode --check app.js' },
+      { role: 'assistant', content: 'native response' },
+      { goal: 'pending receipt', reply: 'already saved', timestamp: stamp(10), run_id: saving },
+    ],
+  });
+  saveRun(linked, { state: 'finished', cwd: beta, finished_at: stamp(2), result: {
+    session_id: exec, turns: 1, model: 'codex/exec', tier: 'sonnet', reasoning_effort: 'high',
+    usage: { input_tokens: 120, output_tokens: 30, cached_input_tokens: 30 }, elapsed_sec: 12,
+    text: 'full exec response', verification: { requested: 'node --test', status: 'passed', checks: [command], commands: [command] },
+  } });
+  saveRun(legacyNative, { state: 'finished', cwd: beta, finished_at: stamp(9), result: {
+    session_id: exec, elapsed_sec: 8, usage: { input_tokens: 50, output_tokens: 25 },
+    text: '[mode=exec | tier=opus]\n\nnative response',
+  } });
+  saveRun(saving, { state: 'running', cwd: beta, created_at: stamp(10), goal: 'pending receipt' });
+  saveRun(resumed, { state: 'failed', session_id: exec, cwd: beta, finished_at: stamp(11), goal: 'failed followup', error: 'worker stopped' });
+  saveRun(runOnly, { state: 'finished', cwd: alpha, finished_at: stamp(12),
+    result: { session_id: 'exec-orphan', turns: 3, text: 'receipt only', tier: 'fable' } });
+  saveRun(failed, { state: 'failed', cwd: alpha, finished_at: stamp(13), goal: 'standalone failure', error: 'failed to start' });
+  saveRun(expired, { state: 'running', deadline: 1, created_at: stamp(14) });
+  saveRun(queued, { state: 'queued', created_at: stamp(15) });
+  saveRun(running, { state: 'running', started_at: stamp(16) });
+  for (let i = 1; i <= 7; i += 1) {
+    saveSession(`consult-filler-${i}`, {
+      created_at: stamp(i), updated_at: stamp(i), turns: [{ goal: `filler ${i}`, reply: 'ok' }],
+    });
+  }
+  saveSession('unrelated', { turns: [{ goal: 'not a dispatch' }] });
+  saveSession('consult-invalid', { mode: 'exec', turns: [{ goal: 'invalid mode' }] });
+  writeFileSync(join(sessionsDir, 'exec-broken.json'), '{');
+  writeFileSync(join(magpieConfigDir, 'usage.jsonl'), JSON.stringify({
+    req: 'group/gempt-sonnet', served: 'codex/direct-marker', status: 200, t: stamp(18), session: consult,
+  }) + '\n');
+
+  const svc = await startServer({ port: 0, configPath, sessionsDir, magpieConfigDir,
+    antigravityPluginDir: join(dir, 'agy'), probeTimeoutMs: 50 });
+  t.after(() => svc.close());
+  const page = await rawHttpGet({ port: svc.port, path: '/' });
+  const key = page.text.match(/<meta name="gempt-key" content="([^"]+)">/)[1];
+  const headers = { 'x-gempt-key': key, Origin: 'null' };
+  const get = (path, extra = {}) => rawHttpGet({ port: svc.port, path, headers: { ...headers, ...extra } });
+  const json = async (path) => {
+    const res = await get(path);
+    assert.equal(res.status, 200, res.text);
+    return JSON.parse(res.text);
+  };
+  const query = (path, options) => json(`${path}?${new URLSearchParams(options)}`);
+
+  const all = await json('/api/requests?limit=100');
+  assert.equal(all.total, 19);
+  assert.equal(all.items.length, all.total);
+  assert.deepEqual(all.items.slice(0, 3).map((r) => r.status), ['running', 'queued', 'outcome_unknown']);
+  assert.equal(all.summary.total_tokens, 300);
+  assert.equal(all.summary.failed, 2);
+  assert.equal(all.summary.retried, 1);
+  assert.deepEqual(all.facets.mode, [{ value: 'consult', count: 10 }, { value: 'exec', count: 9 }]);
+  assert.equal(new Set(all.items.map((r) => r.id)).size, all.total);
+  for (const id of [linked, legacyNative, saving]) {
+    assert.equal(all.items.filter((r) => r.run_id === id).length, 1);
+  }
+  assert.equal(all.items.find((r) => r.run_id === saving).status, 'succeeded');
+  assert.ok(all.items.every((r) => r.reply === undefined && r.prompt === undefined));
+  const page2 = await json('/api/requests?limit=2&offset=2');
+  assert.equal(page2.total, all.total);
+  assert.deepEqual(page2.summary, all.summary);
+  assert.deepEqual(page2.items, all.items.slice(2, 4));
+  assert.deepEqual((await json('/api/requests?limit=0')).items, all.items.slice(0, 1));
+  assert.equal((await json('/api/requests?limit=900&offset=500')).limit, 100);
+  assert.equal((await json('/api/requests?offset=500')).items.length, 0);
+
+  const filtered = await query('/api/requests', { search: 'CHECK PARSER', mode: 'exec', tier: 'sonnet',
+    status: 'succeeded', workspace: beta });
+  assert.deepEqual(filtered.items.map((r) => r.id), [`${exec}:1`]);
+  assert.deepEqual(filtered.facets.workspace, [{ value: beta, count: 1 }]);
+  assert.equal(filtered.summary.cache_read_tokens, 30);
+  assert.equal((await json('/api/requests?status=retried')).total, 1);
+  assert.equal((await json('/api/requests?q=direct-marker')).total, 0);
+  assert.equal((await json('/api/sessions?q=direct-marker')).total, 0);
+  const legacy = await json('/api/requests/consult-legacy%3A1');
+  assert.equal(legacy.timestamp, stamp(8));
+  assert.equal(legacy.elapsed_sec, null);
+  assert.equal(legacy.usage.total_tokens, null);
+
+  const detail = await json(`/api/requests/${encodeURIComponent(`${exec}:1`)}`);
+  assert.equal(detail.reply, 'full exec response');
+  assert.equal(detail.reply_is_preview, false);
+  assert.equal(detail.run_id, linked);
+  assert.equal(detail.elapsed_sec, 12);
+  assert.equal(detail.usage.cache_hit_rate, .25);
+  assert.deepEqual(detail.verification.checks, [command]);
+  assert.deepEqual(detail.commands, [command]);
+  const standalone = await json(`/api/requests/run-${failed}`);
+  assert.equal(standalone.status, 'failed');
+  assert.equal(standalone.goal, 'standalone failure');
+  assert.equal(standalone.error, 'failed to start');
+
+  const sessions = await json('/api/sessions?limit=2&offset=1');
+  assert.equal(sessions.total, 11);
+  assert.equal(sessions.summary.requests, 15);
+  assert.equal(sessions.items.length, 2);
+  assert.ok(sessions.items.every((row) => !('turns' in row)));
+  const narrowed = await query('/api/sessions', { q: 'SECOND REPLY', mode: 'consult', tier: 'sonnet',
+    model: 'codex/alpha', workspace: alpha });
+  assert.deepEqual(narrowed.items.map((row) => row.id), [consult]);
+  assert.equal(narrowed.items[0].title, 'first goal');
+  assert.equal(narrowed.items[0].turn_count, 2);
+  assert.equal(narrowed.items[0].usage.total_tokens, 75);
+
+  const transcript = await json(`/api/sessions/${consult}`);
+  assert.equal(transcript.turns[0].prompt, '## Goal\nfirst goal\n\n## Context\nfull context');
+  assert.equal(transcript.turns[1].reply, rawReply);
+  assert.deepEqual(transcript.turns.map((row) => row.elapsed_sec), [1.5, 3]);
+  assert.deepEqual(transcript.runs, []);
+  const execSession = await json(`/api/sessions/${exec}`);
+  assert.equal(execSession.turn_count, 4);
+  assert.deepEqual(execSession.turns.map((row) => [row.turn, row.run_id, row.status]), [
+    [1, linked, 'succeeded'], [2, legacyNative, 'succeeded'], [3, saving, 'succeeded'], [null, resumed, 'failed'],
+  ]);
+  assert.equal(execSession.turns[1].verification.requested, 'node --check app.js');
+  assert.equal(execSession.turns[1].reply, 'native response');
+  assert.deepEqual(new Set(execSession.runs.map((row) => row.run_id)), new Set([linked, legacyNative, saving, resumed]));
+  assert.equal((await json('/api/sessions/exec-orphan')).turns[0].run_id, runOnly);
+
+  const state = await json('/api/state');
+  assert.deepEqual(state.activity_totals, { requests: 19, sessions: 11, runs: 9 });
+  assert.equal(state.recent_group_calls[0].req, 'group/gempt-sonnet');
+  assert.equal(state.recent_runs.length, 6);
+  assert.ok(state.recent_sessions.length <= 6);
+});
+
+test('history routes enforce loopback host, origin, authorization and opaque detail IDs', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-history-boundary-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const svc = await startServer({ port: 0, sessionsDir: dir });
+  t.after(() => svc.close());
+  const page = await rawHttpGet({ port: svc.port, path: '/' });
+  const key = page.text.match(/<meta name="gempt-key" content="([^"]+)">/)[1];
+  const get = (path, extra = {}) => rawHttpGet({ port: svc.port, path, headers: { 'x-gempt-key': key, ...extra } });
+  for (const [route, valid] of [['requests', 'consult-missing%3A1'], ['sessions', 'exec-missing']]) {
+    const base = `/api/${route}`;
+    assert.equal((await get(base, { 'x-gempt-key': 'incorrect' })).status, 401);
+    assert.equal((await get(`${base}/${valid}`, { Host: 'example.test' })).status, 403);
+    assert.equal((await get(`${base}/${valid}`, { Origin: 'https://example.test' })).status, 403);
+    assert.equal((await get(`${base}/${valid}`)).status, 404);
+    for (const malformed of ['', '..', '%2e%2e', '../state', 'exec-ok%2Fstate', 'exec-ok%5Cstate', '%00', '%ZZ', 'exec-a..b']) {
+      assert.equal((await get(`${base}/${malformed}`)).status, 400, `${route}: ${malformed}`);
+    }
+    const empty = JSON.parse((await get(base)).text);
+    assert.equal(empty.total, 0);
+    assert.deepEqual(empty.items, []);
+  }
+});
+
 test('native Magpie tools: discover, status, consult (zero-config + resume + security), and exec (default-off + sandbox + resume)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'gempt-tools-test-'));
   const magpie = await startMockMagpie();
@@ -753,6 +961,10 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     const c2 = await defaultTools.consult.execute({ goal: 'Follow up question', session_id: c1.session_id }, { agent: 'claude' });
     assert.equal(c2.session_id, c1.session_id);
     assert.equal(magpie.requests[1].body.input.length, 3);
+    const consultHistory = JSON.parse(readFileSync(join(sessDir, `${c1.session_id}.json`), 'utf8'));
+    assert.equal(consultHistory.turn_details[1].agent, 'zcode');
+    assert.equal(consultHistory.turn_details[2].goal, 'Follow up question');
+    assert.deepEqual(consultHistory.turn_details[2].usage, c2.usage);
 
     const cChore = await defaultTools.consult.execute({ goal: 'Summarize logs', tier: 'chore' }, { agent: 'zcode' });
     assert.equal(cChore.model, 'auto/deepseek-v4.1-flash');
@@ -896,6 +1108,9 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
       { goal: 'Continue in same repo', cwd: repoDir, session_id: e1.session_id },
       { agent: 'opencode' },
     );
+    const execHistory = JSON.parse(readFileSync(join(sessDir, `${e2.session_id}.json`), 'utf8'));
+    assert.equal(execHistory.turn_details[2].run_id, e2.run_id);
+    assert.deepEqual(execHistory.turn_details[2].commands, e2.commands);
     assert.equal(e2.session_id, e1.session_id);
 
     const codexCalls = readFileSync(codexLog, 'utf-8').trim().split('\n').map((l) => JSON.parse(l));
