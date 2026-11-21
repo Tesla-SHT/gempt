@@ -1678,6 +1678,27 @@ class BugfixRegressionTests(unittest.TestCase):
             self.assertIn("The gempt-worker itself calls gempt_dispatch", both_on)
             self.assertIn("Current native gemini_family=neon.", both_on)
 
+            detail = "Gemini 负责沟通、设计与常规实现，仅在疑难排错、复杂推理与专家复核时派给 GPT。"
+            for work_split, swarm_split, scope in [
+                ("gemini_first", "inherit", "GemPT ordinary"),
+                ("balanced", "gemini_first", "Swarm"),
+            ]:
+                with self.subTest(work_split=work_split, swarm_split=swarm_split):
+                    self.assertIn(f"{scope}: {detail}", run_hook(work_split, swarm_split))
+
+            run_hook("gemini_first", "inherit")
+            with mock.patch.dict(os.environ, {"GEMPT_CONFIG": str(conf)}), \
+                 mock.patch("gempt.workload.run_consult", return_value={"text": "Reviewed"}) as consult:
+                for kind in ("routine", "design", "engineering", "visual"):
+                    req = {"goal": "Help", "kind": kind, "access": "provided"}
+                    reply = json.loads(_handle_tool_call("gempt_dispatch", req)["content"][0]["text"])
+                    self.assertEqual(reply["action"], "gemini")
+                consult.assert_not_called()
+                req = {"goal": "Review", "kind": "specialist", "access": "provided"}
+                reply = json.loads(_handle_tool_call("gempt_dispatch", req)["content"][0]["text"])
+                self.assertEqual(reply["action"], "consult")
+                consult.assert_called_once()
+
             # Dispatch short-circuits cleanly when leftmost slot ("gemini") is active
             cfg = default_config_template()
             cfg["routing_policy"]["work_split"] = "gemini"

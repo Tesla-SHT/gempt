@@ -72,7 +72,7 @@ def reminder(family):
         team = ordinary
     ordinary_off = not profiles[ordinary]["kinds"]
     swarm_off = not profiles[team]["kinds"]
-    delegate = ('Main Gemini delegates each new substantive task, including consultation and workspace work, '
+    delegate = ('For each new task assigned to GPT by the ordinary work split, delegate '
                 'via invoke_subagent(TypeName="gempt-worker", Model="inherit", Role=..., Prompt=..., Workspace=...). '
                 'Continue the task with send_message to the same subagent for follow-ups, progress, steering or '
                 'ask_gemini replies. The gempt-worker itself calls gempt_dispatch with goal, kind and access.')

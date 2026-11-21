@@ -711,11 +711,23 @@ test('page server supports native-groups, lossless api_fallback <-> subscription
     });
     assert.equal(postAstraLowRejected.status, 400);
 
+    for (const field of ['work_split', 'swarm_split']) {
+      const response = await fetch(`${origin}/api/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'null', 'x-gempt-key': key },
+        body: JSON.stringify({ [field]: 'gemini_first' }),
+      });
+      assert.equal(response.status, 200);
+      assert.equal(JSON.parse(readFileSync(cfgPath, 'utf8')).routing_policy[field], 'gemini_first');
+    }
     const stateRes = await fetch(`${origin}/api/state`, {
       headers: { 'x-gempt-key': key },
     });
     assert.equal(stateRes.status, 200);
     const stateJson = await stateRes.json();
+    assert.equal(stateJson.work_split, 'gemini_first');
+    assert.equal(stateJson.swarm_split, 'gemini_first');
+    assert.deepEqual(Object.values(stateJson.work_profiles).map(({ gpt_share }) => gpt_share), [0, 30, 50, 80, 95]);
     assert.equal(stateJson.auto_effort, false);
     assert.equal(stateJson.tiers.find((t) => t.id === 'opus').reasoning_effort, 'xhigh');
   } finally {
@@ -1360,7 +1372,7 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     const dispatch = enabledTools.dispatch.execute;
     const design = { goal: 'Design a form', kind: 'design', access: 'provided' };
     const config = JSON.parse(readFileSync(cfgPath, 'utf8'));
-    for (const [profile, delegated] of [['gemini', false], ['balanced', false], ['gpt', true], ['gpt_first', true]]) {
+    for (const [profile, delegated] of [['gemini', false], ['gemini_first', false], ['balanced', false], ['gpt', true], ['gpt_first', true]]) {
       config.routing_policy.work_split = profile;
       writeFileSync(cfgPath, JSON.stringify(config));
       const before = magpie.requests.length;
@@ -1396,10 +1408,11 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     }
     assert.equal(magpie.requests.length, beforeOff);
 
-    config.routing_policy.swarm_split = 'balanced';
+    config.routing_policy.swarm_split = 'gemini_first';
     writeFileSync(cfgPath, JSON.stringify(config));
     assert.equal((await dispatch({ ...design, role: 'coordinator' })).action, 'board');
     assert.equal((await dispatch({ ...design, role: 'worker', assignment_id: '1'.repeat(32) })).action, 'gemini');
+    assert.equal((await dispatch({ ...design, kind: 'engineering', role: 'worker', assignment_id: '3'.repeat(32) })).action, 'gemini');
     const revision = { ...hydrogenTask, role: 'worker', kind: 'specialist', assignment_id: '2'.repeat(32) };
     const before = magpie.requests.length;
     const pair = await Promise.all([dispatch(revision), dispatch(revision)]);

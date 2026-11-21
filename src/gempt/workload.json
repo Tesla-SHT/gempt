@@ -6,6 +6,12 @@
       "kinds": [],
       "detail": "已关闭 GemPT 自动协作，全部任务直接由 Gemini 完成，不再派单给 GPT。"
     },
+    "gemini_first": {
+      "label": "Gemini 为主",
+      "gpt_share": 30,
+      "kinds": ["specialist"],
+      "detail": "Gemini 负责沟通、设计与常规实现，仅在疑难排错、复杂推理与专家复核时派给 GPT。"
+    },
     "balanced": {
       "label": "按领域分工",
       "gpt_share": 50,

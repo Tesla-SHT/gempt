@@ -5,7 +5,7 @@
  * with @supports not selector(:has(*)) fallbacks for interactive controls.
  */
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
 
   --gp-bg-light: #fafafa;
   --gp-bg-dark: #141416;
@@ -60,6 +60,7 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
+    color-scheme: dark;
     --gp-fallback-bg: var(--gp-bg-dark);
     --gp-fallback-card: var(--gp-card-dark);
     --gp-fallback-subtle: var(--gp-subtle-dark);
@@ -115,6 +116,12 @@
   --gp-ok: #34d399;
   --gp-warn: #f59e0b;
   --gp-err: #f87171;
+}
+
+/* Native popups need opaque colors even when host theme tokens are translucent. */
+select, select option, select optgroup {
+  background-color: var(--gp-fallback-card);
+  color: var(--gp-fallback-fg);
 }
 
 @supports not (scrollbar-color: auto) {
@@ -1387,8 +1394,8 @@ button.status-chip:focus-visible {
 
 .work-controls { display: grid; gap: 15px; border-top: 1px solid var(--gp-border); padding: 14px 0; }
 .work-controls[hidden] { display: none; }
-.work-options { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
-.work-option { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 2px 6px; border: 1px solid var(--gp-border); border-radius: 7px; padding: 7px; cursor: pointer; }
+.work-options { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
+.work-option { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 2px 6px; border: 1px solid var(--gp-border); border-radius: 7px; padding: 7px; cursor: pointer; }
 .work-option input { grid-row: span 2; margin: 0; accent-color: var(--gp-fg); }
 .work-option strong { font-size: 12px; font-weight: 600; }
 .work-option small { font-size: 11px; color: var(--gp-muted); }
@@ -1402,8 +1409,9 @@ button.status-chip:focus-visible {
   .pairing-options { grid-template-columns: 1fr; }
   .pairing-options label { grid-template-columns: 6em minmax(0, 1fr); align-items: center; }
 }
-.pairing-options select, .swarm-choice select { font: inherit; font-size: 12px; border: 1px solid var(--gp-border); border-radius: 6px; padding: 4px; background: var(--gp-card); color: var(--gp-fg); }
-@media (max-width: 540px) { .work-options { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.pairing-options select, .swarm-choice select { font: inherit; font-size: 12px; border: 1px solid var(--gp-border); border-radius: 6px; padding: 4px; max-width: 100%; }
+@container (max-width: 700px) { .work-options { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@container (max-width: 450px) { .work-options { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 /* Ledger, session list and detail patterns adapted from Magpie's app.css (MIT). */
 .activity-tabs {
   display: flex;
@@ -1490,6 +1498,7 @@ button.status-chip:focus-visible {
   --activity-green: var(--magpie-green, var(--green, var(--gp-ok)));
   --activity-amber: var(--magpie-amber, var(--amber, var(--gp-warn)));
   --activity-red: var(--magpie-red, var(--red, var(--gp-err)));
+  --activity-error-text: color-mix(in srgb, var(--activity-red) 75%, var(--gp-fallback-fg));
 }
 
 .activity-tools,
@@ -1507,18 +1516,17 @@ button.status-chip:focus-visible {
   padding: 0 9px;
   border: 1px solid var(--activity-line);
   border-radius: 7px;
-  background: var(--gp-card);
-  color: var(--gp-fg);
   font: inherit;
   font-size: 12px;
   max-width: 100%;
   min-width: 0;
 }
 
-.activity-search { width: 220px; }
+.activity-search { width: 220px; background: var(--gp-card); color: var(--gp-fg); }
 .activity-search::placeholder { color: var(--gp-muted); }
-.activity-pick { max-width: min(180px, 100%); color: var(--gp-muted); }
-.activity-pick:hover, .activity-pick.is-set { background: var(--gp-pill); color: var(--gp-fg); }
+.activity-pick { max-width: min(180px, 100%); }
+.activity-pick:hover, .activity-pick.is-set { border-color: var(--gp-fallback-muted); }
+.activity-pick.is-set { background-color: var(--gp-fallback-subtle); }
 
 .activity-period {
   display: flex;
@@ -1643,7 +1651,7 @@ button.status-chip:focus-visible {
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
-.kpi-sub .is-err { color: var(--activity-red); }
+.kpi-sub .is-err { color: var(--activity-error-text); }
 .kpi-bar-track {
   height: 5px;
   border-radius: 999px;
@@ -1791,7 +1799,7 @@ button.status-chip:focus-visible {
   color: var(--gp-muted);
   font-variant-numeric: tabular-nums;
 }
-.legend-meta .is-err { color: var(--activity-red); }
+.legend-meta .is-err { color: var(--activity-error-text); }
 
 /* Model speed leaderboard */
 .speed-list {
@@ -2112,7 +2120,7 @@ button.status-chip:focus-visible {
 .activity-ledger [data-latency] { font-weight: 550; }
 .activity-ledger [data-latency="fast"] { color: var(--activity-green); }
 .activity-ledger [data-latency="slow"] { color: var(--activity-amber); }
-.activity-ledger [data-latency="long"] { color: var(--activity-red); }
+.activity-ledger [data-latency="long"] { color: var(--activity-error-text); }
 .ledger-agent { display: inline; }
 .ledger-agent .activity-badge { margin-inline-start: 6px; }
 
@@ -2135,7 +2143,10 @@ button.status-chip:focus-visible {
 }
 
 .activity-status:is([data-status="succeeded"], [data-status="finished"])::before { background: var(--activity-green); }
-.activity-status[data-status="failed"] { color: var(--activity-red); font-weight: 600; }
+.activity-status[data-status="failed"] {
+  color: var(--activity-error-text);
+  font-weight: 600;
+}
 .activity-status[data-status="failed"]::before { content: "×"; width: auto; height: auto; background: none; }
 .activity-status:is([data-status="running"], [data-status="queued"], [data-status="waiting_gemini"], [data-status="interrupted"]) {
   padding: 1px 6px;
@@ -2327,6 +2338,8 @@ button.status-chip:focus-visible {
   .activity-session-num { min-width: 0; }
   .activity-session-num small, .activity-session-icon { display: none; }
   .activity-session-row { gap: 6px; padding-inline: 8px; }
+  .session-folder { display: block; overflow: hidden; text-overflow: ellipsis; }
+  .session-folder::before { content: none; }
   .activity-list-head .activity-search { width: 100%; }
 }
 

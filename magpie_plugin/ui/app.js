@@ -1547,6 +1547,10 @@
       const hmFmt = (d) => reqUi.heatmapMetric === 'requests' ? `${number(d.requests)} 个请求`
         : reqUi.heatmapMetric === 'cost' ? shortCost(d.cost_usd) : `${number(d.tokens, true)} token`;
       const maxHm = Math.max(0, ...hm.days.map(hmVal));
+      if (maxHm <= 0) {
+        heatCard.append(node('div', 'activity-empty', '当前指标暂无用量'));
+        return;
+      }
       const weeks = Math.ceil(hm.days.length / 7);
 
       const scroll = node('div', 'heatmap-scroll');
@@ -2057,7 +2061,7 @@
     const meta = node('small', '', [session.model, filterLabel('tier', session.tier), when(session.updated_at)].filter(Boolean).join(' · '));
     const folder = node('span', 'session-folder', session.cwd);
     folder.title = session.cwd;
-    meta.title = meta.textContent;
+    meta.title = [meta.textContent, session.cwd].filter(Boolean).join(' · ');
     if (session.cwd) meta.append(folder);
     who.append(title, meta);
     const tokens = node('span', 'activity-session-num');
@@ -2424,7 +2428,7 @@
     const query = new URLSearchParams({ q: view.list.querySelector('.activity-search').value.trim() });
     if (view.range !== 'all') query.set('range', view.range);
     for (const select of view.list.querySelectorAll('[data-filter]')) {
-      if (select.value) query.set(select.dataset.filter, select.value);
+      if (select.value && select.dataset.filter !== 'status') query.set(select.dataset.filter, select.value);
     }
     if (view.status) query.set('status', view.status);
     return query;
@@ -2662,25 +2666,29 @@
         syncActivityAutoRefresh();
       };
     }
-    for (const select of view.list.querySelectorAll('[data-filter]')) {
-      select.onchange = () => {
-        clearTimeout(debounce);
-        if (select.dataset.filter === 'status') setStatus('');
-        void loadActivityList(view);
-      };
-    }
-    const statusControls = view.list.querySelectorAll('[data-status]');
+    const statusControls = view.list.querySelectorAll('button[data-status]');
     const statusSelect = view.list.querySelector('[data-filter="status"]');
     const setStatus = (status) => {
       view.status = status;
       for (const control of statusControls) {
-        control.setAttribute('aria-pressed', String(!statusSelect?.value && control.dataset.status === status));
+        control.setAttribute('aria-pressed', String(control.dataset.status === status));
       }
     };
+    for (const select of view.list.querySelectorAll('[data-filter]')) {
+      select.onchange = () => {
+        clearTimeout(debounce);
+        select.classList.toggle('is-set', Boolean(select.value));
+        if (select === statusSelect) setStatus(select.value);
+        void loadActivityList(view);
+      };
+    }
     for (const control of statusControls) {
       control.onclick = () => {
         clearTimeout(debounce);
-        if (statusSelect) statusSelect.value = '';
+        if (statusSelect) {
+          statusSelect.value = '';
+          statusSelect.classList.remove('is-set');
+        }
         setStatus(control.dataset.status);
         void loadActivityList(view);
       };

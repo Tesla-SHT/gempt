@@ -42,7 +42,7 @@ class BoundaryTests(unittest.TestCase):
                     with self.assertRaisesRegex(ConfigError, "No Codex subscription"):
                         configure_gempt(magpie_url=url, config_path=conf)
                 self.assertEqual(seen, [None, None])
-                self.assertEqual(json.loads(conf.read_text())["magpie"]["api_key"], cfg["magpie"]["api_key"])
+                self.assertEqual(json.loads(conf.read_text(encoding="utf-8"))["magpie"]["api_key"], cfg["magpie"]["api_key"])
                 for model in ("openai/gpt-test", "auto/test", "group/other"):
                     with self.assertRaises(ConfigError):
                         resolve_tier(cfg, "sonnet", model_override=model)
