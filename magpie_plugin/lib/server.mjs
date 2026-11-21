@@ -29,6 +29,8 @@ import {
   setFailoverMode,
 } from './backend.mjs';
 
+import { createAppServerManager } from './app-server-manager.mjs';
+
 export const DEFAULT_PORT = 3498;
 const MAX_POST_BYTES = 8192;
 
@@ -98,9 +100,12 @@ export async function startServer({
   magpieCliPath,
   execEnabled = false,
   probeTimeoutMs = 2000,
+  manageAppServer,
+  appServerOptions,
 } = {}) {
   const KEY = randomBytes(24).toString('base64url');
   let actualPort = 0;
+  let appServer;
   let OWN = new Set();
   let HOSTS = new Set();
 
@@ -185,6 +190,14 @@ export async function startServer({
         if (!keyOK(req)) {
           return send(req, res, 401, { error: 'unauthorized: send the x-gempt-key header' });
         }
+        const interrupt = /^\/api\/runs\/(.*?)\/interrupt$/.exec((req.url || '/').split('?', 1)[0]);
+        if (req.method === 'POST' && interrupt) {
+          if (req.headers.origin === 'null') return send(req, res, 403, { error: 'invalid origin' });
+          const id = interrupt[1];
+          if (id.length !== 32 || !/^[a-f0-9]+$/.test(id)) return send(req, res, 400, { error: 'invalid run_id' });
+          if (!appServer) return send(req, res, 503, { error: 'shared Codex app-server management is disabled' });
+          return send(req, res, 200, await appServer.interruptRun(id, sessionsDir));
+        }
         if (req.method === 'GET' && pathname === '/api/state') {
           const state = await readState({
             configPath,
@@ -192,6 +205,7 @@ export async function startServer({
             magpieConfigDir,
             antigravityPluginDir,
             execEnabled,
+            appServer,
             probeTimeoutMs,
           });
           return send(req, res, 200, state);
@@ -337,18 +351,29 @@ export async function startServer({
     server.listen(p, '127.0.0.1');
   });
 
+  let closed = false;
+  const result = (listening, reused) => {
+    if (manageAppServer ?? target !== 0) {
+      appServer = createAppServerManager({ configPath, ...appServerOptions });
+      void appServer.ensureRunning();
+    }
+    return {
+      port: actualPort, listening, reused, server, appServer,
+      async close() {
+        closed = true;
+        await Promise.all([
+          appServer?.stop(),
+          new Promise((done) => (server.listening ? server.close(done) : done())),
+        ]);
+      },
+    };
+  };
+
   if (target === 0) {
     await bindOnce(0);
-    return {
-      port: actualPort,
-      listening: true,
-      reused: false,
-      server,
-      close: () => new Promise((resolveClose) => (server.listening ? server.close(() => resolveClose()) : resolveClose())),
-    };
+    return result(true, false);
   }
 
-  let closed = false;
   const takeover = (p) => {
     (async () => {
       while (!closed) {
@@ -379,31 +404,13 @@ export async function startServer({
         if (again && again.build === BUILD_ID) {
           own(target);
           takeover(target);
-          return {
-            port: target,
-            listening: false,
-            reused: true,
-            server,
-            close: () => {
-              closed = true;
-              return new Promise((resolveClose) => (server.listening ? server.close(() => resolveClose()) : resolveClose()));
-            },
-          };
+          return result(false, true);
         }
         continue;
       }
       own(target);
       takeover(target);
-      return {
-        port: target,
-        listening: false,
-        reused: true,
-        server,
-        close: () => {
-          closed = true;
-          return new Promise((resolveClose) => (server.listening ? server.close(() => resolveClose()) : resolveClose()));
-        },
-      };
+      return result(false, true);
     }
     if (!foreignSince) foreignSince = Date.now();
     if (Date.now() - foreignSince > 4000 || Date.now() >= deadline) {
@@ -413,14 +420,5 @@ export async function startServer({
   }
 
   console.log(`[gempt-magpie-plugin] listening on http://127.0.0.1:${actualPort}`);
-  return {
-    port: actualPort,
-    listening: true,
-    reused: false,
-    server,
-    close: () => {
-      closed = true;
-      return new Promise((resolveClose) => (server.listening ? server.close(() => resolveClose()) : resolveClose()));
-    },
-  };
+  return result(true, false);
 }

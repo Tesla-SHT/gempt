@@ -44,25 +44,28 @@ def reminder(family):
         team = ordinary
     ordinary_off = not profiles[ordinary]["kinds"]
     swarm_off = not profiles[team]["kinds"]
-    dispatch = ("For each new substantive assignment, first call gempt_dispatch with goal, kind and access. "
-                "Do not pre-solve or repeat completed work.")
-    swarm_roles = ("In /swarm the coordinator briefs one owner per 32-hex assignment_id, workers and "
-                   "independent verifiers pass their role and that ID. Coordinator and narrator stay on the board.")
+    delegate = ('Main Gemini delegates each new substantive task, including consultation and workspace work, '
+                'via invoke_subagent(TypeName="gempt-worker", Model="inherit", Role=..., Prompt=..., Workspace=...). '
+                'Continue the task with send_message to the same subagent for follow-ups, progress, steering or '
+                'ask_gemini replies. The gempt-worker itself calls gempt_dispatch with goal, kind and access.')
+    swarm_roles = ("In /swarm the coordinator briefs one owner per 32-hex assignment_id. Each worker and "
+                   "independent verifier first calls gempt_dispatch with goal, kind, access, role and that ID. "
+                   "Coordinator and narrator stay on the board.")
+    no_delegation = "Do not invoke gempt-worker or call gempt_dispatch"
     direct = "Handle tasks directly in Gemini unless the user explicitly asks to invoke GPT."
     if ordinary_off and swarm_off:
-        message = ("GemPT is OFF for ordinary conversations and Swarm. Do not call gempt_dispatch "
-                   f"or automatically delegate to GPT. {direct}")
+        message = f"GemPT is OFF for ordinary conversations and Swarm. {no_delegation}. {direct}"
     elif ordinary_off:
-        message = ("GemPT is OFF for ordinary conversations. Do not call gempt_dispatch in ordinary conversations. "
+        message = (f"GemPT is OFF for ordinary conversations. {no_delegation} in ordinary conversations. "
                    f"{direct} GemPT remains active in Swarm: {profiles[team]['detail']} "
-                   f"In Swarm only: {dispatch} {swarm_roles} Explain the result in the user's language.")
+                   f"In Swarm only: {swarm_roles} Explain the result in the user's language.")
     elif swarm_off:
-        message = ("GemPT is OFF for Swarm. Do not call gempt_dispatch in Swarm. "
+        message = (f"GemPT is OFF for Swarm. {no_delegation} in Swarm. "
                    f"{direct} GemPT remains active in ordinary conversations: {profiles[ordinary]['detail']} "
-                   f"In ordinary conversations only: {dispatch} Explain the result in the user's language.")
+                   f"In ordinary conversations only: {delegate} Explain the result in the user's language.")
     else:
         message = (f"GemPT ordinary: {profiles[ordinary]['detail']}  Swarm: {profiles[team]['detail']} "
-                   f"{dispatch} {swarm_roles} Explain the result in the user's language.")
+                   f"In ordinary conversations: {delegate} {swarm_roles} Explain the result in the user's language.")
     if family and not (ordinary_off and swarm_off):
         message += f" Current native gemini_family={family}."
         if swarm_off:

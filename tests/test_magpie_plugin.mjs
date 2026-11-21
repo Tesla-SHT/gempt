@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { execFile, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -8,6 +11,7 @@ import { delimiter, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { buildMcpSnippet, findMagpieCli, readState, setDefaultSandbox, setDefaultTier } from '../magpie_plugin/lib/backend.mjs';
+import { createAppServerManager } from '../magpie_plugin/lib/app-server-manager.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
 import { createGemptTools } from '../magpie_plugin/lib/tools.mjs';
 
@@ -151,49 +155,118 @@ process.exit(0);
   return shPath;
 }
 
-function createMockCodexCli(dir, logFile) {
-  const jsPath = join(dir, 'mock-codex-cli.mjs');
-  writeFileSync(
-    jsPath,
-    `
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
-const args = process.argv.slice(2);
-const stdinPrompt = readFileSync(0, 'utf8');
-const oIdx = args.indexOf('-o');
-if (oIdx >= 0 && args[oIdx + 1]) {
-  writeFileSync(args[oIdx + 1], 'mock codex final report', 'utf8');
-}
-appendFileSync(
-  ${JSON.stringify(logFile)},
-  JSON.stringify({
-    args,
-    cwd: process.cwd(),
-    stdinPrompt,
-    httpProxy: process.env.HTTP_PROXY || '',
-    httpsProxy: process.env.HTTPS_PROXY || '',
-    noProxy: process.env.NO_PROXY || '',
-    gatewayToken: process.env.GEMPT_EXEC_GATEWAY_TOKEN || '',
-  }) + '\\n',
-  'utf8',
-);
-console.log(JSON.stringify({ type: 'thread.started', thread_id: '01900000-0000-7000-8000-000000000001' }));
-console.log(JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', command: 'echo ok', exit_code: 0, aggregated_output: 'ok' } }));
-console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'mock codex final report' } }));
-console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 20, output_tokens: 10 } }));
-process.exit(0);
-`,
-    'utf-8',
-  );
+const MOCK_THREAD = '01900000-0000-7000-8000-000000000001';
 
-  if (process.platform === 'win32') {
-    const cmdPath = join(dir, 'mock-codex.cmd');
-    writeFileSync(cmdPath, `@echo off\r\n"${process.execPath}" "${jsPath}" %*\r\n`, 'utf-8');
-    return cmdPath;
-  }
-  const shPath = join(dir, 'mock-codex.sh');
-  writeFileSync(shPath, `#!/usr/bin/env sh\nexec "${process.execPath}" "${jsPath}" "$@"\n`, 'utf-8');
-  chmodSync(shPath, 0o755);
-  return shPath;
+async function startMockAppServer({ port = 0, token = 'fixture-capability' } = {}) {
+  const packets = [];
+  const turns = new Map();
+  const sockets = new Set();
+  const server = http.createServer();
+  server.on('upgrade', (req, socket, head) => {
+    if (req.headers.authorization !== `Bearer ${token}`) {
+      socket.end('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      return;
+    }
+    const accept = createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+      + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    socket.on('error', () => {});
+    const frame = (op, data) => {
+      const prefix = data.length < 126 ? Buffer.from([0x80 | op, data.length]) : Buffer.from([0x80 | op, 126, data.length >> 8, data.length & 255]);
+      socket.write(Buffer.concat([prefix, data]));
+    };
+    const send = (data) => frame(1, Buffer.from(JSON.stringify({ jsonrpc: '2.0', ...data })));
+    const notify = (method, params) => send({ method, params });
+    let currentTurn;
+    const processPacket = (message) => {
+      packets.push(message);
+      const { id, method, params } = message;
+      if (method === 'initialize') {
+        assert.equal(params.capabilities.experimentalApi, true);
+        send({ id, result: { userAgent: 'mock' } });
+      } else if (method === 'thread/start' || method === 'thread/resume') {
+        if (method === 'thread/start') {
+          assert.equal(params.dynamicTools[0].name, 'ask_gemini');
+          notify('thread/started', { thread: { id: MOCK_THREAD } });
+        } else {
+          assert.equal(params.threadId, MOCK_THREAD);
+          assert.equal(params.dynamicTools, undefined);
+        }
+        send({ id, result: { thread: { id: MOCK_THREAD }, cwd: params.cwd, modelProvider: params.modelProvider,
+          sandbox: { type: { 'read-only': 'readOnly', 'workspace-write': 'workspaceWrite', 'danger-full-access': 'dangerFullAccess' }[params.sandbox] } } });
+      } else if (method === 'turn/start') {
+        const threadId = params.threadId;
+        const turnId = currentTurn = `turn-${packets.length}`;
+        const emit = (method, data) => notify(method, { threadId, turnId, ...data });
+        const finish = (status) => {
+          if (status === 'completed') emit('item/completed', { item: { id: 'answer', type: 'agentMessage', text: 'mock codex final report' } });
+          emit('turn/completed', { turn: { id: turnId, status } });
+          turns.delete(turnId);
+        };
+        turns.set(turnId, finish);
+        emit('turn/started', { turn: { id: turnId, status: 'inProgress' } });
+        emit('item/agentMessage/delta', { itemId: 'answer', delta: 'live drafting' });
+        emit('item/completed', { item: { id: 'cmd', type: 'commandExecution', command: 'echo ok', exitCode: 0, aggregatedOutput: 'ok' } });
+        send({ id, result: { turn: { id: turnId, status: 'inProgress' } } });
+        if (params.input[0].text.includes('Ask Gemini')) {
+          send({ id: 'tool-rpc', method: 'item/tool/call', params: { threadId, turnId, tool: 'ask_gemini',
+            callId: 'call_native', arguments: { reason: 'decision', question: 'Continue?' } } });
+        } else if (!params.input[0].text.includes('Hold turn')) finish('completed');
+      } else if (method === 'turn/interrupt') {
+        turns.get(params.turnId)?.('interrupted');
+        send({ id, result: {} });
+      } else if (id === 'tool-rpc') {
+        turns.get(currentTurn)?.('completed');
+      }
+    };
+    let received = head;
+    const parse = (data) => {
+      received = Buffer.concat([received, data]);
+      while (received.length >= 2) {
+        const opcode = received[0] & 15;
+        assert.equal(received[1] & 128, 128);
+        let length = received[1] & 127;
+        let offset = 2;
+        if (length === 126) {
+          if (received.length < 4) return;
+          length = received.readUInt16BE(2);
+          offset = 4;
+        }
+        const end = offset + 4 + length;
+        if (received.length < end) return;
+        const mask = received.subarray(offset, offset + 4);
+        const bytes = received.subarray(offset + 4, end);
+        for (let i = 0; i < length; i++) bytes[i] ^= mask[i % 4];
+        received = received.subarray(end);
+        if (opcode === 1) processPacket(JSON.parse(bytes));
+        else if (opcode === 8) { frame(8, bytes); socket.end(); }
+      }
+    };
+    socket.on('data', parse);
+    if (head.length) parse(Buffer.alloc(0));
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', resolve);
+  });
+  return { packets, url: `ws://127.0.0.1:${server.address().port}`,
+    close: () => new Promise((resolve) => {
+      for (const socket of sockets) socket.destroy();
+      server.close(resolve);
+    }) };
+}
+
+async function eventually(probe, timeout = 4000) {
+  const end = Date.now() + timeout;
+  let result;
+  do {
+    result = await probe();
+    if (result) return result;
+    await sleep(20);
+  } while (Date.now() < end);
+  assert.fail('timed out waiting for observed state');
 }
 
 test('package.json Magpie manifest fields and single plugin factory export exist', async () => {
@@ -205,6 +278,8 @@ test('package.json Magpie manifest fields and single plugin factory export exist
     assert.ok(pkg.files.includes(item), `files missing ${item}`);
   }
   assert.ok(existsSync(join(REPO_ROOT, pkg.main)));
+  assert.ok(pkg.files.includes('plugin/agents/*.md'));
+  assert.ok(existsSync(join(REPO_ROOT, 'plugin/agents/gempt-worker.md')));
   assert.equal(pkg.magpie.name, 'GemPT');
   assert.equal(pkg.magpie.page.service.port, 3498);
   assert.equal(pkg.magpie.options.port, 3498);
@@ -910,8 +985,11 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
   writeFileSync(join(repoDir, 'private.pem'), 'PRIVATE KEY\n', 'utf-8');
   writeFileSync(join(outsideDir, 'secret.txt'), 'outside\n', 'utf-8');
 
-  const codexLog = join(dir, 'codex-calls.jsonl');
-  const mockCodex = createMockCodexCli(dir, codexLog);
+  const app = await startMockAppServer();
+  const appState = join(dir, 'app-server-connection.json');
+  const env = { ...process.env, GEMPT_APP_SERVER_STATE: appState };
+  writeFileSync(appState, JSON.stringify({ ws_url: app.url, status: 'running', auth_token: 'fixture-capability',
+    auth_header: 'Authorization', gateway_url: magpie.url }));
 
   const prevMagpieAddr = process.env.MAGPIE_ADDR;
   const prevProxy = process.env.HTTP_PROXY;
@@ -924,7 +1002,7 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
       sessionsDir: sessDir,
       magpieConfigDir: magpieDir,
       antigravityPluginDir: join(dir, 'missing-agy'),
-      codexCliPath: mockCodex,
+      env,
       options: { exec: false },
     });
 
@@ -1008,7 +1086,7 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
       JSON.stringify({
         version: 1,
         magpie: { base_url: magpie.url },
-        codex: { default_sandbox: 'workspace-write', cli_path: mockCodex },
+        codex: { default_sandbox: 'workspace-write' },
         routing_policy: { default_tier: 'opus', failover_mode: 'subscription_only', auto_effort: true },
         tiers: {
           sonnet: { consult_model: 'codex/gpt-6.2-sol', exec_model: 'codex/gpt-6.2-sol', reasoning_effort: 'medium' },
@@ -1025,7 +1103,7 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
       sessionsDir: sessDir,
       magpieConfigDir: magpieDir,
       antigravityPluginDir: join(dir, 'missing-agy'),
-      options: { exec: true },
+      options: { exec: true }, env,
     });
 
     // Routing uses the current settings even for an already registered tool instance.
@@ -1113,32 +1191,47 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     assert.deepEqual(execHistory.turn_details[2].commands, e2.commands);
     assert.equal(e2.session_id, e1.session_id);
 
-    const codexCalls = readFileSync(codexLog, 'utf-8').trim().split('\n').map((l) => JSON.parse(l));
+    const codexCalls = app.packets.filter((p) => p.method === 'turn/start');
     assert.equal(codexCalls.length, 2);
-    assert.equal(codexCalls[0].httpProxy, '');
-    assert.ok(codexCalls[0].noProxy.includes('127.0.0.1'));
-    assert.match(codexCalls[0].stdinPrompt, /## Goal\nInspect repo/);
-    assert.ok(codexCalls[1].args.includes('resume'));
-    assert.ok(codexCalls[1].args.includes('01900000-0000-7000-8000-000000000001'));
+    assert.match(codexCalls[0].params.input[0].text, /## Goal\nInspect repo/);
+    assert.equal(codexCalls[0].params.sandboxPolicy.type, 'readOnly');
+    assert.equal(app.packets.find((p) => p.method === 'thread/resume').params.threadId, MOCK_THREAD);
+    assert.equal(codexCalls[1].params.threadId, MOCK_THREAD);
 
     // A receipt survives a new tool instance and repeat delivery never launches a second worker.
     const job = { goal: 'Edit one file', cwd: repoDir, run_id: '3'.repeat(32), background: true };
     const first = await enabledTools.exec.execute(job);
     assert.equal(first.run_id, job.run_id);
-    const reconnected = createGemptTools({ sessionsDir: sessDir, configPath: cfgPath, options: { exec: true } });
+    const reconnected = createGemptTools({ sessionsDir: sessDir, configPath: cfgPath, options: { exec: true }, env });
     const finished = await reconnected.status.execute({ run_id: job.run_id, wait_sec: 5 });
     assert.equal(finished.state, 'finished', finished.error);
     assert.equal(finished.result.sandbox, 'workspace-write');
     const replay = await reconnected.exec.execute(job);
     assert.equal(replay.session_id, finished.result.session_id);
-    assert.equal(readFileSync(codexLog, 'utf8').trim().split(/\r?\n/).length, codexCalls.length + 1);
+    assert.equal(app.packets.filter((p) => p.method === 'turn/start').length, codexCalls.length + 1);
     await assert.rejects(reconnected.exec.execute({ ...job, cwd: outsideDir }), /different workspace/);
     await assert.rejects(reconnected.status.execute({ run_id: '../wrong' }), /Invalid run_id/);
 
     const pairedExec = await dispatch({ ...hydrogenTask, kind: 'engineering', access: 'inspect', cwd: repoDir });
     assert.equal(pairedExec.model, 'codex/gpt-6-luna');
-    const pairedArgs = JSON.parse(readFileSync(codexLog, 'utf8').trim().split('\n').at(-1)).args;
-    assert.ok(pairedArgs.includes('codex/gpt-6-luna'));
+    assert.equal(app.packets.findLast((p) => p.method === 'turn/start').params.model, 'codex/gpt-6-luna');
+
+    const waiting = await enabledTools.exec.execute({ goal: 'Ask Gemini', cwd: repoDir });
+    assert.equal(waiting.state, 'waiting_gemini');
+    assert.equal(waiting.progress.last_message, 'live drafting');
+    assert.equal(waiting.pending_tool_call.call_id, 'call_native');
+    const runDirectory = join(sessDir, 'runs', waiting.run_id);
+    assert.match(readFileSync(join(runDirectory, 'events.jsonl'), 'utf8'), /item\/tool\/call/);
+    mkdirSync(join(runDirectory, 'tool_replies'));
+    writeFileSync(join(runDirectory, 'tool_replies', 'call_native.json'), JSON.stringify({ answer: 'Proceed', success: true }));
+    const done = await eventually(async () => {
+      const state = await enabledTools.status.execute({ run_id: waiting.run_id });
+      return state.state === 'finished' && state;
+    });
+    assert.equal(done.session_id, waiting.session_id);
+    assert.equal(done.turn_id, waiting.progress.turn_id);
+    assert.deepEqual(app.packets.find((p) => p.id === 'tool-rpc' && p.result).result,
+      { success: true, contentItems: [{ type: 'inputText', text: 'Proceed' }] });
 
     // Auto-effort escalates complex Opus consult to Astra@xhigh and preserves on resume
     const autoHard = await enabledTools.consult.execute({
@@ -1161,6 +1254,7 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     else process.env.MAGPIE_ADDR = prevMagpieAddr;
     if (prevProxy === undefined) delete process.env.HTTP_PROXY;
     else process.env.HTTP_PROXY = prevProxy;
+    await app.close();
     await magpie.close();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1235,4 +1329,107 @@ test('native tool.consult fails over to openai/* backup on HTTP 429 when failove
     await magpie.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('shared app-server manager launches once, authenticates, restarts and serves live run controls', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-app-server-'));
+  const configDir = join(dir, 'cfg');
+  mkdirSync(configDir);
+  const configPath = join(configDir, 'config.json');
+  const sessionsDir = join(dir, 'sessions');
+  const statePath = join(dir, 'explicit-state.json');
+  const gateway = await startMockMagpie();
+  writeFileSync(configPath, JSON.stringify({ codex: { cli_path: process.execPath },
+    magpie: { base_url: gateway.url } }));
+  const children = [];
+  const env = { ...process.env, GEMPT_APP_SERVER_STATE: statePath,
+    CODEX_SESSION_ID: 'desktop-test', CODEX_WINDOWS_REGISTERED_CORE: 'desktop-test' };
+  const choices = { configPath, env, backoffMs: [20, 40], spawnProcess(bin, args, opts) {
+    assert.equal(bin, process.execPath);
+    assert.deepEqual(args.slice(0, 2), ['app-server', '--listen']);
+    assert.ok(args.includes('capability-token'));
+    assert.ok(args.includes('model_providers.gempt_gateway.base_url=' + JSON.stringify(gateway.url + '/v1')));
+    assert.equal(opts.windowsHide, true);
+    assert.equal(opts.env.NO_PROXY, '127.0.0.1,localhost,::1');
+    assert.equal(opts.env.CODEX_SESSION_ID, undefined);
+    assert.equal(opts.env.CODEX_WINDOWS_REGISTERED_CORE, undefined);
+    const child = new EventEmitter();
+    child.pid = process.pid;
+    const token = readFileSync(args[args.indexOf('--ws-token-file') + 1], 'utf8');
+    child.app = startMockAppServer({ token, port: Number(new URL(args[2]).port) });
+    child.crash = async (code) => {
+      await (await child.app).close();
+      child.exitCode = code;
+      child.emit('exit', code);
+    };
+    child.kill = () => { void child.crash(0); };
+    children.push(child);
+    return child;
+  } };
+  const svc = await startServer({ configPath, sessionsDir, port: 0, manageAppServer: true, appServerOptions: choices });
+  const follower = createAppServerManager(choices);
+  t.after(async () => {
+    await follower.stop();
+    await svc.close();
+    await gateway.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const first = await svc.appServer.ensureRunning();
+  assert.equal(first.running, true, first.error);
+  assert.equal((await follower.ensureRunning()).ws_url, first.ws_url);
+  assert.equal(children.length, 1);
+  const firstState = JSON.parse(readFileSync(statePath, 'utf8'));
+  assert.equal(firstState.auth_header, 'Authorization');
+  assert.equal(firstState.status, 'running');
+  assert.ok(firstState.auth_token);
+  await children[0].crash(17);
+  const second = await eventually(() => children.length === 2 && svc.appServer.getStatus().running && svc.appServer.getStatus());
+  const secondState = JSON.parse(readFileSync(statePath, 'utf8'));
+  assert.notEqual(secondState.auth_token, firstState.auth_token);
+
+  const origin = `http://127.0.0.1:${svc.port}`;
+  const key = (await rawHttpGet({ port: svc.port, path: '/' })).text.match(/name="gempt-key" content="([^"]+)"/)[1];
+  const headers = { 'x-gempt-key': key };
+  const readApi = async (path) => (await fetch(origin + path, { headers })).json();
+  const repo = join(dir, 'workspace');
+  mkdirSync(repo);
+  const tools = createGemptTools({ configPath, sessionsDir, options: { exec: true }, env });
+  const receipt = await tools.exec.execute({ goal: 'Ask Gemini', cwd: repo, background: true });
+  const runId = receipt.run_id;
+  await eventually(async () => (await tools.status.execute({ run_id: runId })).state === 'waiting_gemini');
+  const state = await readApi('/api/state');
+  assert.deepEqual(state.app_server, second);
+  assert.equal(state.app_server.auth_token, undefined);
+  assert.deepEqual(state.active_runs.map((run) => [run.run_id, run.state]), [[runId, 'waiting_gemini']]);
+  assert.equal(state.active_runs[0].pending_tool_call.arguments.question, 'Continue?');
+  const request = (await readApi('/api/requests')).items.find((row) => row.run_id === runId);
+  assert.equal(request.state, 'waiting_gemini');
+  assert.equal((await readApi('/api/requests/' + encodeURIComponent(request.id))).progress.last_message, 'live drafting');
+  const session = (await readApi('/api/sessions')).items.find((row) => row.session_id === receipt.session_id);
+  assert.equal(session.pending_tool_call.tool, 'ask_gemini');
+  assert.equal((await readApi('/api/sessions/' + session.id)).state, 'waiting_gemini');
+
+  const path = `/api/runs/${runId}/interrupt`;
+  assert.equal((await fetch(origin + path, { method: 'POST' })).status, 401);
+  assert.equal((await fetch(origin + path, { method: 'POST', headers: { ...headers, origin: 'https://example.invalid' } })).status, 403);
+  assert.equal((await fetch(origin + path, { method: 'POST', headers: { ...headers, origin: 'null' } })).status, 403);
+  assert.equal((await fetch(origin + '/api/runs/%2e%2e%2fstate/interrupt', { method: 'POST', headers })).status, 400);
+  assert.equal((await fetch(origin + '/api/runs/' + 'a'.repeat(32) + '/interrupt', { method: 'POST', headers })).status, 404);
+  const interrupted = await fetch(origin + path, { method: 'POST', headers: { ...headers, origin } });
+  assert.equal(interrupted.status, 200);
+  assert.equal((await interrupted.json()).thread_id, MOCK_THREAD);
+  const finished = await eventually(async () => {
+    const state = await tools.status.execute({ run_id: runId });
+    return state.state === 'interrupted' && state;
+  });
+  assert.equal(finished.session_id, receipt.session_id);
+  assert.equal(finished.codex_thread_id, MOCK_THREAD);
+  assert.equal(finished.pending_tool_call, null);
+  const interrupt = (await children[1].app).packets.find((p) => p.method === 'turn/interrupt');
+  assert.deepEqual(interrupt.params, { threadId: MOCK_THREAD, turnId: finished.turn_id });
+  assert.equal((await readApi('/api/sessions/' + session.id)).state, 'interrupted');
+  assert.deepEqual((await readApi('/api/state')).active_runs, []);
+  await follower.stop();
+  await svc.close();
+  assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).status, 'stopped');
 });

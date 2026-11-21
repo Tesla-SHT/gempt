@@ -616,6 +616,23 @@ export function isActivityId(kind, id) {
   return beyond === undefined && safeSessionId(sid) && /^[1-9][0-9]{0,8}$/.test(turn);
 }
 
+const ACTIVE_RUN_STATES = new Set(['queued', 'running', 'waiting_gemini']);
+
+export function readActiveRuns(sessionsDir) {
+  const dir = join(resolveSessionsDir(sessionsDir), 'runs');
+  const result = [];
+  for (const item of activityEntries(dir)) {
+    if (!item.isDirectory() || !ACTIVITY_RUN_ID.test(item.name)) continue;
+    const { data } = readActivityFile(join(dir, item.name, 'state.json')) || {};
+    if (!data || (data.run_id && data.run_id !== item.name) || !ACTIVE_RUN_STATES.has(data.state)
+        || (data.deadline && Date.now() / 1000 > data.deadline)) continue;
+    result.push({ run_id: item.name, state: data.state, session_id: data.session_id ?? null, cwd: data.cwd,
+      codex_thread_id: data.codex_thread_id ?? null, turn_id: data.turn_id ?? null,
+      progress: data.progress ?? null, pending_tool_call: data.pending_tool_call ?? null });
+  }
+  return result;
+}
+
 function activityEntries(directory) {
   try {
     return readdirSync(directory, { withFileTypes: true });
@@ -698,6 +715,9 @@ function activityRequest(source, context) {
     reply: String(source.reply || source.reply_preview || ''),
     reply_is_preview: !source.reply && Boolean(source.reply_preview),
     status: String(source.status || 'succeeded'),
+    ...(source.state ? { state: source.state } : {}),
+    ...(source.progress ? { progress: source.progress } : {}),
+    ...(source.pending_tool_call ? { pending_tool_call: source.pending_tool_call } : {}),
     retried: Boolean(source.retried || source.attempted_models?.length > 1),
     error: String(source.error || ''),
     elapsed_sec: activityNumber(source.elapsed_sec),
@@ -762,12 +782,12 @@ function readActivityRun(dir, id) {
   if ((data.run_id && data.run_id !== id) || !data.state) return null;
   const result = data.result;
   const sessionId = result?.session_id || data.session_id;
-  const pending = data.state === 'running' || data.state === 'queued';
+  const pending = ACTIVE_RUN_STATES.has(data.state);
   const status = pending && Number.isFinite(data.deadline) && Date.now() / 1000 > data.deadline
     ? 'outcome_unknown' : data.state === 'finished' ? 'succeeded' : data.state;
   const reply = result?.reply ?? String(result?.text || '').replace(/^\[mode=exec \| [^\r\n]+\]\r?\n\r?\n/, '');
   const request = activityRequest({
-    ...data, ...result, status, reply, error: data.error,
+    ...data, ...result, status, state: status === 'succeeded' ? 'finished' : status, reply, error: data.error,
     timestamp: activityTime(data.finished_at, result?.timestamp, data.updated_at, data.started_at, data.created_at, modified),
   }, {
     id: `run-${id}`, run_id: id, mode: 'exec',
@@ -793,7 +813,10 @@ function joinActivityRun(session, request, turn) {
   }
   if (target) {
     target.run_id = request.run_id;
-    if (request.status === 'succeeded' || request.status === 'failed') target.status = request.status;
+    if (request.progress || !ACTIVE_RUN_STATES.has(request.status)) target.status = request.status;
+    for (const key of ['state', 'progress', 'pending_tool_call']) {
+      if (request[key]) target[key] = request[key];
+    }
     target.retried ||= request.retried;
     target.timestamp ||= request.timestamp;
     for (const key of ['cwd', 'agent', 'tier', 'model', 'requested_model', 'sent_model', 'provider', 'account',
@@ -860,7 +883,7 @@ function readDispatchActivity(sessionsDir) {
       if (!run) continue;
       const { request } = run;
       request.session_id = sessionsByRun.get(request.run_id) || request.session_id;
-      if (request.session_id && request.status === 'succeeded' && !sessions.has(request.session_id)) {
+      if (request.session_id && (request.status === 'succeeded' || request.progress) && !sessions.has(request.session_id)) {
         sessions.set(request.session_id, { id: request.session_id, mode: 'exec', requests: [], runs: [] });
       }
       runRecords.push(run);
@@ -889,6 +912,13 @@ function readDispatchActivity(sessionsDir) {
     session.turn_count = session.requests.length;
     session.created_at = session.created_at || first?.timestamp || null;
     session.updated_at = activityTime([session.updated_at, ...session.requests.map((r) => r.timestamp)].filter(Boolean).sort().at(-1));
+    const latest = session.requests.reduce((selected, item) =>
+      !selected || (item.timestamp || '') >= (selected.timestamp || '') ? item : selected, null);
+    if (latest) {
+      session.state = latest.state || (latest.status === 'succeeded' ? 'finished' : latest.status);
+      if (latest.progress) session.progress = latest.progress;
+      if (latest.pending_tool_call) session.pending_tool_call = latest.pending_tool_call;
+    }
     session.usage = totalUsage(session.requests);
     session.elapsed_sec = session.requests.reduce((total, r) => r.elapsed_sec == null ? total : (total ?? 0) + r.elapsed_sec, null);
     ledger.push(...session.requests);
@@ -1233,7 +1263,7 @@ function hasApiSnapshot(cfg) {
   return TIER_ORDER.some((t) => snap[t] && typeof snap[t] === 'object' && typeof snap[t].consult_model === 'string' && snap[t].consult_model.trim());
 }
 
-export async function readState({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, execEnabled, probeTimeoutMs = 2000 } = {}) {
+export async function readState({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, execEnabled, appServer, probeTimeoutMs = 2000 } = {}) {
   const resolvedConfigPath = resolveConfigPath(configPath);
   const resolvedSessionsDir = resolveSessionsDir(sessionsDir);
   const resolvedMagpieDir = resolveMagpieConfigDir(magpieConfigDir);
@@ -1310,6 +1340,8 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
   const { totals: activityTotals } = readDispatchActivity(resolvedSessionsDir);
 
   return {
+    app_server: appServer?.getStatus() ?? { running: false, ws_url: null, pid: null, gateway_url: null, error: null },
+    active_runs: readActiveRuns(resolvedSessionsDir),
     features: { ...FEATURES },
     configured,
     config_path: resolvedConfigPath,

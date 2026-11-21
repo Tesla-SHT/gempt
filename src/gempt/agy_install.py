@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 DEFAULT_AGY_TARGET = Path.home() / ".gemini" / "config" / "plugins" / "gempt"
 _REQUIRED_ASSETS = (
     "plugin.json", "mcp_config.json", "hooks.json", "work_split_hook.py",
-    "rules/AGENTS.md",
+    "rules/AGENTS.md", "agents/gempt-worker.md",
     "skills/gempt/SKILL.md", "skills/gempt-sonnet/SKILL.md", "skills/gempt-opus/SKILL.md",
     "skills/gempt-fable/SKILL.md", "skills/gempt-chore/SKILL.md",
     "templates/gempt.config.example.json", "templates/magpie-groups.template.json",
@@ -79,7 +79,7 @@ def _stage_plugin(staged: Path, source: Path | None) -> None:
     staged.mkdir()
     for name in ("plugin.json", "mcp_config.json", "hooks.json", "work_split_hook.py"):
         (staged / name).write_bytes(plugin.joinpath(name).read_bytes())
-    for folder in ("rules", "skills", "assets"):
+    for folder in ("rules", "agents", "skills", "assets"):
         directory = plugin.joinpath(folder)
         if directory.is_dir():
             _copy_resources(directory, staged / folder)

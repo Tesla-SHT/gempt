@@ -27,11 +27,12 @@ export const GemptPlugin = async (ctx = {}, options = {}) => {
 
   if (!servicePromise) {
     const value = Number(options?.port);
-    const port = Number.isInteger(value) && value > 0 && value < 65536 ? value : undefined;
+    const port = Number.isInteger(value) && value >= 0 && value < 65536 ? value : undefined;
     servicePromise = startServer({
       port,
       magpieConfigDir,
       execEnabled,
+      manageAppServer: options.manageAppServer ?? port !== 0,
     }).catch(() => {
       servicePromise = null;
     });

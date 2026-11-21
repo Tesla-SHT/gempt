@@ -12,12 +12,13 @@
  *   and file attachments enforce realpath containment + secret-file filtering.
  */
 import { readNativeRun, startNativeRun, waitForNativeRun } from './native-runs.mjs';
-import { spawn } from 'node:child_process';
+import { findCodexCli } from './app-server-manager.mjs';
+import { runAppServer, TurnInterrupted } from './app-server-run.mjs';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync, unlinkSync, closeSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, readSync, realpathSync, statSync, closeSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
-import { homedir, tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, join, parse, relative, resolve } from 'node:path';
 import {
   DEFAULT_MAGPIE_URL,
@@ -495,235 +496,6 @@ function saveSession(sessionsDir, record) {
   return file;
 }
 
-function findNodeExe() {
-  if (basename(process.execPath).toLowerCase() === 'node.exe') return process.execPath;
-  for (const dir of String(process.env.PATH || '').split(delimiter)) {
-    if (!dir) continue;
-    const cand = join(dir, process.platform === 'win32' ? 'node.exe' : 'node');
-    if (existsSync(cand)) return cand;
-  }
-  return '';
-}
-
-export function findCodexCli(configuredPath = '', env = process.env) {
-  const cands = [];
-  if (configuredPath && String(configuredPath).trim()) cands.push(expandUser(String(configuredPath).trim()));
-  if (env?.CODEX_BIN && String(env.CODEX_BIN).trim()) cands.push(expandUser(String(env.CODEX_BIN).trim()));
-
-  const names = process.platform === 'win32' ? ['codex.exe', 'codex.cmd', 'codex.bat', 'codex'] : ['codex'];
-  for (const dir of String(env?.PATH || '').split(delimiter)) {
-    if (!dir) continue;
-    for (const name of names) cands.push(join(dir, name));
-  }
-  if (process.platform === 'win32') {
-    const appData = String(env?.APPDATA || '').trim();
-    if (appData) {
-      cands.push(join(appData, 'npm', 'codex.cmd'), join(appData, 'npm', 'codex.exe'));
-    }
-    cands.push(
-      join(homedir(), 'AppData', 'Roaming', 'npm', 'codex.cmd'),
-      join(homedir(), '.npm-global', 'codex.cmd'),
-    );
-  }
-  for (const cand of cands) {
-    try {
-      if (cand && existsSync(cand) && statSync(cand).isFile()) return cand;
-    } catch {
-      // Ignore invalid paths.
-    }
-  }
-  return '';
-}
-
-function parseCodexJsonl(stdoutText) {
-  let threadId = '';
-  const messages = [];
-  let usage = {};
-  const errors = [];
-  const commands = [];
-  let failed = false;
-
-  for (const rawLine of String(stdoutText || '').split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line.startsWith('{')) continue;
-    let ev;
-    try {
-      ev = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (!ev || typeof ev !== 'object') continue;
-    if (ev.type === 'thread.started' && typeof ev.thread_id === 'string') {
-      threadId = ev.thread_id;
-    } else if (ev.type === 'item.completed' && ev.item && typeof ev.item === 'object') {
-      if (ev.item.type === 'agent_message' && typeof ev.item.text === 'string' && ev.item.text.trim()) {
-        messages.push(ev.item.text.trim());
-      } else if (ev.item.type === 'command_execution') {
-        commands.push({
-          command: ev.item.command,
-          exit_code: ev.item.exit_code,
-          output: String(ev.item.aggregated_output || '').slice(-4000),
-        });
-      }
-    } else if (ev.type === 'turn.completed' && ev.usage && typeof ev.usage === 'object') {
-      usage = ev.usage;
-    } else if (ev.type === 'error' || ev.type === 'turn.failed') {
-      if (ev.type === 'turn.failed') failed = true;
-      errors.push(String(ev.error || ev.message || JSON.stringify(ev)));
-    }
-  }
-  return { threadId, messages, usage, errors, commands, failed };
-}
-
-function runCodexExec({
-  cliPath,
-  prompt,
-  cwd,
-  model,
-  reasoningEffort = 'medium',
-  sandbox = 'workspace-write',
-  sandboxExplicit = false,
-  modelProvider = '',
-  codexThreadId = '',
-  gatewayUrl = '',
-  gatewayKey = '',
-  timeoutSec = 600,
-  env = process.env,
-}) {
-  if (!cliPath) {
-    return Promise.reject(new Error('Codex CLI not found (install `@openai/codex` or set codex.cli_path).'));
-  }
-
-  const tempOut = join(tmpdir(), `gempt-codex-last-${process.pid}-${Date.now()}-${randomBytes(4).toString('hex')}.txt`);
-  const isResume = Boolean(String(codexThreadId || '').trim());
-  const args = ['exec'];
-  if (isResume) {
-    args.push('resume');
-  } else {
-    args.push('-C', cwd, '-s', sandbox);
-  }
-  args.push('--skip-git-repo-check');
-  if (model) args.push('-m', model);
-
-  const childEnv = { ...env };
-  for (const k of EXEC_STRIP_ENV) delete childEnv[k];
-  if (gatewayUrl) {
-    if (isLoopbackUrl(gatewayUrl)) {
-      for (const k of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']) {
-        delete childEnv[k];
-      }
-      const noProxySet = new Set(
-        `${childEnv.NO_PROXY || ''},${childEnv.no_proxy || ''}`.split(',').map((s) => s.trim()).filter(Boolean),
-      );
-      for (const host of ['127.0.0.1', 'localhost', '::1']) noProxySet.add(host);
-      const val = [...noProxySet].join(',');
-      childEnv.NO_PROXY = val;
-      childEnv.no_proxy = val;
-    }
-    modelProvider = 'gempt_gateway';
-    args.push(
-      '-c', 'model_providers.gempt_gateway.name="Magpie"',
-      '-c', `model_providers.gempt_gateway.base_url=${JSON.stringify(`${gatewayUrl.replace(/\/+$/, '')}/v1`)}`,
-      '-c', 'model_providers.gempt_gateway.wire_api="responses"',
-    );
-    if (gatewayKey) {
-      childEnv.GEMPT_EXEC_GATEWAY_TOKEN = gatewayKey;
-      args.push('-c', 'model_providers.gempt_gateway.env_key="GEMPT_EXEC_GATEWAY_TOKEN"');
-    }
-  }
-  if (modelProvider) args.push('-c', `model_provider=${JSON.stringify(modelProvider)}`);
-  if (reasoningEffort && reasoningEffort !== 'none') {
-    args.push('-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
-  }
-  if (isResume && sandboxExplicit && sandbox) {
-    args.push('-c', `sandbox_mode=${JSON.stringify(sandbox)}`);
-  }
-  args.push('--json', '-o', tempOut);
-  if (isResume) args.push(String(codexThreadId).trim());
-  args.push('-');
-
-  let bin = cliPath;
-  let finalArgs = args;
-  const lowerCli = cliPath.toLowerCase();
-  if (process.platform === 'win32' && (lowerCli.endsWith('.cmd') || lowerCli.endsWith('.bat') || lowerCli.endsWith('.ps1'))) {
-    const codexJs = join(dirname(cliPath), 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
-    const nodeExe = findNodeExe();
-    if (existsSync(codexJs) && nodeExe) {
-      bin = nodeExe;
-      finalArgs = [codexJs, ...args];
-    } else if (!lowerCli.endsWith('.ps1')) {
-      bin = env.COMSPEC || 'cmd.exe';
-      finalArgs = ['/d', '/c', cliPath, ...args];
-    }
-  }
-
-  const t0 = Date.now();
-  return new Promise((resolveExec, rejectExec) => {
-    const child = spawn(bin, finalArgs, {
-      cwd,
-      env: childEnv,
-      windowsHide: true,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
-    const outChunks = [];
-    const errChunks = [];
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try { child.kill('SIGKILL'); } catch { /* ignore */ }
-    }, Math.max(1, timeoutSec) * 1000);
-    timer.unref?.();
-
-    child.stdout.on('data', (c) => outChunks.push(c));
-    child.stderr.on('data', (c) => errChunks.push(c));
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      try { unlinkSync(tempOut); } catch { /* ignore */ }
-      rejectExec(new Error(`Failed to launch Codex CLI (${cliPath}): ${err.message}`));
-    });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      const elapsedSec = (Date.now() - t0) / 1000;
-      const stdoutText = Buffer.concat(outChunks).toString('utf-8');
-      const stderrText = Buffer.concat(errChunks).toString('utf-8');
-      let lastMessage = '';
-      try {
-        if (existsSync(tempOut)) lastMessage = readFileSync(tempOut, 'utf-8').trim();
-      } finally {
-        try { unlinkSync(tempOut); } catch { /* ignore */ }
-      }
-      if (timedOut) {
-        rejectExec(new Error(`Codex exec timed out after ${timeoutSec}s in ${cwd}`));
-        return;
-      }
-      const parsed = parseCodexJsonl(stdoutText);
-      if (!lastMessage && parsed.messages.length) {
-        lastMessage = parsed.messages[parsed.messages.length - 1];
-      }
-      const resolvedThread = parsed.threadId || String(codexThreadId || '').trim();
-      if (code !== 0 || parsed.failed) {
-        const detail = parsed.errors.join('; ') || stderrText.trim() || stdoutText.trim().slice(0, 800);
-        rejectExec(new Error(`Codex exec failed (exit=${code}, model=${model}, thread=${resolvedThread || '-'}): ${detail}`));
-        return;
-      }
-      if (!lastMessage) {
-        rejectExec(new Error('Codex exited without a final assistant message.'));
-        return;
-      }
-      resolveExec({
-        text: lastMessage,
-        threadId: resolvedThread,
-        usage: parsed.usage,
-        commands: parsed.commands,
-        elapsedSec,
-      });
-    });
-
-    child.stdin.end(prompt, 'utf-8');
-  });
-}
-
 function formatSummaryHeader({ mode, tier, model, effort, sessionId, elapsedSec, usage, extra = {} }) {
   const parts = [
     `mode=${mode}`,
@@ -910,7 +682,8 @@ export function createGemptTools({
   antigravityPluginDir,
   codexCliPath,
   options = {},
-  inExecWorker = false,
+  execRunFile,
+  newExecSession,
   env = process.env,
   probeTimeoutMs = 2000,
 } = {}) {
@@ -966,7 +739,8 @@ export function createGemptTools({
         if (!delegated) {
           return { ...result, action: 'gemini', text: 'Handle this part in Gemini. Report to the board if assigned there.' };
         }
-        const task = { goal, cwd: args.cwd, tier: args.tier, gemini_family: args.gemini_family };
+        const task = { goal, cwd: args.cwd, tier: args.tier, gemini_family: args.gemini_family,
+          context: args.context, file_paths: args.file_paths, session_id: args.session_id };
         const reply = action === 'consult'
           ? await tools.consult.execute({ ...task, expected_output: WORKLOAD.report }, callCtx)
           : await tools.exec.execute({ ...task, run_id: role === 'worker' || role === 'verifier' ? assignment : undefined, verification: args.verification, expected_report: WORKLOAD.report,
@@ -1270,7 +1044,7 @@ export function createGemptTools({
 
     exec: {
       description:
-        'Delegate an autonomous coding, refactoring, or verification task to headless Codex CLI via Magpie inside cwd. Tiers: sonnet (~75%, Sol@medium), opus (~20%, Sol@high; escalate=true -> Astra@xhigh), fable (~5%, Astra@xhigh). Disabled by default until plugin option `exec: true` (or GEMPT_MAGPIE_TOOLS_EXEC=1) is enabled.',
+        'Delegate an autonomous coding, refactoring, or verification task to the Magpie-managed Codex app-server inside cwd. Tiers: sonnet (~75%, Sol@medium), opus (~20%, Sol@high; escalate=true -> Astra@xhigh), fable (~5%, Astra@xhigh). Disabled by default until plugin option `exec: true` (or GEMPT_MAGPIE_TOOLS_EXEC=1) is enabled.',
       args: {
         type: 'object',
         properties: {
@@ -1304,12 +1078,12 @@ export function createGemptTools({
         const goal = typeof args?.goal === 'string' ? args.goal.trim() : '';
         if (!goal) throw new Error('goal is required and must be a non-empty string.');
 
-        if (!inExecWorker) {
+        if (!execRunFile) {
           const cwd = normalizeWorkspaceCwd(args.cwd, { configPath, magpieConfigDir: resolvedMagpieDir, env });
           return startNativeRun({
             args: { ...args, cwd }, agent: callingAgent(callCtx), env,
             host: { configPath: resolveConfigPath(configPath), sessionsDir: resolvedSessionsDir,
-              magpieConfigDir: resolvedMagpieDir, codexCliPath, options: { exec: true }, probeTimeoutMs },
+              magpieConfigDir: resolvedMagpieDir, options: { exec: true }, probeTimeoutMs },
           });
         }
 
@@ -1352,13 +1126,14 @@ export function createGemptTools({
           }
         }
 
-        let effectiveSandbox = priorSession?.sandbox || hostDefaultSandbox;
+        const ceiling = priorSession && SANDBOX_RANK[priorSession.sandbox] < SANDBOX_RANK[hostDefaultSandbox]
+          ? priorSession.sandbox : hostDefaultSandbox;
+        let effectiveSandbox = ceiling;
         if (args?.sandbox) {
           const reqSbx = String(args.sandbox).trim();
           if (!VALID_SANDBOXES.includes(reqSbx)) {
             throw new Error(`Invalid sandbox '${reqSbx}'. Expected one of: ${VALID_SANDBOXES.join(', ')}.`);
           }
-          const ceiling = priorSession?.sandbox || hostDefaultSandbox;
           if (SANDBOX_RANK[reqSbx] > SANDBOX_RANK[ceiling]) {
             throw new Error(`Requested sandbox '${reqSbx}' cannot increase ceiling '${ceiling}'.`);
           }
@@ -1428,7 +1203,6 @@ export function createGemptTools({
           isResume,
         });
 
-        const cliPath = findCodexCli(codexCliPath || runtime.cfg?.codex?.cli_path || '', env);
         const timeoutSec = args?.timeout_sec !== undefined
           ? Math.max(30, Math.min(3600, Number(args.timeout_sec) || 600))
           : Math.max(
@@ -1436,24 +1210,30 @@ export function createGemptTools({
             effortTimeoutFloor(effort, { mode: 'exec' }),
           );
 
+        if (runtime.cfg?.codex?.extra_args?.length) throw new Error('Unrestricted Codex extra_args conflict with gateway and sandbox enforcement.');
+        const sessionId = priorSession?.session_id || newExecSession;
+        const agent = callingAgent(callCtx) || priorSession?.agent || '';
+        const session = {
+          ...(priorSession || {}),
+          paired_model: paired, session_id: sessionId, mode: 'exec', tier: resolved.tier, model: targetModel,
+          reasoning_effort: effort, cwd: workdir, sandbox: effectiveSandbox, gateway: runtime.baseUrl, agent,
+        };
+        saveSession(resolvedSessionsDir, session);
         let res;
         try {
-          res = await runCodexExec({
-            cliPath,
-            prompt,
-            cwd: workdir,
-            model: targetModel,
-            reasoningEffort: effort,
-            sandbox: effectiveSandbox,
-            sandboxExplicit: Boolean(args?.sandbox),
-            modelProvider: String(runtime.cfg?.codex?.model_provider || ''),
-            codexThreadId: priorSession?.codex_thread_id || '',
-            gatewayUrl: runtime.baseUrl,
-            gatewayKey: runtime.apiKey,
+          res = await runAppServer({
+            configPath, env, runFile: execRunFile, sessionId, prompt, cwd: workdir, model: targetModel, effort,
+            sandbox: effectiveSandbox, threadId: priorSession?.codex_thread_id, gatewayUrl: runtime.baseUrl,
+            approvalPolicy: effectiveSandbox === 'danger-full-access' ? runtime.cfg?.codex?.approval_policy || 'never' : 'never',
             timeoutSec,
-            env,
+            onIdentity(threadId, turnId) {
+              session.codex_thread_id = threadId;
+              session.turn_id = turnId;
+              saveSession(resolvedSessionsDir, session);
+            },
           });
         } catch (err) {
+          if (err instanceof TurnInterrupted) throw err;
           const msg = String(err?.message || err);
           const hint = buildEscalationSuggestion({
             mode: 'exec',
@@ -1465,24 +1245,11 @@ export function createGemptTools({
           throw new Error(hint && !msg.includes(hint) ? `${msg} | ${hint}` : msg);
         }
 
-        const sessionId = priorSession?.session_id || generateSessionId('exec');
-        const agent = callingAgent(callCtx) || priorSession?.agent || '';
         const priorTurns = Array.isArray(priorSession?.turns) ? priorSession.turns : [];
         const turn = priorTurns.filter((entry) => !entry.role || entry.role === 'user').length + 1;
         const timestamp = nowIso();
         saveSession(resolvedSessionsDir, {
-          ...(priorSession || {}),
-          paired_model: paired,
-          session_id: sessionId,
-          mode: 'exec',
-          tier: resolved.tier,
-          model: targetModel,
-          reasoning_effort: effort,
-          cwd: workdir,
-          sandbox: effectiveSandbox,
-          gateway: runtime.baseUrl,
-          codex_thread_id: res.threadId,
-          agent,
+          ...session, sandbox: res.sandbox, codex_thread_id: res.threadId, turn_id: res.turnId,
           turns: [...priorTurns, { role: 'user', content: prompt }, { role: 'assistant', content: res.text }],
           turn_details: {
             ...priorSession?.turn_details,
@@ -1503,7 +1270,7 @@ export function createGemptTools({
           elapsedSec: res.elapsedSec,
           usage: res.usage,
           extra: {
-            sandbox: effectiveSandbox,
+            sandbox: res.sandbox,
             codex_thread: res.threadId,
             escalated: resolved.escalated ? 'yes' : '',
             auto_effort: autoEffortInfo ? `${autoEffortInfo.effort}(score=${autoEffortInfo.score})` : '',
@@ -1516,12 +1283,13 @@ export function createGemptTools({
           turns: turn,
           timestamp,
           codex_thread_id: res.threadId,
+          turn_id: res.turnId,
           tier: resolved.tier,
           model: targetModel,
           reasoning_effort: effort,
           escalated: resolved.escalated,
           auto_effort: autoEffortInfo,
-          sandbox: effectiveSandbox,
+          sandbox: res.sandbox,
           cwd: workdir,
           elapsed_sec: Number(res.elapsedSec.toFixed(2)),
           commands: res.commands,

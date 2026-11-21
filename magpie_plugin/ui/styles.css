@@ -1152,6 +1152,13 @@ button.status-chip:focus-visible {
   background: var(--gp-warn);
 }
 
+.app-server-error {
+  margin: 6px 0 0;
+  color: var(--gp-muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
 .chip-name {
   font-weight: 500;
 }
@@ -1431,6 +1438,40 @@ button.status-chip:focus-visible {
 .activity-tabs button[aria-selected="true"] { font-weight: 600; }
 .activity-link:disabled { opacity: .5; cursor: default; }
 
+#active-runs-label { margin: 0; }
+.active-run-list { margin: 0; padding: 0; list-style: none; }
+.active-run {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+  padding: 9px 12px;
+}
+.active-run + .active-run { border-top: 1px solid var(--gp-border); }
+.active-run-info { flex: 1; min-width: 0; }
+.active-run-meta,
+.active-run-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  font-size: 12px;
+}
+.active-run-meta strong,
+.run-preview,
+.run-question {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.run-preview, .run-question { margin: 3px 0 0; font-size: 11.5px; }
+.run-preview, .run-phase, .run-elapsed { color: var(--gp-muted); }
+.run-elapsed { font-variant-numeric: tabular-nums; }
+.run-interrupt:not(:disabled) { color: var(--activity-red, var(--gp-err)); }
+.active-run-actions :focus-visible { outline: 2px solid var(--gp-focus); outline-offset: -2px; }
+
 .recent-links {
   display: flex;
   gap: 4px;
@@ -1582,11 +1623,17 @@ button.status-chip:focus-visible {
   background: currentColor;
 }
 
-.activity-status[data-status="succeeded"]::before { background: var(--activity-green); }
+.activity-status:is([data-status="succeeded"], [data-status="finished"])::before { background: var(--activity-green); }
 .activity-status[data-status="failed"] { color: var(--activity-red); font-weight: 600; }
 .activity-status[data-status="failed"]::before { content: "×"; width: auto; height: auto; background: none; }
-.activity-status[data-status="running"]::before,
-.activity-status[data-status="queued"]::before { background: var(--activity-amber); }
+.activity-status:is([data-status="running"], [data-status="queued"], [data-status="waiting_gemini"], [data-status="interrupted"]) {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--gp-pill);
+}
+.activity-status:is([data-status="running"], [data-status="queued"], [data-status="waiting_gemini"])::before {
+  background: var(--activity-amber, var(--gp-warn));
+}
 
 .activity-badge {
   display: inline-block;
@@ -1744,4 +1791,7 @@ button.status-chip:focus-visible {
   .activity-pane, .activity-tabs { padding-inline: 12px; }
   .activity-detail-box { padding-inline: 12px; }
   .activity-detail-info { column-gap: 8px; }
+  .active-run { flex-wrap: wrap; }
+  .active-run-info { flex-basis: 100%; }
+  .active-run-actions { margin-inline-start: auto; }
 }

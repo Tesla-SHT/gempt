@@ -73,6 +73,19 @@
         "type": "string",
         "description": "Exact workspace for inspect or change."
       },
+      "session_id": {
+        "type": "string",
+        "description": "GemPT session to continue."
+      },
+      "context": {
+        "type": "string",
+        "description": "Relevant findings and context for the worker."
+      },
+      "file_paths": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Optional workspace files to include."
+      },
       "gemini_family": {
         "type": "string",
         "enum": ["hydrogen", "neon", "carbon"],

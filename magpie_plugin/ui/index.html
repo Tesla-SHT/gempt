@@ -46,6 +46,13 @@
         </div>
       </section>
 
+      <section id="active-runs" class="section" aria-labelledby="active-runs-label" hidden>
+        <div class="section-head">
+          <h2 id="active-runs-label" class="section-eyebrow">运行中任务</h2>
+        </div>
+        <ul id="active-run-list" class="surface active-run-list"></ul>
+      </section>
+
       <section class="section" aria-labelledby="route-section-label">
         <div class="section-head">
           <span id="route-section-label" class="section-eyebrow">当前路由</span>
@@ -307,7 +314,13 @@
               <span class="chip-name">Antigravity</span>
               <span id="chip-agy-val" class="chip-val">未安装</span>
             </span>
+            <span id="chip-app-server" class="status-chip is-static">
+              <span class="chip-dot" aria-hidden="true"></span>
+              <span class="chip-name">Codex app-server</span>
+              <span id="chip-app-server-val" class="chip-val">检查中</span>
+            </span>
           </div>
+          <p id="app-server-error" class="app-server-error" hidden></p>
 
           <div class="utility-row">
             <div class="utility-left">

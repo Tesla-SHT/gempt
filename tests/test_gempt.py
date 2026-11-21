@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import hashlib
 import io
 import json
 import os
 import shlex
 import shutil
+import socketserver
+import struct
 import subprocess
 import sys
 import tempfile
@@ -24,7 +28,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from gempt.cli import main as cli_main
-from gempt.codex_runner import build_cli_invocation, run_codex_exec
+from gempt.app_server_client import AppServerClient, AppServerUnavailableError, UNAVAILABLE
 from gempt.config import (
     ConfigError,
     ConfigNotFoundError,
@@ -41,7 +45,7 @@ from gempt.magpie_client import MagpieRequestError, _group_members, consult_with
 from gempt.mcp_server import _dispatch_request, _handle_tool_call, serve_stdio
 from gempt.presets import apply_native_presets, build_native_preset_commands, strip_model_modifiers
 from gempt.protocol import build_consult_prompt, build_exec_prompt, read_context_files
-from gempt.runs import dispatch_exec, read_run, recent_runs, verification_result
+from gempt.runs import dispatch_exec, read_run, recent_runs, run_directory, verification_result, wait_for_run
 from gempt.routing import build_escalation_suggestion, classify_task_effort, effort_timeout_floor
 from gempt.service import (
     configure_gempt,
@@ -429,15 +433,6 @@ class MagpieClientAndCodexRunnerTests(unittest.TestCase):
         self.assertTrue(any("group rule add gempt-harness-opus use=codex/gpt-6.2-astra effort=xhigh" in c for c in opus_cmds))
         self.assertTrue(any("group rule add gempt-harness-opus use=group/auto-deepseek-v4-1-flash compact" in c for c in opus_cmds))
 
-    def test_codex_cmd_invocation_no_shell_interpolation(self) -> None:
-        if sys.platform == "win32":
-            argv = build_cli_invocation("C:\\tools\\codex.cmd", ["exec", "-m", "codex/gpt-6.2-sol", "-"])
-            self.assertEqual(argv[1:4], ["/d", "/c", "C:\\tools\\codex.cmd"])
-        else:
-            argv = build_cli_invocation("/usr/bin/codex", ["exec", "-"])
-            self.assertEqual(argv, ["/usr/bin/codex", "exec", "-"])
-
-
 class McpStdioHandshakeTests(unittest.TestCase):
     def test_mcp_stdio_initialize_list_and_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -473,7 +468,8 @@ class McpStdioHandshakeTests(unittest.TestCase):
             tool_names = [t["name"] for t in lines[1]["result"]["tools"]]
             self.assertEqual(
                 tool_names,
-                ["gempt_discover", "gempt_configure", "gempt_consult", "gempt_exec", "gempt_status", "gempt_dispatch"],
+                ["gempt_discover", "gempt_configure", "gempt_consult", "gempt_exec", "gempt_status", "gempt_dispatch",
+                 "gempt_steer", "gempt_interrupt", "gempt_reply_tool_call"],
             )
             status_payload = json.loads(lines[2]["result"]["content"][0]["text"])
             self.assertFalse(status_payload["configured"])
@@ -649,7 +645,7 @@ class DetachedExecTests(unittest.TestCase):
         # for the Codex service, so no model or gateway is needed.
         package = root / "gempt"
         package.mkdir()
-        for filename in ("__init__.py", "runs.py", "sessions.py"):
+        for filename in ("__init__.py", "runs.py", "sessions.py", "app_server_client.py", "codex_runner.py"):
             shutil.copyfile(SRC_ROOT / "gempt" / filename, package / filename)
         (package / "service.py").write_text(
             "import time\n"
@@ -724,6 +720,8 @@ class DetachedExecTests(unittest.TestCase):
 
 class CliPackagingTests(unittest.TestCase):
     def test_install_agy_uses_packaged_resources_and_base_python(self) -> None:
+        from gempt.agy_install import _validate_staged
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             package = root / "disposable uvx env" / "site-packages" / "gempt"
@@ -734,9 +732,16 @@ class CliPackagingTests(unittest.TestCase):
             shutil.copytree(REPO_ROOT / "templates", package / "plugin_data" / "templates")
             target = root / "plugin outside checkout"
             base_python = Path(sys._base_executable).resolve()
+            worker_path = Path("agents/gempt-worker.md")
+            worker_text = (package / "plugin_data" / worker_path).read_text(encoding="utf-8")
+
+            def validate_staged(staged):
+                self.assertEqual((staged / worker_path).read_text(encoding="utf-8"), worker_text)
+                _validate_staged(staged)
 
             with mock.patch("gempt.agy_install.files", return_value=package), \
                  mock.patch("gempt.agy_install.__file__", str(package / "agy_install.py")), \
+                 mock.patch("gempt.agy_install._validate_staged", side_effect=validate_staged), \
                  mock.patch.object(sys, "executable", str(root / "disposable uvx env" / "python")), \
                  contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cli_main(["install-agy", "--target", str(target)]), 0)
@@ -746,6 +751,7 @@ class CliPackagingTests(unittest.TestCase):
             self.assertEqual(Path(entry["command"]), base_python)
             self.assertEqual(Path(entry["args"][-1]), target / "runtime")
             self.assertTrue((target / "templates" / "gempt.config.example.json").is_file())
+            self.assertEqual((target / worker_path).read_text(encoding="utf-8"), worker_text)
             self.assertTrue((target / "skills" / "gempt" / "references" / "magpie-routing.md").is_file())
             hooks = json.loads((target / "hooks.json").read_text(encoding="utf-8"))["gempt-work-split"]
             hook_command = hooks["PreInvocation"][0]["command"]
@@ -998,37 +1004,6 @@ class BugfixRegressionTests(unittest.TestCase):
                 "unverified",
             )
 
-    def test_codex_runner_sets_loopback_no_proxy(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            seen_env = {}
-
-            def fake_run(cmd, *, env, input, cwd, capture_output, timeout, creationflags):
-                seen_env.update(env)
-                out_idx = cmd.index("-o") + 1
-                Path(cmd[out_idx]).write_text("DONE", encoding="utf-8")
-                return subprocess.CompletedProcess(
-                    cmd,
-                    0,
-                    stdout=json.dumps({"type": "thread.started", "thread_id": "t1"}).encode("utf-8"),
-                    stderr=b"",
-                )
-
-            with mock.patch.dict(os.environ, {"NO_PROXY": "internal.corp", "no_proxy": "internal.corp"}), \
-                 mock.patch("gempt.codex_runner.subprocess.run", side_effect=fake_run):
-                res = run_codex_exec(
-                    cli_path="codex",
-                    prompt="hi",
-                    cwd=tmp,
-                    model="codex/gpt-6.2-sol",
-                    gateway_url="http://127.0.0.1:3425",
-                )
-            self.assertEqual(res["text"], "DONE")
-            for key in ("NO_PROXY", "no_proxy"):
-                parts = seen_env[key].split(",")
-                self.assertEqual(parts[0], "internal.corp")
-                for host in ("127.0.0.1", "localhost", "::1"):
-                    self.assertIn(host, parts)
-
     def test_mcp_configure_allows_sandbox_tightening_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             conf = Path(tmp) / "config.json"
@@ -1252,8 +1227,7 @@ class BugfixRegressionTests(unittest.TestCase):
                     self.assertEqual(c2["reasoning_effort"], "xhigh")
                     self.assertIsNone(c2["auto_effort"])
 
-                with mock.patch("gempt.service.find_codex_cli", return_value={"found": True, "path": str(root / "codex")}), \
-                     mock.patch("gempt.service.run_codex_exec") as mock_exec:
+                with mock.patch("gempt.service.run_app_server") as mock_exec:
                     mock_exec.return_value = {
                         "codex_thread_id": "t_xhigh",
                         "text": "ran check",
@@ -1300,21 +1274,32 @@ class BugfixRegressionTests(unittest.TestCase):
                 return json.loads(proc.stdout)["injectSteps"][0]["ephemeralMessage"]
 
             both_off = run_hook("gemini", "inherit")
+            no_delegation = "Do not invoke gempt-worker or call gempt_dispatch"
+            delegate = 'invoke_subagent(TypeName="gempt-worker", Model="inherit"'
             self.assertIn("GemPT is OFF for ordinary conversations and Swarm", both_off)
+            self.assertIn(no_delegation, both_off)
             self.assertNotIn("first call gempt_dispatch", both_off)
+            self.assertNotIn(delegate, both_off)
 
             ord_off = run_hook("gemini", "gpt")
             self.assertIn("GemPT is OFF for ordinary conversations", ord_off)
+            self.assertIn(f"{no_delegation} in ordinary conversations", ord_off)
             self.assertIn("In Swarm only:", ord_off)
+            self.assertIn("first calls gempt_dispatch", ord_off)
+            self.assertNotIn(delegate, ord_off)
             self.assertIn("Current native gemini_family=neon.", ord_off)
 
             swarm_off = run_hook("gpt", "gemini")
             self.assertIn("GemPT is OFF for Swarm", swarm_off)
+            self.assertIn(f"{no_delegation} in Swarm", swarm_off)
             self.assertIn("In ordinary conversations only:", swarm_off)
+            self.assertIn(delegate, swarm_off)
             self.assertIn("Current native gemini_family=neon.", swarm_off)
 
             both_on = run_hook("balanced", "gpt")
-            self.assertIn("first call gempt_dispatch", both_on)
+            self.assertIn(delegate, both_on)
+            self.assertIn("send_message to the same subagent", both_on)
+            self.assertIn("The gempt-worker itself calls gempt_dispatch", both_on)
             self.assertIn("Current native gemini_family=neon.", both_on)
 
             # Dispatch short-circuits cleanly when leftmost slot ("gemini") is active
@@ -1389,6 +1374,289 @@ class BugfixRegressionTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(json.loads(proc.stdout)["result"]["text"], "DONE_BG")
             t.join(timeout=2)
+
+
+class MockAppServer(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    token = "fixture-capability"
+    gateway_url = "http://127.0.0.1:3425"
+
+    def __init__(self):
+        super().__init__(("127.0.0.1", 0), AppServerHandler)
+        self.requests = []
+        self.replies = []
+        self.pongs = []
+        self.turns = {}
+        self.threads = set()
+        self.lock = threading.Lock()
+
+    def write_state(self, path, token=None):
+        path.write_text(json.dumps({
+            "ws_url": f"ws://127.0.0.1:{self.server_address[1]}",
+            "auth_header": "Authorization", "auth_token": token or self.token,
+            "status": "running", "gateway_url": self.gateway_url,
+        }), encoding="utf-8")
+
+
+class AppServerHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        self.write_lock = threading.Lock()
+        self.deferred = None
+        self.turn = None
+        self.thread_id = None
+        headers = {}
+        if not self.rfile.readline():
+            return
+        while True:
+            line = self.rfile.readline()
+            if line == b"\r\n":
+                break
+            if not line:
+                return
+            key, value = line.split(b":", 1)
+            headers[key.lower()] = value.strip()
+        if headers.get(b"authorization") != f"Bearer {self.server.token}".encode():
+            self.wfile.write(b"HTTP/1.1 401 Unauthorized\r\n\r\n")
+            return
+        accept = base64.b64encode(hashlib.sha1(
+            headers[b"sec-websocket-key"] + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+        self.wfile.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                         b"Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+        try:
+            while True:
+                header = self.rfile.read(2)
+                if not header:
+                    return
+                first, second = header
+                assert second & 128, "client frames must be masked"
+                size = second & 127
+                if size in {126, 127}:
+                    code = "!H" if size == 126 else "!Q"
+                    size = struct.unpack(code, self.rfile.read(struct.calcsize(code)))[0]
+                mask = self.rfile.read(4)
+                data = bytes(value ^ mask[i % 4] for i, value in enumerate(self.rfile.read(size)))
+                if first == 0x88:
+                    return
+                if first == 0x8a:
+                    self.server.pongs.append(data)
+                    continue
+                assert first == 0x81
+                self.process(json.loads(data))
+        except (ConnectionError, OSError):
+            return
+
+    @staticmethod
+    def frame(payload, marker=0x81):
+        size = len(payload)
+        length = bytes([size]) if size < 126 else b"\x7e" + struct.pack("!H", size)
+        return bytes([marker]) + length + payload
+
+    def send(self, *, fragment=False, **message):
+        payload = json.dumps(message, ensure_ascii=False).encode()
+        if fragment:
+            midpoint = len(payload) // 2
+            wire = self.frame(payload[:midpoint], 0x01) + self.frame(b"ping", 0x89) + self.frame(payload[midpoint:], 0x80)
+        else:
+            wire = self.frame(payload)
+        with self.write_lock:
+            self.wfile.write(wire)
+
+    def notify(self, method, **params):
+        self.send(method=method, params=params)
+
+    def complete(self, status="completed"):
+        if status == "completed":
+            self.notify("item/completed", threadId=self.thread_id, turnId=self.turn, item={
+                "type": "agentMessage", "id": "answer", "text": "Completed on the same turn"})
+        self.notify("turn/completed", threadId=self.thread_id,
+                    turn={"id": self.turn, "status": status, "error": {"message": "mock turn failed"} if status == "failed" else None})
+        with self.server.lock:
+            self.server.turns.pop((self.thread_id, self.turn))
+
+    def process(self, packet):
+        assert packet["jsonrpc"] == "2.0"
+        method, ident, params = packet.get("method"), packet.get("id"), packet.get("params", {})
+        if method is None:
+            self.server.replies.append((self.turn, packet))
+            if ident == "rpc-tool-id":
+                self.complete()
+            return
+        self.server.requests.append(packet)
+        if method == "initialize":
+            assert params["capabilities"]["experimentalApi"]
+            self.send(id=ident, result={"userAgent": "fixture"})
+        elif method == "initialized":
+            return
+        elif method == "echo/first":
+            self.deferred = (ident, params)
+            self.notify("test/ready")
+        elif method == "echo/second":
+            self.send(id=ident, result=params, fragment=True)
+            first_id, first_params = self.deferred
+            self.send(id=first_id, result={"length": len(first_params["message"])})
+        elif method in {"thread/start", "thread/resume"}:
+            if method == "thread/start":
+                specs = params["dynamicTools"]
+                assert specs[0]["name"] == "ask_gemini" and specs[0]["type"] == "function"
+                self.thread_id = f"thread-{len(self.server.threads) + 1}"
+                self.server.threads.add(self.thread_id)
+                self.notify("thread/started", thread={"id": self.thread_id})
+            else:
+                assert "dynamicTools" not in params and params["threadId"] in self.server.threads
+                self.thread_id = params["threadId"]
+            self.send(id=ident, result={"thread": {"id": self.thread_id}, "cwd": params["cwd"],
+                                        "modelProvider": params["modelProvider"], "sandbox": {
+                                            "type": {"read-only": "readOnly", "workspace-write": "workspaceWrite",
+                                                     "danger-full-access": "dangerFullAccess"}[params["sandbox"]]}})
+        elif method == "turn/start":
+            prompt = params["input"][0]["text"]
+            self.turn = f"turn-{sum(req['method'] == 'turn/start' for req in self.server.requests)}"
+            with self.server.lock:
+                self.server.turns[(self.thread_id, self.turn)] = self
+            self.notify("turn/started", threadId=self.thread_id, turn={"id": self.turn, "status": "inProgress"})
+            self.notify("item/agentMessage/delta", threadId=self.thread_id, turnId=self.turn, itemId="answer", delta="live")
+            self.notify("item/completed", threadId=self.thread_id, turnId=self.turn,
+                        item={"type": "commandExecution", "id": "command", "command": "python check.py", "exitCode": 0})
+            self.notify("thread/tokenUsage/updated", threadId=self.thread_id, turnId=self.turn, tokenUsage={"last": {
+                "inputTokens": 100, "cachedInputTokens": 91, "outputTokens": 5, "reasoningOutputTokens": 2, "totalTokens": 105}})
+            self.send(id=ident, result={"turn": {"id": self.turn, "status": "inProgress"}})
+            if "Ask Gemini" in prompt:
+                self.send(id="rpc-tool-id", method="item/tool/call", params={"tool": "ask_gemini", "threadId": self.thread_id,
+                          "turnId": self.turn, "callId": "call_fixture", "arguments": {"reason": "visual_check", "question": "Is it legible?"}})
+            elif "Hold turn" in prompt:
+                return
+            else:
+                self.complete("failed" if "Fail turn" in prompt else "completed")
+        elif method in {"turn/steer", "turn/interrupt"}:
+            key = (params["threadId"], params.get("turnId") or params.get("expectedTurnId"))
+            with self.server.lock:
+                original = self.server.turns.get(key)
+            if original is None:
+                self.send(id=ident, error={"code": -32602, "message": "No active turn"})
+                return
+            if method == "turn/interrupt":
+                original.complete("interrupted")
+            self.send(id=ident, result={"turnId": key[1]})
+
+
+class AppServerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.config = self.root / "config.json"
+        self.repo = self.root / "workspace"
+        self.repo.mkdir()
+        self.session_dir = self.root / "sessions"
+        self.manifest = self.root / "connection.json"
+        save_config(default_config_template(), self.config)
+        env = mock.patch.dict(os.environ, GEMPT_CONFIG=str(self.config), GEMPT_APP_SERVER_STATE=str(self.manifest),
+                              GEMPT_SESSIONS_DIR=str(self.session_dir), GEMPT_WORKSPACE_ROOT=str(self.repo),
+                              GEMPT_MCP_WAIT_SEC="8")
+        env.start()
+        self.addCleanup(env.stop)
+        self.server = MockAppServer()
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.server.write_state(self.manifest)
+
+    def mcp(self, name, **arguments):
+        result = _dispatch_request({"id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}})["result"]
+        self.assertFalse(result.get("isError"), result)
+        return json.loads(result["content"][0]["text"])
+
+    def wait_running(self, run_id):
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            record = read_run(run_id)
+            if record.get("turn_id") and record["progress"]["recent_commands"]:
+                return record
+            time.sleep(0.05)
+        self.fail(f"Turn did not start: {read_run(run_id)}")
+
+    def test_websocket_auth_fragmentation_control_frames_and_multiplexing(self):
+        from concurrent.futures import ThreadPoolExecutor
+        ready = threading.Event()
+        with AppServerClient(on_event=lambda _: ready.set()) as client, ThreadPoolExecutor() as pool:
+            client.initialize()
+            first = pool.submit(client.request, "echo/first", {"message": "x" * 66000})
+            self.assertTrue(ready.wait(4))
+            second = client.request("echo/second", {"text": "中文 fragment" * 10})
+            self.assertEqual(second["text"], "中文 fragment" * 10)
+            self.assertEqual(first.result(4)["length"], 66000)
+        self.assertEqual(self.server.pongs, [b"ping"])
+        self.server.write_state(self.manifest, token="wrong")
+        with self.assertRaisesRegex(AppServerUnavailableError, UNAVAILABLE):
+            AppServerClient()
+
+    def test_live_ask_gemini_dispatch_reply_and_warm_resume(self):
+        (self.repo / "notes.txt").write_text("fixture preloaded file", encoding="utf-8")
+        waiting = self.mcp("gempt_dispatch", goal="Ask Gemini", kind="engineering", access="inspect",
+                           cwd=str(self.repo), context="fixture context", file_paths=["notes.txt"], verification="python check.py")
+        run_id, session_id = waiting["run_id"], waiting["session_id"]
+        self.assertEqual(waiting["state"], "waiting_gemini")
+        self.assertEqual(waiting["progress"]["last_message"], "live")
+        self.assertEqual(waiting["progress"]["token_usage"]["cached_input_tokens"], 91)
+        self.assertIn("--wait", waiting["wait_command"])
+        pending = waiting["pending_tool_call"]
+        self.assertEqual(pending["arguments"]["reason"], "visual_check")
+        self.assertEqual(wait_for_run(run_id, timeout_sec=0)["state"], "waiting_gemini")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli_main(["status", "--run-id", run_id, "--wait"]), 0)
+        live = self.mcp("gempt_status", run_id=run_id)
+        self.assertEqual(live["pending_tool_call"], pending)
+        events = (run_directory(run_id) / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        self.assertTrue(any(json.loads(event)["method"] == "item/tool/call" for event in events))
+        start = next(req["params"] for req in self.server.requests if req["method"] == "turn/start")
+        self.assertIn("fixture context", start["input"][0]["text"])
+        self.assertIn("fixture preloaded file", start["input"][0]["text"])
+        self.mcp("gempt_reply_tool_call", run_id=run_id, call_id=pending["call_id"], answer="Yes")
+        deadline = time.monotonic() + 8
+        while read_run(run_id)["state"] == "waiting_gemini" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        finished = wait_for_run(run_id, timeout_sec=8)
+        self.assertEqual(finished["state"], "finished", finished)
+        self.assertEqual(finished["result"]["verification"]["status"], "passed")
+        self.assertIsNone(finished["pending_tool_call"])
+        self.assertEqual(self.server.replies, [(finished["turn_id"], {
+            "jsonrpc": "2.0", "id": "rpc-tool-id", "result": {"success": True, "contentItems": [{"type": "inputText", "text": "Yes"}]},
+        })])
+        resumed = self.mcp("gempt_dispatch", goal="Resume", kind="engineering", access="inspect", cwd=str(self.repo), session_id=session_id)
+        self.assertEqual(resumed["session_id"], session_id)
+        state = read_run(resumed["run_id"])
+        self.assertEqual(state["codex_thread_id"], finished["codex_thread_id"])
+        self.assertNotEqual(state["turn_id"], finished["turn_id"])
+
+    def test_steer_interrupt_and_failure_preserve_identity(self):
+        receipt = self.mcp("gempt_exec", goal="Hold turn", cwd=str(self.repo), background=True)
+        run_id, session_id = receipt["run_id"], receipt["session_id"]
+        live = self.wait_running(run_id)
+        self.mcp("gempt_steer", run_id=run_id, message="Use the new constraint")
+        self.mcp("gempt_interrupt", run_id=run_id)
+        interrupted = wait_for_run(run_id, timeout_sec=8)
+        self.assertEqual(interrupted["state"], "interrupted", interrupted)
+        self.assertEqual(interrupted["session_id"], session_id)
+        self.assertEqual(interrupted["codex_thread_id"], live["codex_thread_id"])
+        self.assertEqual(interrupted["turn_id"], live["turn_id"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli_main(["status", "--run-id", run_id, "--wait"]), 1)
+        expected = next(req["params"] for req in self.server.requests if req["method"] == "turn/steer")
+        self.assertEqual(expected, {"threadId": live["codex_thread_id"], "expectedTurnId": live["turn_id"],
+                                    "input": [{"type": "text", "text": "Use the new constraint"}]})
+        failed = dispatch_exec(goal="Fail turn", cwd=self.repo, session_id=session_id, background=True)
+        state = wait_for_run(failed["run_id"], timeout_sec=8)
+        self.assertEqual(state["state"], "failed", state)
+        self.assertTrue(state["error"].startswith("mock turn failed"), state["error"])
+        self.assertEqual(state["codex_thread_id"], live["codex_thread_id"])
+        session = json.loads((self.session_dir / f"{session_id}.json").read_text(encoding="utf-8"))
+        self.assertEqual(session["turn_id"], state["turn_id"])
+        self.assertEqual(session["codex_thread_id"], live["codex_thread_id"])
+
+    def test_missing_app_server_returns_actionable_error(self):
+        self.manifest.unlink()
+        with self.assertRaisesRegex(RuntimeError, UNAVAILABLE):
+            dispatch_exec(goal="Missing app-server", cwd=self.repo, wait_sec=8)
 
 
 if __name__ == "__main__":

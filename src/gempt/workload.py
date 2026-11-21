@@ -2,7 +2,7 @@
 import re
 
 from .config import WORKLOAD, load_config
-from .runs import build_wait_command, dispatch_exec
+from .runs import ACTIVE_STATES, build_wait_command, dispatch_exec
 from .service import run_consult
 from .sessions import resolve_sessions_dir
 
@@ -50,6 +50,9 @@ def dispatch_task(args, config_path, *, wait_sec: float | None = None):
         return {**result, "action": "gemini", "text": "Handle this part in Gemini. Report to the board if assigned there."}
 
     options = {"goal": goal, "config_path": config_path, "tier": args.get("tier"), "cwd": args.get("cwd")}
+    for field in ("session_id", "context", "file_paths"):
+        if args.get(field) is not None:
+            options[field] = args[field]
     if args.get("gemini_family"):
         options["gemini_family"] = args["gemini_family"]
     if action == "consult":
@@ -58,13 +61,12 @@ def dispatch_task(args, config_path, *, wait_sec: float | None = None):
         reply = dispatch_exec(**options, sandbox="read-only" if access == "inspect" else None,
                               verification=args.get("verification", ""), expected_report=WORKLOAD["report"],
                               wait_sec=wait_sec)
-        if reply.get("state") in {"queued", "running"} and "text" not in reply:
+        if reply.get("state") in ACTIVE_STATES | {"interrupted"}:
             run_id, state = reply["run_id"], reply["state"]
-            return {**result, "action": action, "state": state, "run_id": run_id, "cwd": reply.get("cwd"),
+            return {**result, "action": action, **reply,
                     "wait_command": build_wait_command(run_id),
-                    "text": f"Run {run_id} is {state} in the background. Run wait_command as an async background task "
-                            f"(e.g. run_command with WaitMsBeforeAsync=500) to wake automatically on completion, "
-                            f"or query gempt_status with run_id='{run_id}'; do not re-submit."}
+                    "text": (f"Run {run_id} is waiting for a reply to ask_gemini." if state == "waiting_gemini"
+                             else f"Run {run_id} is {state}. Query gempt_status with run_id='{run_id}'.")}
     fields = ("model", "served_model", "session_id", "run_id", "verification", "usage", "warnings", "text")
     receipt = {key: reply[key] for key in fields if key in reply}
     if "verification" in receipt:

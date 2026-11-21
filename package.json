@@ -19,6 +19,7 @@
     "plugin/hooks.json",
     "plugin/work_split_hook.py",
     "plugin/rules/AGENTS.md",
+    "plugin/agents/*.md",
     "plugin/skills/*/SKILL.md",
     "plugin/skills/*/references/*.md",
     "templates/gempt.config.example.json",

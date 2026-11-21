@@ -25,7 +25,7 @@ from .agy_install import DEFAULT_AGY_TARGET, build_mcp_config, install_agy
 from .config import get_default_tier, load_config, resolve_tier
 from .discover import discover_environment
 from .presets import apply_native_presets
-from .runs import dispatch_exec, read_run, wait_for_run
+from .runs import dispatch_exec, interrupt_run, read_run, reply_tool_call, steer_run, wait_for_run
 from .mcp_server import serve_stdio
 from .workload import SCHEMA as DISPATCH_SCHEMA, dispatch_task
 from .service import configure_gempt, get_status, run_consult, set_auto_effort, set_default_sandbox, set_default_tier, set_tier_effort
@@ -192,6 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch = sub.add_parser("dispatch", help="Apply the current ordinary or Swarm work split")
     for name, prop in DISPATCH_SCHEMA["properties"].items():
         dispatch.add_argument("--" + name.replace("_", "-"), choices=prop.get("enum"),
+                              action="append" if prop["type"] == "array" else "store",
                               required=name in DISPATCH_SCHEMA["required"], help=prop.get("description"))
     dispatch.add_argument("--config")
 
@@ -234,9 +235,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stat = sub.add_parser("status", help="Show active configuration and health")
     p_stat.add_argument("--run-id", default="")
-    p_stat.add_argument("--wait", action="store_true", help="Wait until --run-id reaches a terminal state")
+    p_stat.add_argument("--wait", action="store_true", help="Wait until the run finishes or requests Gemini input")
     p_stat.add_argument("--config", default=None)
     p_stat.add_argument("--sessions", type=int, default=10)
+
+    steer = sub.add_parser("steer", help="Send a message to an active Codex turn")
+    steer.add_argument("--run-id", required=True)
+    steer.add_argument("--message", required=True)
+    steer.add_argument("--config")
+
+    interrupt = sub.add_parser("interrupt", help="Interrupt an active Codex turn")
+    interrupt.add_argument("--run-id", required=True)
+    interrupt.add_argument("--config")
+
+    reply = sub.add_parser("reply-tool", help="Reply to a pending ask_gemini call")
+    reply.add_argument("--run-id", required=True)
+    reply.add_argument("--call-id", required=True)
+    reply.add_argument("--answer", required=True)
+    reply.add_argument("--failure", action="store_true", help="Report that the requested action failed")
 
     p_tier = sub.add_parser("tier", help="Show or switch the default gempt tier (sonnet/opus/fable)")
     p_tier.add_argument("value", nargs="?", choices=(*TIER_ORDER, "lite", "mid", "max"), default=None)
@@ -322,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
             packet = {key: getattr(args, key) for key in DISPATCH_SCHEMA["properties"] if getattr(args, key) is not None}
             result = dispatch_task(packet, args.config or os.environ.get("GEMPT_CONFIG") or DEFAULT_CONFIG_PATH)
             print(json.dumps(result, ensure_ascii=False))
-            return int(result.get("verification", {}).get("status") in {"failed", "unverified"})
+            return int(result.get("state") == "interrupted" or (result.get("verification") or {}).get("status") in {"failed", "unverified"})
 
         if args.command == "consult":
             res = run_consult(
@@ -365,18 +381,28 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_sec=args.timeout,
                 config_path=args.config,
             )
-            if args.json or args.background:
+            if args.json or args.background or "formatted" not in res:
                 print(json.dumps(res, indent=2, ensure_ascii=False))
             else:
                 print(res["formatted"])
                 if res.get("run_id"):
                     print(f"\n[run_id={res['run_id']}]")
-            return 1 if res.get("verification", {}).get("status") in {"failed", "unverified"} else 0
+            return int(res.get("state") == "interrupted" or (res.get("verification") or {}).get("status") in {"failed", "unverified"})
 
         if args.command == "status" and args.run_id:
             record = wait_for_run(args.run_id) if args.wait else read_run(args.run_id)
             print(json.dumps(record, ensure_ascii=False, indent=2))
-            return 1 if args.wait and record.get("state") != "finished" else 0
+            return int(args.wait and record.get("state") in {"failed", "outcome_unknown", "interrupted"})
+
+        if args.command in {"steer", "interrupt", "reply-tool"}:
+            if args.command == "steer":
+                result = steer_run(args.run_id, args.message, config_path=args.config)
+            elif args.command == "interrupt":
+                result = interrupt_run(args.run_id, config_path=args.config)
+            else:
+                result = reply_tool_call(args.run_id, args.call_id, args.answer, success=not args.failure)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
 
         if args.command == "status":
             data = get_status(config_path=args.config, session_limit=args.sessions)

@@ -2,13 +2,13 @@
 
 和用户直接沟通的 Gemini 负责弄清需求，并用用户的语言说明结果、影响、验证情况和待决定的事。简短寒暄、追问需求、解释已取得的结果可直接回复。
 
-Magpie 面板最左档是 **关闭 GemPT**。选中后从下一轮起停止自动派单，无需重启或卸载。普通对话和 Swarm 可独立设置，Swarm 也可跟随普通对话。按当前回合的提醒执行。对已关闭的模式，Gemini 直接处理任务，跳过 `gempt_dispatch`。只有用户明确要求调用 GPT 时才使用 `gempt_consult` 或 `gempt_exec`。
+Magpie 面板最左档是 **关闭 GemPT**。选中后从下一轮起停止自动派单，无需重启或卸载。普通对话和 Swarm 可独立设置，Swarm 也可跟随普通对话。对已关闭的模式，Gemini 直接处理任务，跳过 `gempt-worker` 和 `gempt_dispatch`。只有用户明确要求调用 GPT 时才使用 `gempt_consult` 或 `gempt_exec`。
 
-在启用自动协作的模式下，每个新实质任务的第一步是调用 `gempt_dispatch`。原样保留目标、约束和已有证据，给出 `kind` 与 `access`。把查找文件、定位原因、写实现和运行验收留给被分配的执行者。仅视觉感知需要 Gemini 时，先提取必要观察，再派发设计或实现部分。按真实任务分类：日常内容用 routine，规划与设计用 design，开发与排错用 engineering，疑难推导与独立专家复核用 specialist。材料齐备选 provided，需要检查工作区选 inspect，需要改动选 change；工作区操作传 cwd。
+Antigravity 普通对话启用 GemPT 时，主 Gemini 统一通过 `invoke_subagent(TypeName="gempt-worker", Model="inherit", Role=..., Prompt=..., Workspace=...)` 处理新实质任务的 GPT 协作，包括咨询、工程、设计和专家任务。由子代理调用 `gempt_dispatch`。在同一任务线上用 `send_message` 联系原子代理，继续任务、按需查进度、调整执行方向或回复 `ask_gemini`。子代理返回 Gemini 分配时自行处理，返回结果时检查证据后向用户解释。仅需要 Gemini 视觉感知时，先提取必要观察，再派发后续工作。
 
-工具每次读取 Magpie 面板的分工设置。返回 gemini 时自行完成，返回 consult 或 exec 时 GPT 已接单并返回结果，检查其证据后直接向用户解释。执行返回 queued 或 running 时，若宿主支持异步后台命令（如 Antigravity 的 `run_command`），优先把返回里的 `wait_command` 以后台任务启动（短等待转后台）并结束本轮，等待任务完成自动唤醒后再根据结果解说，不要循环轮询；若无后台命令能力，则用返回的 `run_id` 查询 `gempt_status`，等到 finished 再解说。重复提交可能造成重复修改。出现实质缺口才补查或返工。遇到 worker 不可用、超时、权限不足，向用户说明哪一步受阻，交由用户决定是否由 Gemini 接手。仅在用户明确点名、续接已有 GPT 会话或显式使用打杂档时直接用 `gempt_consult` / `gempt_exec`。档位控制 GPT 的推理深度。若宿主仅能使用 CLI，等价入口为 `python -m gempt dispatch --goal … --kind … --access …`。
+任务单保留原目标、限制、证据和验收条件，把查文件、定位、实现和检查留给执行者。`kind` 按实际任务选 `routine`、`design`、`engineering` 或 `specialist`。材料齐备用 `access=provided`，检查工作区用 `inspect`，修改用 `change`。工作区任务传 `cwd`。
 
-使用宿主报告的当前 Gemini 系列填写 `gemini_family`（hydrogen、neon、carbon），未知时省略。由工具从用户保存的配对选择 GPT。只有用户点名档位或使用对应斜杠命令时传 `tier`。续接使用原 session_id。
+其他启用自动协作的 MCP 宿主直接用 `gempt_dispatch`，仅支持 CLI 时用 `python -m gempt dispatch --goal … --kind … --access …`。执行返回 `queued` 或 `running` 时优先后台运行返回的 `wait_command`，其余宿主用 `run_id` 查 `gempt_status`。遇到权限不足、超时或执行者不可用，向用户说明受阻步骤。按宿主报告填写 `gemini_family`（hydrogen、neon、carbon），未知时省略。只有用户点名档位或使用对应斜杠命令时传 `tier`。续接使用原 `session_id`。
 
 ## Antigravity /swarm
 

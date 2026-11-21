@@ -15,7 +15,7 @@ from typing import Any
 
 from . import CONSULT_TIERS, DEFAULT_CONFIG_PATH, TIER_ORDER, __version__
 from .discover import discover_environment
-from .runs import build_wait_command, dispatch_exec, read_run
+from .runs import ACTIVE_STATES, build_wait_command, dispatch_exec, interrupt_run, read_run, reply_tool_call, steer_run
 from .service import configure_gempt, get_status, run_consult
 from .sessions import exclusive_operation, resolve_sessions_dir, validate_session_id
 from .workload import SCHEMA as DISPATCH_SCHEMA, dispatch_task
@@ -241,6 +241,20 @@ for tool in TOOLS:
         properties["background"] = {"type": "boolean", "description": "Return a durable run ID immediately."}
 
 
+_RUN_ID = {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+_TEXT = {"type": "string"}
+for name, description, fields, required in (
+    ("gempt_steer", "Steer an active Codex turn in the same session.", {"message": _TEXT}, ["message"]),
+    ("gempt_interrupt", "Interrupt the active Codex turn and preserve its session.", {}, []),
+    ("gempt_reply_tool_call", "Reply to ask_gemini and resume the waiting turn.",
+     {"call_id": _TEXT, "answer": _TEXT, "success": {"type": "boolean", "default": True}}, ["call_id", "answer"]),
+):
+    TOOLS.append({"name": name, "description": description, "inputSchema": {
+        "type": "object", "properties": {"run_id": _RUN_ID, **fields},
+        "required": ["run_id", *required], "additionalProperties": False,
+    }})
+
+
 def _resolve_magpie_config_dir(home: Path) -> Path:
     raw = os.environ.get("MAGPIE_CONFIG_DIR", "").strip()
     if not raw:
@@ -302,17 +316,24 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             ))
         data = dispatch_task(args, trusted_config, wait_sec=_mcp_wait_sec())
         return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
-                "isError": data.get("verification", {}).get("status") in {"failed", "unverified"}}
+                "isError": data.get("state") == "interrupted" or (data.get("state") not in ACTIVE_STATES
+                    and (data.get("verification") or {}).get("status") in {"failed", "unverified"})}
     if name == "gempt_exec" or (name == "gempt_consult" and (
         workspace_root is not None or raw_cwd is not None or args.get("file_paths") is not None
     )):
         args["cwd"] = str(_normalize_workspace_cwd(
             raw_cwd, workspace_root=workspace_root, trusted_config=trusted_config,
         ))
-    if name == "gempt_status" and args.get("run_id"):
+    if name in {"gempt_steer", "gempt_interrupt", "gempt_reply_tool_call"} or (name == "gempt_status" and args.get("run_id")):
         data = read_run(args["run_id"])
         if workspace_root is not None and not Path(data["cwd"]).resolve().is_relative_to(workspace_root):
             raise ValueError("Run outside host workspace")
+        if name == "gempt_steer":
+            data = steer_run(args["run_id"], args["message"], config_path=trusted_config)
+        elif name == "gempt_interrupt":
+            data = interrupt_run(args["run_id"], config_path=trusted_config)
+        elif name == "gempt_reply_tool_call":
+            data = reply_tool_call(args["run_id"], args["call_id"], args["answer"], success=args.get("success", True))
         return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}]}
     if name == "gempt_discover" and args.get("magpie_url"):
         from .config import load_config
@@ -409,11 +430,12 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             gemini_family=args.get("gemini_family"),
             timeout_sec=args.get("timeout_sec"),
         )
-        in_progress = res.get("state") in {"queued", "running"}
+        in_progress = res.get("state") in ACTIVE_STATES
         if in_progress and res.get("run_id") and "wait_command" not in res:
             res = {**res, "wait_command": build_wait_command(res["run_id"])}
         return {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}],
-                "isError": not in_progress and res.get("verification", {}).get("status") in {"failed", "unverified"}}
+                "isError": res.get("state") == "interrupted" or (not in_progress
+                    and (res.get("verification") or {}).get("status") in {"failed", "unverified"})}
 
     if name == "gempt_status":
         data = get_status(

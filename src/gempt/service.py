@@ -10,7 +10,7 @@ from typing import Any
 
 from . import DEFAULT_CONFIG_PATH, EFFORT_RANK, TIER_ORDER, VALID_EFFORTS, VALID_FAILOVER_MODES, VALID_SANDBOXES
 from .runs import recent_runs, verification_result
-from .codex_runner import run_codex_exec
+from .app_server_client import AppServerUnavailableError, TurnInterrupted, run_app_server
 from .config import (
     paired_model,
     ConfigError,
@@ -491,22 +491,19 @@ def run_exec(
     timeout_sec: int | None = None,
     config_path: str | Path | None = None,
     _run_id: str = "",
+    _new_session_id: str = "",
 ) -> dict[str, Any]:
-    """Delegate a coding/verification task to headless Codex CLI via Magpie."""
+    """Delegate a coding/verification task to the Magpie-managed Codex app-server."""
     if not goal or not goal.strip():
         raise ConfigError("`goal` must not be empty.")
     workdir = Path(cwd).expanduser().resolve()
     if not workdir.is_dir():
         raise ConfigError(f"`cwd` does not exist or is not a directory: {workdir}")
 
-    cfg, _ = load_config(explicit=config_path, require_exists=True, cwd=workdir)
+    cfg, resolved_config = load_config(explicit=config_path, require_exists=True, cwd=workdir)
     codex_cfg = cfg.get("codex") or {}
-    cli_path = str(codex_cfg.get("cli_path") or "").strip()
-    if not cli_path or not Path(cli_path).is_file():
-        codex_info = find_codex_cli(cli_path)
-        if not codex_info.get("found"):
-            raise ConfigError("Codex CLI not found. Install Codex CLI or configure `codex.cli_path`.")
-        cli_path = codex_info["path"]
+    # Auto-discovered workspace configuration is not a trusted connection manifest.
+    app_config = resolved_config if config_path or os.environ.get("GEMPT_CONFIG") else DEFAULT_CONFIG_PATH
 
     limits = cfg.get("limits") or {}
     file_blocks, warnings = read_context_files(
@@ -530,7 +527,7 @@ def run_exec(
         else:
             raise ConfigError("Unknown exec session; raw Codex thread IDs cannot establish permissions.")
     else:
-        sid = new_session_id("exec")
+        sid = _new_session_id or new_session_id("exec")
         session_record = {
             "session_id": sid,
             "mode": "exec",
@@ -615,21 +612,27 @@ def run_exec(
         )
     if codex_cfg.get("extra_args"):
         raise ConfigError("Unrestricted Codex extra_args conflict with gateway and sandbox enforcement.")
+    session_record.update(paired_model=paired, tier=resolved["tier"], model=resolved["model"],
+                          reasoning_effort=resolved["reasoning_effort"])
+    if _run_id:
+        save_session(session_record)
+
+    def persist_identity(thread_id, turn_id):
+        session_record.update(codex_thread_id=thread_id, turn_id=turn_id)
+        save_session(session_record)
+
+    approval = codex_cfg.get("approval_policy") or "never"
+    if effective_sandbox != "danger-full-access":
+        approval = "never"
     try:
-        res = run_codex_exec(
-            cli_path=cli_path,
-            prompt=prompt,
-            cwd=workdir,
-            model=resolved["model"],
-            reasoning_effort=resolved["reasoning_effort"],
-            sandbox=effective_sandbox,
-            sandbox_explicit=True,
-            model_provider=str(codex_cfg.get("model_provider") or "").strip(),
-            codex_thread_id=codex_thread_id,
-            gateway_url=cfg["magpie"]["base_url"],
-            gateway_key=resolve_magpie_api_key(cfg)[0],
-            timeout_sec=effective_timeout,
+        res = run_app_server(
+            prompt=prompt, cwd=workdir, model=resolved["model"], reasoning_effort=resolved["reasoning_effort"],
+            sandbox=effective_sandbox, approval_policy=approval, codex_thread_id=codex_thread_id,
+            gateway_url=cfg["magpie"]["base_url"], config_path=app_config, timeout_sec=effective_timeout,
+            run_id=_run_id, session_id=sid, on_identity=persist_identity,
         )
+    except (AppServerUnavailableError, TurnInterrupted):
+        raise
     except Exception as exc:
         msg = str(exc)
         hint = build_escalation_suggestion(
@@ -662,10 +665,6 @@ def run_exec(
         effort=resolved["reasoning_effort"],
         verification_status=str(acceptance.get("status") or ""),
     )
-    session_record["paired_model"] = paired
-    session_record["tier"] = resolved["tier"]
-    session_record["model"] = resolved["model"]
-    session_record["reasoning_effort"] = resolved["reasoning_effort"]
     session_record["codex_thread_id"] = res["codex_thread_id"]
     session_record.setdefault("turns", []).append(
         {
@@ -708,6 +707,7 @@ def run_exec(
     return {
         "session_id": sid,
         "codex_thread_id": res["codex_thread_id"],
+        "turn_id": res.get("turn_id"),
         "verification": acceptance,
         "tier": resolved["tier"],
         "model": resolved["model"],

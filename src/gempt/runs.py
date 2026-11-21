@@ -13,7 +13,10 @@ import time
 import uuid
 from pathlib import Path
 
-from .sessions import atomic_json, exclusive_operation, resolve_sessions_dir, validate_session_id
+from .sessions import atomic_json, exclusive_operation, new_session_id, resolve_sessions_dir, validate_session_id
+
+
+ACTIVE_STATES = {"queued", "running", "waiting_gemini"}
 
 
 def verification_result(request, commands):
@@ -66,8 +69,8 @@ def read_run(run_id):
             if attempt == 4:
                 raise
             time.sleep(0.02)
-    if record["state"] in {"queued", "running"} and time.time() > record["deadline"]:
-        record["state"] = "outcome_unknown"
+    if record["state"] in ACTIVE_STATES and time.time() > record.get("deadline", float("inf")):
+        record.update(state="outcome_unknown", pending_tool_call=None)
     return record
 
 
@@ -84,6 +87,52 @@ def wait_for_run(run_id, *, timeout_sec: float | None = None, poll_interval: flo
             time.sleep(min(poll_interval, remaining))
         else:
             time.sleep(poll_interval)
+
+
+def _control_run(run_id, method, *, config_path=None, message=None):
+    from .app_server_client import AppServerClient, text_input
+    record = read_run(run_id)
+    thread_id, turn_id = record.get("codex_thread_id"), record.get("turn_id")
+    if record["state"] not in {"running", "waiting_gemini"} or not thread_id or not turn_id:
+        raise ValueError(f"Run {run_id} has no active Codex turn.")
+    if method == "turn/steer":
+        params = {"threadId": thread_id, "expectedTurnId": turn_id, "input": text_input(message)}
+    else:
+        params = {"threadId": thread_id, "turnId": turn_id}
+    with AppServerClient(config_path=config_path or record.get("config_path")) as client:
+        client.initialize()
+        client.request(method, params, timeout=4)
+    return {"ok": True, "run_id": run_id, "session_id": record.get("session_id"),
+            "thread_id": thread_id, "turn_id": turn_id}
+
+
+def steer_run(run_id, message, *, config_path=None):
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("Steering message must be non-empty.")
+    return _control_run(run_id, "turn/steer", config_path=config_path, message=message)
+
+
+def interrupt_run(run_id, *, config_path=None):
+    return _control_run(run_id, "turn/interrupt", config_path=config_path)
+
+
+def reply_tool_call(run_id, call_id, answer, *, success=True):
+    from .app_server_client import tool_reply_path
+    path = tool_reply_path(run_directory(run_id), call_id)
+    if not isinstance(answer, str) or not isinstance(success, bool):
+        raise ValueError("Tool reply requires a text answer and boolean success.")
+    record = read_run(run_id)
+    if record["state"] != "waiting_gemini" or (record.get("pending_tool_call") or {}).get("call_id") != call_id:
+        raise ValueError(f"Run {run_id} is not waiting for tool call {call_id}.")
+    path.parent.mkdir(exist_ok=True)
+    with exclusive_operation(path.with_suffix(".lock")):
+        reply = {"answer": answer, "success": success}
+        if path.is_file():
+            if json.loads(path.read_text(encoding="utf-8")) != reply:
+                raise ValueError("A different reply was already submitted for this tool call.")
+        else:
+            atomic_json(path, reply)
+    return {"ok": True, "run_id": run_id, "session_id": record.get("session_id"), "call_id": call_id}
 
 
 def build_wait_command(run_id: str) -> str:
@@ -146,9 +195,13 @@ def dispatch_exec(*, background=False, run_id="", wait_sec: float | None = None,
     options["cwd"] = str(Path(options["cwd"]).resolve())
     if options.get("config_path"):
         options["config_path"] = str(Path(options["config_path"]).resolve())
+    if not options.get("session_id"):
+        options["_new_session_id"] = new_session_id("exec")
     record = {"run_id": run_id, "state": "queued", "cwd": options["cwd"],
               "goal": options.get("goal", ""), "tier": options.get("tier"),
-              "session_id": options.get("session_id"), "verification": options.get("verification"),
+              "session_id": options.get("session_id") or options["_new_session_id"],
+              "config_path": options.get("config_path"), "progress": None,
+              "verification": options.get("verification"),
               "created_at": time.time(),
               "deadline": time.time() + 120 + int(options.get("timeout_sec") or 3600)}
     _write_run_state(directory, record)
@@ -159,8 +212,7 @@ def dispatch_exec(*, background=False, run_id="", wait_sec: float | None = None,
         bootstrap = ("import runpy,sys;sys.path.insert(0,sys.argv.pop(1));"
                      "runpy.run_module('gempt.runs',run_name='__main__')")
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        detached = background or wait_sec is not None
-        use_launcher = detached and os.name == "nt"
+        use_launcher = os.name == "nt"
         if use_launcher:
             # A host can close its Windows job when the MCP connection ends.
             # Request independent lifetime, retaining the caller's security token.
@@ -180,7 +232,7 @@ def dispatch_exec(*, background=False, run_id="", wait_sec: float | None = None,
         if use_launcher:
             if proc.wait() != 0:
                 raise RuntimeError("Could not launch independent background worker.")
-        elif detached:
+        else:
             # Reap the POSIX child while the caller is alive, without delaying shutdown.
             threading.Thread(target=proc.wait, daemon=True).start()
     except Exception as exc:
@@ -189,18 +241,10 @@ def dispatch_exec(*, background=False, run_id="", wait_sec: float | None = None,
         raise
     if background:
         return record
-    if wait_deadline is None:
-        proc.wait()
-        record = read_run(run_id)
-    else:
-        while True:
-            record = read_run(run_id)
-            if record["state"] not in {"queued", "running"}:
-                break
-            remaining = wait_deadline - time.monotonic()
-            if remaining <= 0:
-                return record
-            time.sleep(min(0.2, remaining))
+    budget = None if wait_deadline is None else max(0, wait_deadline - time.monotonic())
+    record = wait_for_run(run_id, timeout_sec=budget)
+    if record["state"] in ACTIVE_STATES or record["state"] == "interrupted":
+        return record
     if "result" not in record:
         raise RuntimeError(f"{run_id}: {record.get('error', record['state'])}")
     return record["result"]
@@ -221,6 +265,7 @@ def git_evidence(cwd):
 
 
 def worker(run_id):
+    from .app_server_client import TurnInterrupted
     from .service import run_exec
     directory = run_directory(run_id)
     record = read_run(run_id)
@@ -237,10 +282,16 @@ def worker(run_id):
         with lock:
             result = run_exec(**options, _run_id=run_id)
         result["run_id"] = run_id
-        record.update(state="finished", result=result)
+        outcome = {"state": "finished", "result": result}
+    except TurnInterrupted as exc:
+        outcome = {"state": "interrupted", "error": str(exc)}
     except Exception as exc:
-        record.update(state="failed", error=str(exc))
+        outcome = {"state": "failed", "error": str(exc)}
     finally:
+        record = read_run(run_id)
+        record.update(outcome, pending_tool_call=None)
+        if record.get("progress"):
+            record["progress"].update(phase=record["state"], updated_at=time.time())
         record["after"] = git_evidence(record["cwd"])
         record["finished_at"] = time.time()
         _write_run_state(directory, record)

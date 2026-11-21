@@ -8,6 +8,7 @@ import { writeConfigAtomic } from './backend.mjs';
 
 const workerPath = fileURLToPath(new URL('./exec-worker.mjs', import.meta.url));
 const pending = (state) => state === 'queued' || state === 'running';
+const active = (state) => pending(state) || state === 'waiting_gemini';
 
 function stateFile(sessionsDir, id) {
   if (typeof id !== 'string' || !/^[a-f0-9]{32}$/.test(id)) throw new Error('Invalid run_id.');
@@ -22,7 +23,7 @@ export function saveNativeRun(file, record) {
 export function readNativeRun(sessionsDir, id) {
   const record = JSON.parse(readFileSync(stateFile(sessionsDir, id), 'utf8'));
   if (record.source !== 'magpie_exec') throw new Error('Not a Magpie native exec run.');
-  if (pending(record.state)) {
+  if (active(record.state)) {
     if (Date.now() / 1000 > record.deadline) record.state = 'outcome_unknown';
     else if (record.pid) {
       try { process.kill(record.pid, 0); } catch (err) {
@@ -46,10 +47,13 @@ export async function waitForNativeRun(sessionsDir, id, seconds) {
 function receipt(record) {
   if (record.state === 'failed') throw new Error(record.error);
   if (record.state === 'finished') return { ...record.result, run_id: record.run_id, state: 'finished' };
+  if (record.state === 'interrupted') return record;
   return {
-    state: record.state, run_id: record.run_id, cwd: record.cwd,
+    state: record.state, run_id: record.run_id, cwd: record.cwd, session_id: record.session_id,
+    progress: record.progress, pending_tool_call: record.pending_tool_call,
     text: record.state === 'outcome_unknown'
       ? 'The worker stopped reporting. Inspect workspace evidence before deciding whether to retry.'
+      : record.state === 'waiting_gemini' ? 'Codex is waiting for a reply to ask_gemini.'
       : 'Codex is working. Poll gempt_status with this run_id and wait_sec=20 until finished or failed. Do not submit the task again.',
   };
 }
@@ -76,7 +80,7 @@ export async function startNativeRun({ args, host, agent, env }) {
   }
   const record = { source: 'magpie_exec', run_id: id, cwd: args.cwd, state: 'queued',
     created_at: new Date().toISOString(), goal: args.goal, tier: args.tier, agent,
-    session_id: args.session_id, verification: args.verification,
+    session_id: args.session_id || `exec-${randomUUID()}`, config_path: host.configPath, progress: null, verification: args.verification,
     deadline: Date.now() / 1000 + 120 + (Number(args.timeout_sec) || 3600) };
   saveNativeRun(file, record);
   try {

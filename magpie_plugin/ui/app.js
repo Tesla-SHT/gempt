@@ -7,6 +7,7 @@
  */
 (() => {
   const POLL_MS = 15000;
+  const LIVE_POLL_MS = 2800;
   const MODE_STORAGE_KEY = 'gempt_view_mode';
   const SUPPORTS_HAS = typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('selector(:has(*))');
   const $ = (id) => document.getElementById(id);
@@ -76,6 +77,7 @@
   };
 
   let latestState = null;
+  let stateFetch = null;
   let currentDefaultTier = 'sonnet';
   let currentDefaultSandbox = 'workspace-write';
   let currentFailoverMode = 'subscription_only';
@@ -709,6 +711,8 @@
   function formatRunMeta(run) {
     if (run.verification === 'passed') return '已通过';
     if (run.verification === 'failed' || run.state === 'failed') return '失败';
+    if (run.state === 'waiting_gemini') return '等待 Gemini';
+    if (run.state === 'interrupted') return '已中止';
     if (run.state === 'running' || run.state === 'queued') return '进行中';
     if (run.state === 'finished') return '已完成';
     if (run.state === 'outcome_unknown') return '状态未知';
@@ -906,20 +910,39 @@
     requestAnimationFrame(() => requestAnimationFrame(() => document.documentElement.classList.add('gp-ready')));
   }
 
-  async function refreshState({ manual = false } = {}) {
+  async function refreshState({ manual = false, live = false } = {}) {
+    if (live && stateFetch) return;
+    stateFetch?.abort();
+    const abort = stateFetch = new AbortController();
     const refreshBtn = $('refresh-btn');
     if (manual && refreshBtn) refreshBtn.classList.add('is-spinning');
     try {
-      const res = await apiFetch('/api/state', { method: 'GET' });
+      const res = await apiFetch('/api/state', { signal: abort.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      renderState(data);
+      if (abort.signal.aborted) return;
+      if (live) {
+        latestState = { ...latestState, app_server: data.app_server, active_runs: data.active_runs };
+      } else {
+        renderState(data);
+      }
+      renderLiveOverview(data);
+      // The slow state refresh also discovers runs when an activity list is idle.
+      const view = activityViews[activeTab];
+      if (view && !view.open && !view.listFetch && !view.items.some(isActiveRun)
+          && data.active_runs?.length) {
+        void refreshActivityView(view);
+      }
       if (manual) showToast('状态已更新');
     } catch (err) {
-      if (manual) showToast(`刷新失败: ${err.message}`, 'error');
+      if (manual && !abort.signal.aborted) showToast(`刷新失败: ${err.message}`, 'error');
     } finally {
-      markUiReady();
-      if (refreshBtn) refreshBtn.classList.remove('is-spinning');
+      if (stateFetch === abort) {
+        stateFetch = null;
+        markUiReady();
+        refreshBtn?.classList.remove('is-spinning');
+        syncLivePoll();
+      }
     }
   }
 
@@ -1087,14 +1110,19 @@
   }));
   const modes = { consult: '咨询', exec: '执行' };
   const statuses = {
-    succeeded: '成功', failed: '失败', retried: '重试', running: '进行中', queued: '排队中',
-    outcome_unknown: '状态未知', canceled: '已取消',
+    succeeded: '成功', finished: '成功', failed: '失败', retried: '重试', running: '运行中', queued: '排队中',
+    waiting_gemini: '等待 Gemini', interrupted: '已中止', outcome_unknown: '状态未知', canceled: '已取消',
   };
+  const phases = { ...statuses, connecting: '连接 Codex', completed: '已完成' };
+  const activeRunStates = new Set(['queued', 'running', 'waiting_gemini']);
+  const interrupts = new Set();
+  const overviewRunTimes = new Map();
   const checks = { passed: '已通过', failed: '失败', unverified: '未验证', not_requested: '未要求' };
   const exactNumber = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 3 });
   const compactNumber = new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 });
   const dateTime = new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium', hour12: false });
   let activeTab = 'overview';
+  let liveTimer = null;
 
   function node(tag, cls = '', value = '') {
     const el = document.createElement(tag);
@@ -1180,11 +1208,136 @@
     }
   }
 
-  function statusBadge(request) {
-    const badge = node('span', 'activity-status', statuses[request.status] || request.status);
-    badge.dataset.status = request.status;
-    if (request.retried) badge.append(' · 重试');
+  function runState(record) {
+    return record?.state || record?.status;
+  }
+
+  function isActiveRun(record) {
+    return activeRunStates.has(runState(record));
+  }
+
+  function statusBadge(record) {
+    const status = runState(record);
+    const badge = node('span', 'activity-status', statuses[status] || status);
+    badge.dataset.status = status;
+    if (record.retried) badge.append(' · 重试');
     return badge;
+  }
+
+  function pendingQuestion(run) {
+    return runState(run) === 'waiting_gemini' ? run.pending_tool_call?.arguments : null;
+  }
+
+  async function findRunRequest(runId, signal) {
+    const res = await apiFetch(`/api/requests?${new URLSearchParams({ q: runId })}`, { signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const { items } = await res.json();
+    return items.find((request) => request.run_id === runId);
+  }
+
+  function interruptButton(run, label) {
+    const control = button(label, 'activity-link run-interrupt');
+    control.dataset.runAction = 'interrupt';
+    if (runState(run) === 'queued') {
+      control.disabled = true;
+      control.title = '等待 Codex 启动当前轮';
+      return control;
+    }
+    const id = run.run_id;
+    control.disabled = interrupts.has(id);
+    control.onclick = async () => {
+      if (interrupts.has(id)) return;
+      interrupts.add(id);
+      control.disabled = true;
+      try {
+        const res = await apiFetch(`/api/runs/${encodeURIComponent(id)}/interrupt`, { method: 'POST' });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok || !payload.ok) throw new Error(payload.error || `HTTP ${res.status}`);
+        showToast('已发送中止请求');
+      } catch (err) {
+        showToast(`中止失败 · ${err.message}`, 'error');
+      } finally {
+        interrupts.delete(id);
+        control.disabled = false;
+        await Promise.all([refreshState(), refreshActivityView(activityViews[activeTab])]);
+      }
+    };
+    return control;
+  }
+
+  function runElapsed(run, time) {
+    const start = Date.parse(time);
+    if (Number.isFinite(start)) return duration(Math.max(0, (Date.now() - start) / 1000));
+    if (!overviewRunTimes.has(run.run_id) && activeTab === 'overview') {
+      overviewRunTimes.set(run.run_id, null);
+      // The live state identifies the run. The request ledger supplies its timestamp.
+      void findRunRequest(run.run_id).then((request) => {
+        if (!overviewRunTimes.has(run.run_id) || !request?.timestamp) return;
+        overviewRunTimes.set(run.run_id, request.timestamp);
+        const row = $('active-run-list').querySelector(`[data-run-id="${run.run_id}"]`);
+        const elapsed = row?.querySelector('.run-elapsed');
+        if (elapsed) elapsed.textContent = runElapsed(run, request.timestamp);
+      }).finally(() => {
+        if (overviewRunTimes.get(run.run_id) === null) overviewRunTimes.delete(run.run_id);
+      }).catch(() => {});
+    }
+    return '—';
+  }
+
+  function preview(className, value) {
+    const line = node('p', className, value.replace(/\s+/g, ' ').trim());
+    line.title = line.textContent;
+    return line;
+  }
+
+  function renderLiveOverview(state) {
+    const server = state.app_server;
+    $('chip-app-server').dataset.tone = server?.error ? 'warn' : server?.running ? 'ok' : 'neutral';
+    $('chip-app-server-val').textContent = server?.error ? '异常' : server?.running ? '运行中' : '未运行';
+    const error = $('app-server-error');
+    error.textContent = server?.error || '';
+    error.hidden = !server?.error;
+
+    const runs = state.active_runs || [];
+    const list = $('active-run-list');
+    $('active-runs').hidden = !runs.length;
+    const focused = list.contains(document.activeElement) ? document.activeElement : null;
+    const focusedRunId = focused?.closest('[data-run-id]')?.dataset.runId;
+    let restoreFocus;
+    for (const id of overviewRunTimes.keys()) {
+      if (!runs.some((run) => run.run_id === id)) overviewRunTimes.delete(id);
+    }
+    list.replaceChildren(...runs.map((run) => {
+      const row = node('li', 'active-run');
+      row.dataset.runId = run.run_id;
+      const info = node('div', 'active-run-info');
+      const head = node('div', 'active-run-meta');
+      const workspace = node('strong', '', run.cwd?.split(/[/\\]+/).filter(Boolean).at(-1) || '工作区');
+      workspace.title = run.cwd || '';
+      const phase = run.progress?.phase || run.state;
+      head.append(statusBadge(run.state === 'queued' ? { state: 'running' } : run), workspace,
+        node('span', 'run-phase', phases[phase] || phase),
+        node('span', 'run-elapsed', runElapsed(run, overviewRunTimes.get(run.run_id))));
+      info.append(head);
+      const command = run.progress?.recent_commands?.at(-1);
+      const snippet = (typeof command === 'string' ? command : command?.command) || run.progress?.last_message;
+      if (snippet) info.append(preview('run-preview', snippet));
+      const question = pendingQuestion(run)?.question;
+      if (question) info.append(preview('run-question', question));
+      const actions = node('div', 'active-run-actions');
+      const detail = button('查看详情');
+      detail.dataset.runAction = 'detail';
+      detail.onclick = () => {
+        navigateActivityTab('requests');
+        openActivityDetail(activityViews.requests, `run-${run.run_id}`, { runId: run.run_id });
+      };
+      const interrupt = interruptButton(run, '中止');
+      actions.append(detail, interrupt);
+      row.append(info, actions);
+      if (run.run_id === focusedRunId) restoreFocus = focused.dataset.runAction === 'detail' ? detail : interrupt;
+      return row;
+    }));
+    restoreFocus?.focus({ preventScroll: true });
   }
 
   const ledgerColumns = [
@@ -1208,11 +1361,12 @@
       row.tabIndex = 0;
       row.dataset.activityId = r.id;
       row.title = r.goal;
-      row.onclick = () => { if (!String(window.getSelection())) openActivityDetail(view, r.id, row); };
+      const open = () => openActivityDetail(view, r.id, { runId: r.run_id });
+      row.onclick = () => { if (!String(window.getSelection())) open(); };
       row.onkeydown = (event) => {
         if (event.key !== 'Enter' && event.key !== ' ') return;
         event.preventDefault();
-        openActivityDetail(view, r.id, row);
+        open();
       };
       const add = (value, title) => {
         const td = row.insertCell();
@@ -1276,9 +1430,11 @@
     }
     const arrow = node('span', 'activity-session-go', '›');
     arrow.setAttribute('aria-hidden', 'true');
-    row.append(icon, who, node('span', 'activity-badge', modes[session.mode]), tokens,
+    row.append(icon, who, node('span', 'activity-badge', modes[session.mode]));
+    if (isActiveRun(session) || session.state === 'interrupted') row.append(statusBadge(session));
+    row.append(tokens,
       node('span', 'activity-session-turns', `${number(session.turn_count)} 轮`), arrow);
-    row.onclick = () => openActivityDetail(view, session.id, row);
+    row.onclick = () => openActivityDetail(view, session.id);
     return row;
   }
 
@@ -1305,6 +1461,27 @@
     head.append(node('h4', '', label), copyButton(value, label));
     section.append(head, node('pre', '', value));
     parent.append(section);
+  }
+
+  function renderRunProgress(run) {
+    const progress = run.progress;
+    const question = pendingQuestion(run);
+    if (!progress && !question) return [];
+    const box = node('section', 'activity-detail-box');
+    const info = node('dl', 'activity-detail-info');
+    detailLine(info, '当前阶段', phases[progress?.phase] || progress?.phase);
+    box.append(info);
+    const commands = progress?.recent_commands?.map((entry) => typeof entry === 'string' ? entry : [
+      entry.command, entry.exit_code == null ? '' : `退出码 ${entry.exit_code}`,
+    ].filter(Boolean).join('\n'));
+    detailText(box, '最近命令', commands?.join('\n\n'));
+    detailText(box, '已触及文件', progress?.touched_files?.join('\n'));
+    detailText(box, '实时输出摘要', progress?.last_message);
+    if (question) {
+      detailText(box, '等待 Gemini 回复', [question.question, question.reason && `原因　${question.reason}`,
+        ...(question.media_paths || [])].filter(Boolean).join('\n'));
+    }
+    return box.querySelector('dt, pre') ? [box] : [];
   }
 
   function usageText(usage) {
@@ -1378,22 +1555,41 @@
     view.detail.hidden = true;
     view.detail.replaceChildren();
     view.list.hidden = false;
-    open.row.focus({ preventScroll: true });
+    const row = [...view.results.querySelectorAll('[data-activity-id]')]
+      .find((row) => row.dataset.activityId === open.id);
+    (row || $(`tab-${view.kind}`)).focus({ preventScroll: true });
     window.scrollTo(0, open.scroll);
+    void refreshActivityView(view);
+    syncLivePoll();
   }
 
-  async function loadActivityDetail(view) {
+  async function loadActivityDetail(view, refresh = false) {
     const open = view.open;
     open.abort?.abort();
     const abort = open.abort = new AbortController();
     const body = view.detail.querySelector('.activity-detail-body');
     body.setAttribute('aria-busy', 'true');
     try {
-      const res = await apiFetch(`/api/${view.kind}/${encodeURIComponent(open.id)}`, { signal: abort.signal });
+      const fetchDetail = (id) => apiFetch(`/api/${view.kind}/${encodeURIComponent(id)}`, { signal: abort.signal });
+      let res = await fetchDetail(open.id);
+      if (res.status === 404 && open.runId) {
+        // A run can move into its session's numbered turn when it finishes.
+        const request = await findRunRequest(open.runId, abort.signal);
+        if (request && request.id !== open.id) {
+          open.id = request.id;
+          res = await fetchDetail(open.id);
+        }
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       if (abort.signal.aborted) return;
       const session = view.kind === 'sessions';
+      const run = session ? data.turns.findLast(isActiveRun) || data : data;
+      open.active = isActiveRun(run);
+      if (!session && data.run_id) open.runId = data.run_id;
+      const rendered = JSON.stringify(data);
+      if (open.rendered === rendered && !body.querySelector('button:disabled')) return;
+      open.rendered = rendered;
       const head = node('header', 'activity-detail-head');
       const rawTitle = String(session ? data.title || '（无提示词）' : data.model || data.goal || '请求详情')
         .replace(/\s+/g, ' ')
@@ -1401,20 +1597,32 @@
       const titleNode = node('h2', '', rawTitle.length > 140 ? `${rawTitle.slice(0, 140)}…` : rawTitle);
       if (rawTitle.length > 140) titleNode.title = rawTitle;
       head.append(titleNode);
-      if (!session) head.append(statusBadge(data));
-      body.replaceChildren(head, ...(session ? renderSessionDetail(data) : [renderTurn(data)]));
+      if (runState(run)) head.append(statusBadge(run));
+      const focusedInterrupt = body.contains(document.activeElement)
+        && document.activeElement.dataset.runAction === 'interrupt';
+      const interrupt = run.run_id && ['running', 'waiting_gemini'].includes(runState(run))
+        ? interruptButton(run, '中止当前轮') : null;
+      if (interrupt) head.append(interrupt);
+      body.replaceChildren(head, ...renderRunProgress(run), ...(session ? renderSessionDetail(data) : [renderTurn(data)]));
+      if (focusedInterrupt) (interrupt || view.detail.querySelector('.activity-back')).focus({ preventScroll: true });
     } catch (err) {
-      if (abort.signal.aborted) return;
+      if (abort.signal.aborted || (refresh && open.rendered)) return;
+      open.rendered = null;
       const retry = button('重试');
       retry.onclick = () => loadActivityDetail(view);
       body.replaceChildren(node('p', 'activity-empty', `读取详情失败（${err.message}）`), retry);
     } finally {
-      if (!abort.signal.aborted) body.removeAttribute('aria-busy');
+      if (!abort.signal.aborted) {
+        open.abort = null;
+        body.removeAttribute('aria-busy');
+        syncLivePoll();
+      }
     }
   }
 
-  function openActivityDetail(view, id, row) {
-    view.open = { id, row, scroll: window.scrollY };
+  function openActivityDetail(view, id, { runId } = {}) {
+    view.open?.abort?.abort();
+    view.open = { id, runId, scroll: window.scrollY };
     const back = button(view.kind === 'requests' ? '‹ 请求' : '‹ 会话', 'activity-link activity-back');
     back.onclick = () => closeActivityDetail(view);
     const body = node('div', 'activity-detail-body');
@@ -1427,11 +1635,12 @@
     void loadActivityDetail(view);
   }
 
-  async function loadActivityList(view, offset = 0, append = false) {
+  async function loadActivityList(view, offset = 0, append = false, refresh = false) {
     view.listFetch?.abort();
     const abort = view.listFetch = new AbortController();
     const search = view.list.querySelector('.activity-search').value.trim();
-    const query = new URLSearchParams({ q: search, offset, limit: activityPageSize });
+    const limit = refresh && view.kind === 'sessions' ? Math.max(activityPageSize, view.items.length) : activityPageSize;
+    const query = new URLSearchParams({ q: search, offset, limit: Math.min(100, limit) });
     for (const select of view.list.querySelectorAll('[data-filter]')) {
       if (select.value) query.set(select.dataset.filter, select.value);
     }
@@ -1441,13 +1650,25 @@
     view.results.setAttribute('aria-busy', 'true');
     if (!view.loaded) view.results.replaceChildren(node('div', 'activity-empty', '正在读取记录…'));
     try {
-      const res = await apiFetch(`/api/${view.kind}?${query}`, { signal: abort.signal });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
+      const fetchPage = async () => {
+        const res = await apiFetch(`/api/${view.kind}?${query}`, { signal: abort.signal });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      };
+      const data = await fetchPage();
+      // Preserve the expanded session list when refreshing live rows.
+      while (data.items.length < Math.min(limit, data.total - offset) && !abort.signal.aborted) {
+        query.set('offset', offset + data.items.length);
+        query.set('limit', Math.min(100, limit - data.items.length));
+        const next = await fetchPage();
+        if (!next.items.length) break;
+        data.items.push(...next.items);
+      }
       if (abort.signal.aborted) return;
       if (offset > 0 && data.total <= offset && !append) {
-        return loadActivityList(view, Math.max(0, Math.ceil(data.total / activityPageSize) - 1) * activityPageSize);
+        return loadActivityList(view, Math.max(0, Math.ceil(data.total / activityPageSize) - 1) * activityPageSize, false, refresh);
       }
+      const focusedId = view.results.contains(document.activeElement) && document.activeElement.dataset.activityId;
       view.loaded = true;
       view.offset = data.offset;
       view.total = data.total;
@@ -1469,6 +1690,11 @@
           view.results.replaceChildren(...view.items.map((session) => sessionRow(view, session)));
         }
       }
+      if (focusedId) {
+        const row = [...view.results.querySelectorAll('[data-activity-id]')]
+          .find((row) => row.dataset.activityId === focusedId);
+        row?.focus({ preventScroll: true });
+      }
       setActivityFacets(view, data.facets);
       renderActivitySummary(view, data);
       const end = view.offset + data.items.length;
@@ -1485,6 +1711,11 @@
       }
     } catch (err) {
       if (abort.signal.aborted) return;
+      if (refresh && view.loaded) {
+        for (const control of pagers) control.disabled = control.dataset.page === 'newer' ? view.offset <= 0
+          : view.kind === 'requests' && view.offset + view.items.length >= view.total;
+        return;
+      }
       const retry = button('重试');
       // Rebuild the first page if a failed load replaced its rows.
       retry.onclick = () => loadActivityList(view);
@@ -1493,7 +1724,35 @@
       view.results.replaceChildren(error);
       view.loaded = false;
     } finally {
-      if (!abort.signal.aborted) view.results.removeAttribute('aria-busy');
+      if (!abort.signal.aborted) {
+        view.listFetch = null;
+        view.results.removeAttribute('aria-busy');
+        syncLivePoll();
+      }
+    }
+  }
+
+  function refreshActivityView(view) {
+    if (!view) return;
+    return view.open ? loadActivityDetail(view, true)
+      : loadActivityList(view, view.kind === 'requests' ? view.offset : 0, false, true);
+  }
+
+  function syncLivePoll() {
+    const view = activityViews[activeTab];
+    const active = view?.open ? view.open.active : view ? view.items.some(isActiveRun) : latestState?.active_runs?.length;
+    if (!active || document.visibilityState !== 'visible') {
+      clearTimeout(liveTimer);
+      liveTimer = null;
+    } else if (liveTimer === null) {
+      liveTimer = setTimeout(async () => {
+        liveTimer = null;
+        if (document.visibilityState !== 'visible') return;
+        const current = activityViews[activeTab];
+        if (!current) await refreshState({ live: true });
+        else if (!current.listFetch && !current.open?.abort) await refreshActivityView(current);
+        syncLivePoll();
+      }, LIVE_POLL_MS);
     }
   }
 
@@ -1509,7 +1768,9 @@
     }
     if (focus) $(`tab-${tab}`).focus();
     const view = activityViews[tab];
-    if (view && !view.open && !view.loaded) void loadActivityList(view);
+    if (view) void refreshActivityView(view);
+    else if (latestState) renderLiveOverview(latestState);
+    syncLivePoll();
   }
 
   function navigateActivityTab(tab, focus = false) {
@@ -1577,7 +1838,8 @@
       control.onclick = () => {
         clearTimeout(debounce);
         const page = control.dataset.page;
-        const offset = Math.max(0, view.offset + (page === 'newer' ? -1 : 1) * activityPageSize);
+        const offset = page === 'more' ? view.items.length
+          : Math.max(0, view.offset + (page === 'newer' ? -1 : 1) * activityPageSize);
         void loadActivityList(view, offset, page === 'more');
       };
     }
@@ -1621,9 +1883,7 @@
     if (!btn) return;
     if (btn.id === 'refresh-btn') {
       refreshState({ manual: true });
-      const view = activityViews[activeTab];
-      if (view?.open) void loadActivityDetail(view);
-      else if (view) void loadActivityList(view, view.kind === 'requests' ? view.offset : 0);
+      void refreshActivityView(activityViews[activeTab]);
       return;
     }
     if (btn.id === 'init-sub-btn') {
@@ -1655,7 +1915,11 @@
   });
 
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') refreshState();
+    if (document.visibilityState === 'visible') {
+      refreshState();
+      void refreshActivityView(activityViews[activeTab]);
+    }
+    syncLivePoll();
   });
 
   refreshState();

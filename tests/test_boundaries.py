@@ -119,3 +119,37 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(verification_result("python check.py", [wrapped])["status"], "failed")
         for code, expected in ((0, "passed"), (7, "failed")):
             self.assertEqual(verification_result("python check.py", [{"command":"python check.py","exit_code":code}])["status"], expected)
+
+    def test_run_controls_enforce_workspace_call_id_and_no_escalation(self):
+        from gempt.app_server_client import approval_reply
+        from gempt.runs import reply_tool_call
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_id = "a" * 32
+            run = root / "sessions" / "runs" / run_id
+            run.mkdir(parents=True)
+            (run / "state.json").write_text(json.dumps({
+                "run_id": run_id, "state": "waiting_gemini", "cwd": str(root / "other"),
+                "pending_tool_call": {"tool": "ask_gemini", "call_id": "call_valid"},
+            }), encoding="utf-8")
+            with patch.dict(os.environ, GEMPT_SESSIONS_DIR=str(root / "sessions"), GEMPT_WORKSPACE_ROOT=str(root / "workspace")):
+                for method, args in (
+                    ("gempt_status", {}), ("gempt_steer", {"message": "continue"}), ("gempt_interrupt", {}),
+                    ("gempt_reply_tool_call", {"call_id": "call_valid", "answer": "yes"}),
+                ):
+                    with self.assertRaisesRegex(ValueError, "outside host workspace"):
+                        _handle_tool_call(method, {"run_id": run_id, **args})
+                for call_id in ("../outside", "other-call"):
+                    with self.assertRaises(ValueError):
+                        reply_tool_call(run_id, call_id, "yes")
+                self.assertFalse((run / "tool_replies").exists())
+
+        self.assertEqual(approval_reply("item/commandExecution/requestApproval", {}, "workspace-write"),
+                         {"decision": "decline"})
+        self.assertEqual(approval_reply("item/commandExecution/requestApproval", {"kind": "writeStdin"}, "workspace-write"),
+                         {"decision": "accept"})
+        self.assertEqual(approval_reply("item/fileChange/requestApproval", {"grantRoot": "/other"}, "read-only"),
+                         {"decision": "decline"})
+        self.assertEqual(approval_reply("item/permissions/requestApproval", {"permissions": {"network": {"enabled": True}}}, "read-only"),
+                         {"permissions": {}, "scope": "turn"})
+        self.assertEqual(approval_reply("execCommandApproval", {}, "danger-full-access"), {"decision": "approved"})
