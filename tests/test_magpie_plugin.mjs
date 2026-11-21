@@ -10,7 +10,7 @@ import { homedir, tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
-import { buildMcpSnippet, findMagpieCli, normalizeTitle, readActiveRuns, readState, setDefaultSandbox, setDefaultTier } from '../magpie_plugin/lib/backend.mjs';
+import { buildMcpSnippet, findMagpieCli, listDispatchActivity, normalizeTitle, readActiveRuns, readState, setDefaultSandbox, setDefaultTier } from '../magpie_plugin/lib/backend.mjs';
 import { createAppServerManager } from '../magpie_plugin/lib/app-server-manager.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
 import { createGemptTools } from '../magpie_plugin/lib/tools.mjs';
@@ -1690,4 +1690,74 @@ test('shared app-server manager launches once, authenticates, restarts and serve
   await follower.stop();
   await svc.close();
   assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).status, 'stopped');
+});
+
+test('requests and sessions analytics return buckets, breakdowns, speed board, 53w heatmap, hour matrix, shapes and top tools', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-analytics-'));
+  try {
+    const sessDir = join(dir, 'sessions');
+    const magpieDir = join(dir, 'magpie');
+    mkdirSync(sessDir, { recursive: true });
+    mkdirSync(magpieDir, { recursive: true });
+    const now = new Date();
+    const todayIso = now.toISOString();
+    const yesterdayIso = new Date(now.getTime() - 26 * 3600 * 1000).toISOString();
+    const sessionFile = join(sessDir, 'exec-20261121-analytics1.json');
+    writeFileSync(sessionFile, JSON.stringify({
+      session_id: 'exec-20261121-analytics1',
+      mode: 'exec',
+      cwd: 'D:\\gempt',
+      model: 'codex/gpt-6.2-sol',
+      tier: 'sonnet',
+      created_at: yesterdayIso,
+      updated_at: todayIso,
+      turns: [{ role: 'user', content: 'Analyze repo' }, { role: 'assistant', content: 'Done' }],
+      turn_details: {
+        1: {
+          goal: 'Analyze repo',
+          timestamp: todayIso,
+          model: 'codex/gpt-6.2-sol',
+          provider: 'codex',
+          tier: 'sonnet',
+          status: 'succeeded',
+          elapsed_sec: 120,
+          ttft_ms: 4200,
+          tokens_per_sec: 64,
+          cost_usd: 0.42,
+          usage: { input_tokens: 10000, output_tokens: 800, cached_input_tokens: 8000, total_tokens: 10800 },
+          commands: [
+            '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command \'git status\'',
+            '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command \'$x=Get-Content a.txt\'',
+            '"C:\\Program Files\\Python312\\python.exe" -V',
+          ],
+        },
+      },
+    }), 'utf8');
+
+    const reqAll = await listDispatchActivity('requests', new URLSearchParams({ range: 'all' }), sessDir, magpieDir);
+    assert.equal(reqAll.total, 1);
+    assert.equal(reqAll.summary.avg_speed, 64);
+    assert.equal(reqAll.summary.avg_ttft_ms, 4200);
+    assert.equal(reqAll.analytics.breakdowns.model[0].name, 'codex/gpt-6.2-sol');
+    assert.equal(reqAll.analytics.speed_board.model[0].avg_speed, 64);
+    assert.ok(reqAll.analytics.heatmap_53w.days.length >= 365);
+    assert.ok(reqAll.facets.provider.some((f) => f.value === 'codex'));
+
+    const reqToday = await listDispatchActivity('requests', new URLSearchParams({ range: 'today' }), sessDir, magpieDir);
+    assert.equal(reqToday.analytics.bucket_kind, 'hour');
+    assert.equal(reqToday.analytics.buckets.length, 24);
+
+    const sess90 = await listDispatchActivity('sessions', new URLSearchParams({ range: '90d' }), sessDir, magpieDir);
+    assert.equal(sess90.total, 1);
+    assert.equal(sess90.summary.top_project, 'gempt');
+    assert.equal(sess90.analytics.projects[0].name, 'gempt');
+    assert.equal(sess90.analytics.models[0].name, 'codex/gpt-6.2-sol');
+    assert.equal(sess90.analytics.hour_matrix.matrix.length, 7);
+    assert.equal(sess90.analytics.top_sessions.by_cost[0].id, 'exec-20261121-analytics1');
+    assert.equal(sess90.analytics.shapes.total_sessions, 1);
+    const toolNames = sess90.analytics.top_tools.items.map((i) => i.name).sort();
+    assert.deepEqual(toolNames, ['get-content', 'git', 'python']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

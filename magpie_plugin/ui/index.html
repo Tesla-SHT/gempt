@@ -386,12 +386,24 @@
       <div id="requests-list">
         <div class="activity-period">
           <div class="activity-segment" data-range-controls role="group" aria-label="请求时段"></div>
-          <button type="button" class="activity-link" data-export-csv>导出 CSV</button>
+          <div class="activity-period-right">
+            <button type="button" class="icon-btn activity-refresh-btn" data-activity-refresh aria-label="刷新请求" title="刷新请求">
+              <svg class="icon-svg" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M13.5 8A5.5 5.5 0 1 1 11.9 4.1M13.5 2.5V5.2H10.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+            <select class="activity-pick activity-auto-refresh" data-auto-refresh aria-label="自动刷新间隔">
+              <option value="0">手动</option>
+              <option value="5000">5 秒</option>
+              <option value="15000">15 秒</option>
+            </select>
+            <div class="activity-head-cost" data-head-cost aria-live="polite"></div>
+          </div>
         </div>
         <div class="activity-tools">
-          <input class="activity-search" type="search" aria-label="搜索请求" placeholder="搜索模型、会话、提示词">
           <select class="activity-pick" data-filter="mode" aria-label="模式"><option value="">全部模式</option></select>
           <select class="activity-pick" data-filter="tier" aria-label="档位"><option value="">全部档位</option></select>
+          <select class="activity-pick" data-filter="provider" aria-label="供应商"><option value="">全部供应商</option></select>
           <select class="activity-pick" data-filter="model" aria-label="模型"><option value="">全部模型</option></select>
           <select class="activity-pick" data-filter="workspace" aria-label="文件夹"><option value="">全部文件夹</option></select>
           <div class="activity-segment" role="group" aria-label="状态">
@@ -400,9 +412,16 @@
             <button type="button" data-status="retried" aria-pressed="false">重试</button>
           </div>
           <select class="activity-pick status-other" data-filter="status" aria-label="按状态筛选"><option value="">全部状态</option></select>
+          <div class="activity-tools-right">
+            <input class="activity-search" type="search" aria-label="搜索请求" placeholder="搜索模型、供应商、会话">
+            <button type="button" class="activity-link" data-export-csv>导出 CSV</button>
+          </div>
         </div>
-        <div class="activity-summary-line" aria-live="polite"></div>
+        <p class="activity-scope-note">统计 GemPT 委派与关联的 Magpie 网关调用明细。</p>
         <div class="activity-stats ledger-stats"></div>
+        <section id="requests-chart-card" class="analytics-card" hidden></section>
+        <section id="requests-speed-card" class="analytics-card" hidden></section>
+        <section id="requests-heatmap-card" class="analytics-card" hidden></section>
         <div class="ledger-wrap activity-results" role="region" aria-label="请求记录" tabindex="0"></div>
         <div class="activity-pager" hidden>
           <button type="button" class="activity-link" data-page="newer">较新</button>
@@ -417,6 +436,19 @@
       <div id="sessions-list">
         <div class="activity-period">
           <div class="activity-segment" data-range-controls role="group" aria-label="会话时段"></div>
+          <div class="activity-period-right">
+            <button type="button" class="icon-btn activity-refresh-btn" data-activity-refresh aria-label="刷新会话" title="刷新会话">
+              <svg class="icon-svg" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M13.5 8A5.5 5.5 0 1 1 11.9 4.1M13.5 2.5V5.2H10.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+            <select class="activity-pick activity-auto-refresh" data-auto-refresh aria-label="自动刷新间隔">
+              <option value="0">手动</option>
+              <option value="5000">5 秒</option>
+              <option value="15000">15 秒</option>
+            </select>
+            <div class="activity-head-cost" data-head-cost aria-live="polite"></div>
+          </div>
         </div>
         <div class="activity-tools">
           <select class="activity-pick" data-filter="mode" aria-label="模式"><option value="">全部模式</option></select>
@@ -425,6 +457,8 @@
           <select class="activity-pick" data-filter="workspace" aria-label="文件夹"><option value="">全部文件夹</option></select>
         </div>
         <div class="activity-stats session-stats"></div>
+        <div id="sessions-grid" class="analytics-grid-2" hidden></div>
+        <div id="sessions-grid-bottom" class="analytics-grid-2" hidden></div>
         <div class="activity-list-head">
           <h2>最近的会话</h2>
           <span class="activity-summary-line" aria-live="polite"></span>

@@ -10,93 +10,59 @@
 </head>
 <body>
   <main class="shell">
-    <header class="top">
-      <div class="topline">
-        <h1>GemPT Live</h1>
-        <span id="badge" class="badge">连接中</span>
-        <button id="refresh" class="refresh" type="button" disabled>刷新</button>
+    <header class="topbar">
+      <span id="dot" class="status-dot" title="连接中" aria-hidden="true"></span>
+      <select id="runs" class="run-select" aria-label="选择任务" disabled><option>连接中…</option></select>
+      <div class="top-actions">
+        <button id="scope-toggle" class="chip-btn" type="button" title="切换当前会话 / 全部任务" disabled>本会话</button>
+        <button id="info-toggle" class="icon-btn" type="button" aria-expanded="false" aria-controls="meta-drawer" title="任务信息" disabled>i</button>
+        <button id="refresh" class="icon-btn" type="button" title="刷新" disabled>↻</button>
       </div>
-      <div class="scope-row">
-        <div class="scope" role="group" aria-label="任务范围">
-          <button id="scope-session" type="button" aria-pressed="true" disabled>当前会话</button>
-          <button id="scope-all" type="button" aria-pressed="false" disabled>全部</button>
-        </div>
-        <span id="bound-workspace" class="bound-workspace" hidden></span>
-      </div>
-      <label class="picker" for="runs">
-        <span>任务</span>
-        <select id="runs" disabled><option>正在连接…</option></select>
-      </label>
-      <dl id="metrics" class="metrics" hidden>
-        <div><dt>模型</dt><dd id="model"></dd></div>
-        <div><dt>耗时</dt><dd id="elapsed"></dd></div>
-        <div><dt>Token</dt><dd id="tokens"></dd></div>
-        <div><dt>缓存命中</dt><dd id="cache"></dd></div>
-      </dl>
     </header>
 
-    <p id="notice" class="notice" role="status" hidden></p>
-    <div id="empty" class="empty">
-      <p id="empty-message" role="status">正在连接 GemPT…</p>
-      <button id="empty-all" type="button" hidden>查看全部任务</button>
-    </div>
-
-    <section id="run" aria-label="任务详情" hidden>
-      <details id="goal-details" class="goal">
-        <summary>任务目标</summary>
-        <p id="goal" class="prose"></p>
-        <dl class="identifiers">
+    <section id="meta-drawer" class="meta-drawer" hidden>
+      <div class="meta-grid">
+        <span><em id="badge">连接中</em> · <span id="model">—</span> · <span id="elapsed">—</span></span>
+        <span>Token <strong id="tokens">—</strong> · 缓存 <strong id="cache">—</strong></span>
+      </div>
+      <details id="goal-details" class="meta-goal">
+        <summary>任务目标与标识</summary>
+        <p id="goal" class="goal-text"></p>
+        <dl class="id-list">
           <div><dt>工作区</dt><dd id="workspace" class="mono"></dd></div>
-          <div><dt>run_id</dt><dd><button class="id-copy mono" id="run-id" type="button" aria-label="复制 run_id"></button></dd></div>
-          <div><dt>session_id</dt><dd><button class="id-copy mono" id="session-id" type="button" aria-label="复制 session_id"></button></dd></div>
+          <div><dt>run</dt><dd><button id="run-id" class="id-copy mono" type="button"></button></dd></div>
+          <div><dt>session</dt><dd><button id="session-id" class="id-copy mono" type="button"></button></dd></div>
         </dl>
       </details>
+    </section>
 
-      <section id="ask" class="ask" aria-labelledby="ask-title" hidden>
-        <div class="ask-heading">
-          <h2 id="ask-title">正在等待 Gemini</h2>
+    <p id="notice" class="notice" role="status" hidden></p>
+
+    <div id="empty" class="empty">
+      <p id="empty-message" role="status">正在连接…</p>
+      <button id="empty-all" class="chip-btn" type="button" hidden>查看全部任务</button>
+    </div>
+
+    <section id="feed-wrap" class="feed-wrap" aria-label="GPT 执行流" hidden>
+      <ol id="stream" class="stream"></ol>
+      <section id="ask" class="ask-card" aria-labelledby="ask-title" hidden>
+        <div class="ask-head">
+          <strong id="ask-title">等待主 Gemini 回复</strong>
           <code id="ask-reason"></code>
         </div>
-        <p id="ask-question" class="prose"></p>
-        <div id="ask-context" class="prose"></div>
-        <ul id="ask-media" class="paths mono"></ul>
+        <p id="ask-question" class="ask-q"></p>
+        <p id="ask-context" class="ask-ctx" hidden></p>
+        <ul id="ask-media" class="file-chips" hidden></ul>
       </section>
-
-      <div class="activity">
-        <section class="panel output" aria-labelledby="output-title">
-          <header class="panel-heading">
-            <h2 id="output-title">GPT 输出</h2>
-            <button id="copy-output" type="button" disabled>复制全文</button>
-          </header>
-          <div id="output" class="prose transcript" tabindex="0"></div>
-        </section>
-        <section class="panel timeline" aria-labelledby="timeline-title">
-          <header class="panel-heading"><h2 id="timeline-title">实时时间线</h2></header>
-          <ol id="timeline" class="events"></ol>
-        </section>
-      </div>
-      <div class="evidence">
-        <details class="panel" open>
-          <summary>命令轨迹 <span id="command-count" class="count"></span></summary>
-          <ul id="commands" class="commands"></ul>
-        </details>
-        <details class="panel" open>
-          <summary>触及文件 <span id="file-count" class="count"></span></summary>
-          <ul id="files" class="paths mono"></ul>
-        </details>
-      </div>
     </section>
 
-    <section id="controls" class="controls" aria-label="控制当前回合" hidden>
-      <label for="steer">纠偏</label>
-      <textarea id="steer" rows="2" placeholder="给当前 GPT 回合补充指令"></textarea>
-      <div class="control-actions">
-        <span id="control-status" role="status"></span>
-        <button id="cancel-interrupt" type="button" hidden>取消</button>
-        <button id="interrupt" class="danger" type="button">中止</button>
-        <button id="send-steer" class="primary" type="button">发送纠偏</button>
-      </div>
-    </section>
+    <footer id="controls" class="composer" aria-label="控制当前回合" hidden>
+      <input id="steer" class="steer-input" type="text" placeholder="给 GPT 补充指令…" autocomplete="off">
+      <button id="send-steer" class="btn-primary" type="button">发送</button>
+      <button id="cancel-interrupt" class="btn-ghost" type="button" hidden>取消</button>
+      <button id="interrupt" class="btn-danger" type="button">中止</button>
+      <span id="control-status" class="ctrl-status" role="status" hidden></span>
+    </footer>
   </main>
   <script>/* SCRIPT */</script>
 </body>

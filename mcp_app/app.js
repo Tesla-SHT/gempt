@@ -18,25 +18,27 @@ const node = (tag, text, className) => {
   return element;
 };
 const put = (id, value) => {
-  if ($(id).textContent !== value) $(id).textContent = value;
+  const el = $(id);
+  if (el && el.textContent !== value) el.textContent = value;
 };
-const status = (run) => statuses[run?.state] || "未知状态";
+const statusLabel = (run) => statuses[run?.state] || "未知";
+const basename = (p) => String(p || "").split(/[\\/]/).filter(Boolean).pop() || String(p || "");
 
 let ready = false;
 let supportsTools = false;
 let runs = [];
-let scope = "session";
-let boundConversation = null;
-let boundWorkspace = "";
-let sessionCount = null;
-let listVersion = 0;
-let listLoaded = false;
 let selected = null;
 let selection = 0;
 let snapshot = null;
 let transcript = { text: "", complete: false };
 let fullGoal = null;
 let goalLoading = null;
+let scope = "session";
+let boundConversation = null;
+let boundWorkspace = null;
+let sessionCount = null;
+let listLoaded = false;
+let listVersion = 0;
 let listTimer, streamTimer;
 let readingList = false;
 let listWanted = false;
@@ -45,6 +47,7 @@ let streamWanted = false;
 let control = null;
 let confirming = false;
 const hostStyleKeys = new Set();
+const openSteps = new Set();
 
 function applyHost(context) {
   applyDocumentTheme(context?.theme ?? (systemTheme.matches ? "dark" : "light"));
@@ -75,17 +78,136 @@ const currentRun = () => snapshot?.run ?? runs.find((run) => run.run_id === sele
 const isActive = () => active.has(currentRun()?.state);
 const canFetch = () => ready && supportsTools && !document.hidden;
 
+/* Safe DOM-only Markdown renderer (zero innerHTML, 100% CSP-safe). */
+function appendInline(parent, text) {
+  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*)/g;
+  let last = 0;
+  for (const match of text.matchAll(pattern)) {
+    if (match.index > last) parent.append(document.createTextNode(text.slice(last, match.index)));
+    const token = match[0];
+    if (token.startsWith("`")) parent.append(node("code", token.slice(1, -1)));
+    else parent.append(node("strong", token.slice(2, -2)));
+    last = match.index + token.length;
+  }
+  if (last < text.length) parent.append(document.createTextNode(text.slice(last)));
+}
+
+function renderMarkdown(raw) {
+  const root = node("div", "", "md");
+  const lines = String(raw || "").replace(/\r\n/g, "\n").split("\n");
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) { i++; continue; }
+    if (line.trim().startsWith("```")) {
+      const codeLines = [];
+      i++;
+      while (i < lines.length && !lines[i].trim().startsWith("```")) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      if (i < lines.length) i++;
+      const pre = node("pre");
+      pre.append(node("code", codeLines.join("\n")));
+      root.append(pre);
+      continue;
+    }
+    const heading = /^(#{1,4})\s+(.+)$/.exec(line);
+    if (heading) {
+      const h = node("h" + Math.min(4, heading[1].length));
+      appendInline(h, heading[2]);
+      root.append(h);
+      i++;
+      continue;
+    }
+    if (/^\s*[-*]\s+/.test(line)) {
+      const ul = node("ul");
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+        const li = node("li");
+        appendInline(li, lines[i].replace(/^\s*[-*]\s+/, ""));
+        ul.append(li);
+        i++;
+      }
+      root.append(ul);
+      continue;
+    }
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const ol = node("ol");
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        const li = node("li");
+        appendInline(li, lines[i].replace(/^\s*\d+\.\s+/, ""));
+        ol.append(li);
+        i++;
+      }
+      root.append(ol);
+      continue;
+    }
+    if (line.startsWith(">")) {
+      const bq = node("blockquote");
+      const parts = [];
+      while (i < lines.length && lines[i].startsWith(">")) {
+        parts.push(lines[i].replace(/^>\s?/, ""));
+        i++;
+      }
+      appendInline(bq, parts.join("\n"));
+      root.append(bq);
+      continue;
+    }
+    const para = [];
+    while (
+      i < lines.length && lines[i].trim()
+      && !lines[i].trim().startsWith("```")
+      && !/^(#{1,4})\s+/.test(lines[i])
+      && !/^\s*[-*]\s+/.test(lines[i])
+      && !/^\s*\d+\.\s+/.test(lines[i])
+      && !lines[i].startsWith(">")
+    ) {
+      para.push(lines[i]);
+      i++;
+    }
+    const p = node("p");
+    appendInline(p, para.join("\n"));
+    root.append(p);
+  }
+  return root;
+}
+
+const fileResult = z.object({ isError: z.boolean().optional() }).passthrough();
+function makeFileChip(path, uri) {
+  const label = basename(path);
+  if (!uri) {
+    const span = node("span", label, "file-chip");
+    span.title = path;
+    return span;
+  }
+  const btn = node("button", label, "file-chip");
+  btn.type = "button";
+  btn.title = path;
+  btn.addEventListener("click", async () => {
+    try {
+      await app.request({
+        method: "com.google.antigravity/toggle-aux-pane",
+        params: { tabType: "fileView", uri },
+      }, fileResult, { timeout: 3000 });
+    } catch { /* Graceful fallback on hosts without fileView. */ }
+  });
+  return btn;
+}
+
 function renderRunPicker() {
   const displayed = currentRun();
   const options = displayed && !runs.some((run) => run.run_id === displayed.run_id) ? [displayed, ...runs] : runs;
-  const key = JSON.stringify(options.map((run) => [run.run_id, run.state, run.title]));
+  const key = JSON.stringify(options.map((run) => [run.run_id, run.state, run.title || run.goal]));
   const select = $("runs");
   if (select.dataset.list !== key) {
-    const placeholder = new Option(options.length ? "选择任务" : "暂无任务", "");
+    const emptyLabel = !ready ? "连接中…" : !listLoaded && supportsTools ? "读取中…"
+      : scope === "session" ? "当前会话暂无任务" : "暂无任务";
+    const placeholder = new Option(options.length ? "切换任务…" : emptyLabel, "");
     placeholder.disabled = true;
-    select.replaceChildren(placeholder, ...options.map((run) => new Option(
-      `${status(run)} · ${run.title || run.workspace_name || run.run_id.slice(0, 8)}`, run.run_id,
-    )));
+    select.replaceChildren(placeholder, ...options.map((run) => {
+      const label = (run.title || run.goal || run.run_id).replace(/\s+/g, " ").trim();
+      return new Option(`${statusLabel(run)} · ${label}`, run.run_id);
+    }));
     select.dataset.list = key;
   }
   select.disabled = !options.length;
@@ -99,90 +221,141 @@ function selectRun(id) {
   snapshot = null;
   transcript = { text: "", complete: false };
   fullGoal = null;
-  $("goal-details").open = false;
+  goalLoading = null;
   confirming = false;
+  openSteps.clear();
   $("steer").value = "";
-  $("output").scrollTop = 0;
+  $("control-status").hidden = true;
   put("control-status", "");
   notify();
   render();
 }
 
-function renderTranscript() {
-  const out = $("output");
-  const follow = out.scrollHeight > out.clientHeight && out.scrollHeight - out.scrollTop - out.clientHeight < 20;
-  put("output", transcript.text || (snapshot ? "等待 GPT 输出…" : "正在读取…"));
-  out.dataset.empty = String(!transcript.text);
-  $("copy-output").disabled = !transcript.complete || !transcript.text;
-  put("copy-output", transcript.text && !transcript.complete ? "正在补齐全文…" : "复制全文");
-  if (follow) out.scrollTop = out.scrollHeight;
-}
-
-function updateList(id, data, placeholder, item) {
-  const list = $(id);
-  const value = JSON.stringify(data);
-  if (list.dataset.value === value) return;
-  const opened = new Set([...list.querySelectorAll("details[open]")].map((detail) => detail.dataset.id));
-  list.replaceChildren(...(data.length ? data.map((entry) => item(entry, opened)) : [node("li", placeholder, "placeholder")]));
-  list.dataset.value = value;
-}
-
-function exitLabel(code) {
-  const label = node("span", code == null ? "执行中" : `退出码 ${code}`, "exit");
-  label.dataset.failed = String(code != null && code !== 0);
-  return label;
-}
-
-function eventItem(event) {
-  const li = node("li");
-  const labels = { reasoning: "思考摘要", agent_message: "GPT 消息", command: "命令", files: "文件变更", ask_gemini: "请求 Gemini" };
-  const title = node("span", labels[event.type], "event-label");
-  let detail = event.text;
-  if (event.type === "command") {
-    title.append(exitLabel(event.exit_code));
-    detail = [event.command, event.output].filter(Boolean).join("\n");
-  } else if (event.type === "files") {
-    detail = event.paths?.join("\n") || `${event.count} 个文件`;
-  } else if (event.type === "ask_gemini") {
-    detail = event.arguments?.question;
-  }
-  li.append(title, node("div", detail, "event-text"));
-  return li;
-}
-
-function commandItem(command, opened) {
-  const li = node("li");
-  const detail = node("details", "", "command");
-  detail.dataset.id = command.id;
-  detail.open = opened.has(command.id);
-  const summary = node("summary");
-  summary.append(node("code", command.command || "命令执行"), exitLabel(command.exit_code));
-  detail.append(summary, node("pre", command.output || "暂无命令输出"));
-  li.append(detail);
-  return li;
-}
-
-const fileResult = z.object({ isError: z.boolean().optional() }).passthrough();
-function fileItem([path, uri]) {
-  const li = node("li");
-  if (!uri) {
-    li.textContent = path;
-    return li;
-  }
-  const button = node("button", path, "file-link");
-  button.type = "button";
-  button.addEventListener("click", async () => {
-    try {
-      await app.request({
-        method: "com.google.antigravity/toggle-aux-pane",
-        params: { tabType: "fileView", uri },
-      }, fileResult, { timeout: 3000 });
-    } catch {
-      // Hosts without the file pane still show the path.
-    }
+function buildStepDetails(key, iconChar, tone, titleText, metaText, bodyText, { muted = false, prose = false, failed = false } = {}) {
+  const det = node("details", "", "step-row");
+  det.dataset.stepKey = key;
+  if (openSteps.has(key)) det.open = true;
+  det.addEventListener("toggle", () => {
+    if (det.open) openSteps.add(key);
+    else openSteps.delete(key);
   });
-  li.append(button);
-  return li;
+  const sum = node("summary");
+  const ic = node("span", iconChar, "step-icon");
+  if (tone) ic.dataset.tone = tone;
+  const title = node("span", titleText, muted ? "step-title is-muted" : "step-title");
+  sum.append(ic, title);
+  if (metaText) {
+    const meta = node("span", metaText, "step-meta");
+    if (failed) meta.dataset.failed = "true";
+    sum.append(meta);
+  }
+  det.append(sum);
+  if (bodyText) {
+    det.append(node("pre", bodyText, prose ? "step-body is-prose" : "step-body"));
+  }
+  return det;
+}
+
+function renderStream() {
+  const wrap = $("feed-wrap");
+  const list = $("stream");
+  const run = currentRun();
+  const follow = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 48;
+  const events = snapshot?.timeline || [];
+  const fileUris = snapshot?.file_uris || {};
+  const hasAgentMsg = events.some((e) => e.type === "agent_message" && e.text);
+  const fullText = transcript.text || "";
+
+  const renderKey = JSON.stringify([
+    selected, run?.state, events.length,
+    events.map((e) => [e.type, e.id, e.exit_code, e.text?.length || 0, e.output?.length || 0, e.paths?.length || 0]),
+    hasAgentMsg ? "" : fullText.length, transcript.complete,
+  ]);
+  if (list.dataset.key === renderKey) return;
+  list.dataset.key = renderKey;
+
+  const nodes = [];
+  let lastMsgIdx = -1;
+  events.forEach((ev, idx) => {
+    if (ev.type === "agent_message" && ev.text) lastMsgIdx = idx;
+  });
+
+  const pendingAsk = run?.state === "waiting_gemini" ? run.pending_tool_call : null;
+  events.forEach((ev, idx) => {
+    const li = node("li");
+    const stepKey = ev.id || `${ev.type}-${idx}`;
+    if (ev.type === "reasoning") {
+      const preview = String(ev.text || "").replace(/\s+/g, " ").trim().slice(0, 72) || "思考中…";
+      li.append(buildStepDetails(stepKey, "·", "", `思考：${preview}`, "", ev.text || "", { muted: true, prose: true }));
+    } else if (ev.type === "command") {
+      const running = ev.exit_code == null;
+      const ok = ev.exit_code === 0;
+      const icon = running ? "◌" : ok ? "✓" : "✗";
+      const tone = running ? "run" : ok ? "ok" : "err";
+      const meta = running ? "运行中" : `exit ${ev.exit_code}`;
+      const body = [ev.command, ev.output].filter(Boolean).join("\n\n");
+      li.append(buildStepDetails(stepKey, icon, tone, ev.command || "执行命令", meta, body, { failed: !running && !ok }));
+    } else if (ev.type === "files") {
+      const paths = ev.paths || [];
+      const row = node("div", "", "step-row step-files");
+      row.append(node("span", "✎", "step-icon"), node("span", `变更 ${paths.length || ev.count || 0} 个文件`, "step-title is-muted"));
+      for (const p of paths) row.append(makeFileChip(p, fileUris[p]));
+      li.append(row);
+    } else if (ev.type === "ask_gemini") {
+      const isPendingDup = pendingAsk && (
+        (pendingAsk.call_id && ev.id === pendingAsk.call_id)
+        || (pendingAsk.arguments?.question && ev.arguments?.question === pendingAsk.arguments.question)
+      );
+      if (isPendingDup) return;
+      const q = ev.arguments?.question || "等待主 Gemini 回复";
+      li.append(buildStepDetails(stepKey, "?", "run", `请求 Gemini：${q}`, ev.arguments?.reason || "", ev.arguments?.context || "", { prose: true }));
+    } else if (ev.type === "agent_message" && ev.text) {
+      const box = node("div", "", "msg-block");
+      if (idx === lastMsgIdx) {
+        const head = node("div", "", "msg-head");
+        head.append(node("span", "GPT", "msg-role"));
+        const copyBtn = node("button", transcript.complete ? "复制" : "补齐中…", "copy-btn");
+        copyBtn.type = "button";
+        copyBtn.disabled = !transcript.complete;
+        copyBtn.addEventListener("click", () => copy(fullText || ev.text));
+        head.append(copyBtn);
+        box.append(head);
+      }
+      box.append(renderMarkdown(idx === lastMsgIdx && fullText.length > ev.text.length ? fullText : ev.text));
+      li.append(box);
+    } else {
+      return;
+    }
+    nodes.push(li);
+  });
+
+  if (!hasAgentMsg && fullText) {
+    const li = node("li");
+    const box = node("div", "", "msg-block");
+    const head = node("div", "", "msg-head");
+    head.append(node("span", "GPT", "msg-role"));
+    const copyBtn = node("button", transcript.complete ? "复制" : "补齐中…", "copy-btn");
+    copyBtn.type = "button";
+    copyBtn.disabled = !transcript.complete;
+    copyBtn.addEventListener("click", () => copy(fullText));
+    head.append(copyBtn);
+    box.append(head, renderMarkdown(fullText));
+    li.append(box);
+    nodes.push(li);
+  }
+
+  if (isActive() && !pendingAsk) {
+    const li = node("li");
+    li.append(node("div", "GPT 执行中…", "streaming-indicator"));
+    nodes.push(li);
+  } else if (!nodes.length && !pendingAsk) {
+    const li = node("li");
+    li.append(node("div", snapshot ? "暂无输出内容" : "正在加载执行流…", "streaming-indicator"));
+    nodes.push(li);
+  }
+
+  list.replaceChildren(...nodes);
+  if (follow) wrap.scrollTop = wrap.scrollHeight;
 }
 
 function renderControls(run = currentRun()) {
@@ -198,28 +371,30 @@ function renderControls(run = currentRun()) {
 function formatElapsed(seconds) {
   if (seconds == null) return "—";
   const elapsed = Math.max(0, Math.floor(seconds));
-  return elapsed < 60 ? `${elapsed} 秒` : `${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒`;
+  return elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`;
 }
 
 function render() {
   const run = currentRun();
   renderRunPicker();
-  for (const mode of ["session", "all"]) {
-    const button = $("scope-" + mode);
-    button.setAttribute("aria-pressed", String(scope === mode));
-    button.disabled = !supportsTools || (mode === "session" && listLoaded && !boundConversation);
+  const scopeBtn = $("scope-toggle");
+  scopeBtn.disabled = !supportsTools || (scope === "all" && listLoaded && !boundConversation);
+  scopeBtn.dataset.active = String(scope === "session");
+  put("scope-toggle", scope === "session"
+    ? (sessionCount == null ? "本会话" : `本会话 ${number.format(sessionCount)}`)
+    : "全部");
+  scopeBtn.title = boundWorkspace ? `当前绑定：${boundWorkspace}（点击切换范围）` : "切换当前会话 / 全部任务";
+  $("info-toggle").disabled = !run;
+  if (!run) {
+    $("meta-drawer").hidden = true;
+    $("info-toggle").setAttribute("aria-expanded", "false");
   }
-  put("scope-session", sessionCount == null ? "当前会话" : `当前会话 ${number.format(sessionCount)}`);
-  $("bound-workspace").hidden = !listLoaded;
-  $("bound-workspace").title = boundConversation || "";
-  put("bound-workspace", boundWorkspace || boundConversation?.slice(0, 8) || "未绑定会话");
   $("refresh").disabled = !supportsTools;
-  $("run").hidden = !run;
+  $("dot").dataset.state = run?.state ?? "";
+  $("dot").title = run ? statusLabel(run) : (ready ? "无任务" : "连接中");
+  $("feed-wrap").hidden = !run;
   $("empty").hidden = !!run;
-  $("metrics").hidden = !run;
-  $("badge").dataset.state = run?.state ?? "";
-  put("badge", run ? status(run) : ready ? "无任务" : "连接中");
-  put("empty-message", !ready ? "正在连接 GemPT…" : !listLoaded && supportsTools ? "正在读取 GPT 任务…"
+  put("empty-message", !ready ? "正在连接 GemPT…" : !listLoaded && supportsTools ? "正在读取…"
     : scope === "session" ? "当前会话暂无 GPT 任务" : "暂无 GPT 任务");
   $("empty-all").hidden = scope !== "session" || !listLoaded || !supportsTools;
   renderControls(run);
@@ -229,6 +404,7 @@ function render() {
   const tokens = usage.total_tokens ?? (usage.input_tokens != null ? usage.input_tokens + (usage.output_tokens ?? 0) : null);
   const rate = snapshot?.cache_hit_rate ?? (usage.input_tokens && usage.cached_input_tokens != null
     ? Math.min(1, usage.cached_input_tokens / usage.input_tokens) : null);
+  put("badge", statusLabel(run));
   put("model", run.model || "—");
   put("elapsed", formatElapsed(run.elapsed_sec));
   put("tokens", tokens == null ? "—" : number.format(tokens));
@@ -245,18 +421,17 @@ function render() {
   if (ask) {
     put("ask-reason", ask.reason || "ask_gemini");
     put("ask-question", ask.question || "正在等待回应");
+    $("ask-context").hidden = !ask.context;
     put("ask-context", ask.context || "");
-    updateList("ask-media", ask.media_paths || [], "", (path) => node("li", path));
-    $("ask-media").hidden = !ask.media_paths?.length;
+    const media = ask.media_paths || [];
+    $("ask-media").hidden = !media.length;
+    $("ask-media").replaceChildren(...media.map((p) => {
+      const li = node("li");
+      li.append(makeFileChip(p, snapshot?.file_uris?.[p]));
+      return li;
+    }));
   }
-  renderTranscript();
-  const commands = snapshot?.commands || [];
-  const files = snapshot?.touched_files || [];
-  put("command-count", number.format(commands.length));
-  put("file-count", number.format(files.length));
-  updateList("timeline", snapshot?.timeline || [], "暂无进度事件", eventItem);
-  updateList("commands", commands, "暂无命令", commandItem);
-  updateList("files", files.map((path) => [path, snapshot?.file_uris?.[path]]), "暂无文件变更", fileItem);
+  renderStream();
 }
 
 function acceptSnapshot(data) {
@@ -305,7 +480,7 @@ async function loadTranscript(data, generation, runId) {
   }
   if (generation === selection && offset == null) {
     transcript = { text, complete: true };
-    renderTranscript();
+    renderStream();
   }
 }
 
@@ -380,10 +555,14 @@ async function driveStream() {
         await call(action.name, action.args);
         if (action.generation === selection) {
           if (action.args.message) $("steer").value = "";
+          $("control-status").hidden = false;
           put("control-status", action.args.message ? "已发送纠偏" : "已请求中止");
         }
       } catch (error) {
-        if (action.generation === selection) put("control-status", error.message);
+        if (action.generation === selection) {
+          $("control-status").hidden = false;
+          put("control-status", error.message);
+        }
       } finally {
         control = null;
       }
@@ -419,11 +598,8 @@ async function copy(value) {
       await navigator.clipboard.writeText(value);
       notify("已复制");
       return;
-    } catch {
-      // Fall back when clipboard access is denied.
-    }
+    } catch { /* fallback */ }
   }
-
   const focused = document.activeElement;
   const input = node("textarea", "", "clipboard");
   input.value = value;
@@ -431,11 +607,7 @@ async function copy(value) {
   document.body.append(input);
   input.select();
   let copied = false;
-  try {
-    copied = document.execCommand("copy");
-  } catch {
-    // Opaque iframes may also restrict the legacy copy path.
-  } finally {
+  try { copied = document.execCommand("copy"); } catch { /* restricted */ } finally {
     input.remove();
     focused?.focus();
   }
@@ -446,15 +618,20 @@ function queueControl(name, args) {
   if (!currentRun()?.can_control || !canFetch() || control) return;
   confirming = false;
   control = { name, args: { ...args, run_id: selected }, generation: selection };
+  $("control-status").hidden = false;
   put("control-status", "正在发送…");
   renderControls();
   void driveStream();
 }
 
 $("refresh").addEventListener("click", () => { refreshRuns(); refreshStream(); });
-$("scope-session").addEventListener("click", () => selectScope("session"));
-$("scope-all").addEventListener("click", () => selectScope("all"));
+$("scope-toggle").addEventListener("click", () => selectScope(scope === "session" ? "all" : "session"));
 $("empty-all").addEventListener("click", () => selectScope("all"));
+$("info-toggle").addEventListener("click", () => {
+  const next = $("meta-drawer").hidden;
+  $("meta-drawer").hidden = !next;
+  $("info-toggle").setAttribute("aria-expanded", String(next));
+});
 $("goal-details").addEventListener("toggle", () => { if ($("goal-details").open) void loadGoal(); });
 $("runs").addEventListener("change", (event) => {
   selectRun(event.target.value);
@@ -463,8 +640,13 @@ $("runs").addEventListener("change", (event) => {
 });
 $("run-id").addEventListener("click", () => copy(currentRun()?.run_id));
 $("session-id").addEventListener("click", () => copy(currentRun()?.session_id));
-$("copy-output").addEventListener("click", () => copy(transcript.text));
 $("steer").addEventListener("input", () => renderControls());
+$("steer").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.isComposing) {
+    const message = $("steer").value.trim();
+    if (message) queueControl("gempt_app_steer", { message });
+  }
+});
 $("send-steer").addEventListener("click", () => {
   const message = $("steer").value.trim();
   if (message) queueControl("gempt_app_steer", { message });

@@ -1158,11 +1158,64 @@
     return value == null ? '—' : (compact ? compactNumber : exactNumber).format(value);
   }
 
+  const compactDollar = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const microDollar = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 4, maximumFractionDigits: 4 });
+  const percent2 = new Intl.NumberFormat('zh-CN', { style: 'percent', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const CHART_PALETTE = ['#a5b4fc', '#67e8f9', '#6ee7b7', '#fde047', '#f9a8d4', '#c4b5fd', '#fdba74', '#5eead4'];
+  const WEEKDAYS_ZH = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+  const reqUi = { metric: 'tokens', chartType: 'bar', dim: 'model', speedDim: 'model', heatmapMetric: 'tokens' };
+  const sessUi = { topMetric: 'tokens', shapeMetric: 'turns' };
+  let activityRefreshMs = 0;
+  let activityRefreshTimer = null;
+
+  const shortCost = (value, plus = false) => {
+    if (value == null) return '—';
+    const text = Math.abs(value) >= 0.01 || value === 0 ? compactDollar.format(value) : microDollar.format(value);
+    return plus ? `${text}+` : text;
+  };
   const costText = (value) => value == null ? '—' : dollar.format(value);
   const cacheRateText = (value) => value == null ? '—' : percent.format(value);
-  const speedText = (value) => value == null ? '—' : `${number(value)} tok/s`;
+  const speedText = (value) => value == null ? '—' : `${number(Math.round(value))} tok/s`;
   const msText = (value) => value == null ? '—' : duration(value / 1000);
   const providerText = (row) => row.provider_accounts || [row.provider, row.account].filter(Boolean).join(' · ');
+
+  function svgEl(tag, attrs = {}) {
+    const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
+    return el;
+  }
+
+  function relativeTime(value) {
+    const ms = Date.parse(value || '');
+    if (!Number.isFinite(ms)) return '';
+    const diff = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+    if (diff < 60) return '刚刚';
+    if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+    return `${Math.floor(diff / 86400)} 天前`;
+  }
+
+  function level4(value, max) {
+    if (!value || value <= 0 || !max || max <= 0) return 0;
+    const ratio = value / max;
+    if (ratio >= 0.72) return 4;
+    if (ratio >= 0.44) return 3;
+    if (ratio >= 0.18) return 2;
+    return 1;
+  }
+
+  function makeSegGroup(options, activeVal, onPick, label) {
+    const seg = node('div', 'activity-segment');
+    seg.setAttribute('role', 'group');
+    if (label) seg.setAttribute('aria-label', label);
+    for (const [val, text] of options) {
+      const btn = button(text, '');
+      btn.setAttribute('aria-pressed', String(val === activeVal));
+      btn.onclick = () => onPick(val);
+      seg.append(btn);
+    }
+    return seg;
+  }
 
   function duration(sec) {
     if (sec == null) return '—';
@@ -1207,35 +1260,592 @@
     }
   }
 
-  function activityTile(label, value, exact = '') {
+  function renderHeadCost(view, costUsd, unpricedText) {
+    const host = view.list.querySelector('[data-head-cost]');
+    if (!host) return;
+    host.replaceChildren();
+    if (costUsd != null) {
+      host.append(node('b', '', shortCost(costUsd, Boolean(unpricedText))));
+    }
+    if (unpricedText) {
+      host.append(node('span', '', unpricedText));
+    }
+  }
+
+  function makeRichKpi({ label, value, unit = '', sub = null, valueClass = '', topFirst = false, title = '', barRatio = null }) {
     const tile = node('div', 'activity-kpi');
-    const figure = node('b', '', value);
-    figure.title = exact || value;
-    tile.append(figure, node('span', '', label));
+    const lbl = node('span', 'kpi-label', label);
+    const val = node('div', valueClass ? `kpi-val ${valueClass}` : 'kpi-val');
+    val.title = title || value;
+    val.append(node('span', '', value));
+    if (unit) val.append(node('span', 'kpi-unit', unit));
+    if (topFirst) tile.append(val, lbl);
+    else tile.append(lbl, val);
+    if (barRatio != null) {
+      const track = node('div', 'kpi-bar-track');
+      const fill = node('div', 'kpi-bar-fill');
+      fill.style.width = `${Math.max(0, Math.min(100, Math.round(barRatio * 100)))}%`;
+      track.append(fill);
+      tile.append(track);
+    }
+    if (sub) {
+      if (sub instanceof Node) tile.append(sub);
+      else tile.append(node('div', 'kpi-sub', sub));
+    }
     return tile;
   }
 
-  function renderActivitySummary(view, data) {
-    const s = data.summary;
-    const tile = (label, value) => activityTile(label, number(value, true), number(value));
-    const cost = activityTile('总费用', costText(s.cost_usd));
-    const cache = activityTile('缓存命中率', cacheRateText(s.cache_hit_rate));
-    if (view.kind === 'requests') {
-      const labels = [
-        `${number(data.total)} 个请求`, `输入 ${number(s.input_tokens, true)}`, `输出 ${number(s.output_tokens, true)}`,
-        `缓存写入 ${number(s.cache_write_tokens, true)}`, `缓存读取 ${number(s.cache_read_tokens, true)}`,
-      ];
-      if (s.failed) labels.push(`失败 ${number(s.failed)}`);
-      if (s.retried) labels.push(`重试 ${number(s.retried)}`);
-      view.summary.textContent = labels.join(' · ');
-      view.stats.replaceChildren(tile('请求', data.total), tile('Token', s.total_tokens),
-        tile('缓存读取', s.cache_read_tokens), activityTile('耗时', duration(s.elapsed_sec)),
-        tile('失败', s.failed), cost, cache);
+  function renderRequestAnalytics(data) {
+    const analytics = data.analytics;
+    const chartCard = $('requests-chart-card');
+    const speedCard = $('requests-speed-card');
+    const heatCard = $('requests-heatmap-card');
+    if (!analytics) {
+      chartCard.hidden = speedCard.hidden = heatCard.hidden = true;
+      return;
+    }
+
+    // 1. Trend Chart + Right Breakdown Panel
+    const buckets = analytics.buckets || [];
+    const dimItemsRaw = analytics.breakdowns?.[reqUi.dim] || [];
+    const metricVal = (item) => {
+      if (reqUi.metric === 'cost') return item.cost_usd || 0;
+      if (reqUi.metric === 'requests') return item.requests || 0;
+      if (reqUi.metric === 'speed') return item.avg_speed || 0;
+      return item.total_tokens ?? item.tokens ?? 0;
+    };
+    const formatMetric = (v) => {
+      if (reqUi.metric === 'cost') return shortCost(v);
+      if (reqUi.metric === 'requests') return `${number(Math.round(v))}`;
+      if (reqUi.metric === 'speed') return `${number(Math.round(v))} tok/s`;
+      return number(v, true);
+    };
+    const dimItems = [...dimItemsRaw].sort((a, b) => metricVal(b) - metricVal(a) || b.requests - a.requests);
+    const colorOf = new Map(dimItems.map((item, idx) => [item.name, CHART_PALETTE[idx % CHART_PALETTE.length]]));
+
+    chartCard.hidden = false;
+    chartCard.replaceChildren();
+    const chartHead = node('div', 'analytics-head');
+    const headLeft = node('div', 'analytics-head-left');
+    headLeft.append(
+      makeSegGroup([['tokens', 'Token'], ['cost', '费用'], ['requests', '请求'], ['speed', '速度']], reqUi.metric, (v) => {
+        reqUi.metric = v;
+        renderRequestAnalytics(data);
+      }, '指标'),
+      makeSegGroup([['bar', '柱状'], ['line', '折线']], reqUi.chartType, (v) => {
+        reqUi.chartType = v;
+        renderRequestAnalytics(data);
+      }, '图表类型'),
+    );
+    const headRight = node('div', 'analytics-head-right');
+    headRight.append(
+      node('span', 'analytics-sub', '拆分维度'),
+      makeSegGroup([['model', '模型'], ['model_provider', '模型 · 供应商'], ['provider', '供应商'], ['tier', '档位']], reqUi.dim, (v) => {
+        reqUi.dim = v;
+        renderRequestAnalytics(data);
+      }, '拆分维度'),
+    );
+    chartHead.append(headLeft, headRight);
+    chartCard.append(chartHead);
+
+    const split = node('div', 'trend-split');
+    const chartWrap = node('div', 'trend-chart-wrap');
+    const bucketTotal = (b) => {
+      if (reqUi.metric === 'cost') return b.cost_usd || 0;
+      if (reqUi.metric === 'requests') return b.requests || 0;
+      if (reqUi.metric === 'speed') return b.avg_speed || 0;
+      return b.tokens || 0;
+    };
+    const maxY = Math.max(0, ...buckets.map(bucketTotal));
+    if (!buckets.length || maxY <= 0) {
+      chartWrap.append(node('div', 'trend-empty', '当前时段暂无趋势数据'));
     } else {
-      view.summary.textContent = view.items.length < data.total
-        ? `显示 ${number(data.total)} 个中的 ${number(view.items.length)} 个` : `${number(data.total)} 个会话`;
-      view.stats.replaceChildren(tile('会话', data.total), tile('Token', s.total_tokens), tile('轮次', s.requests),
-        tile('缓存读取', s.cache_read_tokens), activityTile('耗时', duration(s.elapsed_sec)), tile('项目', s.workspaces), cost, cache);
+      const W = 680;
+      const H = 220;
+      const padL = 54;
+      const padR = 12;
+      const padT = 14;
+      const padB = 26;
+      const plotW = W - padL - padR;
+      const plotH = H - padT - padB;
+      const svg = svgEl('svg', { class: 'trend-svg', viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'xMidYMid meet' });
+      const niceMax = maxY * 1.12;
+      for (let i = 0; i <= 4; i += 1) {
+        const y = padT + (plotH * i) / 4;
+        const val = niceMax * (1 - i / 4);
+        svg.append(svgEl('line', { class: 'trend-grid-line', x1: padL, x2: W - padR, y1: y, y2: y }));
+        const txt = svgEl('text', { class: 'trend-axis-text', x: padL - 6, y: y + 3, 'text-anchor': 'end' });
+        txt.textContent = formatMetric(val);
+        svg.append(txt);
+      }
+
+      const n = buckets.length;
+      const stepX = plotW / Math.max(1, n);
+      const barW = Math.max(4, Math.min(28, stepX * 0.62));
+      const labelEvery = Math.max(1, Math.ceil(n / 10));
+
+      if (reqUi.chartType === 'line' || reqUi.metric === 'speed') {
+        const pts = [];
+        buckets.forEach((b, idx) => {
+          const v = bucketTotal(b);
+          const x = padL + stepX * idx + stepX / 2;
+          const y = padT + plotH - (v / niceMax) * plotH;
+          if (v > 0 || reqUi.metric !== 'speed') pts.push([x, y, b, v]);
+        });
+        if (pts.length) {
+          const d = pts.map(([x, y], idx) => `${idx === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
+          svg.append(svgEl('path', { d, fill: 'none', stroke: '#818cf8', 'stroke-width': 2.2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+          for (const [x, y, b, v] of pts) {
+            const c = svgEl('circle', { cx: x.toFixed(1), cy: y.toFixed(1), r: 3.5, fill: '#a5b4fc', class: 'trend-bar-seg' });
+            const title = svgEl('title');
+            title.textContent = `${b.label} · ${formatMetric(v)}`;
+            c.append(title);
+            svg.append(c);
+          }
+        }
+      } else {
+        const orderedNames = dimItems.map((d) => d.name);
+        buckets.forEach((b, idx) => {
+          const dimMap = b.by_dim?.[reqUi.dim] || {};
+          const x = padL + stepX * idx + (stepX - barW) / 2;
+          let accY = 0;
+          for (const name of orderedNames) {
+            const entry = dimMap[name];
+            if (!entry) continue;
+            const v = reqUi.metric === 'cost' ? entry.cost_usd : reqUi.metric === 'requests' ? entry.requests : entry.tokens;
+            if (!v || v <= 0) continue;
+            const h = (v / niceMax) * plotH;
+            const y = padT + plotH - accY - h;
+            accY += h;
+            const rect = svgEl('rect', {
+              class: 'trend-bar-seg',
+              x: x.toFixed(1),
+              y: y.toFixed(1),
+              width: barW.toFixed(1),
+              height: Math.max(1.5, h).toFixed(1),
+              rx: 2,
+              fill: colorOf.get(name) || CHART_PALETTE[0],
+            });
+            const tip = svgEl('title');
+            tip.textContent = `${b.label} · ${name} · ${formatMetric(v)}`;
+            rect.append(tip);
+            svg.append(rect);
+          }
+        });
+      }
+
+      buckets.forEach((b, idx) => {
+        if (idx % labelEvery !== 0 && idx !== n - 1) return;
+        const x = padL + stepX * idx + stepX / 2;
+        const txt = svgEl('text', { class: 'trend-axis-text', x: x.toFixed(1), y: H - 6, 'text-anchor': 'middle' });
+        txt.textContent = b.label;
+        svg.append(txt);
+      });
+      chartWrap.append(svg);
+    }
+
+    const legend = node('div', 'trend-legend');
+    const totalMetricSum = dimItems.reduce((acc, item) => acc + metricVal(item), 0);
+    const maxLegendVal = Math.max(0, ...dimItems.map(metricVal));
+    if (!dimItems.length) {
+      legend.append(node('div', 'analytics-sub', '暂无拆分维度数据'));
+    } else {
+      for (const item of dimItems) {
+        const val = metricVal(item);
+        const color = colorOf.get(item.name) || CHART_PALETTE[0];
+        const share = totalMetricSum > 0 && reqUi.metric !== 'speed' ? val / totalMetricSum : null;
+        const row = node('div', 'legend-item');
+        const top = node('div', 'legend-top');
+        const nameWrap = node('div', 'legend-name-wrap');
+        const dot = node('span', 'legend-dot');
+        dot.style.background = color;
+        const nameEl = node('span', 'legend-name', item.name);
+        nameEl.title = item.name;
+        nameWrap.append(dot, nameEl);
+        top.append(nameWrap, node('span', 'legend-val', formatMetric(val)));
+
+        const barTrack = node('div', 'legend-bar-track');
+        const barFill = node('div', 'legend-bar-fill');
+        barFill.style.background = color;
+        barFill.style.width = `${maxLegendVal > 0 ? Math.max(2, Math.round((val / maxLegendVal) * 100)) : 0}%`;
+        barTrack.append(barFill);
+
+        const meta = node('div', 'legend-meta');
+        const parts = [`${number(item.requests)} 个请求`, `${number(item.total_tokens, true)} token`];
+        if (item.avg_speed != null) parts.push(`${number(Math.round(item.avg_speed))} token/秒 · ${number(item.timed_speed_count)} 次计时`);
+        if (item.avg_ttft_ms != null) parts.push(`首字 ${msText(item.avg_ttft_ms)}`);
+        if (item.cache_hit_rate != null) parts.push(`命中率 ${percent2.format(item.cache_hit_rate)}`);
+        if (share != null) parts.push(`${Math.round(share * 100)}%`);
+        meta.textContent = parts.join(' · ');
+        if (item.failed > 0) {
+          meta.append(' · ', node('span', 'is-err', `${number(item.failed)} 次失败`));
+        }
+        row.append(top, barTrack, meta);
+        legend.append(row);
+      }
+    }
+    split.append(chartWrap, legend);
+    chartCard.append(split);
+
+    // 2. Model Speed Leaderboard
+    const speedRows = analytics.speed_board?.[reqUi.speedDim] || [];
+    speedCard.hidden = !speedRows.length && !(analytics.speed_board?.model?.length || analytics.speed_board?.provider?.length);
+    if (!speedCard.hidden) {
+      speedCard.replaceChildren();
+      const sHead = node('div', 'analytics-head');
+      const sLeft = node('div', 'analytics-head-left');
+      sLeft.append(node('h3', 'analytics-title', '模型速度'));
+      const sRight = node('div', 'analytics-head-right');
+      sRight.append(makeSegGroup([['model', '模型'], ['provider', '供应商']], reqUi.speedDim, (v) => {
+        reqUi.speedDim = v;
+        renderRequestAnalytics(data);
+      }, '速度维度'));
+      sHead.append(sLeft, sRight);
+      speedCard.append(sHead);
+
+      const list = node('div', 'speed-list');
+      const maxSpd = Math.max(1, ...speedRows.map((r) => r.avg_speed || 0));
+      for (const r of speedRows) {
+        const row = node('div', 'speed-row');
+        const nm = node('span', 'speed-name', r.name);
+        nm.title = r.name;
+        const track = node('div', 'speed-track');
+        const fill = node('div', 'speed-fill');
+        fill.style.width = `${Math.max(4, Math.round(((r.avg_speed || 0) / maxSpd) * 100))}%`;
+        track.append(fill);
+        row.append(
+          nm,
+          track,
+          node('span', 'speed-num', `${number(Math.round(r.avg_speed))} token/秒`),
+          node('span', 'speed-muted', r.avg_ttft_ms != null ? msText(r.avg_ttft_ms) : '—'),
+          node('span', 'speed-muted', number(r.timed_count)),
+        );
+        list.append(row);
+      }
+      speedCard.append(list);
+    }
+
+    // 3. 53-Week Usage Heatmap
+    const hm = analytics.heatmap_53w;
+    heatCard.hidden = !hm?.days?.length;
+    if (!heatCard.hidden) {
+      heatCard.replaceChildren();
+      const hHead = node('div', 'analytics-head');
+      const hLeft = node('div', 'analytics-head-left');
+      const hTitleWrap = node('div');
+      hTitleWrap.append(node('h3', 'analytics-title', '用量热力图'), node('span', 'analytics-sub', '最近 53 周的每日用量'));
+      hLeft.append(hTitleWrap);
+      const hRight = node('div', 'analytics-head-right');
+      hRight.append(makeSegGroup([['tokens', 'Token'], ['requests', '请求'], ['cost', '费用']], reqUi.heatmapMetric, (v) => {
+        reqUi.heatmapMetric = v;
+        renderRequestAnalytics(data);
+      }, '热力图指标'));
+      hHead.append(hLeft, hRight);
+      heatCard.append(hHead);
+
+      const hmVal = (d) => reqUi.heatmapMetric === 'requests' ? d.requests : reqUi.heatmapMetric === 'cost' ? d.cost_usd : d.tokens;
+      const hmFmt = (d) => reqUi.heatmapMetric === 'requests' ? `${number(d.requests)} 个请求`
+        : reqUi.heatmapMetric === 'cost' ? shortCost(d.cost_usd) : `${number(d.tokens, true)} token`;
+      const maxHm = Math.max(0, ...hm.days.map(hmVal));
+      const weeks = Math.ceil(hm.days.length / 7);
+
+      const scroll = node('div', 'heatmap-scroll');
+      const inner = node('div', 'heatmap-inner');
+      const months = node('div', 'heatmap-months');
+      months.style.gridTemplateColumns = `repeat(${weeks}, 15px)`;
+      let lastMonth = '';
+      for (let w = 0; w < weeks; w += 1) {
+        const d = hm.days[w * 7];
+        const nextD = hm.days[(w + 1) * 7];
+        const m = d ? Number(d.date.slice(5, 7)) : 0;
+        const nextM = nextD ? Number(nextD.date.slice(5, 7)) : 0;
+        const skipEdge = w === 0 && nextM && nextM !== m;
+        const label = !skipEdge && m && String(m) !== lastMonth ? `${m}月` : '';
+        if (m) lastMonth = String(m);
+        months.append(node('span', '', label));
+      }
+      const weekdays = node('div', 'heatmap-weekdays');
+      for (let i = 0; i < 7; i += 1) {
+        weekdays.append(node('span', '', [0, 2, 4, 6].includes(i) ? WEEKDAYS_ZH[i] : ''));
+      }
+      const grid = node('div', 'heatmap-grid');
+      for (const d of hm.days) {
+        const cell = node('span', 'hm-cell');
+        cell.dataset.lv = String(level4(hmVal(d), maxHm));
+        cell.title = `${d.date} · ${hmFmt(d)} · ${number(d.requests)} 次`;
+        grid.append(cell);
+      }
+      inner.append(months, weekdays, grid);
+      scroll.append(inner);
+      heatCard.append(scroll);
+      requestAnimationFrame(() => { scroll.scrollLeft = scroll.scrollWidth; });
+
+      const foot = node('div', 'heatmap-foot');
+      const scale = node('div', 'heatmap-scale');
+      scale.append(node('span', '', '少'));
+      for (let lv = 0; lv <= 4; lv += 1) {
+        const c = node('span', 'hm-cell');
+        c.dataset.lv = String(lv);
+        scale.append(c);
+      }
+      scale.append(node('span', '', '多'));
+      foot.append(scale);
+      heatCard.append(foot);
+    }
+  }
+
+  function renderRankCard(title, rows) {
+    const card = node('section', 'analytics-card');
+    const head = node('div', 'analytics-head');
+    head.append(node('h3', 'analytics-title', title));
+    card.append(head);
+    const list = node('div', 'rank-list');
+    const visible = rows.slice(0, 6);
+    const maxTok = Math.max(1, ...visible.map((r) => r.total_tokens || 0));
+    if (!visible.length) {
+      list.append(node('div', 'analytics-sub', '暂无数据'));
+    } else {
+      for (const r of visible) {
+        const row = node('div', 'rank-row');
+        const nm = node('span', 'rank-name', r.name);
+        nm.title = r.cwd || r.name;
+        const track = node('div', 'rank-track');
+        const fill = node('div', 'rank-fill');
+        fill.style.width = `${Math.max(4, Math.round(((r.total_tokens || 0) / maxTok) * 100))}%`;
+        track.append(fill);
+        row.append(
+          nm,
+          track,
+          node('span', 'rank-tok', number(r.total_tokens, true)),
+          node('span', 'rank-cost', shortCost(r.cost_usd)),
+        );
+        list.append(row);
+      }
+    }
+    card.append(list);
+    if (rows.length > 6) {
+      card.append(node('div', 'rank-more', `还有 ${number(rows.length - 6)} 个`));
+    }
+    return card;
+  }
+
+  function renderSessionAnalytics(view, data) {
+    const analytics = data.analytics;
+    const gridTop = $('sessions-grid');
+    const gridBottom = $('sessions-grid-bottom');
+    if (!analytics || !data.total) {
+      gridTop.hidden = gridBottom.hidden = true;
+      return;
+    }
+    gridTop.hidden = gridBottom.hidden = false;
+
+    // Card 1 & 2: Projects + Models
+    const projCard = renderRankCard('项目', analytics.projects || []);
+    const modCard = renderRankCard('模型', analytics.models || []);
+
+    // Card 3: Hour Matrix (7x24)
+    const hourCard = node('section', 'analytics-card');
+    const hHead = node('div', 'analytics-head');
+    hHead.append(node('h3', 'analytics-title', '按时段'), node('span', 'analytics-sub', analytics.hour_matrix?.tz || '本地时区'));
+    hourCard.append(hHead);
+    const hmWrap = node('div', 'hour-matrix-wrap');
+    const matrix = analytics.hour_matrix?.matrix || [];
+    const counts = analytics.hour_matrix?.counts || [];
+    const maxH = analytics.hour_matrix?.max || 0;
+    for (let d = 0; d < 7; d += 1) {
+      const row = node('div', 'hour-matrix-row');
+      row.append(node('span', 'hour-day-label', WEEKDAYS_ZH[d]));
+      const cells = node('div', 'hour-cells');
+      for (let h = 0; h < 24; h += 1) {
+        const v = matrix[d]?.[h] || 0;
+        const c = counts[d]?.[h] || 0;
+        const cell = node('span', 'hour-cell');
+        cell.dataset.lv = String(level4(v, maxH));
+        cell.title = `${WEEKDAYS_ZH[d]} ${String(h).padStart(2, '0')}:00 · ${number(c)} 次 · ${number(v, true)} token`;
+        cells.append(cell);
+      }
+      row.append(cells);
+      hmWrap.append(row);
+    }
+    const ticks = node('div', 'hour-ticks');
+    ticks.append(node('span', '', ''), node('span', '', '0'), node('span', '', '6'), node('span', '', '12'), node('span', '', '18'));
+    hmWrap.append(ticks);
+    hourCard.append(hmWrap);
+    const hFoot = node('div', 'heatmap-foot');
+    if (analytics.hour_matrix?.busiest_label) {
+      hFoot.append(node('span', '', `最忙：${analytics.hour_matrix.busiest_label}`));
+    }
+    const hScale = node('div', 'heatmap-scale');
+    hScale.append(node('span', '', '少'));
+    for (let lv = 0; lv <= 4; lv += 1) {
+      const c = node('span', 'hm-cell');
+      c.dataset.lv = String(lv);
+      hScale.append(c);
+    }
+    hScale.append(node('span', '', '多'));
+    hFoot.append(hScale);
+    hourCard.append(hFoot);
+
+    // Card 4: Top Sessions
+    const topCard = node('section', 'analytics-card');
+    const tHead = node('div', 'analytics-head');
+    tHead.append(
+      node('h3', 'analytics-title', '最耗会话'),
+      makeSegGroup([['tokens', 'Token'], ['cost', '费用'], ['active', '活跃']], sessUi.topMetric, (v) => {
+        sessUi.topMetric = v;
+        renderSessionAnalytics(view, data);
+      }, '排序指标'),
+    );
+    topCard.append(tHead);
+    const topKey = sessUi.topMetric === 'cost' ? 'by_cost' : sessUi.topMetric === 'active' ? 'by_active' : 'by_tokens';
+    const topRows = analytics.top_sessions?.[topKey] || [];
+    const topList = node('div', 'top-sess-list');
+    for (const s of topRows) {
+      const row = button('', 'top-sess-row');
+      const icon = node('span', 'activity-session-icon', s.mode === 'exec' ? '>_' : '≡');
+      icon.setAttribute('aria-hidden', 'true');
+      const body = node('span', 'top-sess-body');
+      const title = node('span', 'top-sess-title', s.title);
+      title.title = s.title;
+      const meta = node('span', 'top-sess-meta', [s.project, modes[s.mode], s.model, relativeTime(s.updated_at)].filter(Boolean).join(' · '));
+      body.append(title, meta);
+      const valText = sessUi.topMetric === 'cost' ? shortCost(s.cost_usd)
+        : sessUi.topMetric === 'active' ? duration(s.active_sec) : number(s.total_tokens, true);
+      row.append(icon, body, node('span', 'top-sess-val', valText));
+      row.onclick = () => navigateActivityTab('sessions', false, s.id);
+      topList.append(row);
+    }
+    topCard.append(topList);
+
+    gridTop.replaceChildren(projCard, modCard, hourCard, topCard);
+
+    // Bottom Card 5: Session Shapes Histogram
+    const shapeCard = node('section', 'analytics-card');
+    const shHead = node('div', 'analytics-head');
+    const shLeft = node('div', 'analytics-head-left');
+    shLeft.append(
+      node('h3', 'analytics-title', '会话形态'),
+      makeSegGroup([['turns', '轮次'], ['duration', '时长'], ['commands', '命令']], sessUi.shapeMetric, (v) => {
+        sessUi.shapeMetric = v;
+        renderSessionAnalytics(view, data);
+      }, '形态维度'),
+    );
+    shHead.append(shLeft, node('span', 'analytics-sub', `${number(analytics.shapes?.total_sessions || 0)} 个会话`));
+    shapeCard.append(shHead);
+
+    const bins = analytics.shapes?.[sessUi.shapeMetric] || [];
+    const maxBin = Math.max(1, ...bins.map((b) => b.count || 0));
+    const hist = node('div', 'hist-bars');
+    for (const b of bins) {
+      const col = node('div', 'hist-col');
+      col.append(node('span', 'hist-count', b.count ? number(b.count) : '0'));
+      const barWrap = node('div', 'hist-bar-wrap');
+      const bar = node('div', 'hist-bar');
+      bar.style.height = b.count ? `${Math.max(8, Math.round((b.count / maxBin) * 100))}%` : '3px';
+      bar.style.opacity = b.count ? '1' : '0.25';
+      barWrap.append(bar);
+      col.append(barWrap, node('span', 'hist-label', b.label));
+      hist.append(col);
+    }
+    shapeCard.append(hist);
+
+    // Bottom Card 6: Top Commands / Tools
+    const toolCard = node('section', 'analytics-card');
+    const tlHead = node('div', 'analytics-head');
+    const toolsData = analytics.top_tools || { total_calls: 0, unique_count: 0, items: [] };
+    tlHead.append(
+      node('h3', 'analytics-title', '常用命令 / 工具'),
+      node('span', 'analytics-sub', `${number(toolsData.total_calls)} 次调用 · ${number(toolsData.unique_count)} 种`),
+    );
+    toolCard.append(tlHead);
+    const tlList = node('div', 'tool-list');
+    if (!toolsData.items.length) {
+      tlList.append(node('div', 'analytics-sub', '当前筛选范围内暂无命令调用记录'));
+    } else {
+      const maxCalls = Math.max(1, ...toolsData.items.map((t) => t.calls));
+      for (const item of toolsData.items.slice(0, 6)) {
+        const box = node('div', 'tool-item');
+        const top = node('div', 'tool-top');
+        const track = node('div', 'rank-track');
+        const fill = node('div', 'rank-fill');
+        fill.style.width = `${Math.max(4, Math.round((item.calls / maxCalls) * 100))}%`;
+        track.append(fill);
+        top.append(node('span', 'tool-name', item.name), track, node('span', 'tool-count', number(item.calls)));
+        const metaParts = [`${number(item.sessions)} 个会话`, `${Math.round(item.share * 100)}%`];
+        if (item.projects?.length) metaParts.push(item.projects.join(', '));
+        box.append(top, node('div', 'tool-meta', metaParts.join(' · ')));
+        tlList.append(box);
+      }
+    }
+    toolCard.append(tlList);
+
+    gridBottom.replaceChildren(shapeCard, toolCard);
+  }
+
+  function renderActivitySummary(view, data) {
+    const s = data.summary || {};
+    if (view.kind === 'requests') {
+      renderHeadCost(view, s.cost_usd, s.unpriced_count > 0 ? `${number(s.unpriced_count)} 次调用未计价` : '');
+      const tokSub = `输入 ${number(s.input_tokens, true)} · 输出 ${number(s.output_tokens, true)} · 缓存 ${number(s.cache_read_tokens, true)}`;
+
+      const reqSub = node('div', 'kpi-sub');
+      const reqLines = [];
+      if (s.failed > 0) {
+        const line = node('div');
+        line.append(node('span', 'is-err', `${number(s.failed)} 次失败`));
+        if (s.success_rate != null) line.append(` · 成功 ${percent.format(s.success_rate)}`);
+        reqLines.push(line);
+      } else if (s.success_rate != null) {
+        reqLines.push(node('div', '', `成功率 ${percent.format(s.success_rate)}`));
+      }
+      if (s.retried > 0) reqLines.push(node('div', '', `${number(s.retried)} 次重试`));
+      if (s.interrupted > 0) reqLines.push(node('div', '', `${number(s.interrupted)} 次已中止`));
+      if (!reqLines.length && s.elapsed_sec != null) reqLines.push(node('div', '', `总耗时 ${duration(s.elapsed_sec)}`));
+      reqSub.append(...reqLines);
+
+      const costSub = s.unpriced_count > 0 ? `${number(s.unpriced_count)} 次调用未计价` : '按关联网关费率估算';
+      const speedVal = s.avg_speed != null ? `${number(Math.round(s.avg_speed))} token/秒` : '—';
+      const speedUnit = s.timed_speed_count > 0 ? `${number(s.timed_speed_count)} 次计时` : '';
+      const ttftSub = s.avg_ttft_ms != null
+        ? `首字平均 ${msText(s.avg_ttft_ms)} · ${number(s.timed_ttft_count)} 次计时`
+        : (s.elapsed_sec != null ? `总耗时 ${duration(s.elapsed_sec)}` : '暂无首字计时');
+
+      view.stats.replaceChildren(
+        makeRichKpi({ label: 'Token', value: number(s.total_tokens, true), title: number(s.total_tokens), sub: tokSub }),
+        makeRichKpi({ label: '请求', value: number(data.total), sub: reqSub }),
+        makeRichKpi({ label: '费用', value: shortCost(s.cost_usd, s.unpriced_count > 0), valueClass: 'is-cost', title: costText(s.cost_usd), sub: costSub }),
+        makeRichKpi({
+          label: '缓存命中率',
+          value: s.cache_hit_rate != null ? percent2.format(s.cache_hit_rate) : '—',
+          barRatio: s.cache_hit_rate ?? 0,
+        }),
+        makeRichKpi({ label: '输出速度', value: speedVal, unit: speedUnit, sub: ttftSub }),
+      );
+      renderRequestAnalytics(data);
+    } else {
+      renderHeadCost(view, s.cost_usd, s.unpriced_models > 0 ? `${number(s.unpriced_models)} 个模型未计价` : '');
+      if (view.summary) {
+        view.summary.textContent = view.items.length < data.total
+          ? `显示 ${number(data.total)} 个中的 ${number(view.items.length)} 个` : `${number(data.total)} 个会话`;
+      }
+      const sessSub = s.median_tokens != null
+        ? `中位 ${number(s.median_tokens, true)} · p90 ${number(s.p90_tokens, true)}`
+        : `${number(s.requests)} 轮调用`;
+      const tokSub = `输入 ${number(s.input_tokens, true)} · 输出 ${number(s.output_tokens, true)}`;
+      const costSub = s.unpriced_models > 0 ? `${number(s.unpriced_models)} 个模型未计价` : '按关联网关费率估算';
+      const cacheSub = s.cache_hit_rate != null ? `命中率 ${percent2.format(s.cache_hit_rate)}` : '暂无缓存统计';
+      const activeSub = s.active_days > 0 ? `共 ${number(s.active_days)} 天` : '—';
+      const projSub = s.top_project ? `${s.top_project} 占 ${Math.round((s.top_project_share || 0) * 100)}%` : '—';
+
+      view.stats.replaceChildren(
+        makeRichKpi({ topFirst: true, label: '会话数', value: number(data.total), sub: sessSub }),
+        makeRichKpi({ topFirst: true, label: 'TOKEN', value: number(s.total_tokens, true), title: number(s.total_tokens), sub: tokSub }),
+        makeRichKpi({ topFirst: true, label: '费用', value: shortCost(s.cost_usd, s.unpriced_models > 0), title: costText(s.cost_usd), sub: costSub }),
+        makeRichKpi({ topFirst: true, label: '缓存读取', value: number(s.cache_read_tokens, true), title: number(s.cache_read_tokens), sub: cacheSub }),
+        makeRichKpi({ topFirst: true, label: '活跃时长', value: duration(s.active_sec ?? s.elapsed_sec), sub: activeSub }),
+        makeRichKpi({ topFirst: true, label: '项目', value: number(s.projects ?? s.workspaces), sub: projSub }),
+      );
+      renderSessionAnalytics(view, data);
     }
   }
 
@@ -2004,6 +2614,18 @@
     const view = activityViews[activeTab];
     if (event.key === 'Escape' && view?.open) navigateActivityTab(view.kind);
   });
+  function syncActivityAutoRefresh() {
+    clearInterval(activityRefreshTimer);
+    activityRefreshTimer = null;
+    if (activityRefreshMs > 0) {
+      activityRefreshTimer = setInterval(() => {
+        if (document.visibilityState !== 'visible') return;
+        const view = activityViews[activeTab];
+        if (view && !view.listFetch && !view.open?.abort) void refreshActivityView(view);
+      }, activityRefreshMs);
+    }
+  }
+
   for (const view of Object.values(activityViews)) {
     const search = view.list.querySelector('.activity-search');
     let debounce;
@@ -2013,9 +2635,9 @@
       for (const control of view.list.querySelectorAll('[data-page]')) control.disabled = true;
       debounce = setTimeout(() => loadActivityList(view), 180);
     };
-    const ranges = [
-      ['all', '全部'], ['today', '今日'], ['24h', '24 小时'], ['7d', '7 天'], ['30d', '30 天'],
-    ];
+    const ranges = view.kind === 'requests'
+      ? [['today', '今天'], ['24h', '24 小时'], ['7d', '7 天'], ['30d', '30 天'], ['all', '全部']]
+      : [['today', '今天'], ['7d', '7 天'], ['30d', '30 天'], ['90d', '90 天'], ['all', '全部']];
     const rangeControls = ranges.map(([range, label]) => {
       const control = button(label);
       control.setAttribute('aria-pressed', String(range === view.range));
@@ -2028,6 +2650,18 @@
       return control;
     });
     view.list.querySelector('[data-range-controls]').replaceChildren(...rangeControls);
+    const refreshBtn = view.list.querySelector('[data-activity-refresh]');
+    if (refreshBtn) {
+      refreshBtn.onclick = () => { void refreshActivityView(view); };
+    }
+    const autoSelect = view.list.querySelector('[data-auto-refresh]');
+    if (autoSelect) {
+      autoSelect.onchange = () => {
+        activityRefreshMs = Math.max(0, Number(autoSelect.value) || 0);
+        for (const other of document.querySelectorAll('[data-auto-refresh]')) other.value = String(activityRefreshMs);
+        syncActivityAutoRefresh();
+      };
+    }
     for (const select of view.list.querySelectorAll('[data-filter]')) {
       select.onchange = () => {
         clearTimeout(debounce);
@@ -2040,13 +2674,13 @@
     const setStatus = (status) => {
       view.status = status;
       for (const control of statusControls) {
-        control.setAttribute('aria-pressed', String(!statusSelect.value && control.dataset.status === status));
+        control.setAttribute('aria-pressed', String(!statusSelect?.value && control.dataset.status === status));
       }
     };
     for (const control of statusControls) {
       control.onclick = () => {
         clearTimeout(debounce);
-        statusSelect.value = '';
+        if (statusSelect) statusSelect.value = '';
         setStatus(control.dataset.status);
         void loadActivityList(view);
       };

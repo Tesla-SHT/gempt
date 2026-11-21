@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { correlateGatewayUsage } from './activity-gateway.mjs';
 import { readActivityTimeline } from './activity-timeline.mjs';
+import { buildRequestAnalytics, buildSessionAnalytics } from './activity-analytics.mjs';
 import { isAstraModel } from './routing.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -1089,7 +1090,7 @@ function sessionListItem(row) {
 
 function activityRange(params) {
   const now = new Date();
-  const hours = { '24h': 24, '7d': 7 * 24, '30d': 30 * 24 };
+  const hours = { '24h': 24, '7d': 7 * 24, '30d': 30 * 24, '90d': 90 * 24 };
   const range = params.get('range') || 'all';
   const invalid = (field) => Object.assign(new Error(`invalid activity ${field}`), { status: 400 });
   const dateBound = (field) => {
@@ -1154,11 +1155,18 @@ function activityCsv(rows) {
 
 export async function listDispatchActivity(kind, params, sessionsDir, magpieConfigDir, configPath) {
   const inRange = activityRange(params);
+  const range = params.get('range') || 'all';
   const { ledger, history } = await enrichDispatchActivity(sessionsDir, magpieConfigDir, configPath);
   const isRequests = kind === 'requests';
   const records = isRequests ? (inRange ? ledger.filter((row) => inRange(row.timestamp)) : ledger)
     : (inRange ? history.map((row) => sessionInRange(row, inRange)).filter(Boolean) : history);
-  const fields = { mode: 'mode', tier: 'tier', workspace: 'cwd', model: 'model', ...(isRequests ? { status: 'status' } : {}) };
+  const fields = {
+    mode: 'mode',
+    tier: 'tier',
+    workspace: 'cwd',
+    model: 'model',
+    ...(isRequests ? { provider: 'provider', status: 'status' } : {}),
+  };
   const recordValues = (row, field) => {
     if (field === 'status' && row.retried) return [row.status, 'retried'];
     if (!isRequests && (field === 'tier' || field === 'model' || field === 'cwd')) {
@@ -1193,16 +1201,43 @@ export async function listDispatchActivity(kind, params, sessionsDir, magpieConf
   const limit = Math.min(100, Math.max(1, integer('limit', 25)));
   const offset = integer('offset', 0);
   const requests = isRequests ? filtered : filtered.flatMap((session) => session.requests);
-  const summary = { requests: requests.length, ...totalUsage(requests), cost_usd: activityCost(requests),
-    failed: 0, retried: 0, elapsed_sec: null,
-    workspaces: new Set(requests.map((row) => row.cwd).filter(Boolean)).size };
+  const baseSummary = {
+    requests: requests.length,
+    ...totalUsage(requests),
+    cost_usd: activityCost(requests),
+    failed: 0,
+    retried: 0,
+    elapsed_sec: null,
+    workspaces: new Set(requests.map((row) => row.cwd).filter(Boolean)).size,
+  };
   for (const row of requests) {
-    if (row.status === 'failed') summary.failed += 1;
-    if (row.retried) summary.retried += 1;
-    if (row.elapsed_sec != null) summary.elapsed_sec = (summary.elapsed_sec ?? 0) + row.elapsed_sec;
+    if (row.status === 'failed') baseSummary.failed += 1;
+    if (row.retried) baseSummary.retried += 1;
+    if (row.elapsed_sec != null) baseSummary.elapsed_sec = (baseSummary.elapsed_sec ?? 0) + row.elapsed_sec;
   }
-  return { total: filtered.length, summary, items: filtered.slice(offset, offset + limit)
-    .map(isRequests ? requestListItem : sessionListItem), facets, limit, offset };
+
+  let analytics;
+  if (isRequests) {
+    const unclippedSearchable = query ? ledger.filter((row) => findText(row)) : ledger;
+    const unclippedFiltered = unclippedSearchable.filter((row) => filters.every(([key, field]) => matches(row, key, field)));
+    const { extra_summary, ...rest } = buildRequestAnalytics(filtered, unclippedFiltered, { range });
+    Object.assign(baseSummary, extra_summary);
+    analytics = rest;
+  } else {
+    const { extra_summary, ...rest } = buildSessionAnalytics(filtered);
+    Object.assign(baseSummary, extra_summary);
+    analytics = rest;
+  }
+
+  return {
+    total: filtered.length,
+    summary: baseSummary,
+    analytics,
+    items: filtered.slice(offset, offset + limit).map(isRequests ? requestListItem : sessionListItem),
+    facets,
+    limit,
+    offset,
+  };
 }
 
 export async function getDispatchActivity(kind, id, sessionsDir, magpieConfigDir, configPath) {
