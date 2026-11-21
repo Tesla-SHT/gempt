@@ -42,6 +42,7 @@ from gempt.config import (
 )
 from gempt.discover import build_tier_recommendations, find_magpie_cli, probe_magpie_gateway
 from gempt.magpie_client import MagpieRequestError, _group_members, consult_with_fallback, sync_magpie_groups
+from gempt.mcp_app import APP_URI
 from gempt.mcp_server import _dispatch_request, _handle_tool_call, serve_stdio
 from gempt.presets import apply_native_presets, build_native_preset_commands, strip_model_modifiers
 from gempt.protocol import build_consult_prompt, build_exec_prompt, read_context_files
@@ -443,18 +444,22 @@ class McpStdioHandshakeTests(unittest.TestCase):
             env["PYTHONUTF8"] = "1"
             env["GEMPT_CONFIG"] = str(cfg_path)
             env["GEMPT_SESSIONS_DIR"] = str(sess_dir)
+            env.pop("GEMPT_APP_HTML", None)
 
             requests = [
                 {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}},
                 {"jsonrpc": "2.0", "method": "notifications/initialized"},
                 {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
                 {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "gempt_status", "arguments": {}}},
+                {"jsonrpc": "2.0", "id": 4, "method": "resources/list"},
+                {"jsonrpc": "2.0", "id": 5, "method": "resources/read", "params": {"uri": APP_URI}},
+                {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "gempt_live_view", "arguments": {}}},
             ]
             stdin_payload = "".join(json.dumps(r) + "\n" for r in requests).encode("utf-8")
 
             kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if sys.platform == "win32" else {}
             proc = subprocess.run(
-                [sys.executable, "-m", "gempt.mcp_server"],
+                [sys.executable, "-B", "-m", "gempt.mcp_server"],
                 input=stdin_payload,
                 capture_output=True,
                 env=env,
@@ -462,21 +467,193 @@ class McpStdioHandshakeTests(unittest.TestCase):
                 **kwargs,
             )
             self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
-            lines = [json.loads(line) for line in proc.stdout.decode("utf-8").splitlines() if line.strip()]
-            self.assertEqual(len(lines), 3)  # notification emits no response
-            self.assertEqual(lines[0]["result"]["serverInfo"]["name"], "gempt")
-            tool_names = [t["name"] for t in lines[1]["result"]["tools"]]
+            replies = {packet["id"]: packet["result"] for packet in
+                       map(json.loads, proc.stdout.decode("utf-8").splitlines())}
+            self.assertEqual(replies.keys(), set(range(1, 7)))  # notification emits no response
+            self.assertEqual(replies[1]["serverInfo"]["name"], "gempt")
+            self.assertEqual(replies[1]["capabilities"]["resources"], {"listChanged": False})
+            tools = {tool["name"]: tool for tool in replies[2]["tools"]}
             self.assertEqual(
-                tool_names,
+                list(tools),
                 ["gempt_discover", "gempt_configure", "gempt_consult", "gempt_exec", "gempt_status", "gempt_dispatch",
-                 "gempt_steer", "gempt_interrupt", "gempt_reply_tool_call"],
+                 "gempt_steer", "gempt_interrupt", "gempt_reply_tool_call", "gempt_live_view",
+                 "gempt_app_runs", "gempt_app_stream", "gempt_app_interrupt", "gempt_app_steer"],
             )
-            status_schema = lines[1]["result"]["tools"][tool_names.index("gempt_status")]["inputSchema"]
+            entry = tools["gempt_live_view"]
+            self.assertEqual(entry["inputSchema"], {"type": "object", "properties": {
+                "run_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}}, "additionalProperties": False})
+            self.assertEqual(entry["_meta"], {
+                "ui": {"resourceUri": APP_URI}, "com.google.antigravity/ui": {"entrypoints": [
+                    {"type": "aux_pane", "title": "GemPT Live"}, {"type": "global", "title": "GemPT Live"},
+                ]},
+            })
+            for tool in ("gempt_app_runs", "gempt_app_stream", "gempt_app_interrupt", "gempt_app_steer"):
+                self.assertEqual(tools[tool]["_meta"], {"ui": {"visibility": ["app"]}})
+            status_schema = tools["gempt_status"]["inputSchema"]
             wait_schema = status_schema["properties"]["wait_sec"]
             self.assertEqual((wait_schema["type"], wait_schema["minimum"], wait_schema["maximum"]), ("number", 0, 120))
             self.assertNotIn("wait_sec", status_schema.get("required", []))
-            status_payload = json.loads(lines[2]["result"]["content"][0]["text"])
+            status_payload = json.loads(replies[3]["content"][0]["text"])
             self.assertFalse(status_payload["configured"])
+            resource = {"uri": APP_URI, "mimeType": "text/html;profile=mcp-app", "name": "GemPT Live",
+                        "_meta": {"ui": {"prefersBorder": False}}}
+            self.assertEqual(replies[4]["resources"], [resource])
+            html = (SRC_ROOT / "gempt" / "mcp_app_live.html").read_text(encoding="utf-8")
+            self.assertEqual(replies[5]["contents"], [{**resource, "text": html}])
+            self.assertIn("default-src 'none'", html)
+            for tag in ('<script src=', '<link rel="stylesheet"'):
+                self.assertNotIn(tag, html)
+            self.assertEqual(replies[6]["content"], [{"type": "text", "text": "Opened GemPT Live."}])
+            self.assertEqual(replies[6]["structuredContent"]["runs"], [])
+            self.assertIsNone(replies[6]["structuredContent"]["stream"])
+
+
+class McpLiveTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name).resolve()
+        self.repo = self.root / "workspace"
+        self.repo.mkdir()
+        self.outside = self.root / "workspace-other"
+        self.outside.mkdir()
+        env = mock.patch.dict(os.environ, GEMPT_SESSIONS_DIR=str(self.root / "sessions"),
+                              GEMPT_WORKSPACE_ROOT=str(self.repo))
+        env.start()
+        self.addCleanup(env.stop)
+
+    def request(self, method, **params):
+        return _dispatch_request({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+
+    def call(self, name, **arguments):
+        return self.request("tools/call", name=name, arguments=arguments)["result"]
+
+    def data(self, name, **arguments):
+        result = self.call(name, **arguments)
+        self.assertFalse(result.get("isError"), result)
+        return result["structuredContent"]
+
+    def seed(self, run_id, state, **fields):
+        directory = run_directory(run_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        _write_run_state(directory, {"run_id": run_id, "state": state, "cwd": str(self.repo),
+                                     "session_id": "exec-fixture", "deadline": time.time() + 60, **fields})
+        return directory
+
+    def test_resource_override_validates_utf8_and_size(self):
+        self.assertEqual(self.request("resources/read", uri="ui://gempt/other")["error"]["code"], -32002)
+        html = self.root / "custom.html"
+        with mock.patch.dict(os.environ, GEMPT_APP_HTML=str(html)), contextlib.redirect_stderr(io.StringIO()):
+            document = "<html>自定义视图</html>"
+            html.write_text(document, encoding="utf-8")
+            self.assertEqual(self.request("resources/read", uri=APP_URI)["result"]["contents"][0]["text"], document)
+            for invalid in (b" \n", b"\xff", b"x" * (10 * 1024 * 1024)):
+                html.write_bytes(invalid)
+                self.assertEqual(self.request("resources/read", uri=APP_URI)["error"]["code"], -32603)
+
+    def test_list_and_controls_obey_workspace_and_validate_arguments(self):
+        for run_id, state, extra in (
+            ("a" * 32, "running", {"started_at": "2026-01-01T00:00:00.000Z"}),
+            ("b" * 32, "finished", {}),
+            ("c" * 32, "waiting_gemini", {"cwd": str(self.outside)}),
+        ):
+            self.seed(run_id, state, **extra)
+        runs = self.data("gempt_app_runs")["runs"]
+        self.assertEqual([run["run_id"] for run in runs], ["a" * 32, "b" * 32])
+        self.assertGreater(runs[0]["elapsed_sec"], 0)
+        self.assertEqual(self.data("gempt_app_runs", limit=1)["runs"][0]["run_id"], "a" * 32)
+        self.assertEqual(self.data("gempt_live_view")["stream"]["run"]["run_id"], "a" * 32)
+        self.assertEqual(self.data("gempt_live_view", run_id="b" * 32)["stream"]["run"]["state"], "finished")
+        with contextlib.redirect_stderr(io.StringIO()), \
+             mock.patch("gempt.mcp_app.interrupt_run") as interrupt, mock.patch("gempt.mcp_app.steer_run") as steer:
+            for tool, args in (
+                ("gempt_live_view", {}), ("gempt_app_stream", {}), ("gempt_app_interrupt", {}),
+                ("gempt_app_steer", {"message": "finish"}),
+            ):
+                error = self.call(tool, run_id="c" * 32, **args)
+                self.assertTrue(error["isError"])
+                self.assertIn("outside host workspace", error["content"][0]["text"])
+            self.assertTrue(self.call("gempt_app_runs", limit=True)["isError"])
+            self.assertTrue(self.call("gempt_live_view", extra="ignored")["isError"])
+            self.assertTrue(self.call("gempt_app_stream", run_id="../state")["isError"])
+            self.assertTrue(self.call("gempt_app_steer", run_id="a" * 32)["isError"])
+            interrupt.assert_not_called()
+            steer.assert_not_called()
+
+    def test_incremental_journal_and_bounded_unicode_transcript(self):
+        run_id = "d" * 32
+        pending = {"call_id": "call", "arguments": {"reason": "visual_check", "question": "清楚吗？",
+                   "context": "检查窄栏", "media_paths": ["preview.png"]}}
+        fields = {"turn_id": "turn", "codex_thread_id": "thread", "pending_tool_call": pending}
+        path = self.seed(run_id, "waiting_gemini", **fields) / "events.jsonl"
+
+        def event(method, **params):
+            return {"method": method, "params": {"turnId": "turn", "threadId": "thread", **params}}
+
+        ask = event("item/tool/call", tool="ask_gemini", callId=pending["call_id"], arguments=pending["arguments"])
+        ask["id"] = "rpc-id"
+        items = [
+            event("item/reasoning/summaryTextDelta", itemId="thought", delta="先复核"),
+            event("item/reasoning/textDelta", itemId="thought", delta="raw reasoning"),
+            event("item/agentMessage/delta", itemId="reply", delta="正在"),
+            event("item/agentMessage/delta", itemId="other", delta="wrong turn", turnId="unrelated"),
+            event("item/started", item={"id": "cmd", "type": "commandExecution", "command": "python check.py"}),
+            event("item/commandExecution/outputDelta", itemId="cmd", delta="实时输出"),
+            event("item/completed", item={"id": "file", "type": "fileChange", "changes": [
+                {"path": "src/模块.py"}, {"path": str(self.outside / "other.py")},
+            ]}),
+            ask,
+            event("thread/tokenUsage/updated", tokenUsage={"last": {
+                "inputTokens": 200, "cachedInputTokens": 181, "totalTokens": 220, "outputTokens": 20,
+            }}),
+        ]
+        delta = json.dumps(event("item/agentMessage/delta", itemId="reply", delta="更新"), ensure_ascii=False)
+        path.write_text("bad JSON\n" + "\n".join(json.dumps(item) for item in items) + "\n" + delta,
+                        encoding="utf-8")
+        first = self.data("gempt_app_stream", run_id=run_id)
+        self.assertEqual(first["full_text"], "正在")
+        self.assertEqual(first["cache_hit_rate"], 0.905)
+        self.assertEqual(first["run"]["pending_tool_call"]["arguments"], pending["arguments"])
+        self.assertEqual([row["type"] for row in first["timeline"]],
+                         ["reasoning", "agent_message", "command", "files", "ask_gemini"])
+        self.assertEqual(first["timeline"][0]["text"], "先复核")
+        self.assertEqual(first["commands"][0]["output"], "实时输出")
+        self.assertEqual(first["file_uris"], {"src/模块.py": (self.repo / "src" / "模块.py").as_uri()})
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write("\n")
+        self.assertEqual(self.data("gempt_app_stream", run_id=run_id)["full_text"], "正在更新")
+
+        full_text = '完成\n🚀"\\\x01' * 40000
+        with path.open("a", encoding="utf-8") as stream:
+            for entry in (
+                event("item/completed", item={"id": "reply", "type": "agentMessage", "text": full_text}),
+                event("item/completed", item={"id": "cmd", "type": "commandExecution",
+                      "command": "python check.py", "exitCode": 0, "aggregatedOutput": "最终输出"}),
+                event("serverRequest/resolved", requestId="rpc-id"),
+            ):
+                stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        self.seed(run_id, "finished", **{**fields, "pending_tool_call": None})
+        final = self.call("gempt_app_stream", run_id=run_id)
+        self.assertLess(len(json.dumps(final, ensure_ascii=False).encode()), 350 * 1024)
+        view = self.call("gempt_live_view", run_id=run_id)
+        self.assertLess(len(json.dumps(view, ensure_ascii=False).encode()), 500 * 1024)
+        data = final["structuredContent"]
+        self.assertEqual(data["commands"][0]["exit_code"], 0)
+        self.assertEqual(data["commands"][0]["output"], "最终输出")
+        self.assertEqual(data["timeline"][-1]["status"], "resolved")
+        offset, revision = data["next_text_offset"], data["text_revision"]
+        chunks = [data["full_text"]]
+        while offset is not None:
+            page = self.data("gempt_app_stream", run_id=run_id, text_offset=offset, text_revision=revision)
+            chunks.append(page["full_text"])
+            offset = page["next_text_offset"]
+        self.assertEqual("".join(chunks), full_text)
+
+        path.write_text(json.dumps(event("item/agentMessage/delta", itemId="new", delta="替换日志")) + "\n",
+                        encoding="utf-8")
+        self.assertEqual(self.data("gempt_app_stream", run_id=run_id)["full_text"], "替换日志")
+        self.assertTrue(self.data("gempt_app_stream", run_id=run_id, text_offset=10,
+                                  text_revision=revision)["stale_text_revision"])
 
 
 class McpWorkspaceTests(unittest.TestCase):
@@ -784,10 +961,15 @@ class CliPackagingTests(unittest.TestCase):
             root = Path(tmp)
             package = root / "disposable uvx env" / "site-packages" / "gempt"
             package.mkdir(parents=True)
-            for asset in (*((SRC_ROOT / "gempt").glob("*.py")), SRC_ROOT / "gempt" / "workload.json"):
+            source = SRC_ROOT / "gempt"
+            for asset in (*source.glob("*.py"), source / "workload.json", source / "mcp_app_live.html"):
                 shutil.copyfile(asset, package / asset.name)
             shutil.copytree(REPO_ROOT / "plugin", package / "plugin_data")
             shutil.copytree(REPO_ROOT / "templates", package / "plugin_data" / "templates")
+            (package / "plugin_data" / "skills" / "node_modules").mkdir()
+            (package / "plugin_data" / "skills" / "cache.pyc").touch()
+            (package / "discard.pyc").touch()
+            (package / "__pycache__").mkdir()
             target = root / "plugin outside checkout"
             base_python = Path(sys._base_executable).resolve()
             worker_path = Path("agents/gempt-worker.md")
@@ -810,17 +992,28 @@ class CliPackagingTests(unittest.TestCase):
             self.assertEqual(Path(entry["args"][-1]), target / "runtime")
             self.assertTrue((target / "templates" / "gempt.config.example.json").is_file())
             self.assertEqual((target / worker_path).read_text(encoding="utf-8"), worker_text)
+            self.assertTrue((target / "runtime" / "gempt" / "mcp_app_live.html").is_file())
             self.assertTrue((target / "skills" / "gempt" / "references" / "magpie-routing.md").is_file())
             hooks = json.loads((target / "hooks.json").read_text(encoding="utf-8"))["gempt-work-split"]
             hook_command = hooks["PreInvocation"][0]["command"]
             self.assertEqual(hooks["PreToolUse"][0]["hooks"][0]["command"], hook_command)
             self.assertIn(str(base_python), hook_command)
             self.assertIn(str(target / "work_split_hook.py"), hook_command)
-            request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+            requests = [
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                {"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": APP_URI}},
+            ]
+            env = os.environ.copy()
+            env.pop("GEMPT_APP_HTML", None)
             proc = subprocess.run([entry["command"], *entry["args"]], cwd=root,
-                                  input=json.dumps(request) + "\n", encoding="utf-8",
+                                  input="".join(json.dumps(request) + "\n" for request in requests),
+                                  env=env, encoding="utf-8",
                                   capture_output=True, check=True, timeout=20)
-            self.assertIn("gempt_dispatch", [tool["name"] for tool in json.loads(proc.stdout)["result"]["tools"]])
+            tools, resource = (response["result"] for response in map(json.loads, proc.stdout.splitlines()))
+            self.assertIn("gempt_live_view", [tool["name"] for tool in tools["tools"]])
+            self.assertEqual(resource["contents"][0]["text"], (source / "mcp_app_live.html").read_text(encoding="utf-8"))
+            self.assertFalse(any(path.name in {"node_modules", "__pycache__"} or path.suffix == ".pyc"
+                                 for path in target.rglob("*")))
 
     def test_failed_staged_validation_keeps_existing_plugin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1622,6 +1815,8 @@ class AppServerTests(unittest.TestCase):
     def mcp(self, name, **arguments):
         result = _dispatch_request({"id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}})["result"]
         self.assertFalse(result.get("isError"), result)
+        if "structuredContent" in result:
+            return result["structuredContent"]
         return json.loads(result["content"][0]["text"])
 
     def wait_running(self, run_id):
@@ -1664,6 +1859,11 @@ class AppServerTests(unittest.TestCase):
             self.assertEqual(cli_main(["status", "--run-id", run_id, "--wait"]), 0)
         live = self.mcp("gempt_status", run_id=run_id)
         self.assertEqual(live["pending_tool_call"], pending)
+        snapshot = self.mcp("gempt_live_view", run_id=run_id)["stream"]
+        self.assertEqual(snapshot["full_text"], "live")
+        self.assertEqual(snapshot["cache_hit_rate"], 0.91)
+        self.assertEqual(snapshot["run"]["pending_tool_call"]["arguments"]["question"], "Is it legible?")
+        self.assertEqual(snapshot["run"]["model"], self.server.requests[-1]["params"]["model"])
         events = (run_directory(run_id) / "events.jsonl").read_text(encoding="utf-8").splitlines()
         self.assertTrue(any(json.loads(event)["method"] == "item/tool/call" for event in events))
         start = next(req["params"] for req in self.server.requests if req["method"] == "turn/start")
@@ -1690,8 +1890,8 @@ class AppServerTests(unittest.TestCase):
         receipt = self.mcp("gempt_exec", goal="Hold turn", cwd=str(self.repo), background=True)
         run_id, session_id = receipt["run_id"], receipt["session_id"]
         live = self.wait_running(run_id)
-        self.mcp("gempt_steer", run_id=run_id, message="Use the new constraint")
-        self.mcp("gempt_interrupt", run_id=run_id)
+        self.assertTrue(self.mcp("gempt_app_steer", run_id=run_id, message="Use the new constraint")["ok"])
+        self.assertTrue(self.mcp("gempt_app_interrupt", run_id=run_id)["ok"])
         interrupted = wait_for_run(run_id, timeout_sec=8)
         self.assertEqual(interrupted["state"], "interrupted", interrupted)
         self.assertEqual(interrupted["session_id"], session_id)

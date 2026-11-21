@@ -318,11 +318,11 @@ def approval_reply(method, params, sandbox):
 class TurnJournal:
     """Own the live run state and collect the result from v2 notifications."""
 
-    def __init__(self, run_id, session_id, thread_id, sandbox, on_identity):
+    def __init__(self, run_id, session_id, thread_id, sandbox, on_identity, *, model):
         from .runs import read_run, run_directory
         self.directory = run_directory(run_id) if run_id else None
         self.record = read_run(run_id) if run_id else {}
-        self.record.update(session_id=session_id, state="running", pending_tool_call=None)
+        self.record.update(session_id=session_id, model=model, state="running", pending_tool_call=None)
         self.on_identity = on_identity
         self.sandbox = sandbox
         self.turn = None
@@ -475,7 +475,7 @@ def run_app_server(*, prompt, cwd, model, reasoning_effort, sandbox, approval_po
                    codex_thread_id, gateway_url, config_path, timeout_sec, run_id, session_id, on_identity):
     start = time.monotonic()
     deadline = start + timeout_sec
-    journal = TurnJournal(run_id, session_id, codex_thread_id, sandbox, on_identity)
+    journal = TurnJournal(run_id, session_id, codex_thread_id, sandbox, on_identity, model=model)
     policy = {"type": SANDBOX_TYPES[sandbox]}
     common = {"cwd": str(cwd), "model": model, "modelProvider": PROVIDER,
               "sandbox": sandbox, "approvalPolicy": approval_policy,

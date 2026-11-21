@@ -13,6 +13,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .mcp_app import APP_RESOURCE, APP_URI
 from .sessions import exclusive_operation
 
 if TYPE_CHECKING:
@@ -25,6 +26,7 @@ _REQUIRED_ASSETS = (
     "skills/gempt/SKILL.md", "skills/gempt-sonnet/SKILL.md", "skills/gempt-opus/SKILL.md",
     "skills/gempt-fable/SKILL.md", "skills/gempt-chore/SKILL.md",
     "templates/gempt.config.example.json", "templates/magpie-groups.template.json",
+    "runtime/gempt/mcp_app_live.html",
 )
 
 
@@ -90,7 +92,7 @@ def _stage_plugin(staged: Path, source: Path | None) -> None:
     runtime_pkg = staged / "runtime" / "gempt"
     runtime_pkg.mkdir(parents=True)
     for item in package.iterdir():
-        if item.is_file() and (item.name.endswith(".py") or item.name == "workload.json"):
+        if item.is_file() and (item.name.endswith(".py") or item.name in {"workload.json", "mcp_app_live.html"}):
             (runtime_pkg / item.name).write_bytes(item.read_bytes())
 
 
@@ -123,13 +125,21 @@ def _validate_staged(staged: Path) -> None:
 
     mcp = build_mcp_config(staged / "runtime")["mcpServers"]["gempt"]
     initialize = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}}
+    read_app = {"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": APP_URI}}
     options = dict(cwd=staged, encoding="utf-8", capture_output=True, timeout=20,
                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    server = subprocess.run([mcp["command"], *mcp["args"]], input=json.dumps(initialize) + "\n", **options)
+    env = os.environ.copy()
+    env.pop("GEMPT_APP_HTML", None)
+    requests = "".join(json.dumps(request) + "\n" for request in (initialize, read_app))
+    server = subprocess.run([mcp["command"], *mcp["args"]], input=requests, env=env, **options)
     if server.returncode or not server.stdout:
         raise ValueError(f"Staged Antigravity MCP server failed to start: {server.stderr.strip()}")
-    if json.loads(server.stdout)["result"]["serverInfo"]["name"] != "gempt":
+    responses = {packet["id"]: packet for packet in map(json.loads, server.stdout.splitlines())}
+    if responses.get(1, {}).get("result", {}).get("serverInfo", {}).get("name") != "gempt":
         raise ValueError("Staged Antigravity MCP server did not identify itself as gempt.")
+    contents = responses.get(2, {}).get("result", {}).get("contents", [])
+    if not contents or contents[0].get("mimeType") != APP_RESOURCE["mimeType"] or not contents[0].get("text"):
+        raise ValueError("Staged Antigravity MCP server could not read the bundled GemPT Live app.")
 
     hook = subprocess.run(
         [mcp["command"], "-I", "-X", "utf8", "-B", str(staged / "work_split_hook.py")],

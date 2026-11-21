@@ -7,6 +7,9 @@
   "exports": {
     ".": "./magpie_plugin/index.mjs"
   },
+  "scripts": {
+    "build:mcp-app": "node mcp_app/build.mjs"
+  },
   "files": [
     "magpie_plugin/index.mjs",
     "magpie_plugin/lib/*.mjs",
@@ -14,6 +17,8 @@
     "magpie_plugin/ui/*.{html,js,css}",
     "src/gempt/*.py",
     "src/gempt/workload.json",
+    "src/gempt/mcp_app_live.html",
+    "mcp_app/*.{mjs,js,html,css}",
     "plugin/plugin.json",
     "plugin/mcp_config.json",
     "plugin/hooks.json",

@@ -15,6 +15,7 @@ from typing import Any
 
 from . import CONSULT_TIERS, DEFAULT_CONFIG_PATH, TIER_ORDER, __version__
 from .discover import discover_environment
+from .mcp_app import APP_RESOURCE, APP_TOOLS, APP_URI, call_app_tool, read_app_resource
 from .runs import (
     ACTIVE_STATES, build_wait_command, dispatch_exec, interrupt_run, read_run, reply_tool_call, steer_run, wait_for_run,
 )
@@ -266,6 +267,8 @@ for name, description, fields, required in (
         "required": ["run_id", *required], "additionalProperties": False,
     }})
 
+TOOLS.extend(APP_TOOLS.values())
+
 
 def _resolve_magpie_config_dir(home: Path) -> Path:
     raw = os.environ.get("MAGPIE_CONFIG_DIR", "").strip()
@@ -317,6 +320,8 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
     env_root = os.environ.get("GEMPT_WORKSPACE_ROOT", "").strip()
     workspace_root = Path(env_root).resolve() if env_root else None
     trusted_config = Path(os.environ.get("GEMPT_CONFIG") or DEFAULT_CONFIG_PATH).resolve()
+    if name in APP_TOOLS:
+        return call_app_tool(name, args, root=workspace_root, config=trusted_config)
     if args.get("config_path") and Path(args["config_path"]).resolve() != trusted_config:
         raise ValueError("Config path is outside the host configuration")
     args["config_path"] = str(trusted_config)
@@ -485,7 +490,7 @@ def _dispatch_request(req: dict[str, Any]) -> dict[str, Any] | None:
             client_proto = params.get("protocolVersion") or "2024-11-05"
             result = {
                 "protocolVersion": client_proto,
-                "capabilities": {"tools": {"listChanged": False}},
+                "capabilities": {"tools": {"listChanged": False}, "resources": {"listChanged": False}},
                 "serverInfo": {"name": "gempt", "version": __version__},
             }
             return {"jsonrpc": "2.0", "id": req_id, "result": result}
@@ -496,9 +501,21 @@ def _dispatch_request(req: dict[str, Any]) -> dict[str, Any] | None:
         if method == "tools/list":
             return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
 
+        if method == "resources/list":
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": [APP_RESOURCE]}}
+
+        if method == "resources/read":
+            if params.get("uri") != APP_URI:
+                return {"jsonrpc": "2.0", "id": req_id, "error": {
+                    "code": -32002, "message": "Resource not found", "data": {"uri": params.get("uri")},
+                }}
+            return {"jsonrpc": "2.0", "id": req_id, "result": read_app_resource()}
+
         if method == "tools/call":
             tool_name = str(params.get("name") or "")
-            tool_args = params.get("arguments") or {}
+            tool_args = params.get("arguments", {})
+            if tool_args is None:
+                tool_args = {}
             if not isinstance(tool_args, dict):
                 raise ValueError("Tool arguments must be a JSON object.")
             try:

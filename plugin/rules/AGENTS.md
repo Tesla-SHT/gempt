@@ -4,7 +4,7 @@
 
 Magpie 面板最左档是 **关闭 GemPT**。选中后从下一轮起停止自动派单，无需重启或卸载。普通对话和 Swarm 可独立设置，Swarm 也可跟随普通对话。对已关闭的模式，Gemini 直接处理任务，跳过 `gempt-worker` 和 `gempt_dispatch`。只有用户明确要求调用 GPT 时才使用 `gempt_consult` 或 `gempt_exec`。
 
-Antigravity 普通对话启用 GemPT 时，主 Gemini 统一通过 `invoke_subagent(TypeName="gempt-worker", Model="inherit", Role=..., Prompt=..., Workspace=...)` 处理新实质任务的 GPT 协作，包括咨询、工程、设计和专家任务。由子代理调用 `gempt_dispatch`。在同一任务线上用 `send_message` 联系原子代理，继续任务、按需查进度、调整执行方向或回复 `ask_gemini`。子代理返回 Gemini 分配时自行处理，返回结果时检查证据后向用户解释；若 GPT 产出了实质正文，在回复末尾用折叠块（`<details><summary>查看 GPT 原始输出（模型 · 耗时）</summary>…</details>`）保留其核心原话，方便用户直接查阅。仅需要 Gemini 视觉感知时，先提取必要观察，再派发后续工作。
+Antigravity 普通对话启用 GemPT 时，主 Gemini 统一通过 `invoke_subagent(TypeName="gempt-worker", Model="inherit", Role=..., Prompt=..., Workspace=...)` 处理新实质任务的 GPT 协作，包括咨询、工程、设计和专家任务。由子代理调用 `gempt_dispatch`。在同一任务线上用 `send_message` 联系原子代理，继续任务、按需查进度、调整执行方向或回复 `ask_gemini`。子代理返回 Gemini 分配时自行处理，返回结果时检查证据后向用户解释。用户可在 Antigravity 侧边栏打开 **GemPT Live**，无需消耗模型额度即可查看 GPT 任务的实时过程与完整原文。仅需要 Gemini 视觉感知时，先提取必要观察，再派发后续工作。
 
 任务单保留原目标、限制、证据和验收条件，把查文件、定位、实现和检查留给执行者。`kind` 按实际任务选 `routine`、`design`、`engineering` 或 `specialist`。材料齐备用 `access=provided`，检查工作区用 `inspect`，修改用 `change`。工作区任务传 `cwd`。
 
