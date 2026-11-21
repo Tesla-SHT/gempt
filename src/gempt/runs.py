@@ -8,6 +8,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -57,10 +58,49 @@ def read_run(run_id):
     state_path = run_directory(run_id) / "state.json"
     if not state_path.is_file():
         raise FileNotFoundError(f"Run '{run_id}' not found.")
-    record = json.loads(state_path.read_text(encoding="utf-8"))
+    for attempt in range(5):
+        try:
+            record = json.loads(state_path.read_text(encoding="utf-8"))
+            break
+        except (PermissionError, json.JSONDecodeError):
+            if attempt == 4:
+                raise
+            time.sleep(0.02)
     if record["state"] in {"queued", "running"} and time.time() > record["deadline"]:
         record["state"] = "outcome_unknown"
     return record
+
+
+def wait_for_run(run_id, *, timeout_sec: float | None = None, poll_interval: float = 0.25):
+    deadline = None if timeout_sec is None else time.monotonic() + timeout_sec
+    while True:
+        record = read_run(run_id)
+        if record["state"] not in {"queued", "running"}:
+            return record
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return record
+            time.sleep(min(poll_interval, remaining))
+        else:
+            time.sleep(poll_interval)
+
+
+def build_wait_command(run_id: str) -> str:
+    run_directory(run_id)
+    runtime = str(Path(__file__).resolve().parents[1])
+    bootstrap = (
+        "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));"
+        "runpy.run_module('gempt.cli',run_name='__main__')"
+    )
+    argv = [sys.executable, "-I", "-X", "utf8", "-B", "-c", bootstrap, runtime, "status", "--run-id", run_id, "--wait"]
+    if os.name != "nt":
+        return shlex.join(argv)
+
+    def _ps_quote(arg: str) -> str:
+        return "'" + arg.replace("'", "''") + "'"
+
+    return "& " + " ".join(_ps_quote(a) for a in argv)
 
 
 def recent_runs(limit, root=None):
@@ -81,7 +121,21 @@ def recent_runs(limit, root=None):
     return items
 
 
-def dispatch_exec(*, background=False, run_id="", **options):
+def _write_run_state(directory, record):
+    path = directory / "state.json"
+    for attempt in range(5):
+        try:
+            atomic_json(path, record)
+            return
+        except PermissionError as exc:
+            # On Windows a concurrent status reader can briefly block os.replace.
+            if getattr(exc, "winerror", None) not in {5, 32} or attempt == 4:
+                raise
+            time.sleep(0.02)
+
+
+def dispatch_exec(*, background=False, run_id="", wait_sec: float | None = None, **options):
+    wait_deadline = None if wait_sec is None else time.monotonic() + wait_sec
     run_id = run_id or uuid.uuid4().hex
     directory = run_directory(run_id)
     directory.parent.mkdir(parents=True, exist_ok=True)
@@ -97,7 +151,7 @@ def dispatch_exec(*, background=False, run_id="", **options):
               "session_id": options.get("session_id"), "verification": options.get("verification"),
               "created_at": time.time(),
               "deadline": time.time() + 120 + int(options.get("timeout_sec") or 3600)}
-    atomic_json(directory / "state.json", record)
+    _write_run_state(directory, record)
     try:
         atomic_json(directory / "request.json", options)
         env = os.environ.copy()
@@ -105,13 +159,14 @@ def dispatch_exec(*, background=False, run_id="", **options):
         bootstrap = ("import runpy,sys;sys.path.insert(0,sys.argv.pop(1));"
                      "runpy.run_module('gempt.runs',run_name='__main__')")
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        if os.name == "nt" and background:
+        detached = background or wait_sec is not None
+        use_launcher = detached and os.name == "nt"
+        if use_launcher:
             # A host can close its Windows job when the MCP connection ends.
             # Request independent lifetime, retaining the caller's security token.
             flags |= subprocess.CREATE_BREAKAWAY_FROM_JOB
         argv = [sys.executable, "-I", "-c", bootstrap, runtime, run_id]
-        detach = background and os.name == "nt"
-        if detach:
+        if use_launcher:
             # Antigravity also reaps descendants of a live MCP process. The
             # launcher relinquishes parentage before we acknowledge submission.
             launcher = ("import subprocess,sys;"
@@ -122,16 +177,30 @@ def dispatch_exec(*, background=False, run_id="", **options):
         proc = subprocess.Popen(argv,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 env=env, creationflags=flags, start_new_session=os.name != "nt")
-        if detach and proc.wait() != 0:
-            raise RuntimeError("Could not launch independent background worker.")
+        if use_launcher:
+            if proc.wait() != 0:
+                raise RuntimeError("Could not launch independent background worker.")
+        elif detached:
+            # Reap the POSIX child while the caller is alive, without delaying shutdown.
+            threading.Thread(target=proc.wait, daemon=True).start()
     except Exception as exc:
         record.update(state="failed", error=str(exc), finished_at=time.time())
-        atomic_json(directory / "state.json", record)
+        _write_run_state(directory, record)
         raise
     if background:
         return record
-    proc.wait()
-    record = read_run(run_id)
+    if wait_deadline is None:
+        proc.wait()
+        record = read_run(run_id)
+    else:
+        while True:
+            record = read_run(run_id)
+            if record["state"] not in {"queued", "running"}:
+                break
+            remaining = wait_deadline - time.monotonic()
+            if remaining <= 0:
+                return record
+            time.sleep(min(0.2, remaining))
     if "result" not in record:
         raise RuntimeError(f"{run_id}: {record.get('error', record['state'])}")
     return record["result"]
@@ -160,7 +229,7 @@ def worker(run_id):
         options = json.loads(request.read_text(encoding="utf-8"))
         request.unlink()
         record.update(state="running", pid=os.getpid(), started_at=time.time(), before=git_evidence(record["cwd"]))
-        atomic_json(directory / "state.json", record)
+        _write_run_state(directory, record)
         lock = nullcontext()
         if options.get("session_id"):
             sid = validate_session_id(options["session_id"])
@@ -174,7 +243,7 @@ def worker(run_id):
     finally:
         record["after"] = git_evidence(record["cwd"])
         record["finished_at"] = time.time()
-        atomic_json(directory / "state.json", record)
+        _write_run_state(directory, record)
 
 
 if __name__ == "__main__":

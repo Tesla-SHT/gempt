@@ -3,17 +3,25 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 from . import CONSULT_TIERS, DEFAULT_CONFIG_PATH, TIER_ORDER, __version__
 from .discover import discover_environment
-from .runs import dispatch_exec, read_run
+from .runs import build_wait_command, dispatch_exec, read_run
 from .service import configure_gempt, get_status, run_consult
+from .sessions import exclusive_operation, resolve_sessions_dir, validate_session_id
 from .workload import SCHEMA as DISPATCH_SCHEMA, dispatch_task
+
+_WRITE_LOCK = threading.Lock()
+_CONFIGURE_LOCK = threading.Lock()
 
 TOOLS: list[dict[str, Any]] = [
     {
@@ -268,6 +276,16 @@ def _normalize_workspace_cwd(
     return cwd
 
 
+def _mcp_wait_sec() -> float:
+    try:
+        wait_sec = float(os.environ.get("GEMPT_MCP_WAIT_SEC", "45.0"))
+    except ValueError:
+        wait_sec = math.nan
+    if not math.isfinite(wait_sec) or wait_sec < 0:
+        raise ValueError("GEMPT_MCP_WAIT_SEC must be a finite, non-negative number of seconds.")
+    return wait_sec
+
+
 def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
     args = dict(args)
     env_root = os.environ.get("GEMPT_WORKSPACE_ROOT", "").strip()
@@ -282,7 +300,7 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             args["cwd"] = str(_normalize_workspace_cwd(
                 raw_cwd, workspace_root=workspace_root, trusted_config=trusted_config,
             ))
-        data = dispatch_task(args, trusted_config)
+        data = dispatch_task(args, trusted_config, wait_sec=_mcp_wait_sec())
         return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
                 "isError": data.get("verification", {}).get("status") in {"failed", "unverified"}}
     if name == "gempt_exec" or (name == "gempt_consult" and (
@@ -345,27 +363,35 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return {"content": [{"type": "text", "text": json.dumps(data, indent=2, ensure_ascii=False)}]}
 
     if name == "gempt_consult":
-        res = run_consult(
-            goal=str(args["goal"]),
-            tier=args.get("tier") or None,
-            context=str(args.get("context") or ""),
-            file_paths=args.get("file_paths"),
-            constraints=str(args.get("constraints") or ""),
-            expected_output=str(args.get("expected_output") or ""),
-            session_id=str(args.get("session_id") or ""),
-            reasoning_effort=args.get("reasoning_effort"),
-            escalate=bool(args.get("escalate", False)),
-            model_override=args.get("model_override"),
-            gemini_family=args.get("gemini_family"),
-            max_output_tokens=args.get("max_output_tokens"),
-            api_mode=args.get("api_mode"),
-            cwd=args.get("cwd"),
-            config_path=trusted_config,
-        )
+        session_id = str(args.get("session_id") or "").strip()
+        lock = nullcontext()
+        if session_id:
+            session_id = validate_session_id(session_id)
+            lock = exclusive_operation(resolve_sessions_dir() / f"{session_id}.lock")
+        with lock:
+            res = run_consult(
+                goal=str(args["goal"]),
+                tier=args.get("tier") or None,
+                context=str(args.get("context") or ""),
+                file_paths=args.get("file_paths"),
+                constraints=str(args.get("constraints") or ""),
+                expected_output=str(args.get("expected_output") or ""),
+                session_id=session_id,
+                reasoning_effort=args.get("reasoning_effort"),
+                escalate=bool(args.get("escalate", False)),
+                model_override=args.get("model_override"),
+                gemini_family=args.get("gemini_family"),
+                max_output_tokens=args.get("max_output_tokens"),
+                api_mode=args.get("api_mode"),
+                cwd=args.get("cwd"),
+                config_path=trusted_config,
+            )
         return {"content": [{"type": "text", "text": res["formatted"]}]}
 
     if name == "gempt_exec":
-        res = dispatch_exec(background=bool(args.get("background")), run_id=args.get("run_id", ""),
+        background = bool(args.get("background"))
+        res = dispatch_exec(background=background, run_id=args.get("run_id", ""),
+            wait_sec=None if background else _mcp_wait_sec(),
             config_path=trusted_config,
             goal=str(args["goal"]),
             cwd=str(args["cwd"]),
@@ -383,8 +409,11 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             gemini_family=args.get("gemini_family"),
             timeout_sec=args.get("timeout_sec"),
         )
+        in_progress = res.get("state") in {"queued", "running"}
+        if in_progress and res.get("run_id") and "wait_command" not in res:
+            res = {**res, "wait_command": build_wait_command(res["run_id"])}
         return {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}],
-                "isError": res.get("verification", {}).get("status") in {"failed", "unverified"}}
+                "isError": not in_progress and res.get("verification", {}).get("status") in {"failed", "unverified"}}
 
     if name == "gempt_status":
         data = get_status(
@@ -398,9 +427,10 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _write_message(msg: dict[str, Any]) -> None:
-    line = json.dumps(msg, ensure_ascii=False) + "\n"
-    sys.stdout.buffer.write(line.encode("utf-8"))
-    sys.stdout.buffer.flush()
+    line = (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8")
+    with _WRITE_LOCK:
+        sys.stdout.buffer.write(line)
+        sys.stdout.buffer.flush()
 
 
 def _dispatch_request(req: dict[str, Any]) -> dict[str, Any] | None:
@@ -433,7 +463,8 @@ def _dispatch_request(req: dict[str, Any]) -> dict[str, Any] | None:
             if not isinstance(tool_args, dict):
                 raise ValueError("Tool arguments must be a JSON object.")
             try:
-                tool_res = _handle_tool_call(tool_name, tool_args)
+                with _CONFIGURE_LOCK if tool_name == "gempt_configure" else nullcontext():
+                    tool_res = _handle_tool_call(tool_name, tool_args)
             except Exception as exc:
                 sys.stderr.write(f"[gempt-mcp] tool '{tool_name}' error: {exc}\n")
                 sys.stderr.flush()
@@ -458,31 +489,39 @@ def _dispatch_request(req: dict[str, Any]) -> dict[str, Any] | None:
         }
 
 
+def _respond(req: dict[str, Any]) -> None:
+    resp = _dispatch_request(req)
+    if resp is not None:
+        _write_message(resp)
+
+
 def serve_stdio() -> int:
     """Run the newline-delimited JSON-RPC 2.0 MCP loop on stdin/stdout."""
-    while True:
-        raw_line = sys.stdin.buffer.readline()
-        if not raw_line:
-            break
-        line = raw_line.decode("utf-8", errors="replace").strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except json.JSONDecodeError as exc:
-            _write_message(
-                {
+    # Keep status and discovery available even when every delegation worker is busy.
+    # On EOF the executors join requests that were accepted, but not detached runs.
+    with ThreadPoolExecutor() as tools, ThreadPoolExecutor() as delegations:
+        for raw_line in sys.stdin.buffer:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError as exc:
+                _write_message({
                     "jsonrpc": "2.0",
                     "id": None,
                     "error": {"code": -32700, "message": f"Parse error: {exc}"},
-                }
-            )
-            continue
-        if not isinstance(req, dict):
-            continue
-        resp = _dispatch_request(req)
-        if resp is not None:
-            _write_message(resp)
+                })
+                continue
+            if not isinstance(req, dict):
+                continue
+            if req.get("method") == "tools/call" and req.get("id") is not None:
+                params = req.get("params")
+                name = params.get("name") if isinstance(params, dict) else None
+                pool = delegations if name in ("gempt_dispatch", "gempt_exec", "gempt_consult") else tools
+                pool.submit(_respond, req)
+            else:
+                _respond(req)
     return 0
 
 

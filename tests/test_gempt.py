@@ -11,8 +11,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -35,10 +38,10 @@ from gempt.config import (
 )
 from gempt.discover import build_tier_recommendations, find_magpie_cli, probe_magpie_gateway
 from gempt.magpie_client import MagpieRequestError, _group_members, consult_with_fallback, sync_magpie_groups
-from gempt.mcp_server import _handle_tool_call
+from gempt.mcp_server import _dispatch_request, _handle_tool_call, serve_stdio
 from gempt.presets import apply_native_presets, build_native_preset_commands, strip_model_modifiers
 from gempt.protocol import build_consult_prompt, build_exec_prompt, read_context_files
-from gempt.runs import recent_runs, verification_result
+from gempt.runs import dispatch_exec, read_run, recent_runs, verification_result
 from gempt.routing import build_escalation_suggestion, classify_task_effort, effort_timeout_floor
 from gempt.service import (
     configure_gempt,
@@ -581,6 +584,142 @@ class McpWorkspaceTests(unittest.TestCase):
         with mock.patch.dict(os.environ, GEMPT_WORKSPACE_ROOT=str(self.host)):
             with self.assertRaisesRegex(ValueError, "Run outside host workspace"):
                 _handle_tool_call("gempt_status", args)
+
+    def test_stdio_answers_ping_and_status_while_consult_waits(self):
+        run_id = "b" * 32
+        run = {"run_id": run_id, "cwd": str(self.project), "state": "finished"}
+        state_file = self.sessions / "runs" / run_id / "state.json"
+        state_file.parent.mkdir(parents=True)
+        state_file.write_text(json.dumps(run), encoding="utf-8")
+        status_written = threading.Event()
+
+        class Output(io.BytesIO):
+            def write(self, payload):
+                # Make a partial write possible if responses are not serialized.
+                middle = len(payload) // 2
+                super().write(payload[:middle])
+                time.sleep(0.005)
+                super().write(payload[middle:])
+                if b'"id": 3,' in payload:
+                    status_written.set()
+                return len(payload)
+
+        def slow_consult(**kwargs):
+            if not status_written.wait(timeout=3):
+                raise RuntimeError("status was blocked by the consultation")
+            return {"formatted": "OK"}
+
+        requests = [
+            {"id": 1, "method": "tools/call", "params": {"name": "gempt_consult", "arguments": {"goal": "Wait"}}},
+            {"id": 2, "method": "ping"},
+            {"id": 3, "method": "tools/call", "params": {"name": "gempt_status", "arguments": {"run_id": run_id}}},
+            {"id": 4, "method": "ping"},
+        ]
+        stdin = io.BytesIO("".join(json.dumps({"jsonrpc": "2.0", **r}) + "\n" for r in requests).encode())
+        stdout = Output()
+        with mock.patch("gempt.mcp_server.run_consult", side_effect=slow_consult), \
+             mock.patch.object(sys, "stdin", SimpleNamespace(buffer=stdin)), \
+             mock.patch.object(sys, "stdout", SimpleNamespace(buffer=stdout)):
+            self.assertEqual(serve_stdio(), 0)
+        replies = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        ids = [reply["id"] for reply in replies]
+        self.assertCountEqual(ids, [1, 2, 3, 4])
+        self.assertLess(ids.index(2), ids.index(1))
+        self.assertLess(ids.index(3), ids.index(1))
+        by_id = {reply["id"]: reply for reply in replies}
+        self.assertTrue(all(reply["jsonrpc"] == "2.0" for reply in replies))
+        self.assertEqual(by_id[2]["result"], {})
+        self.assertEqual(json.loads(by_id[3]["result"]["content"][0]["text"]), run)
+        self.assertEqual(by_id[1]["result"]["content"][0]["text"], "OK")
+
+
+class DetachedExecTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name).resolve()
+        self.workspace = root / "workspace"
+        self.workspace.mkdir()
+        env = mock.patch.dict(os.environ, GEMPT_CONFIG=str(root / "config.json"),
+                              GEMPT_WORKSPACE_ROOT=str(self.workspace), GEMPT_SESSIONS_DIR=str(root / "sessions"))
+        env.start()
+        self.addCleanup(env.stop)
+
+        # Run the real detached worker and state persistence with a local stand-in
+        # for the Codex service, so no model or gateway is needed.
+        package = root / "gempt"
+        package.mkdir()
+        for filename in ("__init__.py", "runs.py", "sessions.py"):
+            shutil.copyfile(SRC_ROOT / "gempt" / filename, package / filename)
+        (package / "service.py").write_text(
+            "import time\n"
+            "from pathlib import Path\n"
+            "def run_exec(*, cwd, goal, _run_id, **options):\n"
+            "    if goal == 'slow':\n"
+            "        release = Path(cwd) / f'release-{_run_id}'\n"
+            "        deadline = time.monotonic() + 20\n"
+            "        while not release.exists():\n"
+            "            if time.monotonic() >= deadline:\n"
+            "                raise RuntimeError('Fixture release timed out')\n"
+            "            time.sleep(0.02)\n"
+            "    if goal == 'fail':\n"
+            "        raise RuntimeError('Fixture worker failed')\n"
+            "    return {'text': 'Worker finished', 'verification': {'status': 'not_requested'}}\n",
+            encoding="utf-8",
+        )
+        runtime = mock.patch("gempt.runs.__file__", str(package / "runs.py"))
+        runtime.start()
+        self.addCleanup(runtime.stop)
+
+    def finish_run(self, reply):
+        run_id = reply["run_id"]
+        (self.workspace / f"release-{run_id}").touch()
+        deadline = time.monotonic() + 15
+        while True:
+            record = read_run(run_id)
+            if record["state"] not in {"queued", "running"} or time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+        self.assertEqual(record["state"], "finished", record)
+        self.assertEqual(record["result"]["text"], "Worker finished")
+
+    def test_dispatch_exec_returns_within_wait_budget_and_worker_finishes(self):
+        started = time.monotonic()
+        reply = dispatch_exec(goal="slow", cwd=self.workspace, wait_sec=0.15)
+        elapsed = time.monotonic() - started
+        self.assertIn(reply["state"], {"queued", "running"})
+        self.assertGreaterEqual(elapsed, 0.14)
+        self.assertLess(elapsed, 5.0)
+        self.assertFalse((self.workspace / f"release-{reply['run_id']}").exists())
+        self.finish_run(reply)
+
+    def test_bounded_wait_preserves_worker_errors(self):
+        with self.assertRaisesRegex(RuntimeError, r"^[0-9a-f]{32}: Fixture worker failed$"):
+            dispatch_exec(goal="fail", cwd=self.workspace, wait_sec=15)
+
+    def test_mcp_dispatch_and_exec_return_receipts_or_finished_results(self):
+        def call(tool, goal, budget, **args):
+            with mock.patch.dict(os.environ, GEMPT_MCP_WAIT_SEC=budget):
+                response = _dispatch_request({"id": 1, "method": "tools/call", "params": {"name": tool,
+                    "arguments": {"goal": goal, "cwd": str(self.workspace), **args}}})
+            self.assertIs(response["result"]["isError"], False, response)
+            return json.loads(response["result"]["content"][0]["text"])
+
+        for tool, args in (("gempt_dispatch", {"kind": "engineering", "access": "inspect"}), ("gempt_exec", {})):
+            with self.subTest(tool=tool):
+                for budget in ("0.15", "0"):
+                    reply = call(tool, "slow", budget, verification="fixture check", **args)
+                    self.assertIn(reply["state"], {"queued", "running"})
+                    self.assertEqual(reply["cwd"], str(self.workspace))
+                    self.assertIn("--wait", reply.get("wait_command", ""))
+                    if tool == "gempt_dispatch":
+                        self.assertEqual(reply["action"], "exec")
+                        self.assertIn(f"run_id='{reply['run_id']}'", reply["text"])
+                    self.finish_run(reply)
+                reply = call(tool, "fast", "15", **args)
+                self.assertEqual(reply["text"], "Worker finished")
+                self.assertNotIn("state", reply)
+                self.assertEqual(read_run(reply["run_id"])["state"], "finished")
 
 
 class CliPackagingTests(unittest.TestCase):
@@ -1196,6 +1335,60 @@ class BugfixRegressionTests(unittest.TestCase):
                     self.assertTrue(reply["disabled"])
                 consult_mock.assert_not_called()
                 exec_mock.assert_not_called()
+
+    def test_status_wait_and_wait_command_return_terminal_run(self) -> None:
+        from gempt.runs import build_wait_command
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sess_dir = Path(tmp) / "sessions"
+            run_id = "abcdef0123456789abcdef0123456789"
+            run_dir = sess_dir / "runs" / run_id
+            run_dir.mkdir(parents=True)
+            state_path = run_dir / "state.json"
+            state_path.write_text(
+                json.dumps({"run_id": run_id, "state": "running", "cwd": tmp, "deadline": time.time() + 60}),
+                encoding="utf-8",
+            )
+
+            def finish_later() -> None:
+                time.sleep(0.15)
+                state_path.write_text(
+                    json.dumps({
+                        "run_id": run_id,
+                        "state": "finished",
+                        "cwd": tmp,
+                        "deadline": time.time() + 60,
+                        "result": {"text": "DONE_BG", "run_id": run_id},
+                    }),
+                    encoding="utf-8",
+                )
+
+            t = threading.Thread(target=finish_later, daemon=True)
+            t.start()
+            with mock.patch.dict(os.environ, {"GEMPT_SESSIONS_DIR": str(sess_dir)}):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli_main(["status", "--run-id", run_id, "--wait"])
+                self.assertEqual(rc, 0)
+                parsed = json.loads(buf.getvalue())
+                self.assertEqual(parsed["state"], "finished")
+                self.assertEqual(parsed["result"]["text"], "DONE_BG")
+
+                cmd = build_wait_command(run_id)
+                self.assertIn(run_id, cmd)
+                self.assertIn("--wait", cmd)
+                shell_argv = ["powershell", "-NoProfile", "-Command", cmd] if os.name == "nt" else ["sh", "-c", cmd]
+                proc = subprocess.run(
+                    shell_argv,
+                    env={**os.environ, "GEMPT_SESSIONS_DIR": str(sess_dir)},
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=20,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(json.loads(proc.stdout)["result"]["text"], "DONE_BG")
+            t.join(timeout=2)
 
 
 if __name__ == "__main__":

@@ -2,14 +2,14 @@
 import re
 
 from .config import WORKLOAD, load_config
-from .runs import dispatch_exec
+from .runs import build_wait_command, dispatch_exec
 from .service import run_consult
 from .sessions import resolve_sessions_dir
 
 SCHEMA = WORKLOAD["schema"]
 
 
-def dispatch_task(args, config_path):
+def dispatch_task(args, config_path, *, wait_sec: float | None = None):
     goal = args.get("goal")
     if not isinstance(goal, str) or not goal.strip():
         raise ValueError("A task goal is required.")
@@ -56,7 +56,15 @@ def dispatch_task(args, config_path):
         reply = run_consult(**options, expected_output=WORKLOAD["report"])
     else:
         reply = dispatch_exec(**options, sandbox="read-only" if access == "inspect" else None,
-                              verification=args.get("verification", ""), expected_report=WORKLOAD["report"])
+                              verification=args.get("verification", ""), expected_report=WORKLOAD["report"],
+                              wait_sec=wait_sec)
+        if reply.get("state") in {"queued", "running"} and "text" not in reply:
+            run_id, state = reply["run_id"], reply["state"]
+            return {**result, "action": action, "state": state, "run_id": run_id, "cwd": reply.get("cwd"),
+                    "wait_command": build_wait_command(run_id),
+                    "text": f"Run {run_id} is {state} in the background. Run wait_command as an async background task "
+                            f"(e.g. run_command with WaitMsBeforeAsync=500) to wake automatically on completion, "
+                            f"or query gempt_status with run_id='{run_id}'; do not re-submit."}
     fields = ("model", "served_model", "session_id", "run_id", "verification", "usage", "warnings", "text")
     receipt = {key: reply[key] for key in fields if key in reply}
     if "verification" in receipt:

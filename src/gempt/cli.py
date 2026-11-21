@@ -25,7 +25,7 @@ from .agy_install import DEFAULT_AGY_TARGET, build_mcp_config, install_agy
 from .config import get_default_tier, load_config, resolve_tier
 from .discover import discover_environment
 from .presets import apply_native_presets
-from .runs import dispatch_exec, read_run
+from .runs import dispatch_exec, read_run, wait_for_run
 from .mcp_server import serve_stdio
 from .workload import SCHEMA as DISPATCH_SCHEMA, dispatch_task
 from .service import configure_gempt, get_status, run_consult, set_auto_effort, set_default_sandbox, set_default_tier, set_tier_effort
@@ -234,6 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stat = sub.add_parser("status", help="Show active configuration and health")
     p_stat.add_argument("--run-id", default="")
+    p_stat.add_argument("--wait", action="store_true", help="Wait until --run-id reaches a terminal state")
     p_stat.add_argument("--config", default=None)
     p_stat.add_argument("--sessions", type=int, default=10)
 
@@ -373,8 +374,9 @@ def main(argv: list[str] | None = None) -> int:
             return 1 if res.get("verification", {}).get("status") in {"failed", "unverified"} else 0
 
         if args.command == "status" and args.run_id:
-            print(json.dumps(read_run(args.run_id), ensure_ascii=False, indent=2))
-            return 0
+            record = wait_for_run(args.run_id) if args.wait else read_run(args.run_id)
+            print(json.dumps(record, ensure_ascii=False, indent=2))
+            return 1 if args.wait and record.get("state") != "finished" else 0
 
         if args.command == "status":
             data = get_status(config_path=args.config, session_limit=args.sessions)
