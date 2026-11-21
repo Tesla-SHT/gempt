@@ -32,7 +32,7 @@ try {
   ]);
   const html = template.replace("<!-- CSS -->", () => styles)
     .replace("/* SCRIPT */", () => script.replace(/<\/script/gi, "<\\/script"));
-  await writeFile(output, html, "utf8");
+  await writeFile(output, html.replace(/\r\n/g, "\n"), "utf8");
   console.log(`GemPT Live · ${Buffer.byteLength(html)} bytes`);
 } finally {
   await rm(temporary, { recursive: true, force: true, maxRetries: 3 });

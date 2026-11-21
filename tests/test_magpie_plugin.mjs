@@ -7,16 +7,50 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { execFile, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { delimiter, join, resolve } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
-import { buildMcpSnippet, findMagpieCli, readState, setDefaultSandbox, setDefaultTier } from '../magpie_plugin/lib/backend.mjs';
+import { buildMcpSnippet, findMagpieCli, normalizeTitle, readActiveRuns, readState, setDefaultSandbox, setDefaultTier } from '../magpie_plugin/lib/backend.mjs';
 import { createAppServerManager } from '../magpie_plugin/lib/app-server-manager.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
 import { createGemptTools } from '../magpie_plugin/lib/tools.mjs';
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
+
+test('short titles prefer the explicit value and clean historical goals', () => {
+  for (const [title, goal, cwd, expected] of [
+    ['  侧栏\n绑定　与命名 ', 'ignored', 'D:\\gempt', '侧栏 绑定 与命名'],
+    [null, 'You are executing a task delegated by Gemini.\nRead carefully.\n\n# Goal\n'
+      + '- 用户反馈：请在工作区 D:/gempt 中修复侧栏绑定。跟进测试。', 'D:\\gempt', 'gempt · 修复侧栏绑定'],
+    [' ', '请在你当前分配的隔离工作区中请先修复命名', '/code/gempt/', 'gempt · 修复命名'],
+    [null, '```text\nnot the task\n```\n# 请帮我整理 `session.json`。', '', '整理 session.json'],
+    [null, '1. "C:/My Projects/gempt": clean titles. Verify tests.', '/code/gempt', 'gempt · clean titles'],
+    [null, '`/code/gempt` 修复会话列表', 'C:\\kit\\gempt', 'gempt · 修复会话列表'],
+    ['🧪'.repeat(49), 'ignored', '', '🧪'.repeat(47) + '…'],
+    [null, '标题'.repeat(50), '/code/gempt', 'gempt · ' + '标题'.repeat(12).slice(0, 23) + '…'],
+    [null, '', '', 'GPT 任务'],
+  ]) assert.equal(normalizeTitle(title, goal, cwd), expected);
+});
+
+test('npm pack dry run includes the Live bundle and excludes local state and dependencies', async () => {
+  const npmCli = process.env.npm_execpath || (process.platform === 'win32'
+    ? join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js') : '');
+  const { stdout } = await execFileAsync(npmCli ? process.execPath : 'npm', [
+    ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
+  ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
+  const [{ files }] = JSON.parse(stdout);
+  const paths = files.map((file) => file.path);
+  for (const path of ['src/gempt/mcp_app_live.html', 'src/gempt/host_context.py', 'src/gempt/titles.py',
+    'plugin/hooks.json', 'plugin/work_split_hook.py', 'magpie_plugin/lib/backend.mjs']) {
+    assert.ok(paths.includes(path), path);
+  }
+  const roots = /^(?:LICENSE(?:\.md)?$|README\.md$|install\.(?:sh|ps1)$|package\.json$|pyproject\.toml$|(?:magpie_plugin|mcp_app|plugin|src\/gempt|templates)\/)/;
+  const localFiles = /(?:^|\/)(?:\.[^/]+|node_modules|__pycache__|sessions|runs|host-context(?:[.-][^/]*)?|state\.json|config\.json|request\.json|package-lock\.json)(?:\/|$)|\.(?:pyc|log|jsonl|tgz)$/i;
+  assert.deepEqual(paths.filter((path) => !roots.test(path) || localFiles.test(path)), []);
+  assert.ok(!existsSync(join(REPO_ROOT, 'node_modules')));
+  assert.ok(!existsSync(join(REPO_ROOT, 'mcp_app', 'node_modules')));
+});
 
 function findPythonBin() {
   const candidates = [
@@ -312,7 +346,8 @@ test('package.json Magpie manifest fields and single plugin factory export exist
 
 test('backend discovery uses overrides, PATH and installed MCP configuration', () => {
   const root = mkdtempSync(join(tmpdir(), 'gempt-paths-'));
-  const before = { ...process.env };
+  const keys = ['PATH', 'MAGPIE_BIN', 'PYTHON_BIN'];
+  const before = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   try {
     const bin = join(root, 'bin');
     const win = process.platform === 'win32';
@@ -342,7 +377,7 @@ test('backend discovery uses overrides, PATH and installed MCP configuration', (
     writeFileSync(join(root, 'mcp_config.json'), JSON.stringify(config));
     assert.deepEqual(buildMcpSnippet({ antigravityPluginDir: root }).config, config);
   } finally {
-    for (const key of ['PATH', 'MAGPIE_BIN', 'PYTHON_BIN']) {
+    for (const key of keys) {
       if (before[key] === undefined) delete process.env[key];
       else process.env[key] = before[key];
     }
@@ -810,7 +845,7 @@ test('history API paginates GemPT dispatches, correlates exec receipts and retur
   });
   const command = { command: 'node --test', exit_code: 0, output: 'PASS' };
   saveSession(exec, {
-    mode: 'exec', cwd: beta, tier: 'opus', model: 'codex/exec', updated_at: stamp(10),
+    mode: 'exec', cwd: beta, title: '  解析器\n检查 ', tier: 'opus', model: 'codex/exec', updated_at: stamp(10),
     turns: [
       { goal: 'check parser', timestamp: stamp(2), elapsed_sec: 12, usage: { input_tokens: 120, output_tokens: 30 }, reply_preview: 'full exec' },
       { role: 'user', content: '## Goal\ncontinue work\n\n## Required Verification\nnode --check app.js' },
@@ -827,7 +862,7 @@ test('history API paginates GemPT dispatches, correlates exec receipts and retur
     session_id: exec, elapsed_sec: 8, usage: { input_tokens: 50, output_tokens: 25 },
     text: '[mode=exec | tier=opus]\n\nnative response',
   } });
-  saveRun(saving, { state: 'running', cwd: beta, created_at: stamp(10), goal: 'pending receipt' });
+  saveRun(saving, { state: 'running', cwd: beta, created_at: stamp(10), title: ' 短任务名 ', goal: 'pending receipt' });
   saveRun(resumed, { state: 'failed', session_id: exec, cwd: beta, finished_at: stamp(11), goal: 'failed followup', error: 'worker stopped' });
   saveRun(runOnly, { state: 'finished', cwd: alpha, finished_at: stamp(12),
     result: { session_id: 'exec-orphan', turns: 3, text: 'receipt only', tier: 'fable' } });
@@ -897,6 +932,7 @@ test('history API paginates GemPT dispatches, correlates exec receipts and retur
   assert.equal(legacy.usage.total_tokens, null);
 
   const detail = await json(`/api/requests/${encodeURIComponent(`${exec}:1`)}`);
+  assert.equal(detail.title, '项目 beta · check parser');
   assert.equal(detail.reply, 'full exec response');
   assert.equal(detail.reply_is_preview, false);
   assert.equal(detail.run_id, linked);
@@ -917,7 +953,7 @@ test('history API paginates GemPT dispatches, correlates exec receipts and retur
   const narrowed = await query('/api/sessions', { q: 'SECOND REPLY', mode: 'consult', tier: 'sonnet',
     model: 'codex/alpha', workspace: alpha });
   assert.deepEqual(narrowed.items.map((row) => row.id), [consult]);
-  assert.equal(narrowed.items[0].title, 'first goal');
+  assert.equal(narrowed.items[0].title, 'project alpha · first goal');
   assert.equal(narrowed.items[0].turn_count, 2);
   assert.equal(narrowed.items[0].usage.total_tokens, 75);
 
@@ -927,6 +963,8 @@ test('history API paginates GemPT dispatches, correlates exec receipts and retur
   assert.deepEqual(transcript.turns.map((row) => row.elapsed_sec), [1.5, 3]);
   assert.deepEqual(transcript.runs, []);
   const execSession = await json(`/api/sessions/${exec}`);
+  assert.equal(execSession.title, '解析器 检查');
+  assert.equal(readActiveRuns(sessionsDir).find((run) => run.run_id === saving).title, '短任务名');
   assert.equal(execSession.turn_count, 4);
   assert.deepEqual(execSession.turns.map((row) => [row.turn, row.run_id, row.status]), [
     [1, linked, 'succeeded'], [2, legacyNative, 'succeeded'], [3, saving, 'succeeded'], [null, resumed, 'failed'],
@@ -1119,7 +1157,10 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
       assert.equal(magpie.requests.length - before, Number(delegated));
     }
     const hydrogenTask = { ...design, gemini_family: 'hydrogen' };
-    const initial = await dispatch(hydrogenTask);
+    const initial = await dispatch({ ...hydrogenTask, title: '  表单\n设计 ', host_conversation_id: 'consult-host' });
+    const titledConsult = JSON.parse(readFileSync(join(sessDir, `${initial.session_id}.json`), 'utf8'));
+    assert.equal(titledConsult.title, '表单 设计');
+    assert.equal(titledConsult.host_conversation_id, 'consult-host');
     assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6.1-terra');
     config.routing_policy.pairings = { hydrogen: 'codex/gpt-6-luna' };
     writeFileSync(cfgPath, JSON.stringify(config));
@@ -1164,7 +1205,7 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
 
     // Tighten sandbox to read-only and verify mock codex invocation + thread resume
     const e1 = await enabledTools.exec.execute(
-      { goal: 'Inspect repo', cwd: repoDir, sandbox: 'read-only' },
+      { goal: 'Inspect repo', cwd: repoDir, sandbox: 'read-only', title: '  核对\n工作区 ', host_conversation_id: 'exec-host' },
       { agent: 'opencode' },
     );
     assert.equal(e1.sandbox, 'read-only');
@@ -1187,6 +1228,11 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
       { agent: 'opencode' },
     );
     const execHistory = JSON.parse(readFileSync(join(sessDir, `${e2.session_id}.json`), 'utf8'));
+    assert.equal(execHistory.title, '核对 工作区');
+    assert.equal(execHistory.host_conversation_id, 'exec-host');
+    const resumedState = JSON.parse(readFileSync(join(sessDir, 'runs', e2.run_id, 'state.json'), 'utf8'));
+    assert.equal(resumedState.title, 'workspace · Continue in same re…');
+    assert.equal(resumedState.host_conversation_id, 'exec-host');
     assert.equal(execHistory.turn_details[2].run_id, e2.run_id);
     assert.deepEqual(execHistory.turn_details[2].commands, e2.commands);
     assert.equal(e2.session_id, e1.session_id);

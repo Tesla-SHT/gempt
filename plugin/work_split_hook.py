@@ -1,9 +1,17 @@
-"""Give each Antigravity conversation the current assignment rule before inference."""
+"""Apply GemPT's assignment rules and track the active Antigravity conversation."""
 import json
 import os
 import re
 import sys
 from pathlib import Path
+
+if __name__ == "__main__":
+    plugin = Path(__file__).resolve().parent
+    runtime = plugin / "runtime"
+    sys.path.insert(0, str(runtime if runtime.is_dir() else plugin.parent / "src"))
+
+from gempt.host_context import context_path, update_host_context
+from gempt.titles import explicit_title
 
 
 def native_family(name):
@@ -14,27 +22,47 @@ def native_family(name):
     return match.group(1) if match else None
 
 
-def tool_pairing(payload, family):
+def pre_tool_use(payload, family):
     result = {"decision": "allow"}
     call = payload.get("toolCall") or {}
     args = call.get("args") or {}
+    conversation = payload.get("conversationId")
+    workspace = payload.get("workspacePaths")
+    if call.get("name") == "invoke_subagent" and args.get("TypeName") == "gempt-worker":
+        update_host_context(conversation, workspace)
+        prompt = args.get("Prompt")
+        if (isinstance(conversation, str) and conversation.strip() and isinstance(prompt, str)
+                and not any(line.startswith("GemPT metadata: ") for line in prompt.splitlines())):
+            meta = {"host_conversation_id": conversation, "title": explicit_title(args.get("Role"))}
+            result["overwrite"] = {"Prompt": prompt + "\nGemPT metadata: " + json.dumps(meta, ensure_ascii=False)}
+        return result
     if call.get("name") != "call_mcp_tool" or args.get("ServerName") != "gempt_gempt":
         return result
-    if args.get("ToolName") not in ("gempt_dispatch", "gempt_consult", "gempt_exec"):
-        return result
+    tool = args.get("ToolName")
     task = args.get("Arguments")
-    if not family or not isinstance(task, dict) or task.get("tier") or task.get("session_id"):
+    if task is None:
+        task = {}
+    if not isinstance(task, dict):
         return result
+    updates = {}
+    if isinstance(conversation, str) and conversation.strip() and tool in ("gempt_dispatch", "gempt_exec", "gempt_live_view"):
+        parent = task.get("host_conversation_id")
+        if not parent:
+            updates["host_conversation_id"] = conversation
+        elif isinstance(parent, str) and parent != conversation and tool != "gempt_live_view":
+            update_host_context(conversation, workspace, parent_id=parent)
     # Workers receive the coordinator family from the board, including an unknown family.
-    if task.get("role") not in (None, "solo", "coordinator", "narrator"):
-        return result
-    if task.get("gemini_family") != family:
-        result["overwrite"] = {"Arguments": {**task, "gemini_family": family}}
+    if (tool in ("gempt_dispatch", "gempt_consult", "gempt_exec") and family
+            and not task.get("tier") and not task.get("session_id")
+            and task.get("role") in (None, "solo", "coordinator", "narrator") and task.get("gemini_family") != family):
+        updates["gemini_family"] = family
+    if updates:
+        result["overwrite"] = {"Arguments": {**task, **updates}}
     return result
 
 
 def reminder(family):
-    path = Path(os.environ.get("GEMPT_CONFIG") or Path.home() / ".config/gempt/config.json")
+    path = Path(os.environ.get("GEMPT_CONFIG") or context_path().with_name("config.json")).expanduser()
     policy = json.loads(path.read_text(encoding="utf-8-sig")).get("routing_policy", {}) if path.is_file() else {}
     profiles_file = Path(__file__).parent / "runtime/gempt/workload.json"
     profiles = json.loads(profiles_file.read_text(encoding="utf-8"))["profiles"]
@@ -80,5 +108,9 @@ def reminder(family):
 if __name__ == "__main__":
     payload = json.load(sys.stdin.buffer)
     family = native_family(payload.get("modelName"))
-    response = tool_pairing(payload, family) if "toolCall" in payload else reminder(family)
+    if "toolCall" in payload:
+        response = pre_tool_use(payload, family)
+    else:
+        update_host_context(payload.get("conversationId"), payload.get("workspacePaths"))
+        response = reminder(family)
     print(json.dumps(response))

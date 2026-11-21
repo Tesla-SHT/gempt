@@ -218,6 +218,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_exec.add_argument("--escalate", action="store_true", help="For opus tier: escalate to escalate_model (e.g. Astra)")
     p_exec.add_argument("--cwd", default=".")
     p_exec.add_argument("--goal", required=True)
+    p_exec.add_argument("--title")
+    p_exec.add_argument("--host-conversation-id")
     p_exec.add_argument("--context", default="")
     p_exec.add_argument("--constraints", default="")
     p_exec.add_argument("--verification", default="")
@@ -366,6 +368,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "exec":
             res = dispatch_exec(background=args.background, run_id=args.run_id,
                 goal=args.goal,
+                title=args.title,
+                host_conversation_id=args.host_conversation_id,
                 cwd=args.cwd,
                 tier=args.tier,
                 context=args.context,

@@ -8,6 +8,8 @@ Antigravity 普通对话启用 GemPT 时，主 Gemini 统一通过 `invoke_subag
 
 任务单保留原目标、限制、证据和验收条件，把查文件、定位、实现和检查留给执行者。`kind` 按实际任务选 `routine`、`design`、`engineering` 或 `specialist`。材料齐备用 `access=provided`，检查工作区用 `inspect`，修改用 `change`。工作区任务传 `cwd`。
 
+用现成的 `Role` 作短任务名，能顺手写成 6–15 字即可。派单时沿用该 `title` 和父级 `host_conversation_id`，Antigravity hook 会补齐元数据，省略标题时由 GemPT 从目标自动生成。
+
 其他启用自动协作的 MCP 宿主直接用 `gempt_dispatch`，仅支持 CLI 时用 `python -m gempt dispatch --goal … --kind … --access …`。执行返回 `queued` 或 `running` 时优先后台运行返回的 `wait_command`，其余宿主用 `run_id` 查 `gempt_status`。遇到权限不足、超时或执行者不可用，向用户说明受阻步骤。按宿主报告填写 `gemini_family`（hydrogen、neon、carbon），未知时省略。只有用户点名档位或使用对应斜杠命令时传 `tier`。续接使用原 `session_id`。
 
 ## Antigravity /swarm

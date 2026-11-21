@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .host_context import read_host_context
 from .runs import ACTIVE_STATES, interrupt_run, read_run, run_directory, steer_run
 from .sessions import resolve_sessions_dir
+from .titles import workspace_name
 
 APP_URI = "ui://gempt/live.html"
 APP_RESOURCE = {
@@ -25,7 +27,12 @@ APP_RESOURCE = {
 }
 _MAX_HTML = 10 * 1024 * 1024
 _TEXT_BYTES = 96 * 1024
+_GOAL_BYTES = 16 * 1024
 _RUN_ID = {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+_SCOPE = {
+    "host_conversation_id": {"type": "string", "description": "Antigravity conversation to bind to."},
+    "scope": {"type": "string", "enum": ["session", "all"], "default": "session"},
+}
 _MAX_EVENTS = 200
 _TEXT_REVISIONS = count(1)
 _USAGE_FIELDS = {
@@ -54,14 +61,15 @@ def _tool(name, description, properties, *, required=()):
 
 APP_TOOLS = {
     tool["name"]: tool for tool in (
-        _tool("gempt_live_view", "Open GemPT Live to watch a Codex run.", {"run_id": _RUN_ID}),
+        _tool("gempt_live_view", "Open GemPT Live to watch a Codex run.", {"run_id": _RUN_ID, **_SCOPE}),
         _tool("gempt_app_runs", "List runs in GemPT Live.",
-              {"limit": {"type": "integer", "minimum": 1, "maximum": 50}}),
+              {"limit": {"type": "integer", "minimum": 1, "maximum": 50}, **_SCOPE}),
         _tool("gempt_app_stream", "Read a run snapshot or continue a long transcript.", {
             "run_id": _RUN_ID,
             "max_events": {"type": "integer", "minimum": 1, "maximum": _MAX_EVENTS},
             "text_offset": {"type": "integer", "minimum": 0},
             "text_revision": {"type": "integer", "minimum": 1},
+            "goal_offset": {"type": "integer", "minimum": 0},
         }, required=("run_id",)),
         _tool("gempt_app_interrupt", "Interrupt the selected run.", {"run_id": _RUN_ID}, required=("run_id",)),
         _tool("gempt_app_steer", "Steer the selected run.",
@@ -139,11 +147,13 @@ def _run_summary(record, *, compact=False):
     return {
         "run_id": record["run_id"], "session_id": _text(record.get("session_id"), 128),
         "state": _text(record["state"], 32), "cwd": _bounded_text(record.get("cwd"), 8192),
+        "title": record["title"], "workspace_name": _bounded_text(workspace_name(record.get("cwd")), 512),
+        "host_conversation_id": record.get("host_conversation_id"),
         "can_control": bool(record["state"] in {"running", "waiting_gemini"}
                             and record.get("codex_thread_id") and record.get("turn_id")),
         "model": _text(result.get("model") or record.get("model"), 128),
         "tier": _text(result.get("tier") or record.get("tier"), 64),
-        "goal": _bounded_text(record.get("goal"), 512 if compact else 16384),
+        "goal": _bounded_text(record.get("goal"), 512 if compact else _GOAL_BYTES),
         "started_at": started, "finished_at": finished, "elapsed_sec": elapsed,
         "usage": _usage(result.get("usage") or progress.get("token_usage") or record.get("usage") or {}),
         "progress": {"phase": _text(progress.get("phase"), 64), "updated_at": _timestamp(progress.get("updated_at"))},
@@ -208,14 +218,30 @@ def _within_budget(items, budget):
     return selected
 
 
-def _list_runs(limit, root):
+def _run_scope(args, config):
+    context = read_host_context(config)
+    active = context.get("conversation_id")
+    bound = args.get("host_conversation_id") or (active if isinstance(active, str) else None) or None
+    scope = args.get("scope", "session") if bound else "all"
+    paths = context.get("workspace_paths")
+    workspace = workspace_name(paths[0]) if bound and bound == active and isinstance(paths, list) and paths else ""
+    return {"bound_conversation_id": bound, "scope": scope, "bound_workspace_name": workspace}
+
+
+def _list_runs(limit, root, binding):
     candidates = []
+    bound, scope = binding["bound_conversation_id"], binding["scope"]
+    session_count = 0
     now = time.time()
     for path in (resolve_sessions_dir() / "runs").glob("*/state.json"):
         try:
             stat = path.stat()
             summary, cwd, deadline = _list_summary(path, stat.st_mtime_ns, stat.st_size)
             if not _in_workspace(cwd, root):
+                continue
+            matches = bool(bound and summary["host_conversation_id"] == bound)
+            session_count += int(matches)
+            if scope == "session" and not matches:
                 continue
             if summary["state"] in ACTIVE_STATES:
                 if now > deadline:
@@ -227,7 +253,8 @@ def _list_runs(limit, root):
             continue
     candidates.sort(key=lambda entry: entry[:2], reverse=True)
     runs = _within_budget((entry[2] for entry in candidates[:limit]), 96 * 1024)
-    return {"runs": runs, "app_server": {"name": "gempt", "version": __version__}}
+    return {**binding, "session_count": session_count, "runs": runs,
+            "app_server": {"name": "gempt", "version": __version__}}
 
 
 class _Journal:
@@ -443,10 +470,12 @@ def _stream(record, max_events, offset, root, revision=None):
         ((name, uri) for name in files if (uri := _file_uri(name, cwd, root))), 24 * 1024,
     )
     run = {**_run_summary(record), "usage": usage}
+    goal = record.get("goal")
+    next_goal_offset = len(run["goal"]) if isinstance(goal, str) and len(run["goal"]) < len(goal) else None
     input_tokens = usage.get("input_tokens", 0)
     cached = usage.get("cached_input_tokens")
     return {
-        "run": run, "timeline": timeline, **page, "commands": commands,
+        "run": run, "timeline": timeline, **page, "commands": commands, "next_goal_offset": next_goal_offset,
         "touched_files": files, "file_uris": dict(uris), "usage": usage,
         "cache_hit_rate": min(cached, input_tokens) / input_tokens if input_tokens > 0 and cached is not None else None,
     }
@@ -463,16 +492,21 @@ def call_app_tool(name: str, args: dict[str, Any], *, root: Path | None, config:
     for key, value in args.items():
         field = schema["properties"][key]
         if field["type"] == "string":
-            if not isinstance(value, str) or ("pattern" in field and not re.fullmatch(field["pattern"], value)):
+            if (not isinstance(value, str) or ("pattern" in field and not re.fullmatch(field["pattern"], value))
+                    or ("enum" in field and value not in field["enum"])):
                 raise ValueError(f"Invalid {key}.")
         elif type(value) is not int or not field["minimum"] <= value <= field.get("maximum", value):
             raise ValueError(f"Invalid {key}.")
     run_id = args.get("run_id")
-    if name == "gempt_app_runs":
-        return _result("GemPT Live runs.", _list_runs(args.get("limit", 20), root))
+    if name in ("gempt_app_runs", "gempt_live_view"):
+        binding = _run_scope(args, config)
+        data = _list_runs(args.get("limit", 20), root, binding)
+        if name == "gempt_app_runs":
+            return _result("GemPT Live runs.", data)
     record = _read_workspace_run(run_id, root) if run_id else None
     if name == "gempt_live_view":
-        data = _list_runs(20, root)
+        if record and binding["scope"] == "session" and record.get("host_conversation_id") != binding["bound_conversation_id"]:
+            record = None
         if record is None:
             for run in data["runs"]:
                 try:
@@ -485,6 +519,13 @@ def call_app_tool(name: str, args: dict[str, Any], *, root: Path | None, config:
             "stream": _stream(record, 60, 0, root) if record else None,
         })
     if name == "gempt_app_stream":
+        if (offset := args.get("goal_offset")) is not None:
+            goal = record.get("goal")
+            goal = goal if isinstance(goal, str) else ""
+            end = _text_end(goal, offset, _GOAL_BYTES)
+            return _result("GemPT Live task goal.", {
+                "goal": goal[offset:end], "next_goal_offset": end if end < len(goal) else None,
+            })
         return _result("GemPT Live snapshot.",
                        _stream(record, args.get("max_events", 60), args.get("text_offset", 0),
                                root, args.get("text_revision")))

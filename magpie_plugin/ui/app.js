@@ -733,14 +733,14 @@
 
     const runs = (state.recent_runs || []).map((run) => ({
       tone: run.verification === 'passed' ? 'ok' : (run.state === 'failed' || run.verification === 'failed' ? 'err' : 'neutral'),
-      text: `执行 · ${titleCaseTier(run.tier || 'exec')} · ${run.cwd_name || run.run_id.slice(0, 8)}`,
+      text: `执行 · ${titleCaseTier(run.tier || 'exec')} · ${run.title || run.cwd_name || run.run_id.slice(0, 8)}`,
       meta: formatRunMeta(run),
     }));
     const sessions = (state.recent_sessions || []).map((sess) => {
       const agentTag = sess.agent ? ` · ${sess.agent}` : '';
       return {
         tone: 'ok',
-        text: `${sess.mode === 'exec' ? '执行' : '咨询'} · ${titleCaseTier(sess.tier || 'sonnet')}${agentTag} (${humanizeModel(sess.model || sess.cwd_name)})`,
+        text: `${sess.mode === 'exec' ? '执行' : '咨询'} · ${titleCaseTier(sess.tier || 'sonnet')}${agentTag} · ${sess.title || sess.cwd_name || 'GPT 任务'}`,
         meta: `${Math.max(1, Math.floor((sess.turns || 0) / 2))} 轮`,
       };
     });
@@ -1312,10 +1312,10 @@
       row.dataset.runId = run.run_id;
       const info = node('div', 'active-run-info');
       const head = node('div', 'active-run-meta');
-      const workspace = node('strong', '', run.cwd?.split(/[/\\]+/).filter(Boolean).at(-1) || '工作区');
-      workspace.title = run.cwd || '';
+      const title = node('strong', '', run.title || 'GPT 任务');
+      title.title = run.cwd || '';
       const phase = run.progress?.phase || run.state;
-      head.append(statusBadge(run.state === 'queued' ? { state: 'running' } : run), workspace,
+      head.append(statusBadge(run.state === 'queued' ? { state: 'running' } : run), title,
         node('span', 'run-phase', phases[phase] || phase),
         node('span', 'run-elapsed', runElapsed(run, overviewRunTimes.get(run.run_id))));
       info.append(head);
@@ -1360,7 +1360,7 @@
       const row = body.insertRow();
       row.tabIndex = 0;
       row.dataset.activityId = r.id;
-      row.title = r.goal;
+      row.title = r.title;
       const open = () => openActivityDetail(view, r.id, { runId: r.run_id });
       row.onclick = () => { if (!String(window.getSelection())) open(); };
       row.onkeydown = (event) => {
@@ -1383,7 +1383,7 @@
       add(when(r.timestamp), r.timestamp);
       const agent = node('span', 'ledger-agent', r.agent || 'GemPT');
       agent.append(node('span', 'activity-badge', modes[r.mode]));
-      add(agent, r.goal);
+      add(agent, r.title);
       add(r.requested_model, r.requested_model);
       add([r.provider, r.account].filter(Boolean).join(' · '));
       add(r.sent_model, r.sent_model);
@@ -1414,7 +1414,7 @@
     const icon = node('span', 'activity-session-icon', session.mode === 'exec' ? '>_' : '≡');
     icon.setAttribute('aria-hidden', 'true');
     const who = node('span', 'activity-session-who');
-    const title = node('strong', '', session.title || '（无提示词）');
+    const title = node('strong', '', session.title || 'GPT 任务');
     title.title = session.title;
     const meta = node('small', '', [session.model, filterLabel('tier', session.tier), when(session.updated_at)].filter(Boolean).join(' · '));
     const folder = node('span', 'session-folder', session.cwd);
@@ -1591,12 +1591,7 @@
       if (open.rendered === rendered && !body.querySelector('button:disabled')) return;
       open.rendered = rendered;
       const head = node('header', 'activity-detail-head');
-      const rawTitle = String(session ? data.title || '（无提示词）' : data.model || data.goal || '请求详情')
-        .replace(/\s+/g, ' ')
-        .trim();
-      const titleNode = node('h2', '', rawTitle.length > 140 ? `${rawTitle.slice(0, 140)}…` : rawTitle);
-      if (rawTitle.length > 140) titleNode.title = rawTitle;
-      head.append(titleNode);
+      head.append(node('h2', '', data.title || (session ? 'GPT 会话' : '请求详情')));
       if (runState(run)) head.append(statusBadge(run));
       const focusedInterrupt = body.contains(document.activeElement)
         && document.activeElement.dataset.runAction === 'interrupt';

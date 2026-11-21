@@ -31,8 +31,10 @@ import {
   VALID_SANDBOXES,
   defaultGatewayFromEnv,
   expandUser,
+  explicitTitle,
   isCodexModelId,
   normalizeDefaultTier,
+  normalizeTitle,
   pickSubscriptionPlan,
   probeMagpie,
   readJsonSafe,
@@ -42,6 +44,7 @@ import {
   resolveMagpieApiKey,
   resolveMagpieConfigDir,
   resolveSessionsDir,
+  sessionGoal,
   writeConfigAtomic,
 } from './backend.mjs';
 import {
@@ -740,7 +743,8 @@ export function createGemptTools({
           return { ...result, action: 'gemini', text: 'Handle this part in Gemini. Report to the board if assigned there.' };
         }
         const task = { goal, cwd: args.cwd, tier: args.tier, gemini_family: args.gemini_family,
-          context: args.context, file_paths: args.file_paths, session_id: args.session_id };
+          context: args.context, file_paths: args.file_paths, session_id: args.session_id,
+          title: args.title, host_conversation_id: args.host_conversation_id };
         const reply = action === 'consult'
           ? await tools.consult.execute({ ...task, expected_output: WORKLOAD.report }, callCtx)
           : await tools.exec.execute({ ...task, run_id: role === 'worker' || role === 'verifier' ? assignment : undefined, verification: args.verification, expected_report: WORKLOAD.report,
@@ -987,21 +991,26 @@ export function createGemptTools({
         const sessionId = priorSession?.session_id || generateSessionId('consult');
         const agent = callingAgent(callCtx) || priorSession?.agent || '';
         const turn = Math.floor(messages.length / 2) + 1;
+        const cwd = validatedCwd || priorSession?.cwd || '';
+        const title = normalizeTitle(args.title, goal, cwd);
+        const hostId = args.host_conversation_id || priorSession?.host_conversation_id || null;
         saveSession(resolvedSessionsDir, {
           ...(priorSession || {}),
+          title: explicitTitle(args.title) || (priorSession ? normalizeTitle(priorSession.title, sessionGoal(priorSession), cwd) : title),
+          host_conversation_id: hostId,
           paired_model: paired,
           session_id: sessionId,
           mode: 'consult',
           tier: resolved.tier,
           model: reply.servedModel || usedModel,
           reasoning_effort: effort,
-          cwd: validatedCwd || priorSession?.cwd || '',
+          cwd,
           agent,
           turns: [...messages, { role: 'assistant', content: reply.text }],
           turn_details: {
             ...priorSession?.turn_details,
             [turn]: {
-              goal, timestamp: nowIso(), cwd: validatedCwd || priorSession?.cwd || '', agent,
+              goal, title, host_conversation_id: hostId, timestamp: nowIso(), cwd, agent,
               tier: resolved.tier, served_model: reply.servedModel || usedModel,
               requested_model: resolved.model, sent_model: usedModel, reasoning_effort: effort,
               attempted_models: attemptedModels, elapsed_sec: elapsedSec, usage: reply.usage,
@@ -1049,6 +1058,8 @@ export function createGemptTools({
         type: 'object',
         properties: {
           goal: { type: 'string', description: 'Exact engineering task and scope for Codex to implement/verify.' },
+          title: WORKLOAD.schema.properties.title,
+          host_conversation_id: WORKLOAD.schema.properties.host_conversation_id,
           cwd: { type: 'string', description: 'Target workspace directory (cannot be /, ~, ~/.ssh, ~/.aws, ~/.gnupg, ~/.config/magpie, ~/.config/gempt).' },
           gemini_family: WORKLOAD.schema.properties.gemini_family,
           tier: { type: 'string', enum: TIER_ORDER, description: 'Target tier (sonnet, opus, fable). Omit for the current Gemini pairing or configured default tier.' },
@@ -1080,8 +1091,10 @@ export function createGemptTools({
 
         if (!execRunFile) {
           const cwd = normalizeWorkspaceCwd(args.cwd, { configPath, magpieConfigDir: resolvedMagpieDir, env });
+          const hostId = args.host_conversation_id || (args.session_id && SESSION_ID_RE.test(args.session_id)
+            ? loadSession(resolvedSessionsDir, args.session_id)?.host_conversation_id : null);
           return startNativeRun({
-            args: { ...args, cwd }, agent: callingAgent(callCtx), env,
+            args: { ...args, cwd, host_conversation_id: hostId }, agent: callingAgent(callCtx), env,
             host: { configPath: resolveConfigPath(configPath), sessionsDir: resolvedSessionsDir,
               magpieConfigDir: resolvedMagpieDir, options: { exec: true }, probeTimeoutMs },
           });
@@ -1213,8 +1226,12 @@ export function createGemptTools({
         if (runtime.cfg?.codex?.extra_args?.length) throw new Error('Unrestricted Codex extra_args conflict with gateway and sandbox enforcement.');
         const sessionId = priorSession?.session_id || newExecSession;
         const agent = callingAgent(callCtx) || priorSession?.agent || '';
+        const title = normalizeTitle(args.title, goal, workdir);
+        const hostId = args.host_conversation_id || priorSession?.host_conversation_id || null;
         const session = {
           ...(priorSession || {}),
+          title: explicitTitle(args.title) || (priorSession ? normalizeTitle(priorSession.title, sessionGoal(priorSession), workdir) : title),
+          host_conversation_id: hostId,
           paired_model: paired, session_id: sessionId, mode: 'exec', tier: resolved.tier, model: targetModel,
           reasoning_effort: effort, cwd: workdir, sandbox: effectiveSandbox, gateway: runtime.baseUrl, agent,
         };
@@ -1254,7 +1271,7 @@ export function createGemptTools({
           turn_details: {
             ...priorSession?.turn_details,
             [turn]: {
-              goal, timestamp, cwd: workdir, agent, tier: resolved.tier, model: targetModel,
+              goal, title, host_conversation_id: hostId, timestamp, cwd: workdir, agent, tier: resolved.tier, model: targetModel,
               reasoning_effort: effort, codex_thread_id: res.threadId, run_id: args.run_id,
               elapsed_sec: res.elapsedSec, usage: res.usage, verification: args.verification, commands: res.commands,
             },
@@ -1280,6 +1297,8 @@ export function createGemptTools({
           summary,
           text: `${summary}\n\n${res.text}`,
           session_id: sessionId,
+          title,
+          host_conversation_id: hostId,
           turns: turn,
           timestamp,
           codex_thread_id: res.threadId,

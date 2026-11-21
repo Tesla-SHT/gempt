@@ -561,6 +561,67 @@ function sortedMtimeEntries(dirPath, filterFn) {
   return entries;
 }
 
+// Keep title normalization in sync with src/gempt/titles.py.
+const titleSpace = /[\s\u0085\x1c-\x1f]+/g;
+const titlePrefix = new RegExp([
+  '^[ \\t]*(?:#{1,6}[ \\t]+|[-*+>][ \\t]+|[0-9]+[.)][ \\t]+)',
+  '^(?:用户反馈|任务目标|目标|需求|Goal)\\s*[:：]\\s*',
+  '^请?在(?:你当前分配的|当前分配的|当前的?)?(?:隔离)?\\s*'
+    + '(?:工作区|工作目录|worktree)[^\\n。]*?[中内里][：:,，]?\\s*(?:[（(][^\\n）)]*[）)]\\s*)?',
+  '^请?(?:先|帮我|协助我|麻烦你)\\s*|^请\\s*',
+  /^(?:[`'"“‘](?:[a-z]:[\\/]|[\\/]{1,2}|~\/)[^`'"”’]+[`'"”’]|(?:[a-z]:[\\/]|[\\/]{1,2}|~\/)[^\s：:,，。；;]+)(?:\s+|[：:,，·—–-]+\s*|$)/.source,
+].join('|'), 'i');
+
+export function workspaceName(cwd) {
+  return typeof cwd === 'string' ? cwd.replace(/[/\\]+$/, '').split(/[/\\]+/).at(-1) : '';
+}
+
+function shortenTitle(text, limit) {
+  const characters = Array.from(text);
+  return characters.length <= limit ? text : characters.slice(0, limit - 1).join('').trimEnd() + '…';
+}
+
+export function explicitTitle(title) {
+  return typeof title === 'string' ? shortenTitle(title.replace(titleSpace, ' ').trim(), 48) : '';
+}
+
+export function normalizeTitle(title, goal, cwd) {
+  const name = explicitTitle(title);
+  if (name) return name;
+  let text = typeof goal === 'string' ? goal.replace(/\r\n?/g, '\n') : '';
+  text = text.replace(/^[ \t]*```[^\n]*\n[\s\S]*?(?:^[ \t]*```[^\n]*(?:\n|$)|(?![\s\S]))/gm, '');
+  const section = /^#{1,6}[ \t]+(?:Goal|任务目标|目标)[:：]?[ \t]*$/im.exec(text);
+  if (section) text = text.slice(section.index + section[0].length);
+  text = text.replace(/^\s*You are executing a task delegated by[^\n]*?(?:\.(?=\s|$)|\n|$)/gim, '');
+  for (const raw of text.split(/[\n\v\f\x1c-\x1e\u0085\u2028\u2029]/)) {
+    let line = raw.replace(titleSpace, ' ').trim();
+    while (line) {
+      const stripped = line.replace(titlePrefix, '').trimStart();
+      if (stripped === line) break;
+      line = stripped;
+    }
+    const intent = line.replaceAll('`', '').split(/[。！？!?；;]|\.(?= |$)/, 1)[0]
+      .replace(/^[ #：:，,·—–-]+|[ #：:，,·—–-]+$/g, '');
+    if (intent) {
+      const prefix = shortenTitle(workspaceName(cwd), 16);
+      return shortenTitle(prefix ? `${prefix} · ${intent}` : intent, 32);
+    }
+  }
+  return shortenTitle(workspaceName(cwd), 32) || 'GPT 任务';
+}
+
+export function sessionGoal(record) {
+  if (typeof record.goal === 'string' && record.goal.trim()) return record.goal;
+  let index = 0;
+  for (const turn of Array.isArray(record.turns) ? record.turns : []) {
+    if (!turn || typeof turn !== 'object' || (turn.role != null && turn.role !== 'user')) continue;
+    index++;
+    const goal = record.turn_details?.[index]?.goal || turn.goal || turn.prompt || turn.content;
+    if (typeof goal === 'string' && goal.trim()) return goal;
+  }
+  return '';
+}
+
 export function readRecentActivity(sessionsDir, limit = 6) {
   const recentSessions = [];
   for (const entry of sortedMtimeEntries(sessionsDir, (n) => n.endsWith('.json')).slice(0, limit)) {
@@ -573,7 +634,8 @@ export function readRecentActivity(sessionsDir, limit = 6) {
       model: String(rec.model || ''),
       agent: String(rec.agent || ''),
       turns: Array.isArray(rec.turns) ? rec.turns.length : 0,
-      cwd_name: rec.cwd ? basename(String(rec.cwd)) : '',
+      cwd_name: workspaceName(rec.cwd),
+      title: normalizeTitle(rec.title, sessionGoal(rec), rec.cwd),
       updated_at: String(rec.updated_at || ''),
     });
   }
@@ -593,7 +655,8 @@ export function readRecentActivity(sessionsDir, limit = 6) {
       recentRuns.push({
         run_id: String(rec.run_id || dirEntry.name),
         state: runState,
-        cwd_name: rec.cwd ? basename(String(rec.cwd)) : '',
+        cwd_name: workspaceName(rec.cwd),
+        title: normalizeTitle(rec.title, rec.goal, rec.cwd),
         tier: String(rec.result?.tier || ''),
         model: String(rec.result?.model || ''),
         verification: String(rec.result?.verification?.status || ''),
@@ -627,6 +690,7 @@ export function readActiveRuns(sessionsDir) {
     if (!data || (data.run_id && data.run_id !== item.name) || !ACTIVE_RUN_STATES.has(data.state)
         || (data.deadline && Date.now() / 1000 > data.deadline)) continue;
     result.push({ run_id: item.name, state: data.state, session_id: data.session_id ?? null, cwd: data.cwd,
+      title: normalizeTitle(data.title, data.goal, data.cwd),
       codex_thread_id: data.codex_thread_id ?? null, turn_id: data.turn_id ?? null,
       progress: data.progress ?? null, pending_tool_call: data.pending_tool_call ?? null });
   }
@@ -711,6 +775,7 @@ function activityRequest(source, context) {
     reasoning_effort: String(source.reasoning_effort ?? context.reasoning_effort ?? ''),
     codex_thread_id: String(source.codex_thread_id ?? context.codex_thread_id ?? ''),
     goal: String(source.goal || promptSection(prompt, 'Goal') || prompt),
+    title: explicitTitle(source.title),
     prompt,
     reply: String(source.reply || source.reply_preview || ''),
     reply_is_preview: !source.reply && Boolean(source.reply_preview),
@@ -772,7 +837,7 @@ function readActivitySession(dir, id) {
     });
   });
   return { id, mode, created_at: created, updated_at: updated, requests, runs: [],
-    title: String(data.title || ''), cwd: String(data.cwd || ''), model: String(data.model || ''), tier: String(data.tier || '') };
+    title: explicitTitle(data.title), cwd: String(data.cwd || ''), model: String(data.model || ''), tier: String(data.tier || '') };
 }
 
 function readActivityRun(dir, id) {
@@ -820,7 +885,7 @@ function joinActivityRun(session, request, turn) {
     target.retried ||= request.retried;
     target.timestamp ||= request.timestamp;
     for (const key of ['cwd', 'agent', 'tier', 'model', 'requested_model', 'sent_model', 'provider', 'account',
-      'reasoning_effort', 'codex_thread_id', 'goal', 'prompt', 'error']) {
+      'reasoning_effort', 'codex_thread_id', 'goal', 'title', 'prompt', 'error']) {
       if (request[key]) target[key] = request[key];
     }
     if (request.reply) {
@@ -905,8 +970,8 @@ function readDispatchActivity(sessionsDir) {
     const first = session.requests[0];
     const latestWith = (key) => session.requests.findLast((item) => item[key])?.[key] || '';
     session.session_id = session.id;
-    session.title = first?.goal || session.title || '';
     session.cwd = latestWith('cwd') || session.cwd || '';
+    session.title = session.title || normalizeTitle(first?.title, first?.goal, first?.cwd || session.cwd);
     session.model = latestWith('model') || session.model || '';
     session.tier = latestWith('tier') || session.tier || '';
     session.turn_count = session.requests.length;
@@ -923,6 +988,7 @@ function readDispatchActivity(sessionsDir) {
     session.elapsed_sec = session.requests.reduce((total, r) => r.elapsed_sec == null ? total : (total ?? 0) + r.elapsed_sec, null);
     ledger.push(...session.requests);
   }
+  for (const request of ledger) request.title = normalizeTitle(request.title, request.goal, request.cwd);
   ledger.sort((a, b) => {
     const time = (item) => item.timestamp || sessions.get(item.session_id)?.updated_at || '';
     return time(b).localeCompare(time(a)) || (b.turn ?? 0) - (a.turn ?? 0) || a.id.localeCompare(b.id);

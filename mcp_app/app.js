@@ -25,10 +25,18 @@ const status = (run) => statuses[run?.state] || "未知状态";
 let ready = false;
 let supportsTools = false;
 let runs = [];
+let scope = "session";
+let boundConversation = null;
+let boundWorkspace = "";
+let sessionCount = null;
+let listVersion = 0;
+let listLoaded = false;
 let selected = null;
 let selection = 0;
 let snapshot = null;
 let transcript = { text: "", complete: false };
+let fullGoal = null;
+let goalLoading = null;
 let listTimer, streamTimer;
 let readingList = false;
 let listWanted = false;
@@ -67,17 +75,16 @@ const currentRun = () => snapshot?.run ?? runs.find((run) => run.run_id === sele
 const isActive = () => active.has(currentRun()?.state);
 const canFetch = () => ready && supportsTools && !document.hidden;
 
-function setRuns(items) {
-  runs = items;
+function renderRunPicker() {
   const displayed = currentRun();
   const options = displayed && !runs.some((run) => run.run_id === displayed.run_id) ? [displayed, ...runs] : runs;
-  const key = JSON.stringify(options.map((run) => [run.run_id, run.state, run.goal]));
+  const key = JSON.stringify(options.map((run) => [run.run_id, run.state, run.title]));
   const select = $("runs");
   if (select.dataset.list !== key) {
     const placeholder = new Option(options.length ? "选择任务" : "暂无任务", "");
     placeholder.disabled = true;
     select.replaceChildren(placeholder, ...options.map((run) => new Option(
-      `${status(run)} · ${(run.goal || run.run_id).replace(/\s+/g, " ").slice(0, 110)}`, run.run_id,
+      `${status(run)} · ${run.title || run.workspace_name || run.run_id.slice(0, 8)}`, run.run_id,
     )));
     select.dataset.list = key;
   }
@@ -91,6 +98,8 @@ function selectRun(id) {
   selection++;
   snapshot = null;
   transcript = { text: "", complete: false };
+  fullGoal = null;
+  $("goal-details").open = false;
   confirming = false;
   $("steer").value = "";
   $("output").scrollTop = 0;
@@ -194,14 +203,25 @@ function formatElapsed(seconds) {
 
 function render() {
   const run = currentRun();
-  setRuns(runs);
+  renderRunPicker();
+  for (const mode of ["session", "all"]) {
+    const button = $("scope-" + mode);
+    button.setAttribute("aria-pressed", String(scope === mode));
+    button.disabled = !supportsTools || (mode === "session" && listLoaded && !boundConversation);
+  }
+  put("scope-session", sessionCount == null ? "当前会话" : `当前会话 ${number.format(sessionCount)}`);
+  $("bound-workspace").hidden = !listLoaded;
+  $("bound-workspace").title = boundConversation || "";
+  put("bound-workspace", boundWorkspace || boundConversation?.slice(0, 8) || "未绑定会话");
   $("refresh").disabled = !supportsTools;
   $("run").hidden = !run;
   $("empty").hidden = !!run;
   $("metrics").hidden = !run;
   $("badge").dataset.state = run?.state ?? "";
   put("badge", run ? status(run) : ready ? "无任务" : "连接中");
-  put("empty", ready ? "当前工作区暂无 GPT 任务。" : "正在连接 GemPT…");
+  put("empty-message", !ready ? "正在连接 GemPT…" : !listLoaded && supportsTools ? "正在读取 GPT 任务…"
+    : scope === "session" ? "当前会话暂无 GPT 任务" : "暂无 GPT 任务");
+  $("empty-all").hidden = scope !== "session" || !listLoaded || !supportsTools;
   renderControls(run);
   if (!run) return;
 
@@ -213,7 +233,7 @@ function render() {
   put("elapsed", formatElapsed(run.elapsed_sec));
   put("tokens", tokens == null ? "—" : number.format(tokens));
   put("cache", rate == null ? "—" : percent.format(rate));
-  put("goal", run.goal || "未记录任务目标");
+  put("goal", fullGoal ?? (run.goal || "未记录任务目标"));
   put("workspace", run.cwd || "—");
   put("run-id", run.run_id);
   put("session-id", run.session_id || "—");
@@ -246,6 +266,31 @@ function acceptSnapshot(data) {
     transcript = { text: data.full_text, complete: data.next_text_offset == null };
   }
   render();
+  if ($("goal-details").open) void loadGoal();
+}
+
+async function loadGoal() {
+  const generation = selection;
+  let offset = snapshot?.next_goal_offset;
+  if (offset == null || fullGoal !== null || goalLoading === generation || !canFetch()) return;
+  const runId = selected;
+  let goal = snapshot.run.goal;
+  goalLoading = generation;
+  try {
+    while (offset != null && generation === selection) {
+      const page = await call("gempt_app_stream", { run_id: runId, goal_offset: offset });
+      goal += page.goal;
+      offset = page.next_goal_offset;
+    }
+    if (generation === selection) {
+      fullGoal = goal;
+      put("goal", goal);
+    }
+  } catch (error) {
+    if (generation === selection) notify(`读取任务目标失败：${error.message}`, true);
+  } finally {
+    if (goalLoading === generation) goalLoading = null;
+  }
 }
 
 async function loadTranscript(data, generation, runId) {
@@ -269,26 +314,52 @@ function stopTimers() {
   clearTimeout(streamTimer);
 }
 
+function acceptRuns(data, preferred) {
+  const prior = currentRun();
+  scope = data.scope;
+  boundConversation = data.bound_conversation_id;
+  boundWorkspace = data.bound_workspace_name;
+  sessionCount = boundConversation ? data.session_count : null;
+  runs = data.runs;
+  listLoaded = true;
+  const keepSelected = prior && (scope === "all" || prior.host_conversation_id === boundConversation);
+  const next = preferred || (keepSelected ? selected : runs[0]?.run_id);
+  if ((next || null) !== selected) {
+    selectRun(next);
+    refreshStream();
+  } else {
+    render();
+  }
+}
+
+function selectScope(next) {
+  if (scope === next) return;
+  scope = next;
+  listVersion++;
+  listLoaded = false;
+  runs = [];
+  selectRun(null);
+  render();
+  void refreshRuns();
+}
+
 async function refreshRuns() {
   clearTimeout(listTimer);
   listWanted = true;
   if (readingList || !canFetch()) return;
   readingList = true;
   listWanted = false;
+  const version = listVersion;
   try {
-    const data = await call("gempt_app_runs", {});
-    runs = data.runs;
-    if (!selected && runs.length) {
-      selectRun(runs[0].run_id);
-      refreshStream();
-    }
-    render();
+    const args = boundConversation ? { scope, host_conversation_id: boundConversation } : { scope };
+    const data = await call("gempt_app_runs", args);
+    if (version === listVersion) acceptRuns(data);
   } catch (error) {
-    notify(`刷新任务失败：${error.message}`, true);
+    if (version === listVersion) notify(`刷新任务失败：${error.message}`, true);
   } finally {
     readingList = false;
     if (canFetch() && listWanted) refreshRuns();
-    else if (canFetch() && isActive()) listTimer = setTimeout(refreshRuns, 4000);
+    else if (canFetch()) listTimer = setTimeout(refreshRuns, isActive() ? 4000 : 10000);
   }
 }
 
@@ -381,6 +452,10 @@ function queueControl(name, args) {
 }
 
 $("refresh").addEventListener("click", () => { refreshRuns(); refreshStream(); });
+$("scope-session").addEventListener("click", () => selectScope("session"));
+$("scope-all").addEventListener("click", () => selectScope("all"));
+$("empty-all").addEventListener("click", () => selectScope("all"));
+$("goal-details").addEventListener("toggle", () => { if ($("goal-details").open) void loadGoal(); });
 $("runs").addEventListener("change", (event) => {
   selectRun(event.target.value);
   if (isActive()) refreshRuns();
@@ -401,15 +476,18 @@ $("interrupt").addEventListener("click", () => {
 $("cancel-interrupt").addEventListener("click", () => { confirming = false; renderControls(); });
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) stopTimers();
-  else if (!selected || isActive() || !transcript.complete || control) { refreshRuns(); refreshStream(); }
+  else {
+    refreshRuns();
+    if (isActive() || !transcript.complete || control) refreshStream();
+  }
 });
 systemTheme.addEventListener("change", () => applyHost(app.getHostContext()));
 
 app.ontoolinput = ({ arguments: args }) => {
-  if (args?.run_id) {
-    selectRun(args.run_id);
-    refreshStream();
-  }
+  if (!args || listLoaded) return;
+  listVersion++;
+  boundConversation = args.host_conversation_id || null;
+  scope = args.scope || "session";
 };
 app.ontoolresult = (result) => {
   const data = result.structuredContent;
@@ -417,11 +495,11 @@ app.ontoolresult = (result) => {
     if (result.isError) notify(result.content?.[0]?.text || "无法打开 GemPT Live", true);
     return;
   }
-  runs = data.runs;
-  if (!selected) selectRun(data.run_id || runs[0]?.run_id);
+  listVersion++;
+  acceptRuns(data, data.run_id);
   if (data.stream?.run?.run_id === selected) acceptSnapshot(data.stream);
   else render();
-  if (isActive()) refreshRuns();
+  refreshRuns();
   refreshStream();
 };
 app.onhostcontextchanged = () => applyHost(app.getHostContext());

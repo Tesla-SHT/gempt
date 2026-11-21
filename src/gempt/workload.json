@@ -49,6 +49,14 @@
         "type": "string",
         "description": "User's objective with known constraints and acceptance criteria. Pass it before doing the work."
       },
+      "title": {
+        "type": "string",
+        "description": "Optional short task name, ideally 6–20 characters. Omit for an automatic title."
+      },
+      "host_conversation_id": {
+        "type": "string",
+        "description": "Optional ID of the parent Antigravity conversation."
+      },
       "kind": {
         "type": "string",
         "enum": [

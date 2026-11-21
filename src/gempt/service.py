@@ -42,6 +42,7 @@ from .routing import (
     is_astra_model,
 )
 from .sessions import list_sessions, load_session, new_session_id, save_session
+from .titles import explicit_title, normalize_title
 
 
 def _normalize_default_tier(tier: str) -> str:
@@ -272,6 +273,8 @@ def configure_gempt(
 def run_consult(
     *,
     goal: str,
+    title: str | None = None,
+    host_conversation_id: str | None = None,
     tier: str | None = None,
     context: str = "",
     file_paths: list[str] | None = None,
@@ -414,6 +417,10 @@ def run_consult(
         )
         raise MagpieRequestError(f"{exc} | {hint}" if hint else str(exc)) from exc
 
+    task_title = normalize_title(title, goal, workspace)
+    session_record["title"] = explicit_title(title) or session_record.get("title") or task_title
+    host_conversation_id = host_conversation_id or session_record.get("host_conversation_id")
+    session_record["host_conversation_id"] = host_conversation_id
     session_record["paired_model"] = paired
     session_record["tier"] = resolved["tier"]
     session_record["model"] = res["served_model"]
@@ -427,6 +434,8 @@ def run_consult(
     turn_count = len(session_record["turns"]) // 2
     session_record.setdefault("turn_details", {})[str(turn_count)] = {
         "goal": goal.strip(),
+        "title": task_title,
+        "host_conversation_id": host_conversation_id,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
         "cwd": workspace,
         "tier": resolved["tier"],
@@ -476,6 +485,8 @@ def run_exec(
     *,
     goal: str,
     cwd: str | Path,
+    title: str | None = None,
+    host_conversation_id: str | None = None,
     tier: str | None = None,
     context: str = "",
     file_paths: list[str] | None = None,
@@ -612,8 +623,11 @@ def run_exec(
         )
     if codex_cfg.get("extra_args"):
         raise ConfigError("Unrestricted Codex extra_args conflict with gateway and sandbox enforcement.")
+    task_title = normalize_title(title, goal, str(workdir))
+    host_conversation_id = host_conversation_id or session_record.get("host_conversation_id")
     session_record.update(paired_model=paired, tier=resolved["tier"], model=resolved["model"],
-                          reasoning_effort=resolved["reasoning_effort"])
+                          reasoning_effort=resolved["reasoning_effort"], host_conversation_id=host_conversation_id,
+                          title=explicit_title(title) or session_record.get("title") or task_title)
     if _run_id:
         save_session(session_record)
 
@@ -670,6 +684,8 @@ def run_exec(
         {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
             "goal": goal.strip(),
+            "title": task_title,
+            "host_conversation_id": host_conversation_id,
             "prompt": prompt,
             "reply": res["text"],
             "run_id": _run_id,
@@ -706,6 +722,8 @@ def run_exec(
     )
     return {
         "session_id": sid,
+        "title": task_title,
+        "host_conversation_id": host_conversation_id,
         "codex_thread_id": res["codex_thread_id"],
         "turn_id": res.get("turn_id"),
         "verification": acceptance,

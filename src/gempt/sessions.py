@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from . import SESSIONS_DIR
+from .titles import normalize_title, session_goal
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
@@ -47,7 +48,9 @@ def load_session(session_id: str, sessions_dir: str | Path | None = None) -> dic
     path = resolve_sessions_dir(sessions_dir) / f"{sid}.json"
     if not path.is_file():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["title"] = normalize_title(record.get("title"), session_goal(record), record.get("cwd"))
+    return record
 
 
 def save_session(record: dict[str, Any], sessions_dir: str | Path | None = None) -> Path:
@@ -114,6 +117,8 @@ def list_sessions(limit: int = 10, sessions_dir: str | Path | None = None) -> li
                 "model": data.get("model"),
                 "codex_thread_id": data.get("codex_thread_id"),
                 "cwd": data.get("cwd"),
+                "title": normalize_title(data.get("title"), session_goal(data), data.get("cwd")),
+                "host_conversation_id": data.get("host_conversation_id"),
                 "turns": len(data.get("turns") or []),
                 "updated_at": data.get("updated_at"),
             }

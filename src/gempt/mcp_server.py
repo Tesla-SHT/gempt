@@ -252,6 +252,8 @@ for tool in TOOLS:
         properties["run_id"] = {"type": "string", "pattern": "^[0-9a-f]{32}$"}
     if tool["name"] == "gempt_exec":
         properties["background"] = {"type": "boolean", "description": "Return a durable run ID immediately."}
+        for key in ("title", "host_conversation_id"):
+            properties[key] = DISPATCH_SCHEMA["properties"][key]
 
 
 _RUN_ID = {"type": "string", "pattern": "^[0-9a-f]{32}$"}
@@ -322,6 +324,10 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
     trusted_config = Path(os.environ.get("GEMPT_CONFIG") or DEFAULT_CONFIG_PATH).resolve()
     if name in APP_TOOLS:
         return call_app_tool(name, args, root=workspace_root, config=trusted_config)
+    if name in ("gempt_dispatch", "gempt_exec"):
+        for key in ("title", "host_conversation_id"):
+            if key in args and not isinstance(args[key], str):
+                raise ValueError(f"Invalid {key}.")
     if args.get("config_path") and Path(args["config_path"]).resolve() != trusted_config:
         raise ValueError("Config path is outside the host configuration")
     args["config_path"] = str(trusted_config)
@@ -437,6 +443,8 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             wait_sec=None if background else _mcp_wait_sec(),
             config_path=trusted_config,
             goal=str(args["goal"]),
+            title=args.get("title"),
+            host_conversation_id=args.get("host_conversation_id"),
             cwd=str(args["cwd"]),
             tier=args.get("tier") or None,
             context=str(args.get("context") or ""),

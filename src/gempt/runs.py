@@ -13,7 +13,8 @@ import time
 import uuid
 from pathlib import Path
 
-from .sessions import atomic_json, exclusive_operation, new_session_id, resolve_sessions_dir, validate_session_id
+from .sessions import atomic_json, exclusive_operation, load_session, new_session_id, resolve_sessions_dir, validate_session_id
+from .titles import normalize_title
 
 
 ACTIVE_STATES = {"queued", "running", "waiting_gemini"}
@@ -71,6 +72,7 @@ def read_run(run_id):
             time.sleep(0.02)
     if record["state"] in ACTIVE_STATES and time.time() > record.get("deadline", float("inf")):
         record.update(state="outcome_unknown", pending_tool_call=None)
+    record["title"] = normalize_title(record.get("title"), record.get("goal"), record.get("cwd"))
     return record
 
 
@@ -162,7 +164,7 @@ def recent_runs(limit, root=None):
         try:
             record = read_run(path.parent.name)
             if root is None or Path(record["cwd"]).resolve().is_relative_to(root):
-                items.append({key: record[key] for key in ("run_id", "cwd", "state")})
+                items.append({key: record.get(key) for key in ("run_id", "cwd", "state", "title", "host_conversation_id")})
         except (OSError, json.JSONDecodeError, KeyError, ValueError):
             continue
         if len(items) >= limit:
@@ -185,6 +187,15 @@ def _write_run_state(directory, record):
 
 def dispatch_exec(*, background=False, run_id="", wait_sec: float | None = None, **options):
     wait_deadline = None if wait_sec is None else time.monotonic() + wait_sec
+    options["cwd"] = str(Path(options["cwd"]).resolve())
+    session_id = options.get("session_id")
+    host_id = options.get("host_conversation_id")
+    if session_id and not host_id:
+        try:
+            prior = load_session(session_id) or {}
+            host_id = prior.get("host_conversation_id")
+        except (OSError, ValueError):
+            pass  # The worker validates the session under its lock.
     run_id = run_id or uuid.uuid4().hex
     directory = run_directory(run_id)
     directory.parent.mkdir(parents=True, exist_ok=True)
@@ -192,14 +203,15 @@ def dispatch_exec(*, background=False, run_id="", wait_sec: float | None = None,
         directory.mkdir()  # Exclusive claim; never replay a write on duplicate submission.
     except FileExistsError:
         raise ValueError(f"Run {run_id} already exists; query its status.") from None
-    options["cwd"] = str(Path(options["cwd"]).resolve())
     if options.get("config_path"):
         options["config_path"] = str(Path(options["config_path"]).resolve())
-    if not options.get("session_id"):
+    if not session_id:
         options["_new_session_id"] = new_session_id("exec")
     record = {"run_id": run_id, "state": "queued", "cwd": options["cwd"],
               "goal": options.get("goal", ""), "tier": options.get("tier"),
-              "session_id": options.get("session_id") or options["_new_session_id"],
+              "title": normalize_title(options.get("title"), options.get("goal"), options["cwd"]),
+              "host_conversation_id": host_id,
+              "session_id": session_id or options["_new_session_id"],
               "config_path": options.get("config_path"), "progress": None,
               "verification": options.get("verification"),
               "created_at": time.time(),

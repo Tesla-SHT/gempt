@@ -105,10 +105,11 @@ def _write_launchers(staged: Path, target: Path) -> dict[str, Any]:
     hook_file = staged / "hooks.json"
     config = json.loads(hook_file.read_text(encoding="utf-8"))
     hooks = config["gempt-work-split"]
-    for handler in (hooks["PreInvocation"][0], hooks["PreToolUse"][0]["hooks"][0]):
-        if handler.get("type") != "command":
-            raise ValueError("Expected a command handler in Antigravity hooks.json.")
-        handler["command"] = command
+    for entries in hooks.values():
+        for entry in entries:
+            for handler in entry.get("hooks", [entry]):
+                if handler.get("type") == "command":
+                    handler["command"] = command
     hook_file.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     return mcp_config
 

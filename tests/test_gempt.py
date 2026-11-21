@@ -58,6 +58,38 @@ from gempt.service import (
     set_tier_effort,
 )
 from gempt.sessions import list_sessions, load_session, save_session
+from gempt.titles import normalize_title
+
+
+class TitleTests(unittest.TestCase):
+    def test_explicit_title_and_goal_cleanup(self):
+        cases = [
+            ("  侧栏\n绑定　与命名 ", "ignored", r"D:\gempt", "侧栏 绑定 与命名"),
+            (None, "You are executing a task delegated by Gemini.\nRead carefully.\n\n# Goal\n"
+                   "- 用户反馈：请在工作区 D:/gempt 中修复侧栏绑定。跟进测试。", r"D:\gempt", "gempt · 修复侧栏绑定"),
+            (" ", "请在你当前分配的隔离工作区中请先修复命名", "/code/gempt/", "gempt · 修复命名"),
+            (None, "```text\nnot the task\n```\n# 请帮我整理 `session.json`。", "", "整理 session.json"),
+            (None, '1. "C:/My Projects/gempt": clean titles. Verify tests.', "/code/gempt", "gempt · clean titles"),
+            (None, "`/code/gempt` 修复会话列表", r"C:\kit\gempt", "gempt · 修复会话列表"),
+            ("🧪" * 49, "ignored", "", "🧪" * 47 + "…"),
+            (None, "标题" * 50, "/code/gempt", "gempt · " + ("标题" * 12)[:23] + "…"),
+            (None, "", "", "GPT 任务"),
+        ]
+        for title, goal, cwd, expected in cases:
+            with self.subTest(goal=goal):
+                self.assertEqual(normalize_title(title, goal, cwd), expected)
+
+    def test_legacy_sessions_are_cleaned_on_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "consult-legacy.json"
+            old = {"cwd": r"C:\code\gempt", "turns": [
+                {"role": "user", "content": "## Goal\n请帮我核对命名。\n\n## Context\nDetails"},
+                {"role": "assistant", "content": "Answer"},
+            ]}
+            path.write_text(json.dumps(old), encoding="utf-8")
+            self.assertEqual(load_session("consult-legacy", tmp)["title"], "gempt · 核对命名")
+            self.assertEqual(list_sessions(sessions_dir=tmp)[0]["title"], "gempt · 核对命名")
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), old)
 
 
 class ConfigTests(unittest.TestCase):
@@ -481,7 +513,10 @@ class McpStdioHandshakeTests(unittest.TestCase):
             )
             entry = tools["gempt_live_view"]
             self.assertEqual(entry["inputSchema"], {"type": "object", "properties": {
-                "run_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}}, "additionalProperties": False})
+                "run_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                "host_conversation_id": {"type": "string", "description": "Antigravity conversation to bind to."},
+                "scope": {"type": "string", "enum": ["session", "all"], "default": "session"},
+            }, "additionalProperties": False})
             self.assertEqual(entry["_meta"], {
                 "ui": {"resourceUri": APP_URI}, "com.google.antigravity/ui": {"entrypoints": [
                     {"type": "aux_pane", "title": "GemPT Live"}, {"type": "global", "title": "GemPT Live"},
@@ -518,6 +553,7 @@ class McpLiveTests(unittest.TestCase):
         self.outside = self.root / "workspace-other"
         self.outside.mkdir()
         env = mock.patch.dict(os.environ, GEMPT_SESSIONS_DIR=str(self.root / "sessions"),
+                              GEMPT_CONFIG=str(self.root / "config.json"),
                               GEMPT_WORKSPACE_ROOT=str(self.repo))
         env.start()
         self.addCleanup(env.stop)
@@ -579,6 +615,46 @@ class McpLiveTests(unittest.TestCase):
             self.assertTrue(self.call("gempt_app_steer", run_id="a" * 32)["isError"])
             interrupt.assert_not_called()
             steer.assert_not_called()
+
+    def test_binding_filters_before_limit_and_empty_session_stays_empty(self):
+        context = self.root / "host-context.json"
+        context.write_text(json.dumps({"conversation_id": "main-agy", "workspace_paths": [str(self.repo)]}), encoding="utf-8")
+        goal = "请帮我整理侧栏标题。" + "余下条件。" * 2000
+        self.seed("a" * 32, "finished", goal=goal, host_conversation_id="main-agy")
+        self.seed("b" * 32, "running", goal="其他会话", title=" 另一个\n任务 ", host_conversation_id="another")
+        self.seed("c" * 32, "finished", goal="请先修复搜索。")
+        self.seed("d" * 32, "running", cwd=str(self.outside), host_conversation_id="main-agy")
+
+        view = self.data("gempt_live_view")
+        self.assertEqual(view["scope"], "session")
+        self.assertEqual(view["bound_conversation_id"], "main-agy")
+        self.assertEqual(view["bound_workspace_name"], self.repo.name)
+        self.assertEqual(view["session_count"], 1)
+        self.assertEqual(view["run_id"], "a" * 32)
+        self.assertEqual(view["runs"][0]["title"], f"{self.repo.name} · 整理侧栏标题")
+        self.assertEqual(view["runs"][0]["workspace_name"], self.repo.name)
+        self.assertEqual(view["runs"][0]["host_conversation_id"], "main-agy")
+        self.assertEqual(self.data("gempt_app_runs", limit=1)["runs"][0]["run_id"], "a" * 32)
+        self.assertEqual(self.data("gempt_app_runs", host_conversation_id="another")["runs"][0]["title"], "另一个 任务")
+        empty = self.data("gempt_live_view", host_conversation_id="fresh", run_id="b" * 32)
+        self.assertEqual((empty["scope"], empty["session_count"], empty["runs"], empty["stream"]), ("session", 0, [], None))
+        all_runs = self.data("gempt_app_runs", scope="all")
+        self.assertEqual({run["run_id"] for run in all_runs["runs"]}, {"a" * 32, "b" * 32, "c" * 32})
+        self.assertEqual(all_runs["session_count"], 1)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(self.call("gempt_app_runs", scope="other")["isError"])
+
+        stream = view["stream"]
+        offset, full = stream["next_goal_offset"], stream["run"]["goal"]
+        self.assertIsNotNone(offset)
+        while offset is not None:
+            page = self.data("gempt_app_stream", run_id="a" * 32, goal_offset=offset)
+            full += page["goal"]
+            offset = page["next_goal_offset"]
+        self.assertEqual(full, goal)
+        context.write_text("{broken", encoding="utf-8")
+        fallback = self.data("gempt_live_view")
+        self.assertEqual((fallback["scope"], fallback["bound_conversation_id"], len(fallback["runs"])), ("all", None, 3))
 
     def test_incremental_journal_and_bounded_unicode_transcript(self):
         run_id = "d" * 32
@@ -754,7 +830,7 @@ class McpWorkspaceTests(unittest.TestCase):
         state_file.write_text(json.dumps(run), encoding="utf-8")
         args = {"run_id": run_id}
         result = _handle_tool_call("gempt_status", args)
-        self.assertEqual(json.loads(result["content"][0]["text"]), run)
+        self.assertEqual(json.loads(result["content"][0]["text"]), {**run, "title": self.project.name})
         with mock.patch("gempt.mcp_server.get_status", return_value={}) as status:
             _handle_tool_call("gempt_status", {})
             self.assertIsNone(status.call_args.kwargs["workspace_root"])
@@ -780,7 +856,7 @@ class McpWorkspaceTests(unittest.TestCase):
             for options in ({}, {"wait_sec": 0}):
                 with self.subTest(options=options):
                     result = _handle_tool_call("gempt_status", {"run_id": run["run_id"], **options})
-                    self.assertEqual(json.loads(result["content"][0]["text"]), run)
+                    self.assertEqual(json.loads(result["content"][0]["text"]), {**run, "title": self.project.name})
             wait.assert_not_called()
 
     def test_status_wait_returns_early_when_run_changes_state(self):
@@ -801,14 +877,14 @@ class McpWorkspaceTests(unittest.TestCase):
                 finally:
                     timer.join()
                 self.assertLess(elapsed, 3)
-                self.assertEqual(json.loads(result["content"][0]["text"]), updated)
+                self.assertEqual(json.loads(result["content"][0]["text"]), {**updated, "title": self.project.name})
 
     def test_status_wait_timeout_returns_running_progress(self):
         _, run = self.make_running_run()
         started = time.monotonic()
         result = _handle_tool_call("gempt_status", {"run_id": run["run_id"], "wait_sec": 0.05})
         self.assertGreaterEqual(time.monotonic() - started, 0.05)
-        self.assertEqual(json.loads(result["content"][0]["text"]), run)
+        self.assertEqual(json.loads(result["content"][0]["text"]), {**run, "title": self.project.name})
 
     def test_status_wait_rejects_invalid_values(self):
         _, run = self.make_running_run()
@@ -860,7 +936,7 @@ class McpWorkspaceTests(unittest.TestCase):
         by_id = {reply["id"]: reply for reply in replies}
         self.assertTrue(all(reply["jsonrpc"] == "2.0" for reply in replies))
         self.assertEqual(by_id[2]["result"], {})
-        self.assertEqual(json.loads(by_id[3]["result"]["content"][0]["text"]), run)
+        self.assertEqual(json.loads(by_id[3]["result"]["content"][0]["text"]), {**run, "title": self.project.name})
         self.assertEqual(by_id[1]["result"]["content"][0]["text"], "OK")
 
 
@@ -880,7 +956,7 @@ class DetachedExecTests(unittest.TestCase):
         # for the Codex service, so no model or gateway is needed.
         package = root / "gempt"
         package.mkdir()
-        for filename in ("__init__.py", "runs.py", "sessions.py", "app_server_client.py", "codex_runner.py"):
+        for filename in ("__init__.py", "runs.py", "sessions.py", "titles.py", "app_server_client.py", "codex_runner.py"):
             shutil.copyfile(SRC_ROOT / "gempt" / filename, package / filename)
         (package / "service.py").write_text(
             "import time\n"
@@ -939,10 +1015,13 @@ class DetachedExecTests(unittest.TestCase):
         for tool, args in (("gempt_dispatch", {"kind": "engineering", "access": "inspect"}), ("gempt_exec", {})):
             with self.subTest(tool=tool):
                 for budget in ("0.15", "0"):
-                    reply = call(tool, "slow", budget, verification="fixture check", **args)
+                    reply = call(tool, "slow", budget, verification="fixture check",
+                                 title=" 派单\n短标题 ", host_conversation_id="parent-id", **args)
                     self.assertIn(reply["state"], {"queued", "running"})
                     self.assertEqual(reply["cwd"], str(self.workspace))
                     self.assertIn("--wait", reply.get("wait_command", ""))
+                    saved = json.loads((run_directory(reply["run_id"]) / "state.json").read_text(encoding="utf-8"))
+                    self.assertEqual((saved["title"], saved["host_conversation_id"]), ("派单 短标题", "parent-id"))
                     if tool == "gempt_dispatch":
                         self.assertEqual(reply["action"], "exec")
                         self.assertIn(f"run_id='{reply['run_id']}'", reply["text"])
@@ -966,6 +1045,12 @@ class CliPackagingTests(unittest.TestCase):
                 shutil.copyfile(asset, package / asset.name)
             shutil.copytree(REPO_ROOT / "plugin", package / "plugin_data")
             shutil.copytree(REPO_ROOT / "templates", package / "plugin_data" / "templates")
+            hooks_path = package / "plugin_data" / "hooks.json"
+            hooks_asset = json.loads(hooks_path.read_text(encoding="utf-8"))
+            extra = {"type": "command", "command": "placeholder", "timeout": 5}
+            hooks_asset["gempt-work-split"]["PreToolUse"].append({"matcher": "second", "hooks": [extra, extra]})
+            hooks_asset["gempt-work-split"]["PreInvocation"].append(extra)
+            hooks_path.write_text(json.dumps(hooks_asset), encoding="utf-8")
             (package / "plugin_data" / "skills" / "node_modules").mkdir()
             (package / "plugin_data" / "skills" / "cache.pyc").touch()
             (package / "discard.pyc").touch()
@@ -996,7 +1081,9 @@ class CliPackagingTests(unittest.TestCase):
             self.assertTrue((target / "skills" / "gempt" / "references" / "magpie-routing.md").is_file())
             hooks = json.loads((target / "hooks.json").read_text(encoding="utf-8"))["gempt-work-split"]
             hook_command = hooks["PreInvocation"][0]["command"]
-            self.assertEqual(hooks["PreToolUse"][0]["hooks"][0]["command"], hook_command)
+            self.assertEqual(hooks["PreToolUse"][0]["matcher"], "call_mcp_tool|invoke_subagent")
+            for handler in [*hooks["PreInvocation"], *(item for entry in hooks["PreToolUse"] for item in entry["hooks"])]:
+                self.assertEqual(handler["command"], hook_command)
             self.assertIn(str(base_python), hook_command)
             self.assertIn(str(target / "work_split_hook.py"), hook_command)
             requests = [
@@ -1089,8 +1176,8 @@ class CliPackagingTests(unittest.TestCase):
 
             hook = target / "work_split_hook.py"
             def native_hook(payload):
-                out = subprocess.check_output([sys.executable, "-I", str(hook)], input=json.dumps(payload),
-                                              text=True, cwd=tmp)
+                out = subprocess.check_output([sys.executable, "-I", "-B", str(hook)], input=json.dumps(payload),
+                                              text=True, cwd=tmp, env={**os.environ, "GEMPT_CONFIG": str(Path(tmp) / "config.json")})
                 return json.loads(out)
             packet = {"modelName": "gemini-4-hydrogen-high", "toolCall": {"name": "call_mcp_tool", "args": {
                 "ServerName": "gempt_gempt", "ToolName": "gempt_dispatch", "Arguments": {"goal": "review"}}}}
@@ -1101,6 +1188,41 @@ class CliPackagingTests(unittest.TestCase):
             packet["modelName"] = "future"
             self.assertNotIn("overwrite", native_hook(packet))
 
+            context_path = Path(tmp) / "host-context.json"
+            main = {"conversationId": "main", "workspacePaths": ["D:/gempt"]}
+            child = {"conversationId": "child", "workspacePaths": ["D:/worktree"]}
+            self.assertIn("injectSteps", native_hook(main))
+            invoke = {**main, "toolCall": {"name": "invoke_subagent", "args": {
+                "TypeName": "gempt-worker", "Role": "  自动命名 ", "Prompt": "Keep the original goal.\n"}}}
+            prompt = native_hook(invoke)["overwrite"]["Prompt"]
+            self.assertEqual(prompt.rsplit("\n", 1)[0], invoke["toolCall"]["args"]["Prompt"])
+            self.assertEqual(json.loads(prompt.split("GemPT metadata: ")[-1]),
+                             {"host_conversation_id": "main", "title": "自动命名"})
+            invoke["toolCall"]["args"]["Prompt"] = prompt
+            self.assertNotIn("overwrite", native_hook(invoke))
+            self.assertIn("injectSteps", native_hook(child))
+            call = packet["toolCall"]
+            call["args"]["Arguments"] = {"goal": "Use the parent", "host_conversation_id": "main", "title": "自动命名"}
+            self.assertNotIn("overwrite", native_hook({**packet, **child}))
+            self.assertIn("injectSteps", native_hook(child))
+            cached = json.loads(context_path.read_text(encoding="utf-8"))
+            self.assertEqual(cached["conversation_id"], "main")
+            self.assertEqual(cached["workspace_paths"], ["D:/gempt"])
+            self.assertEqual(cached["subagent_conversations"], ["child"])
+            self.assertGreater(cached["updated_at"], 0)
+            self.assertIn("injectSteps", native_hook({"conversationId": "another", "workspacePaths": ["D:/another"]}))
+            native_hook({**packet, **child})
+            self.assertEqual(json.loads(context_path.read_text(encoding="utf-8"))["conversation_id"], "another")
+            for tool in ("gempt_dispatch", "gempt_exec", "gempt_live_view"):
+                call["args"].update(ToolName=tool, Arguments={})
+                overwrite = native_hook({**packet, **main})["overwrite"]
+                self.assertEqual(overwrite["Arguments"], {"host_conversation_id": "main"})
+            call["args"]["Arguments"] = {"host_conversation_id": "manual", "scope": "all"}
+            self.assertNotIn("overwrite", native_hook({**packet, **main}))
+
+            context_path.unlink()
+            context_path.mkdir()  # Simulate a host-context path that cannot be replaced.
+            self.assertIn("injectSteps", native_hook(main))
             self.assertFalse((target / "sidecars" / "gempt_panel").exists())
             self.assertFalse((target / "sidecars").exists())
 
@@ -1460,6 +1582,7 @@ class BugfixRegressionTests(unittest.TestCase):
                 ) as mock_consult:
                     c1 = run_consult(
                         goal="Diagnose race condition and deadlock in scheduler state machine",
+                        title=" 排查调度竞争 ", host_conversation_id="consult-parent",
                         cwd=repo,
                         config_path=conf,
                     )
@@ -1477,6 +1600,8 @@ class BugfixRegressionTests(unittest.TestCase):
                     )
                     self.assertEqual(c2["reasoning_effort"], "xhigh")
                     self.assertIsNone(c2["auto_effort"])
+                    session = load_session(c2["session_id"])
+                    self.assertEqual((session["title"], session["host_conversation_id"]), ("排查调度竞争", "consult-parent"))
 
                 with mock.patch("gempt.service.run_app_server") as mock_exec:
                     mock_exec.return_value = {
@@ -1846,6 +1971,7 @@ class AppServerTests(unittest.TestCase):
     def test_live_ask_gemini_dispatch_reply_and_warm_resume(self):
         (self.repo / "notes.txt").write_text("fixture preloaded file", encoding="utf-8")
         waiting = self.mcp("gempt_dispatch", goal="Ask Gemini", kind="engineering", access="inspect",
+                           title="  核对\n视觉效果 ", host_conversation_id="parent-session",
                            cwd=str(self.repo), context="fixture context", file_paths=["notes.txt"], verification="python check.py")
         run_id, session_id = waiting["run_id"], waiting["session_id"]
         self.assertEqual(waiting["state"], "waiting_gemini")
@@ -1859,11 +1985,14 @@ class AppServerTests(unittest.TestCase):
             self.assertEqual(cli_main(["status", "--run-id", run_id, "--wait"]), 0)
         live = self.mcp("gempt_status", run_id=run_id)
         self.assertEqual(live["pending_tool_call"], pending)
-        snapshot = self.mcp("gempt_live_view", run_id=run_id)["stream"]
+        snapshot = self.mcp("gempt_live_view", run_id=run_id, host_conversation_id="parent-session")["stream"]
         self.assertEqual(snapshot["full_text"], "live")
         self.assertEqual(snapshot["cache_hit_rate"], 0.91)
         self.assertEqual(snapshot["run"]["pending_tool_call"]["arguments"]["question"], "Is it legible?")
         self.assertEqual(snapshot["run"]["model"], self.server.requests[-1]["params"]["model"])
+        self.assertEqual(snapshot["run"]["title"], "核对 视觉效果")
+        persisted = json.loads((Path(os.environ["GEMPT_SESSIONS_DIR"]) / f"{session_id}.json").read_text(encoding="utf-8"))
+        self.assertEqual((persisted["title"], persisted["host_conversation_id"]), ("核对 视觉效果", "parent-session"))
         events = (run_directory(run_id) / "events.jsonl").read_text(encoding="utf-8").splitlines()
         self.assertTrue(any(json.loads(event)["method"] == "item/tool/call" for event in events))
         start = next(req["params"] for req in self.server.requests if req["method"] == "turn/start")
@@ -1885,6 +2014,9 @@ class AppServerTests(unittest.TestCase):
         state = read_run(resumed["run_id"])
         self.assertEqual(state["codex_thread_id"], finished["codex_thread_id"])
         self.assertNotEqual(state["turn_id"], finished["turn_id"])
+        self.assertEqual(state["host_conversation_id"], "parent-session")
+        self.assertEqual(state["title"], f"{self.repo.name} · Resume")
+        self.assertEqual(load_session(session_id)["title"], "核对 视觉效果")
 
     def test_steer_interrupt_and_failure_preserve_identity(self):
         receipt = self.mcp("gempt_exec", goal="Hold turn", cwd=str(self.repo), background=True)

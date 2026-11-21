@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
-import { writeConfigAtomic } from './backend.mjs';
+import { normalizeTitle, writeConfigAtomic } from './backend.mjs';
 
 const workerPath = fileURLToPath(new URL('./exec-worker.mjs', import.meta.url));
 const pending = (state) => state === 'queued' || state === 'running';
@@ -23,6 +23,7 @@ export function saveNativeRun(file, record) {
 export function readNativeRun(sessionsDir, id) {
   const record = JSON.parse(readFileSync(stateFile(sessionsDir, id), 'utf8'));
   if (record.source !== 'magpie_exec') throw new Error('Not a Magpie native exec run.');
+  record.title = normalizeTitle(record.title, record.goal, record.cwd);
   if (active(record.state)) {
     if (Date.now() / 1000 > record.deadline) record.state = 'outcome_unknown';
     else if (record.pid) {
@@ -80,6 +81,7 @@ export async function startNativeRun({ args, host, agent, env }) {
   }
   const record = { source: 'magpie_exec', run_id: id, cwd: args.cwd, state: 'queued',
     created_at: new Date().toISOString(), goal: args.goal, tier: args.tier, agent,
+    title: normalizeTitle(args.title, args.goal, args.cwd), host_conversation_id: args.host_conversation_id || null,
     session_id: args.session_id || `exec-${randomUUID()}`, config_path: host.configPath, progress: null, verification: args.verification,
     deadline: Date.now() / 1000 + 120 + (Number(args.timeout_sec) || 3600) };
   saveNativeRun(file, record);

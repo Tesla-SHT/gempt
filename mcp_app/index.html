@@ -16,6 +16,13 @@
         <span id="badge" class="badge">连接中</span>
         <button id="refresh" class="refresh" type="button" disabled>刷新</button>
       </div>
+      <div class="scope-row">
+        <div class="scope" role="group" aria-label="任务范围">
+          <button id="scope-session" type="button" aria-pressed="true" disabled>当前会话</button>
+          <button id="scope-all" type="button" aria-pressed="false" disabled>全部</button>
+        </div>
+        <span id="bound-workspace" class="bound-workspace" hidden></span>
+      </div>
       <label class="picker" for="runs">
         <span>任务</span>
         <select id="runs" disabled><option>正在连接…</option></select>
@@ -29,10 +36,13 @@
     </header>
 
     <p id="notice" class="notice" role="status" hidden></p>
-    <p id="empty" class="empty">正在连接 GemPT…</p>
+    <div id="empty" class="empty">
+      <p id="empty-message" role="status">正在连接 GemPT…</p>
+      <button id="empty-all" type="button" hidden>查看全部任务</button>
+    </div>
 
     <section id="run" aria-label="任务详情" hidden>
-      <details class="goal" open>
+      <details id="goal-details" class="goal">
         <summary>任务目标</summary>
         <p id="goal" class="prose"></p>
         <dl class="identifiers">

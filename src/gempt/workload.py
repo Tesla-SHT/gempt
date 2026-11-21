@@ -50,7 +50,7 @@ def dispatch_task(args, config_path, *, wait_sec: float | None = None):
         return {**result, "action": "gemini", "text": "Handle this part in Gemini. Report to the board if assigned there."}
 
     options = {"goal": goal, "config_path": config_path, "tier": args.get("tier"), "cwd": args.get("cwd")}
-    for field in ("session_id", "context", "file_paths"):
+    for field in ("session_id", "context", "file_paths", "title", "host_conversation_id"):
         if args.get(field) is not None:
             options[field] = args[field]
     if args.get("gemini_family"):

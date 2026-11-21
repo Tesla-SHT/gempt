@@ -87,6 +87,11 @@ h1 { font-size: 20px; font-weight: 680; letter-spacing: -.035em; line-height: 1.
 .badge[data-state="running"], .badge[data-state="finished"] { background: var(--accent-bg); color: var(--accent); }
 .badge[data-state="waiting_gemini"], .badge[data-state="outcome_unknown"] { background: var(--warning-bg); color: var(--warning); }
 .badge[data-state="failed"], .badge[data-state="interrupted"] { color: var(--danger); }
+.scope-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 9px; min-width: 0; }
+.scope { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--line); border-radius: 8px; background: var(--subtle); }
+.scope button { min-height: 28px; padding: 2px 9px; border-color: transparent; background: transparent; font-size: 13px; }
+.scope button[aria-pressed="true"] { background: var(--surface); border-color: var(--line); font-weight: 650; }
+.bound-workspace { color: var(--muted); font-size: 12px; }
 .picker { display: flex; align-items: center; gap: 9px; }
 .picker > span { flex: none; color: var(--muted); font-size: 13px; }
 .picker select { width: 100%; min-height: 35px; padding: 4px 8px; }
@@ -98,6 +103,7 @@ dt, .count { color: var(--muted); font-size: 12px; }
 .notice { padding: 8px 10px; border-inline-start: 2px solid var(--ring); background: var(--surface); }
 .notice[data-error="true"] { border-color: var(--danger); color: var(--danger); }
 .empty { color: var(--muted); padding: 24px 0; }
+.empty button { margin-top: 9px; }
 #run { display: grid; gap: 12px; }
 .goal { padding: 9px 0 2px; }
 summary { cursor: pointer; font-weight: 650; }
@@ -175,6 +181,7 @@ pre { margin: 6px 0 0; font-size: 12px; white-space: pre-wrap; overflow-wrap: an
 
 @media (min-width: 820px) {
   .top { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: center; }
+  .topline { grid-column: 1 / -1; }
   .metrics { grid-column: 1 / -1; max-width: 700px; }
   .activity { grid-template-columns: minmax(0, 1.48fr) minmax(0, 1fr); }
   .evidence { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
