@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { execFile, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -981,6 +981,217 @@ test('history API paginates GemPT dispatches, correlates exec receipts and retur
   assert.ok(state.recent_sessions.length <= 6);
 });
 
+async function activityFixture(t) {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-history-parity-'));
+  const sessionsDir = join(dir, 'sessions');
+  const magpieConfigDir = join(dir, 'magpie');
+  const configPath = join(dir, 'config.json');
+  const usageFile = join(magpieConfigDir, 'usage.jsonl');
+  mkdirSync(join(sessionsDir, 'runs'), { recursive: true });
+  mkdirSync(magpieConfigDir);
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const put = (file, data) => writeFileSync(file, JSON.stringify(data));
+  const putLines = (file, rows) => writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+  return {
+    usageFile,
+    session: (id, data) => put(join(sessionsDir, `${id}.json`), { session_id: id, ...data }),
+    run: (id, data, events) => {
+      const directory = join(sessionsDir, 'runs', id);
+      mkdirSync(directory);
+      put(join(directory, 'state.json'), { run_id: id, ...data });
+      const journal = join(directory, 'events.jsonl');
+      putLines(journal, events);
+      return journal;
+    },
+    ledger: (rows) => putLines(usageFile, rows),
+    start: async (base_url = 'http://127.0.0.1:1') => {
+      put(configPath, { magpie: { base_url } });
+      const svc = await startServer({ port: 0, configPath, sessionsDir, magpieConfigDir });
+      t.after(() => svc.close());
+      const page = await rawHttpGet({ port: svc.port, path: '/' });
+      const headers = { 'x-gempt-key': page.text.match(/<meta name="gempt-key" content="([^"]+)">/)[1], Origin: 'null' };
+      const get = (path) => rawHttpGet({ port: svc.port, path, headers });
+      const json = async (path) => {
+        const res = await get(path);
+        assert.equal(res.status, 200, res.text);
+        return JSON.parse(res.text);
+      };
+      return { get, json, query: (kind, params) => json(`/api/${kind}?${new URLSearchParams(params)}`) };
+    },
+  };
+}
+
+test('gateway calls enrich GemPT turns one-to-many, isolate routes and reuse a growing ledger', async (t) => {
+  const f = await activityFixture(t);
+  const stamp = (second) => new Date(Date.UTC(2026, 9, 15, 12, 0, second)).toISOString();
+  const model = 'codex/original';
+  const thread = 'codex-thread-test';
+  f.session('exec-gateway', { mode: 'exec', model, codex_thread_id: thread, turns: [
+    { goal: 'first turn', timestamp: stamp(20), elapsed_sec: 10 },
+    { goal: 'second turn', timestamp: stamp(40), elapsed_sec: 10 },
+  ] });
+  f.session('consult-gateway', { mode: 'consult', model, turns: [
+    { goal: 'primary consult', timestamp: stamp(50), elapsed_sec: 5, response_id: 'resp-consult' },
+    { goal: 'legacy consult', timestamp: stamp(57), elapsed_sec: 4, usage: { input_tokens: 120, output_tokens: 12 } },
+  ] });
+  const base = { agent: 'gempt', req: model, model: 'sent-actual', served: 'served-actual',
+    provider: 'codex', providerAccount: 'one', ep: '/v1/responses', status: 200 };
+  const row = (route_id, time, extra) => ({ ...base, route_id, t: stamp(time), ...extra });
+  const first = row(1001, 13, { session: thread, native_session: thread, in: 80, out: 15, reasoning: 5,
+    cache_read: 20, cache_write: 4, ttft_ms: 100, ms: 1100, cost: 0.125 });
+  const second = row(1002, 19, { native_session: thread, providerAccount: 'two', in: 60, out: 40,
+    cache_read: 40, cache_write: 6, ttft_ms: 200, first_text_ms: 400, ms: 2400 });
+  f.ledger([first, second,
+    row(1003, 31, { session_id: thread, cache_write: 0, cost_usd: .5, tokens_per_sec: 9 }),
+    row(1004, 13, { session: 'other-thread', cost: 44 }),
+    row(1005, 17, { session: thread, req: 'group/gempt-sonnet', cost: 44 }),
+    row(1006, 43, { session: thread, cost: 44 }),
+    row(1007, 17, { session: thread, agent: 'codex', ep: '/backend-api/codex/responses', cost: 44 }),
+    row(1008, 48, { status: 429, cost: .01 }),
+    row(1009, 49, { response_id: 'resp-consult', agent: 'http', cost: .1 }),
+    row(1010, 49, { response_id: 'other-response', cost: 44 }),
+    row(1011, 55, { agent: 'Python-urllib', response_id: 'old-consult', in: 100, cache_read: 20, out: 12, cost: .2 }),
+    row(1012, 55, { agent: 'Python-urllib', response_id: 'unrelated-consult', in: 100, cache_read: 20, out: 22, cost: 44 }),
+    row(1014, 34, { ws: true, cost: 0 }),
+    row(1015, 34, { ws: true, req: 'codex/wrong-model', cost: 44 }),
+  ]);
+  let nativeCalls = 0;
+  const magpie = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    if (url.pathname !== '/v1/magpie/usage/requests' || url.searchParams.get('agent') !== 'gempt') {
+      res.writeHead(404).end();
+      return;
+    }
+    nativeCalls++;
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ total: 2, rows: [{ ...second, t: stamp(18), cost: 44 }, { ...second, cost: .375, priced: true }] }));
+  });
+  await new Promise((resolve) => magpie.listen(0, '127.0.0.1', resolve));
+  t.after(() => magpie.close());
+  const { json, query } = await f.start(`http://127.0.0.1:${magpie.address().port}`);
+  const listing = await json('/api/requests');
+  assert.equal(listing.total, 4);
+  assert.equal(listing.summary.cost_usd, 1.31);
+  assert.ok(listing.items.every((row) => !('gateway_requests' in row)));
+  const r = listing.items.find((row) => row.id === 'exec-gateway:1');
+  assert.deepEqual([r.requested_model, r.provider, r.account, r.sent_model, r.usage.cache_write_tokens, r.cost_usd, r.ttft_ms],
+    [model, 'codex', 'one / two', 'sent-actual', 10, .5, 100]);
+  assert.equal(r.provider_accounts, 'codex · one / codex · two');
+  assert.ok(Math.abs(r.usage.cache_hit_rate - 60 / 210) < 1e-10);
+  assert.equal(r.tokens_per_sec, 50 / 3);
+  assert.equal(r.gateway_request_count, 2);
+
+  const detail = await json('/api/requests/exec-gateway%3A1');
+  assert.deepEqual(detail.gateway_requests.map((call) => [call.route_id, call.timestamp, call.status_code,
+    call.duration_ms, call.output_tokens, call.cost_usd, call.tokens_per_sec]), [
+    [1001, stamp(13), 200, 1100, 15, .125, 10],
+    [1002, stamp(19), 200, 2400, 40, .375, 20],
+  ]);
+  const session = await json('/api/sessions/exec-gateway');
+  assert.equal(session.cost_usd, 1);
+  assert.deepEqual(session.turns.map((turn) => turn.gateway_requests.map((call) => call.route_id)), [[1001, 1002], [1003, 1014]]);
+  assert.equal(session.gateway_requests.length, 4);
+  const consult = await json('/api/sessions/consult-gateway');
+  assert.deepEqual(consult.turns.map((turn) => turn.gateway_requests.map((call) => call.route_id)), [[1008, 1009], [1011]]);
+  const scoped = await query('sessions', { from: stamp(15), to: stamp(25) });
+  assert.deepEqual(scoped.items.map(({ id, turn_count }) => [id, turn_count]), [['exec-gateway', 1]]);
+  assert.equal(scoped.summary.cost_usd, .5);
+  assert.equal(scoped.summary.cache_hit_rate, 60 / 210);
+  assert.equal(nativeCalls, 1);
+
+  const appended = JSON.stringify(row(1013, 18, { session: thread, cost: .25 }));
+  appendFileSync(f.usageFile, appended.slice(0, 20));
+  assert.equal((await json('/api/requests/exec-gateway%3A1')).gateway_requests.length, 2);
+  appendFileSync(f.usageFile, appended.slice(20) + '\n');
+  assert.equal((await json('/api/requests/exec-gateway%3A1')).cost_usd, .75);
+  f.ledger([first]);
+  assert.equal((await json('/api/sessions/exec-gateway')).cost_usd, .125);
+});
+
+test('request and session time presets and explicit bounds scope KPIs and CSV exports all filtered rows safely', async (t) => {
+  const f = await activityFixture(t);
+  const now = Date.now();
+  const hour = 3_600_000;
+  const midnight = new Date().setHours(0, 0, 0, 0);
+  const combined = '=SUM(1,2),"quoted"\nsecond line';
+  const dates = [new Date(midnight).toISOString(), ...[25, 6 * 24, 10 * 24, 35 * 24].map((ago) => new Date(now - ago * hour).toISOString())];
+  dates.forEach((timestamp, index) => f.session(`consult-date-${index}`, {
+    mode: 'consult', turns: [{ timestamp, title: index === 0 ? '＝2+2' : `test-${index}`,
+      goal: index === 0 ? combined : 'filtered export', agent: index === 0 ? '\tplain' : 'CLI',
+      cost_usd: index + 1, usage: { input_tokens: 100, cached_input_tokens: 25 } }],
+  }));
+  const { get, query } = await f.start();
+  for (const kind of ['requests', 'sessions']) {
+    for (const [range, count, cost] of [['today', 1, 1], ['24h', 1, 1], ['7d', 3, 6], ['30d', 4, 10], ['all', 5, 15]]) {
+      const data = await query(kind, { range, limit: 1 });
+      assert.equal(data.total, count, range);
+      assert.equal(data.summary.cost_usd, cost, range);
+      assert.equal(data.summary.cache_hit_rate, .25, range);
+    }
+    const exact = await query(kind, { from: dates[2], to: dates[2] });
+    assert.equal(exact.total, 1);
+    assert.equal(exact.summary.cost_usd, 3);
+    for (const invalid of ['range=yesterday', 'from=invalid', `from=${encodeURIComponent(dates[0])}&to=${encodeURIComponent(dates[4])}`]) {
+      assert.equal((await get(`/api/${kind}?${invalid}`)).status, 400);
+    }
+  }
+  const filtered = await get('/api/requests?format=csv&range=7d&limit=1&offset=70');
+  assert.equal(filtered.status, 200);
+  assert.match(filtered.headers['content-type'], /^text\/csv\b/);
+  assert.equal(filtered.text.charCodeAt(0), 0xFEFF);
+  assert.match(filtered.text, /"'＝2\+2"/);
+  assert.ok(filtered.text.includes(`"'=SUM(1,2),""quoted""\nsecond line","consult","'\tplain"`));
+  const ids = [...filtered.text.matchAll(/"consult-date-\d:1"/g)].map(([id]) => id);
+  assert.deepEqual(ids, ['"consult-date-0:1"', '"consult-date-1:1"', '"consult-date-2:1"']);
+  const searched = await get('/api/requests?format=csv&range=7d&q=quoted');
+  assert.doesNotMatch(searched.text, /consult-date-[1-4]/);
+  assert.match(searched.text, /consult-date-0/);
+});
+
+test('activity details fold raw app-server events into a bounded turn timeline', async (t) => {
+  const f = await activityFixture(t);
+  const id = '9'.repeat(32);
+  const stamp = '2026-11-04T10:00:00Z';
+  const threadId = 'trace-thread';
+  const turnId = 'trace-turn';
+  f.session('exec-trace', { mode: 'exec', turns: [{ timestamp: stamp, run_id: id, goal: 'trace goal' }] });
+  const event = (method, fields, extra) => ({ method, params: { threadId, turnId, ...fields }, ...extra });
+  const item = (entry) => event('item/completed', { item: entry });
+  const journal = f.run(id, { session_id: 'exec-trace', state: 'finished', codex_thread_id: threadId,
+    turn_id: turnId, finished_at: stamp }, [
+    { method: 'noise', text: 'A'.repeat(800 * 1024) },
+    event('item/reasoning/summaryTextDelta', { itemId: 'r', delta: 'Plan ' }),
+    event('item/reasoning/summaryTextDelta', { itemId: 'r', delta: 'tests' }),
+    item({ type: 'reasoning', id: 'r', summary: ['Plan tests'], content: ['private reasoning'] }),
+    item({ type: 'agentMessage', id: 'mid', text: 'tests running', phase: 'commentary' }),
+    event('item/started', { item: { type: 'commandExecution', id: 'c', command: 'node --test' } }),
+    event('item/commandExecution/outputDelta', { itemId: 'c', delta: 'partial' }),
+    item({ type: 'commandExecution', id: 'c', exitCode: 2, aggregatedOutput: 'test output' }),
+    item({ type: 'fileChange', id: 'f', changes: [{ path: 'lib/trace.js', diff: 'large diff' }] }),
+    event('item/tool/call', { tool: 'ask_gemini', callId: 'ask', arguments: { question: 'Verify UI', reason: 'visual_check' } }, { id: 99 }),
+    event('serverRequest/resolved', { requestId: 99 }),
+    event('item/agentMessage/delta', { itemId: 'false', turnId: 'some-other-turn', delta: 'unrelated event' }),
+    event('item/agentMessage/delta', { itemId: 'last', delta: 'done fragment' }),
+    item({ type: 'agentMessage', id: 'last', text: 'completed reply' }),
+  ]);
+  appendFileSync(journal, '{"method": incomplete');
+  const { json } = await f.start();
+  const detail = await json('/api/requests/exec-trace%3A1');
+  assert.equal(detail.timeline_truncated, true);
+  assert.deepEqual(detail.timeline.map(({ type }) => type), ['reasoning', 'agent_message', 'command', 'files', 'ask_gemini', 'agent_message']);
+  const [reasoning, message, command, files, ask, final] = detail.timeline;
+  assert.deepEqual(reasoning, { type: 'reasoning', id: 'r:0', text: 'Plan tests' });
+  assert.equal(message.phase, 'commentary');
+  assert.equal(message.text, 'tests running');
+  assert.deepEqual(command, { type: 'command', id: 'c', command: 'node --test', exit_code: 2, output: 'test output' });
+  assert.deepEqual(files.paths, ['lib/trace.js']);
+  assert.equal(ask.status, 'resolved');
+  assert.equal(ask.arguments.question, 'Verify UI');
+  assert.equal(final.phase, 'final_answer');
+  assert.equal(final.text, 'completed reply');
+  assert.deepEqual((await json('/api/sessions/exec-trace')).turns[0].timeline, detail.timeline);
+});
+
 test('history routes enforce loopback host, origin, authorization and opaque detail IDs', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'gempt-history-boundary-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -1079,6 +1290,7 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     assert.equal(magpie.requests[1].body.input.length, 3);
     const consultHistory = JSON.parse(readFileSync(join(sessDir, `${c1.session_id}.json`), 'utf8'));
     assert.equal(consultHistory.turn_details[1].agent, 'zcode');
+    assert.ok(consultHistory.turn_details[1].response_id);
     assert.equal(consultHistory.turn_details[2].goal, 'Follow up question');
     assert.deepEqual(consultHistory.turn_details[2].usage, c2.usage);
 

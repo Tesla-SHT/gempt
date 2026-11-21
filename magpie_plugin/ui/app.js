@@ -1105,7 +1105,7 @@
     return [kind, {
       kind, list, detail: $(`${kind}-detail`), results: list.querySelector('.activity-results'),
       summary: list.querySelector('.activity-summary-line'), stats: list.querySelector('.activity-stats'),
-      offset: 0, items: [], status: '', total: 0, loaded: false, listFetch: null, open: null,
+      offset: 0, items: [], status: '', range: 'all', total: 0, loaded: false, listFetch: null, open: null,
     }];
   }));
   const modes = { consult: '咨询', exec: '执行' };
@@ -1120,6 +1120,8 @@
   const checks = { passed: '已通过', failed: '失败', unverified: '未验证', not_requested: '未要求' };
   const exactNumber = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 3 });
   const compactNumber = new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 });
+  const dollar = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 8 });
+  const percent = new Intl.NumberFormat('zh-CN', { style: 'percent', maximumFractionDigits: 1 });
   const dateTime = new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium', hour12: false });
   let activeTab = 'overview';
   let liveTimer = null;
@@ -1134,6 +1136,12 @@
   function number(value, compact = false) {
     return value == null ? '—' : (compact ? compactNumber : exactNumber).format(value);
   }
+
+  const costText = (value) => value == null ? '—' : dollar.format(value);
+  const cacheRateText = (value) => value == null ? '—' : percent.format(value);
+  const speedText = (value) => value == null ? '—' : `${number(value)} tok/s`;
+  const msText = (value) => value == null ? '—' : duration(value / 1000);
+  const providerText = (row) => row.provider_accounts || [row.provider, row.account].filter(Boolean).join(' · ');
 
   function duration(sec) {
     if (sec == null) return '—';
@@ -1189,6 +1197,8 @@
   function renderActivitySummary(view, data) {
     const s = data.summary;
     const tile = (label, value) => activityTile(label, number(value, true), number(value));
+    const cost = activityTile('总费用', costText(s.cost_usd));
+    const cache = activityTile('缓存命中率', cacheRateText(s.cache_hit_rate));
     if (view.kind === 'requests') {
       const labels = [
         `${number(data.total)} 个请求`, `输入 ${number(s.input_tokens, true)}`, `输出 ${number(s.output_tokens, true)}`,
@@ -1199,12 +1209,12 @@
       view.summary.textContent = labels.join(' · ');
       view.stats.replaceChildren(tile('请求', data.total), tile('Token', s.total_tokens),
         tile('缓存读取', s.cache_read_tokens), activityTile('耗时', duration(s.elapsed_sec)),
-        tile('失败', s.failed));
+        tile('失败', s.failed), cost, cache);
     } else {
       view.summary.textContent = view.items.length < data.total
         ? `显示 ${number(data.total)} 个中的 ${number(view.items.length)} 个` : `${number(data.total)} 个会话`;
       view.stats.replaceChildren(tile('会话', data.total), tile('Token', s.total_tokens), tile('轮次', s.requests),
-        tile('缓存读取', s.cache_read_tokens), activityTile('耗时', duration(s.elapsed_sec)), tile('项目', s.workspaces));
+        tile('缓存读取', s.cache_read_tokens), activityTile('耗时', duration(s.elapsed_sec)), tile('项目', s.workspaces), cost, cache);
     }
   }
 
@@ -1327,10 +1337,7 @@
       const actions = node('div', 'active-run-actions');
       const detail = button('查看详情');
       detail.dataset.runAction = 'detail';
-      detail.onclick = () => {
-        navigateActivityTab('requests');
-        openActivityDetail(activityViews.requests, `run-${run.run_id}`, { runId: run.run_id });
-      };
+      detail.onclick = () => navigateActivityTab('requests', false, `run-${run.run_id}`);
       const interrupt = interruptButton(run, '中止');
       actions.append(detail, interrupt);
       row.append(info, actions);
@@ -1361,7 +1368,7 @@
       row.tabIndex = 0;
       row.dataset.activityId = r.id;
       row.title = r.title;
-      const open = () => openActivityDetail(view, r.id, { runId: r.run_id });
+      const open = () => navigateActivityTab(view.kind, false, r.id);
       row.onclick = () => { if (!String(window.getSelection())) open(); };
       row.onkeydown = (event) => {
         if (event.key !== 'Enter' && event.key !== ' ') return;
@@ -1385,7 +1392,7 @@
       agent.append(node('span', 'activity-badge', modes[r.mode]));
       add(agent, r.title);
       add(r.requested_model, r.requested_model);
-      add([r.provider, r.account].filter(Boolean).join(' · '));
+      add(providerText(r), providerText(r));
       add(r.sent_model, r.sent_model);
       const served = node('span', 'ledger-agent', r.model || '—');
       if (r.tier) served.append(node('span', 'activity-badge', titleCaseTier(r.tier)));
@@ -1395,14 +1402,14 @@
       token(r.usage.output_tokens);
       token(r.usage.cache_write_tokens);
       token(r.usage.cache_read_tokens);
-      add(r.usage.cache_hit_rate == null ? '—' : `${number(Math.round(r.usage.cache_hit_rate * 1000) / 10)}%`);
-      add(r.cost == null ? '—' : `$${number(r.cost)}`);
-      add(r.ttft_ms == null ? '—' : duration(r.ttft_ms / 1000));
+      add(cacheRateText(r.usage.cache_hit_rate));
+      add(costText(r.cost_usd));
+      add(msText(r.ttft_ms));
       const elapsed = add(duration(r.elapsed_sec), r.elapsed_sec == null ? '' : `${number(r.elapsed_sec)} s`);
       if (r.elapsed_sec != null) {
         elapsed.dataset.latency = r.elapsed_sec <= 10 ? 'fast' : r.elapsed_sec <= 30 ? 'slow' : 'long';
       }
-      add(r.output_tokens_per_sec == null ? '—' : `${number(r.output_tokens_per_sec)} tok/s`);
+      add(speedText(r.tokens_per_sec));
       add(statusBadge(r));
     }
     view.results.replaceChildren(table);
@@ -1434,7 +1441,7 @@
     if (isActiveRun(session) || session.state === 'interrupted') row.append(statusBadge(session));
     row.append(tokens,
       node('span', 'activity-session-turns', `${number(session.turn_count)} 轮`), arrow);
-    row.onclick = () => openActivityDetail(view, session.id);
+    row.onclick = () => navigateActivityTab(view.kind, false, session.id);
     return row;
   }
 
@@ -1445,12 +1452,13 @@
     return copy;
   }
 
-  function detailLine(list, label, value, copy = false) {
+  function detailLine(list, label, value, copy = false, action) {
     if (value == null || value === '') return;
     const body = node('dd');
     if (value instanceof Node) body.append(value);
     else body.textContent = value;
     if (copy) body.append(' ', copyButton(value, label));
+    if (action) body.append(' ', action);
     list.append(node('dt', '', label), body);
   }
 
@@ -1492,9 +1500,98 @@
     ].join(' · ');
   }
 
+  function detailLink(tab, id, label) {
+    const link = node('a', 'activity-link', label);
+    link.href = `#${tab}/${encodeURIComponent(id)}`;
+    return link;
+  }
+
+  const commandText = (entries) => entries.map((entry) => typeof entry === 'string' ? entry : [
+    entry?.command, entry?.exit_code == null ? '' : `退出码 ${entry.exit_code}`, entry?.output,
+  ].filter(Boolean).join('\n')).join('\n\n');
+
+  const eventTitle = (event) => ({
+    reasoning: '思考过程摘要',
+    agent_message: event.phase === 'final_answer' ? '最终回复' : '中间消息',
+    command: event.exit_code == null ? '命令' : `命令 · 退出码 ${event.exit_code}`,
+    files: `触及文件 · ${event.count ?? 0}`,
+    ask_gemini: `ask_gemini · ${({ pending: '等待回复', resolved: '已回复', completed: '已完成',
+      inProgress: '进行中', failed: '失败' })[event.status] || event.status || '已记录'}`,
+  })[event.type];
+
+  function eventText(event) {
+    if (event.type === 'command') return [event.command, event.output].filter(Boolean).join('\n');
+    if (event.type === 'files') return event.paths.join('\n');
+    if (event.type === 'ask_gemini') {
+      const args = event.arguments ?? {};
+      return [args.question, args.reason, args.context, ...(args.media_paths || []), event.result].filter(Boolean).join('\n');
+    }
+    return event.text;
+  }
+
+  function renderTimeline(turn) {
+    if (!turn.timeline.length && !turn.timeline_truncated) return null;
+    const section = node('section', 'activity-detail-text activity-trace');
+    section.append(node('h4', '', '执行轨迹'));
+    const list = node('ol', 'activity-events');
+    for (const event of turn.timeline) {
+      const item = node('li', 'activity-event');
+      const title = eventTitle(event);
+      if (event.type === 'reasoning' || event.type === 'command' || event.type === 'ask_gemini') {
+        const details = node('details');
+        details.dataset.event = `${turn.id}/${event.type}/${event.id}`;
+        details.append(node('summary', '', title), node('pre', '', eventText(event)));
+        item.append(details);
+      } else {
+        item.append(node('strong', '', title), node('pre', '', eventText(event)));
+      }
+      list.append(item);
+    }
+    section.append(list);
+    if (turn.timeline_truncated) section.append(node('p', 'activity-muted', '仅显示可载入的近期事件。'));
+    return section;
+  }
+
+  function renderGatewayRequests(rows) {
+    if (!rows.length) return null;
+    const section = node('section', 'activity-detail-text');
+    section.append(node('h4', '', `底层网关调用 · ${number(rows.length)} 次`));
+    const wrap = node('div', 'ledger-wrap activity-gateway-wrap');
+    wrap.tabIndex = 0;
+    wrap.setAttribute('role', 'region');
+    wrap.setAttribute('aria-label', '底层网关调用明细');
+    const table = node('table', 'activity-ledger activity-gateway');
+    const columns = [
+      ['时间', (r) => when(r.timestamp)], ['请求模型', (r) => r.requested_model], ['发送模型', (r) => r.sent_model],
+      ['响应模型', (r) => r.model], ['供应商 · 账号', providerText], ['状态码', (r) => r.status_code],
+      ['TTFT', (r) => msText(r.ttft_ms)], ['耗时', (r) => msText(r.duration_ms)],
+      ['速度', (r) => speedText(r.tokens_per_sec)], ['输入', (r) => number(r.input_tokens)],
+      ['输出', (r) => number(r.output_tokens)], ['缓存读取', (r) => number(r.cache_read_tokens)],
+      ['缓存写入', (r) => number(r.cache_write_tokens)], ['费用', (r) => costText(r.cost_usd)],
+    ];
+    const header = table.createTHead().insertRow();
+    for (const [label] of columns) {
+      const th = node('th', '', label);
+      th.scope = 'col';
+      header.append(th);
+    }
+    const body = table.createTBody();
+    for (const row of rows) {
+      const tr = body.insertRow();
+      for (const [, value] of columns) tr.insertCell().textContent = value(row) || '—';
+    }
+    wrap.append(table);
+    section.append(wrap);
+    return section;
+  }
+
   function renderTurn(r, heading) {
     const box = node('article', 'activity-detail-box');
-    if (heading) box.append(node('h3', '', heading));
+    if (heading) {
+      const head = node('header', 'activity-turn-head');
+      head.append(node('h3', '', heading), detailLink('requests', r.id, '查看该轮请求 ›'));
+      box.append(head);
+    }
     const info = node('dl', 'activity-detail-info');
     const add = (label, value, copy = false) => detailLine(info, label, value, copy);
     add('时间', when(r.timestamp));
@@ -1504,30 +1601,34 @@
     add('请求模型', r.requested_model);
     add('发送模型', r.sent_model);
     add('响应模型', r.model);
-    add('供应商 · 账号', [r.provider, r.account].filter(Boolean).join(' · '));
+    add('供应商 · 账号', providerText(r));
     add('档位', r.tier && titleCaseTier(r.tier));
     add('推理强度', r.reasoning_effort);
     add('耗时', duration(r.elapsed_sec));
-    add('TTFT', r.ttft_ms == null ? '' : duration(r.ttft_ms / 1000));
-    add('速度', r.output_tokens_per_sec == null ? '' : `${number(r.output_tokens_per_sec)} tok/s`);
-    add('费用', r.cost == null ? '' : `$${number(r.cost)}`);
+    add('TTFT', msText(r.ttft_ms));
+    add('速度', speedText(r.tokens_per_sec));
+    add('费用', costText(r.cost_usd));
     add('Token', usageText(r.usage));
     add('文件夹', r.cwd, true);
-    add('会话 ID', r.session_id, true);
+    detailLine(info, '会话 ID', r.session_id, true, !heading && r.session_id
+      ? detailLink('sessions', r.session_id, '查看所属会话 ›') : null);
     add('运行 ID', r.run_id, true);
     add('Codex 线程 ID', r.codex_thread_id, true);
     add('验证', checks[r.verification.status] || r.verification.status);
     box.append(info);
     detailText(box, '目标', r.goal);
     if (r.prompt !== r.goal) detailText(box, '提示词', r.prompt);
-    detailText(box, r.reply_is_preview ? '回复预览' : '回复', r.reply);
+    if (!r.timeline.some((event) => event.type === 'agent_message' && event.phase === 'final_answer' && event.text === r.reply)) {
+      detailText(box, r.reply_is_preview ? '回复预览' : '回复', r.reply);
+    }
     detailText(box, '错误', r.error);
     detailText(box, '要求验证', r.verification.requested);
-    const commandText = (entries) => entries.map((entry) => typeof entry === 'string' ? entry : [
-      entry?.command, entry?.exit_code == null ? '' : `退出码 ${entry.exit_code}`, entry?.output,
-    ].filter(Boolean).join('\n')).join('\n\n');
     detailText(box, '验证检查', commandText(r.verification.checks));
-    detailText(box, '执行的命令', commandText(r.commands));
+    if (!r.timeline.some((event) => event.type === 'command')) detailText(box, '执行的命令', commandText(r.commands));
+    const timeline = renderTimeline(r);
+    if (timeline) box.append(timeline);
+    const gateway = renderGatewayRequests(r.gateway_requests);
+    if (gateway) box.append(gateway);
     return box;
   }
 
@@ -1542,12 +1643,58 @@
     detailLine(info, '轮次', number(session.turn_count));
     detailLine(info, 'Token', usageText(session.usage));
     detailLine(info, '耗时', duration(session.elapsed_sec));
+    detailLine(info, '总费用', costText(session.cost_usd));
     box.append(info);
     return [box, ...session.turns.map((turn) => renderTurn(turn, turn.turn == null
       ? '执行记录' : `第 ${number(turn.turn)} 轮`))];
   }
 
-  function closeActivityDetail(view) {
+  function downloadActivity(file, value) {
+    const url = URL.createObjectURL(value);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = file;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function exportSession(session) {
+    const inline = (value) => String(value ?? '—').replace(/\s*\r?\n\s*/g, ' ')
+      .replace(/[\\`*_{}\[\]()#+.!<>|&~]/g, '\\$&');
+    const textSection = (label, value) => {
+      if (!value) return '';
+      let fenceLength = 3;
+      for (const [run] of value.matchAll(/`+/g)) fenceLength = Math.max(fenceLength, run.length + 1);
+      const fence = '`'.repeat(fenceLength);
+      return `### ${label}\n\n${fence}text\n${value}\n${fence}\n\n`;
+    };
+    const meta = (label, value) => `- ${label}　${inline(value)}\n`;
+    let markdown = `# ${inline(session.title || 'GPT 会话')}\n\n`
+      + meta('会话 ID', session.session_id) + meta('文件夹', session.cwd || '—')
+      + meta('模式', modes[session.mode]) + meta('模型', session.model || '—')
+      + meta('创建', when(session.created_at)) + meta('更新', when(session.updated_at))
+      + meta('轮次', session.turn_count) + meta('总费用', costText(session.cost_usd)) + '\n';
+    for (const turn of session.turns) {
+      const events = (kind) => turn.timeline.filter((event) => event.type === kind);
+      const loggedCommands = events('command');
+      const commands = [...turn.commands, ...loggedCommands.filter((event) =>
+        !turn.commands.some((prior) => (typeof prior === 'string' ? prior : prior.command) === event.command))];
+      markdown += `## ${turn.turn == null ? '执行记录' : `第 ${turn.turn} 轮`}\n\n`
+        + meta('请求 ID', turn.id) + meta('时间', when(turn.timestamp)) + meta('模型', turn.model || '—')
+        + meta('状态', statuses[runState(turn)] || runState(turn))
+        + meta('验证', checks[turn.verification.status] || turn.verification.status || '—') + '\n'
+        + textSection('目标', turn.goal) + textSection('思考过程摘要', events('reasoning').map(eventText).join('\n\n'))
+        + textSection('回复', turn.reply || events('agent_message').map(eventText).join('\n\n'))
+        + textSection('命令', commandText(commands)) + textSection('要求验证', turn.verification.requested)
+        + textSection('验证结果', commandText(turn.verification.checks));
+      if (turn.timeline_truncated) markdown += '部分轨迹已截断。\n\n';
+    }
+    downloadActivity(`${session.session_id}.md`, new Blob([markdown], { type: 'text/markdown;charset=utf-8' }));
+  }
+
+  function closeActivityDetail(view, restore = true) {
     const open = view.open;
     if (!open) return;
     open.abort?.abort();
@@ -1555,12 +1702,11 @@
     view.detail.hidden = true;
     view.detail.replaceChildren();
     view.list.hidden = false;
+    if (!restore) return;
     const row = [...view.results.querySelectorAll('[data-activity-id]')]
       .find((row) => row.dataset.activityId === open.id);
     (row || $(`tab-${view.kind}`)).focus({ preventScroll: true });
     window.scrollTo(0, open.scroll);
-    void refreshActivityView(view);
-    syncLivePoll();
   }
 
   async function loadActivityDetail(view, refresh = false) {
@@ -1577,6 +1723,11 @@
         const request = await findRunRequest(open.runId, abort.signal);
         if (request && request.id !== open.id) {
           open.id = request.id;
+          const current = activityLocation();
+          if (current.tab === view.kind && current.id === open.linkId) {
+            history.replaceState(null, '', `#${view.kind}/${encodeURIComponent(open.id)}`);
+            open.linkId = open.id;
+          }
           res = await fetchDetail(open.id);
         }
       }
@@ -1598,7 +1749,14 @@
       const interrupt = run.run_id && ['running', 'waiting_gemini'].includes(runState(run))
         ? interruptButton(run, '中止当前轮') : null;
       if (interrupt) head.append(interrupt);
+      if (session) {
+        const exportButton = button('导出 Markdown');
+        exportButton.onclick = () => exportSession(data);
+        head.append(exportButton);
+      }
+      const expanded = new Set([...body.querySelectorAll('details[open]')].map((details) => details.dataset.event));
       body.replaceChildren(head, ...renderRunProgress(run), ...(session ? renderSessionDetail(data) : [renderTurn(data)]));
+      for (const details of body.querySelectorAll('details[data-event]')) details.open = expanded.has(details.dataset.event);
       if (focusedInterrupt) (interrupt || view.detail.querySelector('.activity-back')).focus({ preventScroll: true });
     } catch (err) {
       if (abort.signal.aborted || (refresh && open.rendered)) return;
@@ -1615,11 +1773,12 @@
     }
   }
 
-  function openActivityDetail(view, id, { runId } = {}) {
+  function openActivityDetail(view, id) {
     view.open?.abort?.abort();
-    view.open = { id, runId, scroll: window.scrollY };
+    const runId = /^run-([a-f0-9]{32})$/.exec(id)?.[1];
+    view.open = { id, linkId: id, runId, scroll: window.scrollY };
     const back = button(view.kind === 'requests' ? '‹ 请求' : '‹ 会话', 'activity-link activity-back');
-    back.onclick = () => closeActivityDetail(view);
+    back.onclick = () => navigateActivityTab(view.kind);
     const body = node('div', 'activity-detail-body');
     body.append(node('p', 'activity-empty', view.kind === 'sessions' ? '正在读取会话…' : '正在读取请求…'));
     view.detail.replaceChildren(back, body);
@@ -1630,16 +1789,23 @@
     void loadActivityDetail(view);
   }
 
-  async function loadActivityList(view, offset = 0, append = false, refresh = false) {
-    view.listFetch?.abort();
-    const abort = view.listFetch = new AbortController();
-    const search = view.list.querySelector('.activity-search').value.trim();
-    const limit = refresh && view.kind === 'sessions' ? Math.max(activityPageSize, view.items.length) : activityPageSize;
-    const query = new URLSearchParams({ q: search, offset, limit: Math.min(100, limit) });
+  function activityQuery(view) {
+    const query = new URLSearchParams({ q: view.list.querySelector('.activity-search').value.trim() });
+    if (view.range !== 'all') query.set('range', view.range);
     for (const select of view.list.querySelectorAll('[data-filter]')) {
       if (select.value) query.set(select.dataset.filter, select.value);
     }
     if (view.status) query.set('status', view.status);
+    return query;
+  }
+
+  async function loadActivityList(view, offset = 0, append = false, refresh = false) {
+    view.listFetch?.abort();
+    const abort = view.listFetch = new AbortController();
+    const limit = refresh && view.kind === 'sessions' ? Math.max(activityPageSize, view.items.length) : activityPageSize;
+    const query = activityQuery(view);
+    query.set('offset', offset);
+    query.set('limit', Math.min(100, limit));
     const pagers = view.list.querySelectorAll('[data-page]');
     for (const control of pagers) control.disabled = true;
     view.results.setAttribute('aria-busy', 'true');
@@ -1675,7 +1841,7 @@
       } else {
         view.items = data.items;
         if (!data.items.length) {
-          const filtered = search || [...query.keys()].some((key) => !['q', 'offset', 'limit'].includes(key));
+          const filtered = query.get('q') || [...query.keys()].some((key) => !['q', 'offset', 'limit'].includes(key));
           const message = view.kind === 'requests' ? (filtered ? '没有符合这些筛选条件的请求。' : '暂无请求。')
             : (filtered ? '没有匹配的会话。' : '暂无会话。');
           view.results.replaceChildren(node('div', 'activity-empty', message));
@@ -1751,9 +1917,23 @@
     }
   }
 
-  function selectActivityTab(tab, focus = false) {
-    if (!activityTabs.includes(tab)) tab = 'overview';
-    if (tab !== activeTab) window.scrollTo(0, 0);
+  function activityLocation() {
+    const [tab, encodedId, rest] = location.hash.slice(1).split('/');
+    if (!activityTabs.includes(tab)) return { tab: 'overview' };
+    let id;
+    if (activityViews[tab] && encodedId && rest === undefined) {
+      try { id = decodeURIComponent(encodedId); } catch { /* Invalid URL fragment. */ }
+    }
+    return { tab, id };
+  }
+
+  function selectActivityLocation(focus = false) {
+    const { tab, id } = activityLocation();
+    const previous = activeTab;
+    if (tab !== previous) {
+      if (activityViews[previous]) closeActivityDetail(activityViews[previous], false);
+      window.scrollTo(0, 0);
+    }
     activeTab = tab;
     for (const name of activityTabs) {
       const selected = name === tab;
@@ -1763,14 +1943,20 @@
     }
     if (focus) $(`tab-${tab}`).focus();
     const view = activityViews[tab];
-    if (view) void refreshActivityView(view);
+    if (view && id) {
+      if (view.open?.linkId !== id) openActivityDetail(view, id);
+    } else if (view) {
+      closeActivityDetail(view, !focus && tab === previous);
+      void refreshActivityView(view);
+    }
     else if (latestState) renderLiveOverview(latestState);
     syncLivePoll();
   }
 
-  function navigateActivityTab(tab, focus = false) {
-    if (location.hash !== `#${tab}`) history.pushState(null, '', `#${tab}`);
-    selectActivityTab(tab, focus);
+  function navigateActivityTab(tab, focus = false, id) {
+    const hash = `#${tab}${id ? `/${encodeURIComponent(id)}` : ''}`;
+    if (location.hash !== hash) history.pushState(null, '', hash);
+    selectActivityLocation(focus);
   }
 
   for (const tab of activityTabs) {
@@ -1792,10 +1978,10 @@
       navigateActivityTab(link.dataset.activityTab, true);
     };
   }
-  window.addEventListener('hashchange', () => selectActivityTab(location.hash.slice(1)));
+  window.addEventListener('hashchange', () => selectActivityLocation());
   document.addEventListener('keydown', (event) => {
     const view = activityViews[activeTab];
-    if (event.key === 'Escape' && view?.open) closeActivityDetail(view);
+    if (event.key === 'Escape' && view?.open) navigateActivityTab(view.kind);
   });
   for (const view of Object.values(activityViews)) {
     const search = view.list.querySelector('.activity-search');
@@ -1806,6 +1992,21 @@
       for (const control of view.list.querySelectorAll('[data-page]')) control.disabled = true;
       debounce = setTimeout(() => loadActivityList(view), 180);
     };
+    const ranges = [
+      ['all', '全部'], ['today', '今日'], ['24h', '24 小时'], ['7d', '7 天'], ['30d', '30 天'],
+    ];
+    const rangeControls = ranges.map(([range, label]) => {
+      const control = button(label);
+      control.setAttribute('aria-pressed', String(range === view.range));
+      control.onclick = () => {
+        clearTimeout(debounce);
+        view.range = range;
+        for (const rangeButton of rangeControls) rangeButton.setAttribute('aria-pressed', String(rangeButton === control));
+        void loadActivityList(view);
+      };
+      return control;
+    });
+    view.list.querySelector('[data-range-controls]').replaceChildren(...rangeControls);
     for (const select of view.list.querySelectorAll('[data-filter]')) {
       select.onchange = () => {
         clearTimeout(debounce);
@@ -1839,7 +2040,22 @@
       };
     }
   }
-  selectActivityTab(location.hash.slice(1));
+  const exportCsv = document.querySelector('[data-export-csv]');
+  exportCsv.onclick = async () => {
+    exportCsv.disabled = true;
+    try {
+      const query = activityQuery(activityViews.requests);
+      query.set('format', 'csv');
+      const response = await apiFetch(`/api/requests?${query}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      downloadActivity('gempt-requests.csv', await response.blob());
+    } catch (error) {
+      showToast(`导出失败（${error.message}）`, 'error');
+    } finally {
+      exportCsv.disabled = false;
+    }
+  };
+  selectActivityLocation();
 
   document.addEventListener('change', (ev) => {
     const target = ev.target;

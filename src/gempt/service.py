@@ -441,6 +441,8 @@ def run_consult(
         "tier": resolved["tier"],
         "served_model": res["served_model"],
         "requested_model": resolved["model"],
+        "response_id": res.get("response_id"),
+        "attempted_models": [attempt["model"] for attempt in res.get("attempts", []) if "model" in attempt],
         "reasoning_effort": resolved["reasoning_effort"],
         "elapsed_sec": float(res["elapsed_sec"]),
         "usage": res.get("usage") or {},

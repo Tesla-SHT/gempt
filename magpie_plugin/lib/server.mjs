@@ -169,12 +169,13 @@ export async function startServer({
         if (!keyOK(req)) return send(req, res, 401, { error: 'unauthorized: send the x-gempt-key header' });
         const [, kind, encodedId] = activity;
         if (encodedId === undefined) {
-          return send(req, res, 200, listDispatchActivity(kind, url.searchParams, sessionsDir));
+          const result = await listDispatchActivity(kind, url.searchParams, sessionsDir, magpieConfigDir, configPath);
+          return send(req, res, 200, result, typeof result === 'string' ? 'text/csv; charset=utf-8' : undefined);
         }
         let id;
         try { id = decodeURIComponent(encodedId); } catch { /* Invalid percent encoding. */ }
         if (!id || !isActivityId(kind, id)) return send(req, res, 400, { error: 'invalid activity id' });
-        const result = getDispatchActivity(kind, id, sessionsDir);
+        const result = await getDispatchActivity(kind, id, sessionsDir, magpieConfigDir, configPath);
         return result ? send(req, res, 200, result) : send(req, res, 404, { error: 'not found' });
       }
       if (pathname === '/api/ping') {

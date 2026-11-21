@@ -384,13 +384,17 @@
     <!-- Requests and Sessions layout adapted from Magpie (MIT). -->
     <main id="requests" class="activity-pane" role="tabpanel" aria-labelledby="tab-requests" tabindex="0" hidden>
       <div id="requests-list">
+        <div class="activity-period">
+          <div class="activity-segment" data-range-controls role="group" aria-label="请求时段"></div>
+          <button type="button" class="activity-link" data-export-csv>导出 CSV</button>
+        </div>
         <div class="activity-tools">
           <input class="activity-search" type="search" aria-label="搜索请求" placeholder="搜索模型、会话、提示词">
           <select class="activity-pick" data-filter="mode" aria-label="模式"><option value="">全部模式</option></select>
           <select class="activity-pick" data-filter="tier" aria-label="档位"><option value="">全部档位</option></select>
           <select class="activity-pick" data-filter="model" aria-label="模型"><option value="">全部模型</option></select>
           <select class="activity-pick" data-filter="workspace" aria-label="文件夹"><option value="">全部文件夹</option></select>
-          <div class="activity-status-filter" role="group" aria-label="状态">
+          <div class="activity-segment" role="group" aria-label="状态">
             <button type="button" data-status="" aria-pressed="true">全部</button>
             <button type="button" data-status="failed" aria-pressed="false">失败</button>
             <button type="button" data-status="retried" aria-pressed="false">重试</button>
@@ -399,7 +403,7 @@
         </div>
         <div class="activity-summary-line" aria-live="polite"></div>
         <div class="activity-stats ledger-stats"></div>
-        <div class="ledger-wrap activity-results" role="region" aria-label="请求记录"></div>
+        <div class="ledger-wrap activity-results" role="region" aria-label="请求记录" tabindex="0"></div>
         <div class="activity-pager" hidden>
           <button type="button" class="activity-link" data-page="newer">较新</button>
           <span></span>
@@ -411,6 +415,9 @@
 
     <main id="sessions" class="activity-pane" role="tabpanel" aria-labelledby="tab-sessions" tabindex="0" hidden>
       <div id="sessions-list">
+        <div class="activity-period">
+          <div class="activity-segment" data-range-controls role="group" aria-label="会话时段"></div>
+        </div>
         <div class="activity-tools">
           <select class="activity-pick" data-filter="mode" aria-label="模式"><option value="">全部模式</option></select>
           <select class="activity-pick" data-filter="tier" aria-label="档位"><option value="">全部档位</option></select>

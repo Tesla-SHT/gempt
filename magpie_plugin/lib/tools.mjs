@@ -1013,7 +1013,7 @@ export function createGemptTools({
               goal, title, host_conversation_id: hostId, timestamp: nowIso(), cwd, agent,
               tier: resolved.tier, served_model: reply.servedModel || usedModel,
               requested_model: resolved.model, sent_model: usedModel, reasoning_effort: effort,
-              attempted_models: attemptedModels, elapsed_sec: elapsedSec, usage: reply.usage,
+              attempted_models: attemptedModels, elapsed_sec: elapsedSec, usage: reply.usage, response_id: reply.responseId,
             },
           },
         });

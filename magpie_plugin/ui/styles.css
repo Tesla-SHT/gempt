@@ -1415,7 +1415,7 @@ button.status-chip:focus-visible {
 
 .activity-tabs button,
 .activity-link,
-.activity-status-filter button {
+.activity-segment button {
   border: 0;
   background: transparent;
   color: var(--gp-muted);
@@ -1429,7 +1429,7 @@ button.status-chip:focus-visible {
 
 .activity-tabs button:hover,
 .activity-link:hover,
-.activity-status-filter button:hover,
+.activity-segment button:hover,
 .activity-tabs button[aria-selected="true"] {
   background: var(--gp-pill);
   color: var(--gp-fg);
@@ -1520,7 +1520,17 @@ button.status-chip:focus-visible {
 .activity-pick { max-width: min(180px, 100%); color: var(--gp-muted); }
 .activity-pick:hover, .activity-pick.is-set { background: var(--gp-pill); color: var(--gp-fg); }
 
-.activity-status-filter {
+.activity-period {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin-bottom: 8px;
+}
+
+.activity-period > button { margin-inline-start: auto; }
+
+.activity-segment {
   display: inline-flex;
   gap: 1px;
   align-items: center;
@@ -1529,13 +1539,15 @@ button.status-chip:focus-visible {
   background: var(--gp-pill);
 }
 
-.activity-status-filter button {
+.activity-segment button {
   padding: 0 9px;
   height: 22px;
   white-space: nowrap;
 }
 
-.activity-status-filter button[aria-pressed="true"] {
+.activity-period .activity-segment button { height: 28px; }
+
+.activity-segment button[aria-pressed="true"] {
   background: var(--gp-card);
   color: var(--gp-fg);
   box-shadow: 0 1px 2px var(--activity-line);
@@ -1550,7 +1562,7 @@ button.status-chip:focus-visible {
 
 .activity-stats {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   margin: 0 0 10px;
   border-radius: 12px;
   border: 1px solid var(--activity-line);
@@ -1662,7 +1674,7 @@ button.status-chip:focus-visible {
 .activity-empty { margin: 0; padding: 18px 16px; color: var(--gp-muted); text-align: center; }
 .activity-results[aria-busy="true"] > * { opacity: .55; }
 
-.session-stats { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.session-stats { grid-template-columns: repeat(8, minmax(0, 1fr)); }
 .activity-list-head h2 { margin: 0; font-size: 12px; font-weight: 600; }
 .activity-list-head .activity-summary-line { flex: 1; margin: 0; }
 .activity-session-row {
@@ -1738,6 +1750,15 @@ button.status-chip:focus-visible {
 }
 
 .activity-detail-box h3 { margin: 0 0 8px; font-size: 13px; font-weight: 650; }
+.activity-turn-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin-bottom: 8px;
+}
+.activity-turn-head h3 { margin: 0; }
 .activity-detail-info {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);
@@ -1762,6 +1783,16 @@ button.status-chip:focus-visible {
   user-select: text;
 }
 
+.activity-events { list-style: none; margin: 6px 0 0; padding: 0; }
+.activity-event { padding: 5px 0; }
+.activity-event + .activity-event { border-top: 1px solid var(--activity-line-2); }
+.activity-event strong, .activity-event summary { font-size: 12px; font-weight: 600; }
+.activity-event summary { color: var(--gp-muted); cursor: pointer; }
+.activity-event pre { padding-inline: 4px; }
+.activity-muted { margin: 5px 0 0; color: var(--gp-muted); font-size: 11px; }
+.activity-gateway-wrap { margin-top: 5px; }
+.activity-gateway tbody tr { cursor: default; }
+
 .activity-pane :focus-visible,
 .activity-tabs :focus-visible,
 .recent-links :focus-visible { outline: 2px solid var(--gp-focus); outline-offset: -2px; }
@@ -1773,7 +1804,7 @@ button.status-chip:focus-visible {
 
 @container (max-width: 850px) {
   .activity-ledger .wide { display: none; }
-  .session-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .activity-stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .activity-kpi { border-bottom: 1px solid var(--activity-line-2); }
 }
 
@@ -1789,6 +1820,7 @@ button.status-chip:focus-visible {
 
 @media (max-width: 620px) {
   .activity-pane, .activity-tabs { padding-inline: 12px; }
+  .activity-period > button { margin-inline-start: 0; }
   .activity-detail-box { padding-inline: 12px; }
   .activity-detail-info { column-gap: 8px; }
   .active-run { flex-wrap: wrap; }

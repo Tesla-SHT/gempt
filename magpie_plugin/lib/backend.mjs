@@ -14,6 +14,8 @@ import { homedir } from 'node:os';
 import { basename, delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { correlateGatewayUsage } from './activity-gateway.mjs';
+import { readActivityTimeline } from './activity-timeline.mjs';
 import { isAstraModel } from './routing.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -764,6 +766,8 @@ function activityRequest(source, context) {
   return {
     ...context,
     timestamp: activityTime(source.timestamp, source.finished_at, source.updated_at, source.started_at, source.created_at),
+    started_at: activityTime(source.started_at),
+    finished_at: activityTime(source.finished_at),
     cwd: String(source.cwd ?? context.cwd ?? ''),
     agent: String(source.agent ?? context.agent ?? ''),
     tier: String(source.tier ?? context.tier ?? ''),
@@ -774,6 +778,9 @@ function activityRequest(source, context) {
     account: String(source.account || ''),
     reasoning_effort: String(source.reasoning_effort ?? context.reasoning_effort ?? ''),
     codex_thread_id: String(source.codex_thread_id ?? context.codex_thread_id ?? ''),
+    turn_id: String(source.turn_id ?? source.progress?.turn_id ?? ''),
+    response_id: String(source.response_id ?? ''),
+    attemptedModels: Array.isArray(source.attempted_models) ? source.attempted_models.filter((model) => typeof model === 'string') : [],
     goal: String(source.goal || promptSection(prompt, 'Goal') || prompt),
     title: explicitTitle(source.title),
     prompt,
@@ -787,8 +794,8 @@ function activityRequest(source, context) {
     error: String(source.error || ''),
     elapsed_sec: activityNumber(source.elapsed_sec),
     ttft_ms: activityNumber(source.ttft_ms),
-    output_tokens_per_sec: activityNumber(source.output_tokens_per_sec),
-    cost: activityNumber(source.cost),
+    output_tokens_per_sec: activityNumber(source.tokens_per_sec ?? source.output_tokens_per_sec),
+    cost: activityNumber(source.cost_usd ?? source.cost),
     usage: activityUsage(source.usage),
     verification: {
       status: String(verification?.status || (requested ? 'unverified' : '')),
@@ -885,9 +892,10 @@ function joinActivityRun(session, request, turn) {
     target.retried ||= request.retried;
     target.timestamp ||= request.timestamp;
     for (const key of ['cwd', 'agent', 'tier', 'model', 'requested_model', 'sent_model', 'provider', 'account',
-      'reasoning_effort', 'codex_thread_id', 'goal', 'title', 'prompt', 'error']) {
+      'reasoning_effort', 'codex_thread_id', 'turn_id', 'response_id', 'started_at', 'finished_at', 'goal', 'title', 'prompt', 'error']) {
       if (request[key]) target[key] = request[key];
     }
+    if (request.attemptedModels.length) target.attemptedModels = request.attemptedModels;
     if (request.reply) {
       target.reply = request.reply;
       target.reply_is_preview = request.reply_is_preview;
@@ -918,7 +926,61 @@ function totalUsage(requests) {
       if (key !== 'cache_hit_rate' && request.usage[key] != null) totals[key] = (totals[key] ?? 0) + request.usage[key];
     }
   }
+  const measured = requests.filter((row) => row.usage.cache_hit_rate != null);
+  const input = sumKnown(measured, (row) => row.cacheInput);
+  if (input > 0) totals.cache_hit_rate = Math.min(1, sumKnown(measured, (row) => row.usage.cache_read_tokens) / input);
   return totals;
+}
+
+function sumKnown(rows, value) {
+  return rows.reduce((total, row) => {
+    const current = value(row);
+    return current == null ? total : (total ?? 0) + current;
+  }, null);
+}
+
+function activityCost(rows) {
+  return sumKnown(rows, (row) => row.cost_usd);
+}
+
+function mergeGatewayUsage(request, rows) {
+  request.gateway_requests = rows;
+  request.gateway_request_count = rows.length;
+  request.cost_usd = request.cost = activityCost(rows) ?? request.cost;
+  const distinct = (value) => [...new Set(rows.map(value).filter(Boolean))].join(' / ');
+  for (const key of ['requested_model', 'sent_model', 'provider', 'account']) {
+    request[key] = distinct((row) => row[key]) || request[key];
+  }
+  request.provider_accounts = distinct((row) => [row.provider, row.account].filter(Boolean).join(' · '));
+  const withTtft = rows.filter((row) => row.ttft_ms != null);
+  request.ttft_ms = (withTtft.find((row) => row.status_code >= 200 && row.status_code < 300) ?? withTtft[0])?.ttft_ms
+    ?? request.ttft_ms;
+  const estimates = rows.filter((row) => row.tokens_per_sec != null);
+  const generationMs = (row) => row.tokens_per_sec > 0 && row.generated_tokens > 0
+    ? row.generated_tokens * 1000 / row.tokens_per_sec : row.generation_ms;
+  const duration = sumKnown(estimates, generationMs);
+  request.tokens_per_sec = request.output_tokens_per_sec = duration > 0
+    ? sumKnown(estimates, (row) => generationMs(row) == null ? null : row.tokens_per_sec * generationMs(row)) / duration
+    : estimates[0]?.tokens_per_sec ?? request.output_tokens_per_sec;
+
+  const usage = request.usage;
+  const cached = sumKnown(rows, (row) => row.cache_read_tokens);
+  const input = sumKnown(rows.filter((row) => row.cache_read_tokens != null), (row) => row.input_tokens == null ? null
+    : row.input_tokens + (row.input_includes_cache ? 0 : row.cache_read_tokens + (row.cache_write_tokens ?? 0)));
+  if (cached != null) {
+    usage.cache_read_tokens = cached;
+    usage.cache_hit_rate = input > 0 ? Math.min(1, cached / input) : null;
+    request.cacheInput = input;
+  } else if (usage.cache_hit_rate != null) {
+    request.cacheInput = usage.cache_hit_rate > 0 ? usage.cache_read_tokens / usage.cache_hit_rate : usage.input_tokens;
+  }
+  usage.cache_write_tokens = sumKnown(rows, (row) => row.cache_write_tokens) ?? usage.cache_write_tokens;
+  for (const key of ['input_tokens', 'output_tokens', 'reasoning_tokens']) {
+    usage[key] ??= sumKnown(rows, (row) => row[key]);
+  }
+  usage.total_tokens ??= sumKnown(rows, (row) => row.input_tokens == null && row.output_tokens == null ? null
+    : (row.input_tokens ?? 0) + (row.output_tokens ?? 0)
+      + (row.input_includes_cache ? 0 : (row.cache_read_tokens ?? 0) + (row.cache_write_tokens ?? 0)));
 }
 
 function readDispatchActivity(sessionsDir) {
@@ -960,6 +1022,7 @@ function readDispatchActivity(sessionsDir) {
     const session = sessions.get(request.session_id);
     if (session) joinActivityRun(session, request, turn);
     else {
+      request.dispatchSessionId = request.session_id;
       request.session_id = '';
       ledger.push(request);
     }
@@ -997,8 +1060,25 @@ function readDispatchActivity(sessionsDir) {
   return { ledger, history, totals: { requests: ledger.length, sessions: history.length, runs: runRecords.length } };
 }
 
+async function enrichDispatchActivity(sessionsDir, magpieConfigDir, configPath) {
+  const data = readDispatchActivity(sessionsDir);
+  const cfg = readJsonSafe(resolveConfigPath(configPath));
+  const baseUrl = cfg?.magpie?.base_url || defaultGatewayFromEnv();
+  const candidates = data.ledger.map((row) => ({ ...row, dispatchSessionId: row.session_id || row.dispatchSessionId,
+    active: ACTIVE_RUN_STATES.has(row.status) }));
+  const linked = await correlateGatewayUsage(join(resolveMagpieConfigDir(magpieConfigDir), 'usage.jsonl'), candidates,
+    { baseUrl, apiKey: cfg ? resolveMagpieApiKey(cfg, baseUrl) : '' });
+  data.ledger.forEach((row, index) => mergeGatewayUsage(row, linked.get(candidates[index]) || []));
+  for (const session of data.history) {
+    session.usage = totalUsage(session.requests);
+    session.cost_usd = activityCost(session.requests);
+    session.gateway_request_count = session.requests.reduce((total, row) => total + row.gateway_request_count, 0);
+  }
+  return data;
+}
+
 function requestListItem(row) {
-  const { prompt, reply, error, verification, commands, ...item } = row;
+  const { prompt, reply, error, verification, commands, gateway_requests, cacheInput, attemptedModels, dispatchSessionId, ...item } = row;
   return { ...item, goal: item.goal.slice(0, 320) };
 }
 
@@ -1007,10 +1087,77 @@ function sessionListItem(row) {
   return { ...item, title: item.title.slice(0, 320) };
 }
 
-export function listDispatchActivity(kind, params, sessionsDir) {
-  const { ledger, history } = readDispatchActivity(sessionsDir);
+function activityRange(params) {
+  const now = new Date();
+  const hours = { '24h': 24, '7d': 7 * 24, '30d': 30 * 24 };
+  const range = params.get('range') || 'all';
+  const invalid = (field) => Object.assign(new Error(`invalid activity ${field}`), { status: 400 });
+  const dateBound = (field) => {
+    const value = params.get(field);
+    if (!value) return undefined;
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(value);
+    const bound = date ? Date.parse(`${value}T${field === 'to' ? '23:59:59.999' : '00:00:00.000'}`) : Date.parse(value);
+    if (!Number.isFinite(bound)) throw invalid(field);
+    return bound;
+  };
+  let start = -Infinity;
+  let end = Infinity;
+  if (range === 'today') {
+    end = now.getTime();
+    start = now.setHours(0, 0, 0, 0);
+  } else if (Object.hasOwn(hours, range)) {
+    end = now.getTime();
+    start = end - hours[range] * 3_600_000;
+  } else if (range !== 'all') {
+    throw invalid('range');
+  }
+  const from = dateBound('from');
+  const to = dateBound('to');
+  if (from > to) throw invalid('from/to');
+  start = Math.max(start, from ?? -Infinity);
+  end = Math.min(end, to ?? Infinity);
+  return start === -Infinity && end === Infinity ? null : (timestamp) => {
+    const time = Date.parse(timestamp);
+    return time >= start && time <= end;
+  };
+}
+
+function sessionInRange(session, inRange) {
+  const requests = session.requests.filter((row) => inRange(row.timestamp));
+  if (!requests.length && (session.requests.length || !inRange(session.updated_at))) return null;
+  return { ...session, requests, usage: totalUsage(requests), turn_count: requests.length,
+    elapsed_sec: sumKnown(requests, (row) => row.elapsed_sec), cost_usd: activityCost(requests),
+    gateway_request_count: requests.reduce((total, row) => total + row.gateway_request_count, 0) };
+}
+
+const activityCsvFields = [
+  ['时间', (r) => r.timestamp], ['请求 ID', (r) => r.id], ['会话 ID', (r) => r.session_id],
+  ['标题', (r) => r.title], ['目标', (r) => r.goal], ['模式', (r) => r.mode], ['Agent', (r) => r.agent],
+  ['档位', (r) => r.tier], ['文件夹', (r) => r.cwd], ['请求模型', (r) => r.requested_model],
+  ['供应商 · 账号', (r) => r.provider_accounts || [r.provider, r.account].filter(Boolean).join(' · ')],
+  ['发送模型', (r) => r.sent_model], ['响应模型', (r) => r.model], ['推理强度', (r) => r.reasoning_effort],
+  ['输入 Token', (r) => r.usage.input_tokens], ['输出 Token', (r) => r.usage.output_tokens],
+  ['缓存写入 Token', (r) => r.usage.cache_write_tokens], ['缓存读取 Token', (r) => r.usage.cache_read_tokens],
+  ['缓存命中率', (r) => r.usage.cache_hit_rate], ['费用 USD', (r) => r.cost_usd], ['TTFT ms', (r) => r.ttft_ms],
+  ['耗时 s', (r) => r.elapsed_sec], ['速度 tok/s', (r) => r.tokens_per_sec], ['状态', (r) => r.status],
+];
+
+function activityCsv(rows) {
+  const cell = (value) => {
+    let text = String(value ?? '');
+    if (typeof value === 'string' && /^(?:\s*[=+\-@＝＋－＠]|[\t\r\n])/u.test(text)) text = `'${text}`;
+    return `"${text.replaceAll('"', '""')}"`;
+  };
+  return '\uFEFF' + [activityCsvFields.map(([label]) => cell(label)).join(','),
+    ...rows.map((row) => activityCsvFields.map(([, value]) => cell(value(row))).join(','))].join('\r\n') + '\r\n';
+}
+
+export async function listDispatchActivity(kind, params, sessionsDir, magpieConfigDir, configPath) {
+  const inRange = activityRange(params);
+  const { ledger, history } = await enrichDispatchActivity(sessionsDir, magpieConfigDir, configPath);
   const isRequests = kind === 'requests';
-  const records = isRequests ? ledger : history;
+  const records = isRequests ? (inRange ? ledger.filter((row) => inRange(row.timestamp)) : ledger)
+    : (inRange ? history.map((row) => sessionInRange(row, inRange)).filter(Boolean) : history);
   const fields = { mode: 'mode', tier: 'tier', workspace: 'cwd', model: 'model', ...(isRequests ? { status: 'status' } : {}) };
   const recordValues = (row, field) => {
     if (field === 'status' && row.retried) return [row.status, 'retried'];
@@ -1022,10 +1169,12 @@ export function listDispatchActivity(kind, params, sessionsDir) {
   const matches = (row, key, field) => !params.get(key) || recordValues(row, field).includes(params.get(key));
   const query = (params.get('q') ?? params.get('search') ?? '').trim().toLowerCase();
   const findText = (row) => [row.id, row.session_id, row.run_id, row.title, row.goal, row.prompt, row.reply, row.error, row.model,
-    row.tier, row.agent, row.cwd].some((value) => value?.toLowerCase().includes(query));
+    row.tier, row.agent, row.cwd, row.requested_model, row.sent_model, row.provider, row.account]
+    .some((value) => value?.toLowerCase().includes(query));
   const searchable = query ? records.filter((row) => findText(row) || row.requests?.some(findText)) : records;
   const filters = Object.entries(fields);
   const filtered = searchable.filter((row) => filters.every(([key, field]) => matches(row, key, field)));
+  if (isRequests && params.get('format') === 'csv') return activityCsv(filtered);
   const facets = Object.fromEntries(filters.map(([key, field]) => {
     const counts = new Map();
     for (const row of searchable) {
@@ -1044,7 +1193,8 @@ export function listDispatchActivity(kind, params, sessionsDir) {
   const limit = Math.min(100, Math.max(1, integer('limit', 25)));
   const offset = integer('offset', 0);
   const requests = isRequests ? filtered : filtered.flatMap((session) => session.requests);
-  const summary = { requests: requests.length, ...totalUsage(requests), failed: 0, retried: 0, elapsed_sec: null,
+  const summary = { requests: requests.length, ...totalUsage(requests), cost_usd: activityCost(requests),
+    failed: 0, retried: 0, elapsed_sec: null,
     workspaces: new Set(requests.map((row) => row.cwd).filter(Boolean)).size };
   for (const row of requests) {
     if (row.status === 'failed') summary.failed += 1;
@@ -1055,14 +1205,28 @@ export function listDispatchActivity(kind, params, sessionsDir) {
     .map(isRequests ? requestListItem : sessionListItem), facets, limit, offset };
 }
 
-export function getDispatchActivity(kind, id, sessionsDir) {
+export async function getDispatchActivity(kind, id, sessionsDir, magpieConfigDir, configPath) {
   if (!isActivityId(kind, id)) return null;
-  const { ledger, history } = readDispatchActivity(sessionsDir);
-  if (kind === 'requests') return ledger.find((row) => row.id === id) ?? null;
+  const { ledger, history } = await enrichDispatchActivity(sessionsDir, magpieConfigDir, configPath);
+  const runsDir = join(resolveSessionsDir(sessionsDir), 'runs');
+  let remaining = 192 * 1024;
+  const renderTurn = ({ cacheInput, attemptedModels, dispatchSessionId, ...row }) => {
+    const { timeline, timeline_truncated, bytes } = row.run_id
+      ? readActivityTimeline(join(runsDir, row.run_id, 'events.jsonl'),
+        { ...row, active: ACTIVE_RUN_STATES.has(row.status) }, Math.min(48 * 1024, remaining))
+      : { timeline: [], timeline_truncated: false, bytes: 0 };
+    remaining -= bytes;
+    return { ...row, timeline, timeline_truncated };
+  };
+  if (kind === 'requests') {
+    const row = ledger.find((row) => row.id === id);
+    return row ? renderTurn(row) : null;
+  }
   const session = history.find((row) => row.id === id);
   if (!session) return null;
   const { requests: turns, ...detail } = session;
-  return { ...detail, turns };
+  return { ...detail, turns: [...turns].reverse().map(renderTurn).reverse(),
+    gateway_requests: turns.flatMap((row) => row.gateway_requests).sort((a, b) => a.timestamp.localeCompare(b.timestamp)) };
 }
 
 function buildTierView(tierId, tierCfg, defaultTier, fallbackPreset) {
