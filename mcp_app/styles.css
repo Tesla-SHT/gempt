@@ -157,6 +157,52 @@ select, select option, select optgroup {
 .icon-btn:hover, .chip-btn:hover, .copy-btn:hover { background: var(--surface-2); color: var(--fg); }
 button:disabled { opacity: 0.45; cursor: default; }
 
+/* Concurrent GPT run chip strip (shown when >=2 parallel/active runs exist) */
+.run-chips {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.run-chips::-webkit-scrollbar { display: none; }
+.run-chip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 156px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font: 500 11px/1 var(--font);
+  cursor: pointer;
+}
+.run-chip:hover { background: var(--surface-2); color: var(--fg); }
+.run-chip[aria-selected="true"] {
+  background: color-mix(in srgb, var(--info) 14%, var(--surface));
+  border-color: color-mix(in srgb, var(--info) 45%, var(--border));
+  color: var(--fg);
+  font-weight: 600;
+}
+.run-chip[data-state="waiting_gemini"] {
+  border-color: color-mix(in srgb, var(--warn) 65%, var(--border));
+}
+.run-chip .status-dot { width: 6px; height: 6px; box-shadow: none; }
+.run-chip-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Collapsible metadata drawer (hidden by default) */
 .meta-drawer {
   flex: none;

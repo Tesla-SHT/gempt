@@ -211,7 +211,8 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "gemini_family": DISPATCH_SCHEMA["properties"]["gemini_family"],
                 "model_override": {"type": "string", "description": "Optional explicit model/group ID override."},
-                "timeout_sec": {"type": "integer", "minimum": 30, "maximum": 3600},
+                "workspace": DISPATCH_SCHEMA["properties"]["workspace"],
+                "timeout_sec": {"type": "integer", "minimum": 0, "maximum": 14400, "description": "Optional safety wall-clock timeout in seconds (0 = idle watchdog only, no wall-clock limit)."},
             },
             "required": ["goal", "cwd"],
             "additionalProperties": False,
@@ -219,11 +220,12 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "gempt_status",
-        "description": "Show redacted active gempt config, Magpie & Codex health checks, and recent delegation sessions.",
+        "description": "Show active GPT runs, conversation-scoped reusable GPT thread roster, redacted config, and Magpie & Codex health checks.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "config_path": {"type": "string"},
+                "host_conversation_id": DISPATCH_SCHEMA["properties"]["host_conversation_id"],
                 "session_limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
                 "wait_sec": {
                     "type": "number",
@@ -352,7 +354,8 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
         if isinstance(wait_sec, bool) or not isinstance(wait_sec, (int, float)) or not 0 <= wait_sec <= 120:
             raise ValueError("wait_sec must be a number between 0 and 120 seconds.")
         data = read_run(args["run_id"])
-        if workspace_root is not None and not Path(data["cwd"]).resolve().is_relative_to(workspace_root):
+        check_cwd = data.get("source_cwd") or data["cwd"]
+        if workspace_root is not None and not Path(check_cwd).resolve().is_relative_to(workspace_root):
             raise ValueError("Run outside host workspace")
         if name == "gempt_steer":
             data = steer_run(args["run_id"], args["message"], config_path=trusted_config)
@@ -441,6 +444,7 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
         background = bool(args.get("background"))
         res = dispatch_exec(background=background, run_id=args.get("run_id", ""),
             wait_sec=None if background else _mcp_wait_sec(),
+            workspace=args.get("workspace") or "inherit",
             config_path=trusted_config,
             goal=str(args["goal"]),
             title=args.get("title"),
@@ -472,6 +476,7 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             workspace_root=workspace_root,
             config_path=args.get("config_path"),
             session_limit=int(args.get("session_limit") or 10),
+            host_conversation_id=args.get("host_conversation_id"),
         )
         return {"content": [{"type": "text", "text": json.dumps(data, indent=2, ensure_ascii=False)}]}
 

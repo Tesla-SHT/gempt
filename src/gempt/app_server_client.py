@@ -332,10 +332,12 @@ class TurnJournal:
         self.accept_turn = False
         self.tools = {}
         self.commands = {}
+        self.active_commands = set()
         self.messages = {}
         self.files = {}
         self.usage = {}
         self.last_write = 0.0
+        self.last_activity = time.monotonic()
         self.progress = {"phase": "connecting", "thread_id": thread_id or None, "turn_id": None,
                          "last_message": "", "recent_commands": [], "touched_files": [], "token_usage": {}}
         self.save(force=True)
@@ -343,9 +345,12 @@ class TurnJournal:
     def save(self, *, force=False):
         now = time.monotonic()
         if self.directory and (force or now - self.last_write >= 0.5):
-            from .runs import _write_run_state
-            self.progress["updated_at"] = time.time()
+            from .runs import ACTIVE_STATES, _write_run_state
+            now_wall = time.time()
+            self.progress["updated_at"] = now_wall
             self.record["progress"] = self.progress
+            if self.record.get("state") in ACTIVE_STATES:
+                self.record["deadline"] = max(float(self.record.get("deadline") or 0), now_wall + 900)
             _write_run_state(self.directory, self.record)
             self.last_write = now
 
@@ -371,6 +376,7 @@ class TurnJournal:
 
     def event(self, message):
         with self.lock:
+            self.last_activity = time.monotonic()
             if self.directory:
                 with (self.directory / "events.jsonl").open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(message, ensure_ascii=False) + "\n")
@@ -394,6 +400,7 @@ class TurnJournal:
                 self.identity(turn_id=params["turn"]["id"])
                 self.turn = params["turn"]
                 self.tools.clear()
+                self.active_commands.clear()
                 self.record.update(state="running", pending_tool_call=None)
                 self.progress["phase"] = self.turn["status"]
                 self.save(force=True)
@@ -402,7 +409,7 @@ class TurnJournal:
                 self.tools.pop(params["requestId"])
                 self.pending_changed()
             elif method in {"item/started", "item/completed"}:
-                self.item(params["item"])
+                self.item(params["item"], completed=(method == "item/completed"))
                 self.save(force=True)
             elif method == "item/agentMessage/delta":
                 ident = params["itemId"]
@@ -417,12 +424,16 @@ class TurnJournal:
                 self.progress["token_usage"] = self.usage
                 self.save()
 
-    def item(self, item):
+    def item(self, item, *, completed=False):
         kind = item["type"]
         if kind == "agentMessage":
             self.messages[item["id"]] = item["text"]
             self.progress["last_message"] = item["text"][-1500:]
         elif kind == "commandExecution":
+            if completed or item.get("exitCode") is not None:
+                self.active_commands.discard(item["id"])
+            else:
+                self.active_commands.add(item["id"])
             self.commands[item["id"]] = {"command": item["command"], "exit_code": item.get("exitCode"),
                                          "output": str(item.get("aggregatedOutput") or "")[-4000:]}
             self.progress["recent_commands"] = list(self.commands.values())[-5:]
@@ -468,13 +479,20 @@ class TurnJournal:
         self.client.reply(ident, {"success": reply["success"], "contentItems": [
             {"type": "inputText", "text": reply["answer"]}]})
         self.tools.pop(ident)
+        self.last_activity = time.monotonic()
         self.pending_changed()
 
 
 def run_app_server(*, prompt, cwd, model, reasoning_effort, sandbox, approval_policy,
-                   codex_thread_id, gateway_url, config_path, timeout_sec, run_id, session_id, on_identity):
+                   codex_thread_id, gateway_url, config_path, timeout_sec, run_id, session_id, on_identity,
+                   idle_timeout_sec=300):
     start = time.monotonic()
-    deadline = start + timeout_sec
+    timeout_val = float(timeout_sec) if timeout_sec is not None else 600.0
+    strict_short = 0 < timeout_val < 60
+    rpc_timeout = max(0.05, min(60.0, timeout_val)) if strict_short else 60.0
+    max_wall = timeout_val if strict_short else (None if timeout_val <= 0 else max(timeout_val * 4.0, 3600.0))
+    idle_limit = None if strict_short else (float(idle_timeout_sec) if idle_timeout_sec and idle_timeout_sec > 0 else None)
+
     journal = TurnJournal(run_id, session_id, codex_thread_id, sandbox, on_identity, model=model)
     policy = {"type": SANDBOX_TYPES[sandbox]}
     common = {"cwd": str(cwd), "model": model, "modelProvider": PROVIDER,
@@ -486,7 +504,7 @@ def run_app_server(*, prompt, cwd, model, reasoning_effort, sandbox, approval_po
         method, params = ("thread/resume", {"threadId": codex_thread_id, "excludeTurns": True}) if codex_thread_id else (
             "thread/start", {"dynamicTools": [ASK_GEMINI], "allowProviderModelFallback": False})
         # Codex stores dynamic tool specs with the thread. Resume has no dynamicTools field.
-        thread = client.request(method, {**common, **params}, timeout=max(0.01, deadline - time.monotonic()))
+        thread = client.request(method, {**common, **params}, timeout=rpc_timeout)
         thread_id = thread["thread"]["id"]
         with journal.lock:
             journal.identity(thread_id=thread_id)
@@ -504,23 +522,43 @@ def run_app_server(*, prompt, cwd, model, reasoning_effort, sandbox, approval_po
             result = client.request("turn/start", {
                 "threadId": thread_id, "input": text_input(prompt), "effort": reasoning_effort,
                 "model": model, "cwd": str(cwd), "sandboxPolicy": policy, "approvalPolicy": approval_policy,
-            }, timeout=max(0.01, deadline - time.monotonic()))
+            }, timeout=rpc_timeout)
             with journal.lock:
                 journal.identity(turn_id=result["turn"]["id"])
+                journal.last_activity = time.monotonic()
+            paused_sec = 0.0
+            last_tick = time.monotonic()
             while True:
                 with journal.lock:
+                    now = time.monotonic()
+                    dt = max(0.0, now - last_tick)
+                    last_tick = now
                     if journal.turn:
                         break
                     if client.error:
                         raise client.error
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise CodexExecError(f"Codex turn timed out after {timeout_sec}s.")
+                    waiting_tool = bool(journal.tools)
+                    if waiting_tool:
+                        paused_sec += dt
+                        journal.last_activity = now
+                    else:
+                        active_elapsed = (now - start) - paused_sec
+                        if max_wall is not None and active_elapsed >= max_wall:
+                            label = int(timeout_val) if strict_short else int(max_wall)
+                            raise CodexExecError(f"Codex turn timed out after {label}s.")
+                        if idle_limit is not None:
+                            effective_idle = max(idle_limit, 600.0) if journal.active_commands else idle_limit
+                            if now - journal.last_activity >= effective_idle:
+                                raise CodexExecError(f"Codex turn stalled (no activity for {int(effective_idle)}s).")
                     journal.poll_reply()
+                    journal.save()
                     journal.changed.clear()
-                journal.changed.wait(min(0.1, remaining))
+                    wait_cap = 0.1
+                    if strict_short and max_wall is not None:
+                        wait_cap = min(wait_cap, max(0.01, max_wall - ((now - start) - paused_sec)))
+                journal.changed.wait(wait_cap)
         except CodexExecError as exc:
-            if "timed out" in str(exc) and journal.progress["turn_id"]:
+            if ("timed out" in str(exc) or "stalled" in str(exc)) and journal.progress["turn_id"]:
                 with suppress(CodexExecError, OSError):
                     client.request("turn/interrupt", {"threadId": thread_id, "turnId": journal.progress["turn_id"]}, timeout=4)
             raise

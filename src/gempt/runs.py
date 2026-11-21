@@ -13,7 +13,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .sessions import atomic_json, exclusive_operation, load_session, new_session_id, resolve_sessions_dir, validate_session_id
+from .sessions import atomic_json, exclusive_operation, list_sessions, load_session, new_session_id, resolve_sessions_dir, validate_session_id
 from .titles import normalize_title
 
 
@@ -91,6 +91,28 @@ def wait_for_run(run_id, *, timeout_sec: float | None = None, poll_interval: flo
             time.sleep(poll_interval)
 
 
+def wait_for_runs(run_ids, *, wait_any: bool = True, timeout_sec: float | None = None, poll_interval: float = 0.25):
+    ids = [rid.strip() for rid in run_ids if isinstance(rid, str) and rid.strip()]
+    if not ids:
+        raise ValueError("At least one run_id is required.")
+    for rid in ids:
+        run_directory(rid)
+    deadline = None if timeout_sec is None else time.monotonic() + timeout_sec
+    while True:
+        records = {rid: read_run(rid) for rid in ids}
+        ready = [rid for rid, rec in records.items() if rec["state"] not in {"queued", "running"}]
+        active = [rid for rid, rec in records.items() if rec["state"] in {"queued", "running"}]
+        if (wait_any and ready) or (not wait_any and not active):
+            return {"ready": ready, "active": active, "runs": records}
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"ready": ready, "active": active, "runs": records}
+            time.sleep(min(poll_interval, remaining))
+        else:
+            time.sleep(poll_interval)
+
+
 def _control_run(run_id, method, *, config_path=None, message=None):
     from .app_server_client import AppServerClient, text_input
     record = read_run(run_id)
@@ -137,14 +159,13 @@ def reply_tool_call(run_id, call_id, answer, *, success=True):
     return {"ok": True, "run_id": run_id, "session_id": record.get("session_id"), "call_id": call_id}
 
 
-def build_wait_command(run_id: str) -> str:
-    run_directory(run_id)
+def _format_cli_command(cli_args: list[str]) -> str:
     runtime = str(Path(__file__).resolve().parents[1])
     bootstrap = (
         "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));"
         "runpy.run_module('gempt.cli',run_name='__main__')"
     )
-    argv = [sys.executable, "-I", "-X", "utf8", "-B", "-c", bootstrap, runtime, "status", "--run-id", run_id, "--wait"]
+    argv = [sys.executable, "-I", "-X", "utf8", "-B", "-c", bootstrap, runtime, *cli_args]
     if os.name != "nt":
         return shlex.join(argv)
 
@@ -154,7 +175,38 @@ def build_wait_command(run_id: str) -> str:
     return "& " + " ".join(_ps_quote(a) for a in argv)
 
 
-def recent_runs(limit, root=None):
+def build_wait_command(run_id: str) -> str:
+    run_directory(run_id)
+    return _format_cli_command(["status", "--run-id", run_id, "--wait"])
+
+
+def build_wait_many_command(run_ids: list[str], *, wait_any: bool = True) -> str:
+    ids = [rid.strip() for rid in run_ids if isinstance(rid, str) and rid.strip()]
+    if not ids:
+        raise ValueError("At least one run_id is required.")
+    for rid in ids:
+        run_directory(rid)
+    args = ["status", "--run-ids", ",".join(ids), "--wait"]
+    if not wait_any:
+        args.append("--wait-all")
+    return _format_cli_command(args)
+
+
+def _cwd_within_root(record: dict, root: Path | None) -> bool:
+    if root is None:
+        return True
+    for candidate in (record.get("source_cwd"), record.get("cwd")):
+        if not candidate:
+            continue
+        try:
+            if Path(candidate).resolve().is_relative_to(root):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def recent_runs(limit, root=None, host_conversation_id=None):
     directory = resolve_sessions_dir() / "runs"
     if not directory.is_dir():
         return []
@@ -163,13 +215,127 @@ def recent_runs(limit, root=None):
     for path in files:
         try:
             record = read_run(path.parent.name)
-            if root is None or Path(record["cwd"]).resolve().is_relative_to(root):
-                items.append({key: record.get(key) for key in ("run_id", "cwd", "state", "title", "host_conversation_id")})
+            if not _cwd_within_root(record, root):
+                continue
+            if host_conversation_id and record.get("host_conversation_id") != host_conversation_id:
+                continue
+            items.append({key: record.get(key) for key in (
+                "run_id", "session_id", "cwd", "worktree_path", "source_cwd", "state", "title", "host_conversation_id",
+            )})
         except (OSError, json.JSONDecodeError, KeyError, ValueError):
             continue
         if len(items) >= limit:
             break
     return items
+
+
+def active_runs_summary(limit=20, root=None, host_conversation_id=None):
+    directory = resolve_sessions_dir() / "runs"
+    if not directory.is_dir():
+        return []
+    files = sorted(directory.glob("*/state.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    items = []
+    for path in files:
+        try:
+            record = read_run(path.parent.name)
+            if record.get("state") not in ACTIVE_STATES:
+                continue
+            if not _cwd_within_root(record, root):
+                continue
+            if host_conversation_id and record.get("host_conversation_id") != host_conversation_id:
+                continue
+            progress = record.get("progress") or {}
+            items.append({
+                "run_id": record.get("run_id"),
+                "session_id": record.get("session_id"),
+                "title": record.get("title"),
+                "state": record.get("state"),
+                "phase": progress.get("phase"),
+                "model": record.get("model"),
+                "cwd": record.get("cwd"),
+                "worktree_path": record.get("worktree_path"),
+                "source_cwd": record.get("source_cwd"),
+                "host_conversation_id": record.get("host_conversation_id"),
+                "last_message": (progress.get("last_message") or "")[-240:],
+                "pending_tool_call": record.get("pending_tool_call"),
+            })
+        except (OSError, json.JSONDecodeError, KeyError, ValueError):
+            continue
+        if len(items) >= limit:
+            break
+    return items
+
+
+def session_roster(limit=15, root=None, host_conversation_id=None):
+    """Build a concise per-session GPT roster (for resuming or inspecting parallel threads)."""
+    latest_by_session = {}
+    directory = resolve_sessions_dir() / "runs"
+    if directory.is_dir():
+        for path in sorted(directory.glob("*/state.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                rec = read_run(path.parent.name)
+            except (OSError, json.JSONDecodeError, KeyError, ValueError):
+                continue
+            sid = rec.get("session_id")
+            if not sid or sid in latest_by_session:
+                continue
+            if not _cwd_within_root(rec, root):
+                continue
+            if host_conversation_id and rec.get("host_conversation_id") != host_conversation_id:
+                continue
+            latest_by_session[sid] = rec
+
+    roster = []
+    seen = set()
+    for sess in list_sessions(limit=max(limit * 3, 30)):
+        sid = sess.get("session_id")
+        if not sid or sid in seen:
+            continue
+        rec = latest_by_session.get(sid)
+        full = load_session(sid) or {}
+        if host_conversation_id and (full.get("host_conversation_id") or (rec or {}).get("host_conversation_id")) != host_conversation_id:
+            continue
+        if not _cwd_within_root(full, root):
+            continue
+        seen.add(sid)
+        progress = (rec or {}).get("progress") or {}
+        roster.append({
+            "session_id": sid,
+            "latest_run_id": (rec or {}).get("run_id"),
+            "title": (rec or {}).get("title") or full.get("title") or normalize_title(None, "", full.get("cwd")),
+            "mode": full.get("mode", "exec"),
+            "state": (rec or {}).get("state", "finished"),
+            "model": (rec or {}).get("model") or full.get("model"),
+            "cwd": full.get("cwd") or (rec or {}).get("cwd"),
+            "worktree_path": full.get("worktree_path") or (rec or {}).get("worktree_path"),
+            "source_cwd": full.get("source_cwd") or (rec or {}).get("source_cwd"),
+            "turns": len(full.get("turns") or []),
+            "updated_at": full.get("updated_at") or "",
+            "last_message": (progress.get("last_message") or "")[-200:],
+        })
+        if len(roster) >= limit:
+            break
+
+    # Include newly queued/running sessions that have not written a session json yet.
+    for sid, rec in latest_by_session.items():
+        if sid in seen or len(roster) >= limit:
+            continue
+        progress = rec.get("progress") or {}
+        roster.insert(0, {
+            "session_id": sid,
+            "latest_run_id": rec.get("run_id"),
+            "title": rec.get("title"),
+            "mode": "exec",
+            "state": rec.get("state"),
+            "model": rec.get("model"),
+            "cwd": rec.get("cwd"),
+            "worktree_path": rec.get("worktree_path"),
+            "source_cwd": rec.get("source_cwd"),
+            "turns": 0,
+            "updated_at": "",
+            "last_message": (progress.get("last_message") or "")[-200:],
+        })
+    return roster[:limit]
 
 
 def _write_run_state(directory, record):
@@ -185,15 +351,23 @@ def _write_run_state(directory, record):
             time.sleep(0.02)
 
 
-def dispatch_exec(*, background=False, run_id="", wait_sec: float | None = None, **options):
+def dispatch_exec(*, background=False, run_id="", wait_sec: float | None = None, workspace: str | None = None, **options):
     wait_deadline = None if wait_sec is None else time.monotonic() + wait_sec
-    options["cwd"] = str(Path(options["cwd"]).resolve())
+    source_cwd = str(Path(options["cwd"]).resolve())
+    options["cwd"] = source_cwd
     session_id = options.get("session_id")
     host_id = options.get("host_conversation_id")
-    if session_id and not host_id:
+    worktree_path = ""
+    prior = {}
+    if session_id:
         try:
             prior = load_session(session_id) or {}
-            host_id = prior.get("host_conversation_id")
+            if not host_id:
+                host_id = prior.get("host_conversation_id")
+            if prior.get("worktree_path") and Path(prior["worktree_path"]).is_dir():
+                worktree_path = str(Path(prior["worktree_path"]).resolve())
+                source_cwd = str(prior.get("source_cwd") or source_cwd)
+                options["cwd"] = str(Path(prior.get("cwd") or worktree_path).resolve())
         except (OSError, ValueError):
             pass  # The worker validates the session under its lock.
     run_id = run_id or uuid.uuid4().hex
@@ -205,17 +379,35 @@ def dispatch_exec(*, background=False, run_id="", wait_sec: float | None = None,
         raise ValueError(f"Run {run_id} already exists; query its status.") from None
     if options.get("config_path"):
         options["config_path"] = str(Path(options["config_path"]).resolve())
+    effective_sid = session_id or new_session_id("exec")
     if not session_id:
-        options["_new_session_id"] = new_session_id("exec")
+        options["_new_session_id"] = effective_sid
+    if workspace == "share" and not worktree_path:
+        from .worktrees import ensure_share_worktree
+        try:
+            wt = ensure_share_worktree(options["cwd"], effective_sid)
+        except Exception:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+            raise
+        options["cwd"] = wt["cwd"]
+        worktree_path = wt["worktree_root"]
+        source_cwd = wt["source_cwd"]
+    if worktree_path:
+        options["_worktree_path"] = worktree_path
+        options["_source_cwd"] = source_cwd
     record = {"run_id": run_id, "state": "queued", "cwd": options["cwd"],
+              "worktree_path": worktree_path or None, "source_cwd": source_cwd if worktree_path else None,
               "goal": options.get("goal", ""), "tier": options.get("tier"),
-              "title": normalize_title(options.get("title"), options.get("goal"), options["cwd"]),
+              "title": normalize_title(options.get("title"), options.get("goal"), source_cwd),
               "host_conversation_id": host_id,
-              "session_id": session_id or options["_new_session_id"],
+              "session_id": effective_sid,
               "config_path": options.get("config_path"), "progress": None,
               "verification": options.get("verification"),
               "created_at": time.time(),
-              "deadline": time.time() + 120 + int(options.get("timeout_sec") or 3600)}
+              "deadline": time.time() + 900 + int(options.get("timeout_sec") or 3600)}
     _write_run_state(directory, record)
     try:
         atomic_json(directory / "request.json", options)

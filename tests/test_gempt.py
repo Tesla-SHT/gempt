@@ -1650,8 +1650,8 @@ class BugfixRegressionTests(unittest.TestCase):
                 return json.loads(proc.stdout)["injectSteps"][0]["ephemeralMessage"]
 
             both_off = run_hook("gemini", "inherit")
-            no_delegation = "Do not invoke gempt-worker or call gempt_dispatch"
-            delegate = 'invoke_subagent(TypeName="gempt-worker", Model="inherit"'
+            no_delegation = "Do not call gempt_dispatch"
+            delegate = "call gempt_dispatch directly"
             self.assertIn("GemPT is OFF for ordinary conversations and Swarm", both_off)
             self.assertIn(no_delegation, both_off)
             self.assertNotIn("first call gempt_dispatch", both_off)
@@ -1674,8 +1674,8 @@ class BugfixRegressionTests(unittest.TestCase):
 
             both_on = run_hook("balanced", "gpt")
             self.assertIn(delegate, both_on)
-            self.assertIn("send_message to the same subagent", both_on)
-            self.assertIn("The gempt-worker itself calls gempt_dispatch", both_on)
+            self.assertIn('workspace="share"', both_on)
+            self.assertIn("zero-poll wakeup", both_on)
             self.assertIn("Current native gemini_family=neon.", both_on)
 
             detail = "Gemini 负责沟通、设计与常规实现，仅在疑难排错、复杂推理与专家复核时派给 GPT。"
@@ -2068,6 +2068,82 @@ class AppServerTests(unittest.TestCase):
         self.manifest.unlink()
         with self.assertRaisesRegex(RuntimeError, UNAVAILABLE):
             dispatch_exec(goal="Missing app-server", cwd=self.repo, wait_sec=8)
+
+    def test_first_class_direct_dispatch_worktree_batch_wait_roster_and_escalation(self):
+        from gempt.runs import build_wait_many_command, wait_for_runs
+        from gempt.worktrees import ensure_share_worktree, remove_share_worktree
+
+        # 1. Accurate escalation hints (no false "Already at xhigh/fable" on medium/Sol)
+        fable_med = build_escalation_suggestion(
+            mode="exec", tier="fable", effort="medium", model="codex/gpt-6.2-sol", timed_out=True,
+        )
+        self.assertNotIn("Already at xhigh/fable", fable_med)
+        self.assertIn("higher effort", fable_med)
+        fable_top = build_escalation_suggestion(
+            mode="exec", tier="fable", effort="xhigh", model="codex/gpt-6.2-astra", timed_out=True,
+        )
+        self.assertIn("Already at xhigh/fable", fable_top)
+
+        # 2. Native Git share worktree isolation + reuse + batch wait + conversation roster
+        wt_root_dir = self.repo.parent / "managed-worktrees"
+        with mock.patch.dict(os.environ, {"GEMPT_WORKTREES_DIR": str(wt_root_dir)}):
+            subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True)
+            subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "t@example.com"], check=True)
+            subprocess.run(["git", "-C", str(self.repo), "config", "user.name", "Test"], check=True)
+            (self.repo / "hello.txt").write_text("hi\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "-m", "init"], check=True)
+
+            conv_id = "conv-first-class-001"
+            r1 = self.mcp(
+                "gempt_dispatch",
+                goal="Hold turn",
+                kind="engineering",
+                access="change",
+                cwd=str(self.repo),
+                workspace="share",
+                background=True,
+                title="并行任务A",
+                host_conversation_id=conv_id,
+            )
+            r2 = self.mcp(
+                "gempt_dispatch",
+                goal="Quick isolated check",
+                kind="engineering",
+                access="change",
+                cwd=str(self.repo),
+                workspace="share",
+                background=True,
+                title="并行任务B",
+                host_conversation_id=conv_id,
+            )
+            self.assertTrue(r1.get("worktree_path"))
+            self.assertTrue(r2.get("worktree_path"))
+            self.assertNotEqual(r1["worktree_path"], r2["worktree_path"])
+            self.assertTrue(Path(r1["worktree_path"]).is_dir())
+            self.assertTrue(Path(r2["worktree_path"]).is_dir())
+
+            batch_cmd = build_wait_many_command([r1["run_id"], r2["run_id"]])
+            self.assertIn("--run-ids", batch_cmd)
+            batch = wait_for_runs([r1["run_id"], r2["run_id"]], wait_any=True, timeout_sec=10)
+            self.assertIn(r2["run_id"], batch["ready"])
+            self.assertIn(r1["run_id"], batch["active"])
+
+            # Conversation-scoped roster via gempt_status
+            status = self.mcp("gempt_status", host_conversation_id=conv_id)
+            roster_ids = {row["session_id"] for row in status["roster"]}
+            self.assertIn(r1["session_id"], roster_ids)
+            self.assertIn(r2["session_id"], roster_ids)
+            self.assertTrue(any(row["run_id"] == r1["run_id"] for row in status["active_runs"]))
+
+            # Interrupt r1 cleanly and verify worktree reuse + cleanup
+            self.wait_running(r1["run_id"])
+            self.mcp("gempt_interrupt", run_id=r1["run_id"])
+            wait_for_run(r1["run_id"], timeout_sec=8)
+            reused = ensure_share_worktree(self.repo, r2["session_id"])
+            self.assertEqual(reused["worktree_root"], r2["worktree_path"])
+            self.assertTrue(remove_share_worktree(self.repo, r1["worktree_path"]))
+            self.assertTrue(remove_share_worktree(self.repo, r2["worktree_path"]))
 
 
 if __name__ == "__main__":

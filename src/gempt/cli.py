@@ -25,7 +25,7 @@ from .agy_install import DEFAULT_AGY_TARGET, build_mcp_config, install_agy
 from .config import get_default_tier, load_config, resolve_tier
 from .discover import discover_environment
 from .presets import apply_native_presets
-from .runs import dispatch_exec, interrupt_run, read_run, reply_tool_call, steer_run, wait_for_run
+from .runs import dispatch_exec, interrupt_run, read_run, reply_tool_call, steer_run, wait_for_run, wait_for_runs
 from .mcp_server import serve_stdio
 from .workload import SCHEMA as DISPATCH_SCHEMA, dispatch_task
 from .service import configure_gempt, get_status, run_consult, set_auto_effort, set_default_sandbox, set_default_tier, set_tier_effort
@@ -191,9 +191,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     dispatch = sub.add_parser("dispatch", help="Apply the current ordinary or Swarm work split")
     for name, prop in DISPATCH_SCHEMA["properties"].items():
-        dispatch.add_argument("--" + name.replace("_", "-"), choices=prop.get("enum"),
-                              action="append" if prop["type"] == "array" else "store",
-                              required=name in DISPATCH_SCHEMA["required"], help=prop.get("description"))
+        if prop["type"] == "boolean":
+            dispatch.add_argument("--" + name.replace("_", "-"), action="store_true", default=None, help=prop.get("description"))
+        else:
+            dispatch.add_argument("--" + name.replace("_", "-"), choices=prop.get("enum"),
+                                  action="append" if prop["type"] == "array" else "store",
+                                  required=name in DISPATCH_SCHEMA["required"], help=prop.get("description"))
     dispatch.add_argument("--config")
 
     p_cons = sub.add_parser("consult", help="Consult GPT/utility via Magpie HTTP API (no Codex tool overhead)")
@@ -217,6 +220,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_exec.add_argument("--tier", choices=(*TIER_ORDER, "lite", "mid", "max"), default=None, help="Target tier (defaults to routing_policy.default_tier)")
     p_exec.add_argument("--escalate", action="store_true", help="For opus tier: escalate to escalate_model (e.g. Astra)")
     p_exec.add_argument("--cwd", default=".")
+    p_exec.add_argument("--workspace", choices=("inherit", "share"), default="inherit")
     p_exec.add_argument("--goal", required=True)
     p_exec.add_argument("--title")
     p_exec.add_argument("--host-conversation-id")
@@ -237,7 +241,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stat = sub.add_parser("status", help="Show active configuration and health")
     p_stat.add_argument("--run-id", default="")
-    p_stat.add_argument("--wait", action="store_true", help="Wait until the run finishes or requests Gemini input")
+    p_stat.add_argument("--run-ids", default="", help="Comma-separated run IDs for batch status/wait")
+    p_stat.add_argument("--wait", action="store_true", help="Wait until the run (or any run in --run-ids) finishes or requests Gemini input")
+    p_stat.add_argument("--wait-all", action="store_true", help="With --run-ids --wait, wait until all runs reach a non-running state")
     p_stat.add_argument("--config", default=None)
     p_stat.add_argument("--sessions", type=int, default=10)
 
@@ -366,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "exec":
-            res = dispatch_exec(background=args.background, run_id=args.run_id,
+            res = dispatch_exec(background=args.background, run_id=args.run_id, workspace=args.workspace,
                 goal=args.goal,
                 title=args.title,
                 host_conversation_id=args.host_conversation_id,
@@ -392,6 +398,20 @@ def main(argv: list[str] | None = None) -> int:
                 if res.get("run_id"):
                     print(f"\n[run_id={res['run_id']}]")
             return int(res.get("state") == "interrupted" or (res.get("verification") or {}).get("status") in {"failed", "unverified"})
+
+        if args.command == "status" and args.run_ids:
+            ids = [x.strip() for x in args.run_ids.split(",") if x.strip()]
+            if args.wait or args.wait_all:
+                batch = wait_for_runs(ids, wait_any=not args.wait_all)
+            else:
+                records = {rid: read_run(rid) for rid in ids}
+                batch = {
+                    "ready": [rid for rid, rec in records.items() if rec["state"] not in {"queued", "running"}],
+                    "active": [rid for rid, rec in records.items() if rec["state"] in {"queued", "running"}],
+                    "runs": records,
+                }
+            print(json.dumps(batch, ensure_ascii=False, indent=2))
+            return 0
 
         if args.command == "status" and args.run_id:
             record = wait_for_run(args.run_id) if args.wait else read_run(args.run_id)

@@ -212,6 +212,35 @@ function renderRunPicker() {
   }
   select.disabled = !options.length;
   select.value = selected ?? "";
+
+  const chipsEl = $("run-chips");
+  if (chipsEl) {
+    const activeRuns = options.filter((run) => active.has(run.state));
+    const showChips = activeRuns.length >= 2 || (activeRuns.length >= 1 && options.length >= 2);
+    const chipItems = showChips ? options.slice(0, 8) : [];
+    const chipKey = JSON.stringify([selected, chipItems.map((r) => [r.run_id, r.state, r.title || r.goal])]);
+    chipsEl.hidden = !showChips;
+    if (showChips && chipsEl.dataset.key !== chipKey) {
+      chipsEl.dataset.key = chipKey;
+      chipsEl.replaceChildren(...chipItems.map((run) => {
+        const btn = node("button", "", "run-chip");
+        btn.type = "button";
+        btn.setAttribute("role", "tab");
+        btn.setAttribute("aria-selected", String(run.run_id === selected));
+        btn.dataset.state = run.state || "";
+        const label = (run.title || run.goal || run.run_id).replace(/\s+/g, " ").trim();
+        btn.title = `${statusLabel(run)} · ${label}`;
+        const dot = node("span", "", "status-dot");
+        dot.dataset.state = run.state || "";
+        btn.append(dot, node("span", label, "run-chip-label"));
+        btn.addEventListener("click", () => {
+          selectRun(run.run_id);
+          void refreshStream();
+        });
+        return btn;
+      }));
+    }
+  }
 }
 
 function selectRun(id) {

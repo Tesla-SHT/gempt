@@ -58,16 +58,19 @@ def dispatch_task(args, config_path, *, wait_sec: float | None = None):
     if action == "consult":
         reply = run_consult(**options, expected_output=WORKLOAD["report"])
     else:
+        background = bool(args.get("background"))
+        workspace = args.get("workspace") or "inherit"
         reply = dispatch_exec(**options, sandbox="read-only" if access == "inspect" else None,
                               verification=args.get("verification", ""), expected_report=WORKLOAD["report"],
-                              wait_sec=wait_sec)
+                              background=background, workspace=workspace,
+                              wait_sec=None if background else wait_sec)
         if reply.get("state") in ACTIVE_STATES | {"interrupted"}:
             run_id, state = reply["run_id"], reply["state"]
             return {**result, "action": action, **reply,
                     "wait_command": build_wait_command(run_id),
                     "text": (f"Run {run_id} is waiting for a reply to ask_gemini." if state == "waiting_gemini"
-                             else f"Run {run_id} is {state}. Query gempt_status with run_id='{run_id}'.")}
-    fields = ("model", "served_model", "session_id", "run_id", "verification", "usage", "warnings", "text")
+                             else f"Run {run_id} is {state}. Run wait_command in background (zero-poll) or query gempt_status with run_id='{run_id}'.")}
+    fields = ("model", "served_model", "session_id", "run_id", "worktree_path", "source_cwd", "verification", "usage", "warnings", "text")
     receipt = {key: reply[key] for key in fields if key in reply}
     if "verification" in receipt:
         evidence = receipt["verification"]

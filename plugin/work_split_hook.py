@@ -45,11 +45,11 @@ def pre_tool_use(payload, family):
     if not isinstance(task, dict):
         return result
     updates = {}
-    if isinstance(conversation, str) and conversation.strip() and tool in ("gempt_dispatch", "gempt_exec", "gempt_live_view"):
+    if isinstance(conversation, str) and conversation.strip() and tool in ("gempt_dispatch", "gempt_exec", "gempt_live_view", "gempt_status"):
         parent = task.get("host_conversation_id")
-        if not parent:
+        if not parent and (tool != "gempt_status" or not task.get("run_id")):
             updates["host_conversation_id"] = conversation
-        elif isinstance(parent, str) and parent != conversation and tool != "gempt_live_view":
+        elif isinstance(parent, str) and parent != conversation and tool not in ("gempt_live_view", "gempt_status"):
             update_host_context(conversation, workspace, parent_id=parent)
     # Workers receive the coordinator family from the board, including an unknown family.
     if (tool in ("gempt_dispatch", "gempt_consult", "gempt_exec") and family
@@ -72,14 +72,16 @@ def reminder(family):
         team = ordinary
     ordinary_off = not profiles[ordinary]["kinds"]
     swarm_off = not profiles[team]["kinds"]
-    delegate = ('For each new task assigned to GPT by the ordinary work split, delegate '
-                'via invoke_subagent(TypeName="gempt-worker", Model="inherit", Role=..., Prompt=..., Workspace=...). '
-                'Continue the task with send_message to the same subagent for follow-ups, progress, steering or '
-                'ask_gemini replies. The gempt-worker itself calls gempt_dispatch with goal, kind and access.')
+    delegate = ('For each new task assigned to GPT by the ordinary work split, call gempt_dispatch directly '
+                '(goal, kind, access, cwd, short title; pass background=true for long or parallel runs and '
+                'workspace="share" for concurrent repo edits). Run the returned wait_command (or --run-ids ... --wait '
+                'for batches) via run_command(WaitMsBeforeAsync=500) for zero-poll wakeup. Reuse session_id to continue '
+                'a GPT thread, call gempt_status() for this conversation roster, and use gempt_steer/gempt_interrupt/'
+                'gempt_reply_tool_call directly.')
     swarm_roles = ("In /swarm the coordinator briefs one owner per 32-hex assignment_id. Each worker and "
                    "independent verifier first calls gempt_dispatch with goal, kind, access, role and that ID. "
                    "Coordinator and narrator stay on the board.")
-    no_delegation = "Do not invoke gempt-worker or call gempt_dispatch"
+    no_delegation = "Do not call gempt_dispatch"
     direct = "Handle tasks directly in Gemini unless the user explicitly asks to invoke GPT."
     if ordinary_off and swarm_off:
         message = f"GemPT is OFF for ordinary conversations and Swarm. {no_delegation}. {direct}"

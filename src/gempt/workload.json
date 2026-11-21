@@ -87,6 +87,18 @@
         "type": "string",
         "description": "Exact workspace for inspect or change."
       },
+      "workspace": {
+        "type": "string",
+        "enum": [
+          "inherit",
+          "share"
+        ],
+        "description": "inherit (default) runs in cwd directly; share creates/reuses an isolated detached Git worktree bound to session_id so parallel GPT tasks can edit safely without colliding."
+      },
+      "background": {
+        "type": "boolean",
+        "description": "Return a durable run receipt (run_id, session_id, wait_command) immediately for zero-poll async waiting or concurrent fan-out."
+      },
       "session_id": {
         "type": "string",
         "description": "GemPT session to continue."

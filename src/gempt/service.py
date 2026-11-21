@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from . import DEFAULT_CONFIG_PATH, EFFORT_RANK, TIER_ORDER, VALID_EFFORTS, VALID_FAILOVER_MODES, VALID_SANDBOXES
-from .runs import recent_runs, verification_result
+from .runs import active_runs_summary, recent_runs, session_roster, verification_result
 from .app_server_client import AppServerUnavailableError, TurnInterrupted, run_app_server
 from .config import (
     paired_model,
@@ -505,6 +505,8 @@ def run_exec(
     config_path: str | Path | None = None,
     _run_id: str = "",
     _new_session_id: str = "",
+    _worktree_path: str = "",
+    _source_cwd: str = "",
 ) -> dict[str, Any]:
     """Delegate a coding/verification task to the Magpie-managed Codex app-server."""
     if not goal or not goal.strip():
@@ -630,6 +632,10 @@ def run_exec(
     session_record.update(paired_model=paired, tier=resolved["tier"], model=resolved["model"],
                           reasoning_effort=resolved["reasoning_effort"], host_conversation_id=host_conversation_id,
                           title=explicit_title(title) or session_record.get("title") or task_title)
+    if _worktree_path:
+        session_record["worktree_path"] = _worktree_path
+    if _source_cwd:
+        session_record["source_cwd"] = _source_cwd
     if _run_id:
         save_session(session_record)
 
@@ -640,12 +646,13 @@ def run_exec(
     approval = codex_cfg.get("approval_policy") or "never"
     if effective_sandbox != "danger-full-access":
         approval = "never"
+    idle_timeout = int(codex_cfg.get("idle_timeout_sec") if codex_cfg.get("idle_timeout_sec") is not None else 300)
     try:
         res = run_app_server(
             prompt=prompt, cwd=workdir, model=resolved["model"], reasoning_effort=resolved["reasoning_effort"],
             sandbox=effective_sandbox, approval_policy=approval, codex_thread_id=codex_thread_id,
             gateway_url=cfg["magpie"]["base_url"], config_path=app_config, timeout_sec=effective_timeout,
-            run_id=_run_id, session_id=sid, on_identity=persist_identity,
+            idle_timeout_sec=idle_timeout, run_id=_run_id, session_id=sid, on_identity=persist_identity,
         )
     except (AppServerUnavailableError, TurnInterrupted):
         raise
@@ -655,7 +662,8 @@ def run_exec(
             mode="exec",
             tier=resolved["tier"],
             effort=resolved["reasoning_effort"],
-            timed_out="timed out" in msg.lower(),
+            model=resolved["model"],
+            timed_out="timed out" in msg.lower() or "stalled" in msg.lower(),
             error_message=msg,
         )
         if hint and hint not in msg:
@@ -679,6 +687,7 @@ def run_exec(
         mode="exec",
         tier=resolved["tier"],
         effort=resolved["reasoning_effort"],
+        model=resolved["model"],
         verification_status=str(acceptance.get("status") or ""),
     )
     session_record["codex_thread_id"] = res["codex_thread_id"]
@@ -726,6 +735,8 @@ def run_exec(
         "session_id": sid,
         "title": task_title,
         "host_conversation_id": host_conversation_id,
+        "worktree_path": session_record.get("worktree_path"),
+        "source_cwd": session_record.get("source_cwd"),
         "codex_thread_id": res["codex_thread_id"],
         "turn_id": res.get("turn_id"),
         "verification": acceptance,
@@ -746,8 +757,14 @@ def run_exec(
     }
 
 
-def get_status(*, workspace_root: Path | None = None, config_path: str | Path | None = None, session_limit: int = 10) -> dict[str, Any]:
-    """Return active configuration (redacted), Magpie & Codex health, and recent sessions."""
+def get_status(
+    *,
+    workspace_root: Path | None = None,
+    config_path: str | Path | None = None,
+    session_limit: int = 10,
+    host_conversation_id: str | None = None,
+) -> dict[str, Any]:
+    """Return active configuration (redacted), Magpie & Codex health, active runs, and GPT roster."""
     resolved_path, exists = config_exists(explicit=config_path)
     if exists:
         cfg, resolved_path = load_config(explicit=config_path, require_exists=True)
@@ -766,7 +783,9 @@ def get_status(*, workspace_root: Path | None = None, config_path: str | Path | 
         redacted = None
 
     return {
-        "recent_runs": recent_runs(session_limit, workspace_root),
+        "active_runs": active_runs_summary(limit=max(session_limit, 20), root=workspace_root, host_conversation_id=host_conversation_id),
+        "roster": session_roster(limit=session_limit, root=workspace_root, host_conversation_id=host_conversation_id),
+        "recent_runs": recent_runs(session_limit, workspace_root, host_conversation_id=host_conversation_id),
         "configured": exists,
         "default_tier": get_default_tier(cfg) if exists else "sonnet",
         "auto_effort": bool((cfg.get("routing_policy") or {}).get("auto_effort", False)) if exists else False,

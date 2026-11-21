@@ -225,6 +225,7 @@ def build_escalation_suggestion(
     mode: str,
     tier: str,
     effort: str,
+    model: str = "",
     verification_status: str = "",
     timed_out: bool = False,
     error_message: str = "",
@@ -236,6 +237,7 @@ def build_escalation_suggestion(
 
     clean_tier = str(tier or "sonnet").strip().lower()
     clean_effort = str(effort or "medium").strip().lower()
+    clean_model = str(model or "").strip()
 
     if clean_tier == "sonnet":
         return (
@@ -246,6 +248,13 @@ def build_escalation_suggestion(
         return (
             "Retry in a fresh thread (omit session_id) with tier='opus', escalate=true "
             "(or tier='fable') for Astra @ xhigh. Do not bump effort mid-thread on resume and avoid ultra."
+        )
+    at_top_model = (not clean_model) or is_astra_model(clean_model)
+    at_top_effort = clean_effort in {"xhigh", "max", "ultra"}
+    if clean_tier == "fable" and (not at_top_effort or not at_top_model):
+        return (
+            "Retry in a fresh thread (omit session_id) with higher effort (high/xhigh) or explicit "
+            "tier='fable' (Astra @ xhigh), or decompose into smaller verified steps (avoid ultra)."
         )
     return (
         "Already at xhigh/fable; decompose into smaller verified steps or isolate root cause via gempt_consult "
