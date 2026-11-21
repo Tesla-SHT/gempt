@@ -354,7 +354,7 @@ export async function startServer({
   let closed = false;
   const result = (listening, reused) => {
     if (manageAppServer ?? target !== 0) {
-      appServer = createAppServerManager({ configPath, ...appServerOptions });
+      appServer = createAppServerManager({ configPath, sessionsDir, ...appServerOptions });
       void appServer.ensureRunning();
     }
     return {

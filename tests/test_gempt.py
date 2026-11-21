@@ -45,7 +45,7 @@ from gempt.magpie_client import MagpieRequestError, _group_members, consult_with
 from gempt.mcp_server import _dispatch_request, _handle_tool_call, serve_stdio
 from gempt.presets import apply_native_presets, build_native_preset_commands, strip_model_modifiers
 from gempt.protocol import build_consult_prompt, build_exec_prompt, read_context_files
-from gempt.runs import dispatch_exec, read_run, recent_runs, run_directory, verification_result, wait_for_run
+from gempt.runs import _write_run_state, dispatch_exec, read_run, recent_runs, run_directory, verification_result, wait_for_run
 from gempt.routing import build_escalation_suggestion, classify_task_effort, effort_timeout_floor
 from gempt.service import (
     configure_gempt,
@@ -471,6 +471,10 @@ class McpStdioHandshakeTests(unittest.TestCase):
                 ["gempt_discover", "gempt_configure", "gempt_consult", "gempt_exec", "gempt_status", "gempt_dispatch",
                  "gempt_steer", "gempt_interrupt", "gempt_reply_tool_call"],
             )
+            status_schema = lines[1]["result"]["tools"][tool_names.index("gempt_status")]["inputSchema"]
+            wait_schema = status_schema["properties"]["wait_sec"]
+            self.assertEqual((wait_schema["type"], wait_schema["minimum"], wait_schema["maximum"]), ("number", 0, 120))
+            self.assertNotIn("wait_sec", status_schema.get("required", []))
             status_payload = json.loads(lines[2]["result"]["content"][0]["text"])
             self.assertFalse(status_payload["configured"])
 
@@ -580,6 +584,60 @@ class McpWorkspaceTests(unittest.TestCase):
         with mock.patch.dict(os.environ, GEMPT_WORKSPACE_ROOT=str(self.host)):
             with self.assertRaisesRegex(ValueError, "Run outside host workspace"):
                 _handle_tool_call("gempt_status", args)
+            with mock.patch("gempt.mcp_server.wait_for_run", wraps=wait_for_run) as wait:
+                with self.assertRaisesRegex(ValueError, "Run outside host workspace"):
+                    _handle_tool_call("gempt_status", {**args, "wait_sec": 1})
+                wait.assert_not_called()
+
+    def make_running_run(self):
+        run_id = "a" * 32
+        directory = run_directory(run_id)
+        directory.mkdir(parents=True)
+        run = {"run_id": run_id, "cwd": str(self.project), "state": "running", "progress": {"phase": "working"}}
+        _write_run_state(directory, run)
+        return directory, run
+
+    def test_status_reads_running_run_without_wait(self):
+        _, run = self.make_running_run()
+        with mock.patch("gempt.mcp_server.wait_for_run", wraps=wait_for_run) as wait:
+            for options in ({}, {"wait_sec": 0}):
+                with self.subTest(options=options):
+                    result = _handle_tool_call("gempt_status", {"run_id": run["run_id"], **options})
+                    self.assertEqual(json.loads(result["content"][0]["text"]), run)
+            wait.assert_not_called()
+
+    def test_status_wait_returns_early_when_run_changes_state(self):
+        directory, run = self.make_running_run()
+        for update in (
+            {"state": "waiting_gemini", "pending_tool_call": {"call_id": "fixture"}},
+            {"state": "finished", "result": {"text": "Worker finished"}},
+        ):
+            with self.subTest(state=update["state"]):
+                _write_run_state(directory, run)
+                updated = {**run, **update}
+                timer = threading.Timer(0.05, _write_run_state, args=(directory, updated))
+                timer.start()
+                try:
+                    started = time.monotonic()
+                    result = _handle_tool_call("gempt_status", {"run_id": run["run_id"], "wait_sec": 3})
+                    elapsed = time.monotonic() - started
+                finally:
+                    timer.join()
+                self.assertLess(elapsed, 3)
+                self.assertEqual(json.loads(result["content"][0]["text"]), updated)
+
+    def test_status_wait_timeout_returns_running_progress(self):
+        _, run = self.make_running_run()
+        started = time.monotonic()
+        result = _handle_tool_call("gempt_status", {"run_id": run["run_id"], "wait_sec": 0.05})
+        self.assertGreaterEqual(time.monotonic() - started, 0.05)
+        self.assertEqual(json.loads(result["content"][0]["text"]), run)
+
+    def test_status_wait_rejects_invalid_values(self):
+        _, run = self.make_running_run()
+        for wait_sec in (-1, 120.01, None, "1", True, float("nan"), float("inf")):
+            with self.subTest(wait_sec=wait_sec), self.assertRaisesRegex(ValueError, "wait_sec"):
+                _handle_tool_call("gempt_status", {"run_id": run["run_id"], "wait_sec": wait_sec})
 
     def test_stdio_answers_ping_and_status_while_consult_waits(self):
         run_id = "b" * 32

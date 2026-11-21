@@ -15,7 +15,9 @@ from typing import Any
 
 from . import CONSULT_TIERS, DEFAULT_CONFIG_PATH, TIER_ORDER, __version__
 from .discover import discover_environment
-from .runs import ACTIVE_STATES, build_wait_command, dispatch_exec, interrupt_run, read_run, reply_tool_call, steer_run
+from .runs import (
+    ACTIVE_STATES, build_wait_command, dispatch_exec, interrupt_run, read_run, reply_tool_call, steer_run, wait_for_run,
+)
 from .service import configure_gempt, get_status, run_consult
 from .sessions import exclusive_operation, resolve_sessions_dir, validate_session_id
 from .workload import SCHEMA as DISPATCH_SCHEMA, dispatch_task
@@ -222,6 +224,16 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "config_path": {"type": "string"},
                 "session_limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                "wait_sec": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 120,
+                    "description": (
+                        "Use only with run_id. Wait for the run to reach finished, failed, interrupted, "
+                        "outcome_unknown, or waiting_gemini. On timeout, return the current live status and progress. "
+                        "Omit or set to 0 for an immediate read."
+                    ),
+                },
             },
             "additionalProperties": False,
         },
@@ -325,6 +337,9 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             raw_cwd, workspace_root=workspace_root, trusted_config=trusted_config,
         ))
     if name in {"gempt_steer", "gempt_interrupt", "gempt_reply_tool_call"} or (name == "gempt_status" and args.get("run_id")):
+        wait_sec = args.get("wait_sec", 0) if name == "gempt_status" else 0
+        if isinstance(wait_sec, bool) or not isinstance(wait_sec, (int, float)) or not 0 <= wait_sec <= 120:
+            raise ValueError("wait_sec must be a number between 0 and 120 seconds.")
         data = read_run(args["run_id"])
         if workspace_root is not None and not Path(data["cwd"]).resolve().is_relative_to(workspace_root):
             raise ValueError("Run outside host workspace")
@@ -334,6 +349,8 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             data = interrupt_run(args["run_id"], config_path=trusted_config)
         elif name == "gempt_reply_tool_call":
             data = reply_tool_call(args["run_id"], args["call_id"], args["answer"], success=args.get("success", True))
+        elif wait_sec > 0:
+            data = wait_for_run(args["run_id"], timeout_sec=wait_sec)
         return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}]}
     if name == "gempt_discover" and args.get("magpie_url"):
         from .config import load_config

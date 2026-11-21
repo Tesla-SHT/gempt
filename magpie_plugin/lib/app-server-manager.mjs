@@ -5,7 +5,7 @@ import { createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { basename, delimiter, dirname, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { defaultGatewayFromEnv, expandUser, readJsonSafe, resolveConfigPath, resolveMagpieApiKey, resolveSessionsDir } from './backend.mjs';
+import { defaultGatewayFromEnv, expandUser, readActiveRuns, readJsonSafe, resolveConfigPath, resolveMagpieApiKey, resolveSessionsDir } from './backend.mjs';
 import { appServerStatePath, connectAppServer, UNAVAILABLE } from './app-server-client.mjs';
 
 const STRIPPED_ENV = ['CODEX_WINDOWS_REGISTERED_CORE', 'CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY', 'CODEX_APP_TOOLS_PIPE_PATH',
@@ -81,7 +81,7 @@ function terminate(child) {
 }
 
 export function createAppServerManager({
-  configPath, env = process.env, port = Number(env.GEMPT_APP_SERVER_PORT || 0),
+  configPath, sessionsDir, env = process.env, port = Number(env.GEMPT_APP_SERVER_PORT || 0),
   spawnProcess = spawn, connect = connectAppServer, startupMs = 8000,
   backoffMs = [250, 500, 1000, 2000, 4000, 8000],
 } = {}) {
@@ -196,7 +196,8 @@ export function createAppServerManager({
       args.push('-c', 'model_providers.gempt_gateway.env_key="GEMPT_APP_SERVER_GATEWAY_TOKEN"');
     }
     const spawned = child = spawnProcess(bin, args, { cwd: homedir(), env: childEnv, windowsHide: true,
-      stdio: ['ignore', 'ignore', 'pipe'] });
+      detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    spawned.unref?.();
     startedAt = Date.now();
     let stderr = '';
     let startupError;
@@ -269,8 +270,19 @@ export function createAppServerManager({
     } finally { rpc.close(); }
   }
 
-  function cleanup() {
+  function cleanup({ preserveActive = false } = {}) {
     if (!ownsLock) return;
+    if (preserveActive && connection?.status === 'running' && alive(connection.pid)) {
+      let hasActive = false;
+      try { hasActive = readActiveRuns(sessionsDir).length > 0; } catch { /* Best effort. */ }
+      if (hasActive) {
+        // Let the reloaded plugin host adopt the live app-server without dropping active turns.
+        if (existsSync(tokenFile)) unlinkSync(tokenFile);
+        if (readFileSync(lockFile, 'utf8') === owner) unlinkSync(lockFile);
+        ownsLock = false;
+        return;
+      }
+    }
     terminate(child);
     if (!child && connection?.status === 'running' && alive(connection.pid)) {
       // This was an authenticated orphan published by a former lock owner.
@@ -288,7 +300,7 @@ export function createAppServerManager({
     ownsLock = false;
   }
 
-  const atExit = () => { stopped = true; try { cleanup(); } catch { /* Process is exiting. */ } };
+  const atExit = () => { stopped = true; try { cleanup({ preserveActive: true }); } catch { /* Process is exiting. */ } };
   process.once('exit', atExit);
   return { getStatus, ensureRunning, interruptRun, async stop() {
     stopped = true;
