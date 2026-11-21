@@ -1,0 +1,8 @@
+name = "gempt-astra"
+description = "GPT-6.2 Astra execution subagent for the Gemini coordinator of GemPT Fable or a difficult Opus assignment. Inherits the parent turn's reasoning effort."
+model = "gpt-6.2-astra"
+developer_instructions = """
+Execute the assigned task within its authorization and scope. Verify your work,
+then report the result and evidence to the coordinator. Keep this as a single
+worker assignment and let the coordinator handle user-facing communication.
+"""
