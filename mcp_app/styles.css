@@ -64,7 +64,7 @@ html, body {
 [hidden] { display: none !important; }
 .mono { font-family: var(--mono); }
 
-.shell {
+.shell, .view {
   display: flex;
   flex-direction: column;
   height: 100vh;
@@ -77,11 +77,45 @@ html, body {
   flex: none;
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
+  gap: 7px;
+  padding: 7px 10px;
   border-bottom: 1px solid var(--border);
   background: var(--bg);
   min-width: 0;
+}
+
+.list-heading {
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--fg);
+  letter-spacing: -0.01em;
+}
+.count-pill {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  font: 600 11px/1.4 var(--mono);
+  color: var(--muted);
+}
+
+.detail-title {
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+  font: 620 12.5px/1.3 var(--font);
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.top-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
 }
 
 .status-dot {
@@ -104,33 +138,7 @@ html, body {
 .status-dot[data-state="failed"],
 .status-dot[data-state="interrupted"] { background: var(--err); }
 
-select, select option, select optgroup {
-  background-color: var(--select-bg);
-  color: var(--select-fg);
-}
-
-.run-select {
-  flex: 1;
-  min-width: 0;
-  height: 26px;
-  padding: 0 6px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  font: 600 12.5px/1 var(--font);
-  text-overflow: ellipsis;
-  cursor: pointer;
-}
-.run-select:hover { border-color: var(--muted); }
-.run-select:focus-visible { outline: 2px solid var(--select-fg); }
-
-.top-actions {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex: none;
-}
-
-.chip-btn, .icon-btn, .btn-primary, .btn-danger, .btn-ghost, .copy-btn {
+.icon-btn, .btn-primary, .btn-danger, .btn-ghost, .copy-btn {
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--surface);
@@ -138,12 +146,6 @@ select, select option, select optgroup {
   font: 500 11.5px/1 var(--font);
   cursor: pointer;
   white-space: nowrap;
-}
-.chip-btn { height: 24px; padding: 0 8px; }
-.chip-btn[data-active="true"] {
-  background: color-mix(in srgb, var(--info) 14%, var(--surface));
-  border-color: color-mix(in srgb, var(--info) 40%, var(--border));
-  color: var(--info);
 }
 .icon-btn {
   width: 24px;
@@ -154,11 +156,127 @@ select, select option, select optgroup {
   font-size: 12px;
   color: var(--muted);
 }
-.icon-btn:hover, .chip-btn:hover, .copy-btn:hover { background: var(--surface-2); color: var(--fg); }
+.back-btn {
+  font-size: 16px;
+  line-height: 1;
+  color: var(--fg);
+}
+.icon-btn:hover, .copy-btn:hover { background: var(--surface-2); color: var(--fg); }
 button:disabled { opacity: 0.45; cursor: default; }
 
-/* Concurrent GPT run chip strip (shown when >=2 parallel/active runs exist) */
-.run-chips {
+/* Screen 1: Native Subagent Cards List */
+.list-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 10px;
+}
+
+.session-cards {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+.session-cards > li { min-width: 0; max-width: 100%; }
+
+.session-card {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 10px 11px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--fg);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+.session-card:hover {
+  background: var(--surface-2);
+  border-color: color-mix(in srgb, var(--fg) 22%, var(--border));
+}
+.session-card[data-state="running"],
+.session-card[data-state="queued"] {
+  border-color: color-mix(in srgb, var(--info) 42%, var(--border));
+}
+.session-card[data-state="waiting_gemini"] {
+  border-color: color-mix(in srgb, var(--warn) 58%, var(--border));
+  background: color-mix(in srgb, var(--warn) 7%, var(--surface));
+}
+
+.sc-top {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  width: 100%;
+}
+.sc-glyph {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+}
+.sc-glyph[data-state="finished"] { color: var(--ok); }
+.sc-glyph[data-state="failed"],
+.sc-glyph[data-state="interrupted"] { color: var(--err); }
+.sc-glyph .status-dot { width: 7px; height: 7px; }
+
+.sc-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 620;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sc-meta {
+  flex: none;
+  font: 500 11px/1 var(--mono);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.sc-meta[data-state="running"],
+.sc-meta[data-state="queued"] { color: var(--info); }
+.sc-meta[data-state="waiting_gemini"] { color: var(--warn); }
+.sc-chevron {
+  flex: none;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--faint);
+}
+
+.sc-preview {
+  margin: 0;
+  padding-left: 23px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sc-preview.is-cmd { font-family: var(--mono); font-size: 11px; }
+.sc-preview.is-ask { color: var(--warn); font-weight: 550; }
+.sc-preview.is-err { color: var(--err); }
+
+/* Multi-turn switcher inside a resumed GPT session */
+.turn-strip {
   flex: none;
   display: flex;
   align-items: center;
@@ -169,14 +287,13 @@ button:disabled { opacity: 0.45; cursor: default; }
   overflow-x: auto;
   scrollbar-width: none;
 }
-.run-chips::-webkit-scrollbar { display: none; }
-.run-chip {
+.turn-strip::-webkit-scrollbar { display: none; }
+.turn-pill {
   flex: none;
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  max-width: 156px;
-  height: 24px;
+  height: 22px;
   padding: 0 8px;
   border: 1px solid var(--border);
   border-radius: 999px;
@@ -185,23 +302,14 @@ button:disabled { opacity: 0.45; cursor: default; }
   font: 500 11px/1 var(--font);
   cursor: pointer;
 }
-.run-chip:hover { background: var(--surface-2); color: var(--fg); }
-.run-chip[aria-selected="true"] {
+.turn-pill:hover { background: var(--surface-2); color: var(--fg); }
+.turn-pill[aria-selected="true"] {
   background: color-mix(in srgb, var(--info) 14%, var(--surface));
   border-color: color-mix(in srgb, var(--info) 45%, var(--border));
   color: var(--fg);
   font-weight: 600;
 }
-.run-chip[data-state="waiting_gemini"] {
-  border-color: color-mix(in srgb, var(--warn) 65%, var(--border));
-}
-.run-chip .status-dot { width: 6px; height: 6px; box-shadow: none; }
-.run-chip-label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+.turn-pill .status-dot { width: 6px; height: 6px; box-shadow: none; }
 
 /* Collapsible metadata drawer (hidden by default) */
 .meta-drawer {
@@ -220,8 +328,7 @@ button:disabled { opacity: 0.45; cursor: default; }
   justify-content: space-between;
   gap: 4px 12px;
 }
-.meta-grid em { font-style: normal; font-weight: 600; color: var(--fg); }
-.meta-grid strong { font-weight: 600; color: var(--fg); }
+.meta-grid em, .meta-grid strong { font-style: normal; font-weight: 600; color: var(--fg); }
 .meta-goal summary { cursor: pointer; color: var(--muted); font-size: 11.5px; }
 .goal-text {
   margin: 6px 0;
@@ -270,7 +377,7 @@ button:disabled { opacity: 0.45; cursor: default; }
   display: grid;
   place-content: center;
   justify-items: center;
-  gap: 10px;
+  gap: 8px;
   padding: 24px;
   color: var(--muted);
   text-align: center;
@@ -317,10 +424,7 @@ button:disabled { opacity: 0.45; cursor: default; }
   min-width: 0;
   width: 100%;
 }
-.stream > li {
-  min-width: 0;
-  max-width: 100%;
-}
+.stream > li { min-width: 0; max-width: 100%; }
 
 /* Compact step rows (reasoning / command / files) */
 .step-row {
@@ -402,10 +506,7 @@ button.file-chip { cursor: pointer; color: var(--info); }
 button.file-chip:hover { background: var(--surface-2); }
 
 /* GPT Markdown messages */
-.msg-block {
-  min-width: 0;
-  padding: 2px 2px 4px;
-}
+.msg-block { min-width: 0; padding: 2px 2px 4px; }
 .msg-head {
   display: flex;
   align-items: center;
@@ -478,17 +579,17 @@ button.file-chip:hover { background: var(--surface-2); }
   height: 28px;
   padding: 0 9px;
   border: 1px solid var(--border);
-  border-radius: 7px;
+  border-radius: 6px;
   background: var(--surface);
   color: var(--fg);
-  font: 12px/1 var(--font);
+  font: 12.5px/1 var(--font);
 }
 .steer-input:focus { outline: none; border-color: var(--info); }
 .btn-primary, .btn-danger, .btn-ghost { height: 28px; padding: 0 10px; }
 .btn-primary {
   background: var(--fg);
   color: var(--bg);
-  border-color: var(--fg);
+  border-color: transparent;
 }
 .btn-danger {
   color: var(--err);
@@ -496,9 +597,5 @@ button.file-chip:hover { background: var(--surface-2); }
   background: transparent;
 }
 .btn-ghost { background: transparent; color: var(--muted); }
-.ctrl-status {
-  width: 100%;
-  font-size: 11px;
-  color: var(--muted);
-}
-.clipboard { position: fixed; opacity: 0; pointer-events: none; }
+.ctrl-status { flex-basis: 100%; font-size: 11px; color: var(--muted); }
+.ctrl-status[data-error="true"] { color: var(--err); }

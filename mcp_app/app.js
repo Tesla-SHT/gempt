@@ -4,7 +4,7 @@ import { z } from "zod";
 const app = new App({ name: "GemPT Live", version: "1.0.0" }, {});
 const active = new Set(["queued", "running", "waiting_gemini"]);
 const statuses = {
-  queued: "排队中", running: "运行中", waiting_gemini: "等待 Gemini", finished: "已完成",
+  queued: "排队中", running: "运行中", waiting_gemini: "等待回复", finished: "已完成",
   failed: "失败", interrupted: "已中止", outcome_unknown: "状态未确认",
 };
 const systemTheme = matchMedia("(prefers-color-scheme: dark)");
@@ -28,15 +28,13 @@ let ready = false;
 let supportsTools = false;
 let runs = [];
 let selected = null;
+let viewMode = "list"; // "list" | "detail"
 let selection = 0;
 let snapshot = null;
 let transcript = { text: "", complete: false };
 let fullGoal = null;
 let goalLoading = null;
-let scope = "session";
 let boundConversation = null;
-let boundWorkspace = null;
-let sessionCount = null;
 let listLoaded = false;
 let listVersion = 0;
 let listTimer, streamTimer;
@@ -61,9 +59,13 @@ function applyHost(context) {
 }
 
 function notify(message = "", error = false) {
-  $("notice").hidden = !message;
-  $("notice").dataset.error = String(error);
-  put("notice", message);
+  for (const id of ["notice", "notice-list"]) {
+    const el = $(id);
+    if (!el) continue;
+    el.hidden = !message;
+    el.dataset.error = String(error);
+    el.textContent = message;
+  }
 }
 
 async function call(name, args) {
@@ -77,6 +79,39 @@ async function call(name, args) {
 const currentRun = () => snapshot?.run ?? runs.find((run) => run.run_id === selected);
 const isActive = () => active.has(currentRun()?.state);
 const canFetch = () => ready && supportsTools && !document.hidden;
+
+function formatElapsed(seconds) {
+  if (seconds == null) return "";
+  const elapsed = Math.max(0, Math.floor(seconds));
+  return elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`;
+}
+
+/* Group runs strictly belonging to this conversation by session_id (1 card per GPT session). */
+function groupSessions(runList) {
+  const bySession = new Map();
+  for (const run of runList) {
+    const key = run.session_id || run.run_id;
+    let group = bySession.get(key);
+    if (!group) {
+      group = { key, session_id: run.session_id || "", runs: [], latest: run };
+      bySession.set(key, group);
+    }
+    group.runs.push(run);
+  }
+  const groups = [...bySession.values()].map((g) => {
+    // Chronological turns (oldest -> newest) for turn pills; latest is active or most recent.
+    const chrono = [...g.runs].sort((a, b) => (a.started_at || 0) - (b.started_at || 0));
+    const latest = g.runs.find((r) => active.has(r.state)) || chrono[chrono.length - 1] || g.latest;
+    return { ...g, runs: chrono, latest };
+  });
+  groups.sort((a, b) => {
+    const aAct = active.has(a.latest.state) ? 1 : 0;
+    const bAct = active.has(b.latest.state) ? 1 : 0;
+    if (aAct !== bAct) return bAct - aAct;
+    return (b.latest.started_at || 0) - (a.latest.started_at || 0);
+  });
+  return groups;
+}
 
 /* Safe DOM-only Markdown renderer (zero innerHTML, 100% CSP-safe). */
 function appendInline(parent, text) {
@@ -194,70 +229,128 @@ function makeFileChip(path, uri) {
   return btn;
 }
 
-function renderRunPicker() {
-  const displayed = currentRun();
-  const options = displayed && !runs.some((run) => run.run_id === displayed.run_id) ? [displayed, ...runs] : runs;
-  const key = JSON.stringify(options.map((run) => [run.run_id, run.state, run.title || run.goal]));
-  const select = $("runs");
-  if (select.dataset.list !== key) {
-    const emptyLabel = !ready ? "连接中…" : !listLoaded && supportsTools ? "读取中…"
-      : scope === "session" ? "当前会话暂无任务" : "暂无任务";
-    const placeholder = new Option(options.length ? "切换任务…" : emptyLabel, "");
-    placeholder.disabled = true;
-    select.replaceChildren(placeholder, ...options.map((run) => {
-      const label = (run.title || run.goal || run.run_id).replace(/\s+/g, " ").trim();
-      return new Option(`${statusLabel(run)} · ${label}`, run.run_id);
-    }));
-    select.dataset.list = key;
+function openSessionDetail(runId) {
+  if (!runId) return;
+  viewMode = "detail";
+  if (runId !== selected) {
+    selected = runId;
+    selection++;
+    snapshot = null;
+    transcript = { text: "", complete: false };
+    fullGoal = null;
+    goalLoading = null;
+    confirming = false;
+    openSteps.clear();
+    $("steer").value = "";
+    $("control-status").hidden = true;
+    put("control-status", "");
+    $("meta-drawer").hidden = true;
+    $("info-toggle").setAttribute("aria-expanded", "false");
+    notify();
   }
-  select.disabled = !options.length;
-  select.value = selected ?? "";
-
-  const chipsEl = $("run-chips");
-  if (chipsEl) {
-    const activeRuns = options.filter((run) => active.has(run.state));
-    const showChips = activeRuns.length >= 2 || (activeRuns.length >= 1 && options.length >= 2);
-    const chipItems = showChips ? options.slice(0, 8) : [];
-    const chipKey = JSON.stringify([selected, chipItems.map((r) => [r.run_id, r.state, r.title || r.goal])]);
-    chipsEl.hidden = !showChips;
-    if (showChips && chipsEl.dataset.key !== chipKey) {
-      chipsEl.dataset.key = chipKey;
-      chipsEl.replaceChildren(...chipItems.map((run) => {
-        const btn = node("button", "", "run-chip");
-        btn.type = "button";
-        btn.setAttribute("role", "tab");
-        btn.setAttribute("aria-selected", String(run.run_id === selected));
-        btn.dataset.state = run.state || "";
-        const label = (run.title || run.goal || run.run_id).replace(/\s+/g, " ").trim();
-        btn.title = `${statusLabel(run)} · ${label}`;
-        const dot = node("span", "", "status-dot");
-        dot.dataset.state = run.state || "";
-        btn.append(dot, node("span", label, "run-chip-label"));
-        btn.addEventListener("click", () => {
-          selectRun(run.run_id);
-          void refreshStream();
-        });
-        return btn;
-      }));
-    }
-  }
+  render();
+  void refreshStream();
 }
 
-function selectRun(id) {
-  if (id === selected) return;
-  selected = id || null;
-  selection++;
-  snapshot = null;
-  transcript = { text: "", complete: false };
-  fullGoal = null;
-  goalLoading = null;
+function backToList() {
+  viewMode = "list";
   confirming = false;
-  openSteps.clear();
-  $("steer").value = "";
-  $("control-status").hidden = true;
-  put("control-status", "");
+  $("meta-drawer").hidden = true;
+  $("info-toggle").setAttribute("aria-expanded", "false");
   notify();
   render();
+  scheduleStream();
+}
+
+function buildStatusGlyph(state) {
+  const wrap = node("span", "", "sc-glyph");
+  wrap.dataset.state = state || "";
+  if (state === "finished") {
+    wrap.textContent = "✓";
+  } else if (state === "failed" || state === "interrupted") {
+    wrap.textContent = "×";
+  } else {
+    const dot = node("span", "", "status-dot");
+    dot.dataset.state = state || "";
+    wrap.append(dot);
+  }
+  return wrap;
+}
+
+function sessionPreview(run) {
+  if (run.state === "waiting_gemini" && run.pending_tool_call?.arguments?.question) {
+    return { text: `等待回复：${run.pending_tool_call.arguments.question}`, cls: "sc-preview is-ask" };
+  }
+  if (run.error && (run.state === "failed" || run.state === "interrupted")) {
+    return { text: run.error.replace(/\s+/g, " ").trim(), cls: "sc-preview is-err" };
+  }
+  if (active.has(run.state) && run.last_command) {
+    return { text: `$ ${run.last_command.replace(/\s+/g, " ").trim()}`, cls: "sc-preview is-cmd" };
+  }
+  if (run.last_message) {
+    return { text: run.last_message.replace(/\s+/g, " ").trim(), cls: "sc-preview" };
+  }
+  if (run.goal) {
+    return { text: run.goal.replace(/\s+/g, " ").trim(), cls: "sc-preview" };
+  }
+  return { text: statusLabel(run), cls: "sc-preview" };
+}
+
+function renderList() {
+  const sessions = groupSessions(runs);
+  const countEl = $("session-count");
+  countEl.hidden = !sessions.length;
+  countEl.textContent = number.format(sessions.length);
+  $("refresh-list").disabled = !supportsTools;
+
+  const hasSessions = sessions.length > 0;
+  $("list-wrap").hidden = !hasSessions;
+  $("empty").hidden = hasSessions;
+  if (!hasSessions) {
+    put("empty-message", !ready ? "正在连接 GemPT…" : !listLoaded && supportsTools ? "正在读取当前对话的 GPT 会话…" : "当前对话暂无 GPT 会话");
+    return;
+  }
+
+  const list = $("session-cards");
+  const key = JSON.stringify(sessions.map((s) => [
+    s.key, s.runs.length, s.latest.run_id, s.latest.state, s.latest.title,
+    s.latest.elapsed_sec, s.latest.last_command, s.latest.last_message,
+    s.latest.pending_tool_call?.arguments?.question,
+  ]));
+  if (list.dataset.key === key) return;
+  list.dataset.key = key;
+
+  list.replaceChildren(...sessions.map((sess) => {
+    const run = sess.latest;
+    const li = node("li");
+    const card = node("button", "", "session-card");
+    card.type = "button";
+    card.dataset.state = run.state || "";
+
+    const top = node("div", "", "sc-top");
+    const title = (run.title || run.goal || run.session_id || run.run_id).replace(/\s+/g, " ").trim();
+    const titleEl = node("span", title, "sc-title");
+    titleEl.title = title;
+
+    const metaParts = [];
+    if (sess.runs.length > 1) metaParts.push(`${sess.runs.length} 轮`);
+    if (run.state === "waiting_gemini") metaParts.push("等待回复");
+    else if (active.has(run.state)) metaParts.push(formatElapsed(run.elapsed_sec) || "运行中");
+    else metaParts.push(formatElapsed(run.elapsed_sec) || statusLabel(run));
+    const metaEl = node("span", metaParts.join(" · "), "sc-meta");
+    metaEl.dataset.state = run.state || "";
+
+    top.append(buildStatusGlyph(run.state), titleEl, metaEl, node("span", "›", "sc-chevron"));
+
+    const prev = sessionPreview(run);
+    const prevEl = node("p", prev.text, prev.cls);
+    prevEl.title = prev.text;
+
+    card.append(top, prevEl);
+    card.addEventListener("click", () => openSessionDetail(run.run_id));
+    li.append(card);
+    return li;
+  }));
 }
 
 function buildStepDetails(key, iconChar, tone, titleText, metaText, bodyText, { muted = false, prose = false, failed = false } = {}) {
@@ -283,6 +376,30 @@ function buildStepDetails(key, iconChar, tone, titleText, metaText, bodyText, { 
     det.append(node("pre", bodyText, prose ? "step-body is-prose" : "step-body"));
   }
   return det;
+}
+
+function renderTurnStrip(run) {
+  const strip = $("turn-strip");
+  if (!run) { strip.hidden = true; return; }
+  const sessKey = run.session_id || run.run_id;
+  const group = groupSessions(runs).find((g) => g.key === sessKey);
+  const turns = group && group.runs.length >= 2 ? group.runs : [];
+  strip.hidden = !turns.length;
+  if (!turns.length) return;
+  const key = JSON.stringify([selected, turns.map((t) => [t.run_id, t.state])]);
+  if (strip.dataset.key === key) return;
+  strip.dataset.key = key;
+  strip.replaceChildren(...turns.map((turn, idx) => {
+    const btn = node("button", "", "turn-pill");
+    btn.type = "button";
+    btn.setAttribute("role", "tab");
+    btn.setAttribute("aria-selected", String(turn.run_id === selected));
+    const dot = node("span", "", "status-dot");
+    dot.dataset.state = turn.state || "";
+    btn.append(dot, node("span", `第 ${idx + 1} 轮`));
+    btn.addEventListener("click", () => openSessionDetail(turn.run_id));
+    return btn;
+  }));
 }
 
 function renderStream() {
@@ -397,37 +514,23 @@ function renderControls(run = currentRun()) {
   put("interrupt", confirming ? "确认中止" : "中止");
 }
 
-function formatElapsed(seconds) {
-  if (seconds == null) return "—";
-  const elapsed = Math.max(0, Math.floor(seconds));
-  return elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`;
-}
-
-function render() {
+function renderDetail() {
   const run = currentRun();
-  renderRunPicker();
-  const scopeBtn = $("scope-toggle");
-  scopeBtn.disabled = !supportsTools || (scope === "all" && listLoaded && !boundConversation);
-  scopeBtn.dataset.active = String(scope === "session");
-  put("scope-toggle", scope === "session"
-    ? (sessionCount == null ? "本会话" : `本会话 ${number.format(sessionCount)}`)
-    : "全部");
-  scopeBtn.title = boundWorkspace ? `当前绑定：${boundWorkspace}（点击切换范围）` : "切换当前会话 / 全部任务";
-  $("info-toggle").disabled = !run;
   if (!run) {
-    $("meta-drawer").hidden = true;
-    $("info-toggle").setAttribute("aria-expanded", "false");
+    viewMode = "list";
+    render();
+    return;
   }
+  const title = (run.title || run.goal || run.session_id || run.run_id).replace(/\s+/g, " ").trim();
+  put("detail-title", title);
+  $("detail-title").title = title;
+  $("dot").dataset.state = run.state || "";
+  $("dot").title = statusLabel(run);
+  $("info-toggle").disabled = false;
   $("refresh").disabled = !supportsTools;
-  $("dot").dataset.state = run?.state ?? "";
-  $("dot").title = run ? statusLabel(run) : (ready ? "无任务" : "连接中");
-  $("feed-wrap").hidden = !run;
-  $("empty").hidden = !!run;
-  put("empty-message", !ready ? "正在连接 GemPT…" : !listLoaded && supportsTools ? "正在读取…"
-    : scope === "session" ? "当前会话暂无 GPT 任务" : "暂无 GPT 任务");
-  $("empty-all").hidden = scope !== "session" || !listLoaded || !supportsTools;
+
+  renderTurnStrip(run);
   renderControls(run);
-  if (!run) return;
 
   const usage = snapshot?.usage ?? run.usage ?? {};
   const tokens = usage.total_tokens ?? (usage.input_tokens != null ? usage.input_tokens + (usage.output_tokens ?? 0) : null);
@@ -435,11 +538,11 @@ function render() {
     ? Math.min(1, usage.cached_input_tokens / usage.input_tokens) : null);
   put("badge", statusLabel(run));
   put("model", run.model || "—");
-  put("elapsed", formatElapsed(run.elapsed_sec));
+  put("elapsed", formatElapsed(run.elapsed_sec) || "—");
   put("tokens", tokens == null ? "—" : number.format(tokens));
   put("cache", rate == null ? "—" : percent.format(rate));
   put("goal", fullGoal ?? (run.goal || "未记录任务目标"));
-  put("workspace", run.cwd || "—");
+  put("workspace", run.worktree_path || run.cwd || "—");
   put("run-id", run.run_id);
   put("session-id", run.session_id || "—");
   $("session-id").disabled = !run.session_id;
@@ -463,6 +566,14 @@ function render() {
   renderStream();
 }
 
+function render() {
+  const showDetail = viewMode === "detail" && Boolean(currentRun());
+  $("view-list").hidden = showDetail;
+  $("view-detail").hidden = !showDetail;
+  if (showDetail) renderDetail();
+  else renderList();
+}
+
 function acceptSnapshot(data) {
   const previousRevision = snapshot?.text_revision;
   snapshot = data;
@@ -483,256 +594,233 @@ async function loadGoal() {
   try {
     while (offset != null && generation === selection) {
       const page = await call("gempt_app_stream", { run_id: runId, goal_offset: offset });
+      if (generation !== selection) return;
       goal += page.goal;
       offset = page.next_goal_offset;
     }
     if (generation === selection) {
       fullGoal = goal;
-      put("goal", goal);
+      render();
     }
   } catch (error) {
-    if (generation === selection) notify(`读取任务目标失败：${error.message}`, true);
+    if (generation === selection) notify(error.message, true);
   } finally {
     if (goalLoading === generation) goalLoading = null;
   }
 }
 
-async function loadTranscript(data, generation, runId) {
-  let offset = data.next_text_offset;
-  if (offset == null || transcript.complete) return;
-  let text = data.full_text;
-  while (offset != null && canFetch() && generation === selection && !control) {
-    const page = await call("gempt_app_stream", { run_id: runId, text_offset: offset, text_revision: data.text_revision });
-    if (page.stale_text_revision) return;
-    text += page.full_text;
-    offset = page.next_text_offset;
-  }
-  if (generation === selection && offset == null) {
-    transcript = { text, complete: true };
-    renderStream();
+async function loadMoreTranscript(generation, runId, offset, revision) {
+  let text = transcript.text;
+  try {
+    while (offset != null && generation === selection && canFetch()) {
+      const page = await call("gempt_app_stream", {
+        run_id: runId, text_offset: offset, ...(revision ? { text_revision: revision } : {}),
+      });
+      if (generation !== selection) return;
+      if (page.stale_text_revision) {
+        transcript = { text: "", complete: false };
+        void refreshStream();
+        return;
+      }
+      text += page.full_text;
+      offset = page.next_text_offset;
+    }
+    if (generation === selection && offset == null) {
+      transcript = { text, complete: true };
+      render();
+    }
+  } catch (error) {
+    if (generation === selection) notify(error.message, true);
   }
 }
 
-function stopTimers() {
+function scheduleList() {
   clearTimeout(listTimer);
-  clearTimeout(streamTimer);
+  if (canFetch()) listTimer = setTimeout(() => void refreshRuns(), 2500);
 }
 
-function acceptRuns(data, preferred) {
-  const prior = currentRun();
-  scope = data.scope;
-  boundConversation = data.bound_conversation_id;
-  boundWorkspace = data.bound_workspace_name;
-  sessionCount = boundConversation ? data.session_count : null;
-  runs = data.runs;
-  listLoaded = true;
-  const keepSelected = prior && (scope === "all" || prior.host_conversation_id === boundConversation);
-  const next = preferred || (keepSelected ? selected : runs[0]?.run_id);
-  if ((next || null) !== selected) {
-    selectRun(next);
-    refreshStream();
-  } else {
-    render();
+function scheduleStream() {
+  clearTimeout(streamTimer);
+  if (canFetch() && viewMode === "detail" && selected) {
+    streamTimer = setTimeout(() => void refreshStream(), isActive() ? 1000 : 4000);
   }
 }
 
-function selectScope(next) {
-  if (scope === next) return;
-  scope = next;
-  listVersion++;
-  listLoaded = false;
-  runs = [];
-  selectRun(null);
+function filterConversationRuns(rawRuns, convId) {
+  if (!convId) return [];
+  return (rawRuns || []).filter((r) => r.host_conversation_id === convId);
+}
+
+function applyRunList(data, { explicitRunId = null } = {}) {
+  const nextConversation = data.bound_conversation_id || boundConversation;
+  const conversationChanged = Boolean(nextConversation && boundConversation && nextConversation !== boundConversation);
+  boundConversation = nextConversation || null;
+  listLoaded = true;
+  runs = filterConversationRuns(data.runs, boundConversation);
+
+  if (conversationChanged) {
+    selected = null;
+    snapshot = null;
+    viewMode = "list";
+  }
+
+  if (explicitRunId && runs.some((r) => r.run_id === explicitRunId)) {
+    selected = explicitRunId;
+    viewMode = "detail";
+  } else if (viewMode === "detail" && selected && !runs.some((r) => r.run_id === selected)) {
+    selected = null;
+    snapshot = null;
+    viewMode = "list";
+  }
   render();
-  void refreshRuns();
 }
 
 async function refreshRuns() {
-  clearTimeout(listTimer);
-  listWanted = true;
-  if (readingList || !canFetch()) return;
+  if (!canFetch()) return;
+  if (readingList) { listWanted = true; return; }
   readingList = true;
   listWanted = false;
+  clearTimeout(listTimer);
   const version = listVersion;
   try {
-    const args = boundConversation ? { scope, host_conversation_id: boundConversation } : { scope };
+    const args = { scope: "session", limit: 50, ...(boundConversation ? { host_conversation_id: boundConversation } : {}) };
     const data = await call("gempt_app_runs", args);
-    if (version === listVersion) acceptRuns(data);
+    if (version !== listVersion) return;
+    applyRunList(data);
+    if (viewMode === "detail" && selected && !snapshot) void refreshStream();
+    notify();
   } catch (error) {
-    if (version === listVersion) notify(`刷新任务失败：${error.message}`, true);
+    notify(error.message, true);
   } finally {
     readingList = false;
-    if (canFetch() && listWanted) refreshRuns();
-    else if (canFetch()) listTimer = setTimeout(refreshRuns, isActive() ? 4000 : 10000);
+    if (listWanted) void refreshRuns();
+    else scheduleList();
   }
 }
 
-function refreshStream() {
-  streamWanted = true;
-  void driveStream();
-}
-
-async function driveStream() {
-  clearTimeout(streamTimer);
-  if (readingStream || !canFetch() || (!streamWanted && !control)) return;
+async function refreshStream() {
+  if (!canFetch() || viewMode !== "detail" || !selected) return;
+  if (readingStream) { streamWanted = true; return; }
   readingStream = true;
+  streamWanted = false;
+  clearTimeout(streamTimer);
   const generation = selection;
-  const action = control;
+  const runId = selected;
   try {
-    if (action) {
-      try {
-        await call(action.name, action.args);
-        if (action.generation === selection) {
-          if (action.args.message) $("steer").value = "";
-          $("control-status").hidden = false;
-          put("control-status", action.args.message ? "已发送纠偏" : "已请求中止");
-        }
-      } catch (error) {
-        if (action.generation === selection) {
-          $("control-status").hidden = false;
-          put("control-status", error.message);
-        }
-      } finally {
-        control = null;
-      }
-    }
-    const runId = selected;
-    if (runId && canFetch()) {
-      const current = selection;
-      streamWanted = false;
-      const data = await call("gempt_app_stream", { run_id: runId });
-      if (current === selection) {
-        if (!data.run.error && $("notice").dataset.error === "true") notify();
-        acceptSnapshot(data);
-        await loadTranscript(data, current, runId);
-      }
-    } else {
-      streamWanted = false;
-    }
+    const data = await call("gempt_app_stream", { run_id: runId });
+    if (generation !== selection) return;
+    acceptSnapshot(data);
+    if (data.next_text_offset != null) void loadMoreTranscript(generation, runId, data.next_text_offset, data.text_revision);
+    if (!data.run.error) notify();
   } catch (error) {
-    if (generation === selection) notify(`读取进度失败：${error.message}`, true);
+    if (generation === selection) notify(error.message, true);
   } finally {
     readingStream = false;
+    if (streamWanted) void refreshStream();
+    else scheduleStream();
+  }
+}
+
+function setControlStatus(message = "", error = false) {
+  $("control-status").hidden = !message;
+  $("control-status").dataset.error = String(error);
+  put("control-status", message);
+}
+
+async function sendControl(name, args, doneMessage) {
+  if (!selected || control) return;
+  const generation = selection;
+  control = name;
+  confirming = false;
+  renderControls();
+  setControlStatus("发送中…");
+  try {
+    await call(name, args);
+    if (generation !== selection) return;
+    if (name === "gempt_app_steer") $("steer").value = "";
+    setControlStatus(doneMessage);
+    void refreshStream();
+    void refreshRuns();
+  } catch (error) {
+    if (generation === selection) setControlStatus(error.message, true);
+  } finally {
+    control = null;
     renderControls();
-    if (control || streamWanted) void driveStream();
-    else if (canFetch() && isActive()) streamTimer = setTimeout(refreshStream, 1200);
-    else clearTimeout(listTimer);
   }
 }
 
 async function copy(value) {
   if (!value) return;
-  if (navigator.clipboard && document.featurePolicy?.allowsFeature("clipboard-write") !== false) {
-    try {
-      await navigator.clipboard.writeText(value);
-      notify("已复制");
-      return;
-    } catch { /* fallback */ }
+  try {
+    await navigator.clipboard.writeText(value);
+    notify("已复制");
+    setTimeout(() => { if ($("notice").textContent === "已复制") notify(); }, 1200);
+  } catch {
+    notify("当前环境不支持剪贴板复制", true);
   }
-  const focused = document.activeElement;
-  const input = node("textarea", "", "clipboard");
-  input.value = value;
-  input.readOnly = true;
-  document.body.append(input);
-  input.select();
-  let copied = false;
-  try { copied = document.execCommand("copy"); } catch { /* restricted */ } finally {
-    input.remove();
-    focused?.focus();
-  }
-  notify(copied ? "已复制" : "复制受限，请选中文字后手动复制。", !copied);
 }
 
-function queueControl(name, args) {
-  if (!currentRun()?.can_control || !canFetch() || control) return;
-  confirming = false;
-  control = { name, args: { ...args, run_id: selected }, generation: selection };
-  $("control-status").hidden = false;
-  put("control-status", "正在发送…");
-  renderControls();
-  void driveStream();
-}
+app.onhostcontextchanged = applyHost;
+app.ontoolresult = (result) => {
+  const data = result?.structuredContent;
+  if (!data) return;
+  listVersion++;
+  // Only drill directly into Detail when explicitly opened with a specific run_id;
+  // otherwise land on the conversation's Subagent Sessions list.
+  const explicitId = data.requested_run && data.run_id && data.stream?.run?.run_id === data.run_id ? data.run_id : null;
+  if (Array.isArray(data.runs)) applyRunList(data, { explicitRunId: explicitId });
+  if (explicitId && data.stream?.run?.host_conversation_id === boundConversation) {
+    selected = explicitId;
+    viewMode = "detail";
+    selection++;
+    fullGoal = null;
+    goalLoading = null;
+    acceptSnapshot(data.stream);
+    if (data.stream.next_text_offset != null) {
+      void loadMoreTranscript(selection, explicitId, data.stream.next_text_offset, data.stream.text_revision);
+    }
+    scheduleStream();
+  }
+  scheduleList();
+};
 
-$("refresh").addEventListener("click", () => { refreshRuns(); refreshStream(); });
-$("scope-toggle").addEventListener("click", () => selectScope(scope === "session" ? "all" : "session"));
-$("empty-all").addEventListener("click", () => selectScope("all"));
+$("back-btn").addEventListener("click", backToList);
+$("refresh-list").addEventListener("click", () => void refreshRuns());
+$("refresh").addEventListener("click", () => { void refreshRuns(); void refreshStream(); });
 $("info-toggle").addEventListener("click", () => {
-  const next = $("meta-drawer").hidden;
-  $("meta-drawer").hidden = !next;
-  $("info-toggle").setAttribute("aria-expanded", String(next));
+  const drawer = $("meta-drawer");
+  const open = drawer.hidden;
+  drawer.hidden = !open;
+  $("info-toggle").setAttribute("aria-expanded", String(open));
 });
 $("goal-details").addEventListener("toggle", () => { if ($("goal-details").open) void loadGoal(); });
-$("runs").addEventListener("change", (event) => {
-  selectRun(event.target.value);
-  if (isActive()) refreshRuns();
-  refreshStream();
-});
-$("run-id").addEventListener("click", () => copy(currentRun()?.run_id));
-$("session-id").addEventListener("click", () => copy(currentRun()?.session_id));
+$("run-id").addEventListener("click", () => copy($("run-id").textContent));
+$("session-id").addEventListener("click", () => copy($("session-id").textContent));
 $("steer").addEventListener("input", () => renderControls());
 $("steer").addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.isComposing) {
-    const message = $("steer").value.trim();
-    if (message) queueControl("gempt_app_steer", { message });
-  }
+  if (event.key === "Enter" && !$("send-steer").disabled) $("send-steer").click();
 });
 $("send-steer").addEventListener("click", () => {
   const message = $("steer").value.trim();
-  if (message) queueControl("gempt_app_steer", { message });
+  if (message) void sendControl("gempt_app_steer", { run_id: selected, message }, "已发送纠偏指令");
 });
 $("interrupt").addEventListener("click", () => {
-  if (confirming) queueControl("gempt_app_interrupt", {});
-  else { confirming = true; renderControls(); }
+  if (!confirming) { confirming = true; renderControls(); return; }
+  void sendControl("gempt_app_interrupt", { run_id: selected }, "已请求中止当前回合");
 });
 $("cancel-interrupt").addEventListener("click", () => { confirming = false; renderControls(); });
-document.addEventListener("visibilitychange", () => {
-  if (document.hidden) stopTimers();
-  else {
-    refreshRuns();
-    if (isActive() || !transcript.complete || control) refreshStream();
-  }
-});
 systemTheme.addEventListener("change", () => applyHost(app.getHostContext()));
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { clearTimeout(listTimer); clearTimeout(streamTimer); }
+  else { void refreshRuns(); if (viewMode === "detail") void refreshStream(); }
+});
 
-app.ontoolinput = ({ arguments: args }) => {
-  if (!args || listLoaded) return;
-  listVersion++;
-  boundConversation = args.host_conversation_id || null;
-  scope = args.scope || "session";
-};
-app.ontoolresult = (result) => {
-  const data = result.structuredContent;
-  if (!data) {
-    if (result.isError) notify(result.content?.[0]?.text || "无法打开 GemPT Live", true);
-    return;
-  }
-  listVersion++;
-  acceptRuns(data, data.run_id);
-  if (data.stream?.run?.run_id === selected) acceptSnapshot(data.stream);
-  else render();
-  refreshRuns();
-  refreshStream();
-};
-app.onhostcontextchanged = () => applyHost(app.getHostContext());
-
-async function connect() {
-  applyHost();
-  try {
-    await app.connect();
-    ready = true;
-    supportsTools = !!app.getHostCapabilities()?.serverTools;
-    applyHost(app.getHostContext());
-    render();
-    if (supportsTools) {
-      refreshRuns();
-      refreshStream();
-    } else {
-      notify("当前宿主未提供实时读取和控制能力。");
-    }
-  } catch (error) {
-    put("badge", "连接失败");
-    $("empty").hidden = true;
-    notify(`无法连接 GemPT：${error.message}`, true);
-  }
-}
-void connect();
+render();
+app.connect().then(() => {
+  ready = true;
+  supportsTools = Boolean(app.getHostCapabilities()?.serverTools);
+  applyHost(app.getHostContext());
+  render();
+  if (supportsTools) void refreshRuns();
+  else notify("当前宿主未开放实时工具调用。");
+}).catch((error) => notify(error.message, true));

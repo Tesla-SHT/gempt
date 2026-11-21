@@ -144,16 +144,27 @@ def _run_summary(record, *, compact=False):
     elapsed = _number(result.get("elapsed_sec"))
     if elapsed is None and started is not None:
         elapsed = round(max(0, (finished if finished is not None else time.time()) - started), 1)
+    recent_cmds = _array(progress.get("recent_commands"))
+    last_cmd_item = recent_cmds[-1] if recent_cmds else None
+    last_command = ""
+    if isinstance(last_cmd_item, dict):
+        last_command = _text(last_cmd_item.get("command"), 160)
+    elif isinstance(last_cmd_item, str):
+        last_command = _text(last_cmd_item, 160)
+    last_message = _text(progress.get("last_message") or result.get("text"), 200)
     return {
         "run_id": record["run_id"], "session_id": _text(record.get("session_id"), 128),
         "state": _text(record["state"], 32), "cwd": _bounded_text(record.get("cwd"), 8192),
-        "title": record["title"], "workspace_name": _bounded_text(workspace_name(record.get("cwd")), 512),
+        "worktree_path": _bounded_text(record.get("worktree_path"), 8192) or None,
+        "title": record["title"], "workspace_name": _bounded_text(workspace_name(record.get("source_cwd") or record.get("cwd")), 512),
         "host_conversation_id": record.get("host_conversation_id"),
         "can_control": bool(record["state"] in {"running", "waiting_gemini"}
                             and record.get("codex_thread_id") and record.get("turn_id")),
         "model": _text(result.get("model") or record.get("model"), 128),
         "tier": _text(result.get("tier") or record.get("tier"), 64),
         "goal": _bounded_text(record.get("goal"), 512 if compact else _GOAL_BYTES),
+        "last_message": last_message,
+        "last_command": last_command,
         "started_at": started, "finished_at": finished, "elapsed_sec": elapsed,
         "usage": _usage(result.get("usage") or progress.get("token_usage") or record.get("usage") or {}),
         "progress": {"phase": _text(progress.get("phase"), 64), "updated_at": _timestamp(progress.get("updated_at"))},
@@ -176,7 +187,7 @@ def _read_record(run_id):
 
 def _read_workspace_run(run_id, root):
     record = _read_record(run_id)
-    if not _in_workspace(record.get("cwd"), root):
+    if not (_in_workspace(record.get("cwd"), root) or _in_workspace(record.get("source_cwd"), root)):
         raise ValueError("Run outside host workspace")
     return record
 
@@ -184,7 +195,7 @@ def _read_workspace_run(run_id, root):
 @lru_cache(maxsize=512)
 def _list_summary(path, mtime_ns, size):
     record = _read_record(path.parent.name)
-    return _run_summary(record, compact=True), record.get("cwd"), record.get("deadline", float("inf"))
+    return _run_summary(record, compact=True), record.get("source_cwd") or record.get("cwd"), record.get("deadline", float("inf"))
 
 
 def _json_size(value):
@@ -516,6 +527,7 @@ def call_app_tool(name: str, args: dict[str, Any], *, root: Path | None, config:
                     continue
         return _result("Opened GemPT Live.", {
             **data, "run_id": record["run_id"] if record else None,
+            "requested_run": bool(run_id),
             "stream": _stream(record, 60, 0, root) if record else None,
         })
     if name == "gempt_app_stream":
