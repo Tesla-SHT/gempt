@@ -142,12 +142,27 @@
     }
   }
 
+  let reloadingForAuth = false;
   async function apiFetch(path, options = {}) {
     const headers = {
       ...(options.headers || {}),
       'x-gempt-key': apiKey,
     };
-    return fetch(path, { ...options, headers });
+    const res = await fetch(path, { ...options, headers });
+    if (res.status === 401 && !reloadingForAuth) {
+      try {
+        const last = Number(sessionStorage.getItem('gempt-auth-reload') || 0);
+        if (Date.now() - last > 3000) {
+          reloadingForAuth = true;
+          sessionStorage.setItem('gempt-auth-reload', String(Date.now()));
+          location.reload();
+        }
+      } catch {
+        reloadingForAuth = true;
+        location.reload();
+      }
+    }
+    return res;
   }
 
   function showToast(message, kind = 'info') {
@@ -1021,6 +1036,9 @@
       syncHasFallbackClasses();
       showToast(`切换失败: ${err.message}`, 'error');
     } finally {
+      const allow = Boolean(latestState?.configured) || currentViewMode === 'native';
+      for (const r of radios) r.disabled = !allow;
+      syncHasFallbackClasses();
       await refreshState();
     }
   }
@@ -1049,6 +1067,9 @@
       syncHasFallbackClasses();
       showToast(`设置失败: ${err.message}`, 'error');
     } finally {
+      const allow = Boolean(latestState?.configured);
+      for (const r of radios) r.disabled = !allow;
+      syncHasFallbackClasses();
       await refreshState();
     }
   }
