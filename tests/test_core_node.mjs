@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync,
+  rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -16,6 +17,7 @@ import { contextPath, readHostContext, updateHostContext } from '../core/host-co
 import { APP_RESOURCE, APP_URI, callAppTool, readAppResource } from '../core/mcp-app.mjs';
 import { buildWaitCommand, dispatchRun, interruptRun, listActiveRoster, readRun, replyToolCall, runDirectory,
   saveRun, steerRun, waitForRun, waitForRuns } from '../core/runs.mjs';
+import { withLock } from '../core/state.mjs';
 import { ensureShareWorktree, removeShareWorktree, worktreesRoot } from '../core/worktrees.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -116,9 +118,14 @@ test('Node hook applies write and explore gates with exemptions, resets and fail
 
 test('Antigravity installer replaces a legacy target and stages a runnable Node-only plugin and wait shims', async (t) => {
   const f = fixture(t);
-  const target = join(f.root, "plugin with spaces");
+  const target = join(f.root, 'plugins with spaces', 'gempt');
   const binDir = join(f.root, 'bin with spaces');
+  const legacyLock = join(dirname(target), '.gempt-install.lock');
+  const legacyWait = join(binDir, 'gempt-wait.py');
   mkdirSync(join(target, 'runtime', 'gempt'), { recursive: true });
+  mkdirSync(binDir);
+  writeFileSync(legacyLock, '');
+  writeFileSync(legacyWait, 'legacy');
   writeFileSync(join(target, 'plugin.json'), JSON.stringify({ name: 'gempt' }));
   writeFileSync(join(target, 'work_split_hook.py'), 'legacy');
   writeFileSync(join(target, 'runtime', 'gempt', 'mcp_server.py'), 'legacy');
@@ -137,6 +144,9 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   assert.equal(resolveNodeExecutable({ execPath: join(f.root, 'magpie-bun'), env: { PATH: dirname(process.execPath) } }), process.execPath);
   const installed = await installAgy({ target, binDir, env });
   assert.equal(installed.installed, true);
+  assert.ok(!existsSync(legacyLock));
+  assert.ok(!existsSync(legacyWait));
+  assert.ok(existsSync(join(binDir, 'gempt-wait.mjs')));
   assert.ok(installed.refresh.refreshed);
   assert.deepEqual(refreshCalls, [{ url: '/exa.language_server_pb.LanguageServerService/RefreshMcpServers',
     method: 'POST', token: 'fixture', data: { serverName: 'gempt_gempt' } }]);
@@ -350,12 +360,19 @@ async function until(probe) {
   assert.fail('Timed out waiting for fixture state.');
 }
 
-test('host context restores the main conversation and tracks subagents across lock contention', async (t) => {
+test('host context reclaims a dead PID lock, restores the main conversation and tracks subagents', async (t) => {
   const { cwd, configPath } = fixture(t);
   const opts = { configPath };
+  const lock = join(dirname(configPath), 'host-context.lock');
+  const exited = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+  assert.equal(exited.status, 0);
+  mkdirSync(dirname(configPath));
+  writeFileSync(lock, `${exited.pid}:${Date.now()}\n`);
   assert.equal(basename(contextPath(configPath)), 'host-context.json');
   assert.deepEqual(readHostContext(configPath), {});
   await updateHostContext('main', [cwd, 1], { ...opts, geminiFamily: ' pro ' });
+  assert.equal(readHostContext(configPath).conversation_id, 'main');
+  assert.ok(!existsSync(lock));
   await updateHostContext('child', ['other'], opts);
   await updateHostContext('child', ['other'], { ...opts, parentId: 'main' });
   assert.equal(readHostContext(configPath).conversation_id, 'main');
@@ -367,6 +384,44 @@ test('host context restores the main conversation and tracks subagents across lo
   assert.ok(before.updated_at > 0);
   await updateHostContext('child', [], opts);
   assert.deepEqual(readHostContext(configPath), before);
+});
+
+test('lock retries while an owner is alive and reclaims a malformed legacy record', async (t) => {
+  const { root } = fixture(t);
+  const lock = join(root, 'state.lock');
+  writeFileSync(lock, 'legacy\n');
+  const events = [];
+  const first = withLock(lock, async () => {
+    assert.match(readFileSync(lock, 'utf8'), new RegExp(`^${process.pid}:\\d+\\n$`));
+    events.push('first enters');
+    await sleep(100);
+    events.push('first leaves');
+  });
+  const second = withLock(lock, () => events.push('second enters'));
+  await Promise.all([first, second]);
+  assert.deepEqual(events, ['first enters', 'first leaves', 'second enters']);
+  assert.ok(!existsSync(lock));
+});
+
+test('expired lock owners preserve a replacement lock on release', async (t) => {
+  const { root } = fixture(t);
+  const lock = join(root, 'state.lock');
+  let releaseFirst;
+  const first = withLock(lock, () => new Promise((resolve) => { releaseFirst = resolve; }));
+  const expired = new Date(Date.now() - 10_000);
+  utimesSync(lock, expired, expired);
+  try {
+    await withLock(lock, async () => {
+      const replacement = readFileSync(lock, 'utf8');
+      releaseFirst();
+      await first;
+      assert.equal(readFileSync(lock, 'utf8'), replacement);
+    }, { staleMs: 5_000 });
+  } finally {
+    releaseFirst();
+    await first;
+  }
+  assert.ok(!existsSync(lock));
 });
 
 test('shared worktrees use detached Git HEAD, preserve subdirectories, reuse, and remove', (t) => {

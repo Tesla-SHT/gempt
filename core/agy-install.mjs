@@ -153,6 +153,7 @@ function installWaitShim(target, nodeBin, binDir) {
     writeFileSync(cmd, `@echo off\r\n${[nodeBin, helper].map((value) => quoteWindows(value.replaceAll('%', '%%'))).join(' ')} %*\r\n`);
     written.push(cmd);
   }
+  try { rmSync(join(binDir, 'gempt-wait.py'), { force: true }); } catch {}
   return written;
 }
 

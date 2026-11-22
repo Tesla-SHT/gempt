@@ -24,7 +24,7 @@ export async function updateHostContext(conversationId, workspacePaths, { parent
   if (typeof conversationId !== 'string' || !conversationId.trim()) return;
   const path = contextPath(configPath);
   try {
-    await withLock(join(dirname(path), 'host-context.node.lock'), () => {
+    await withLock(join(dirname(path), 'host-context.lock'), () => {
       const data = readHostContext(configPath);
       const entries = data.subagent_conversations;
       const children = new Set(Array.isArray(entries) ? entries.filter((entry) => typeof entry === 'string') : []);
