@@ -416,14 +416,106 @@
     const workDetail = $('work-detail');
     workDetail.textContent = ordinary?.detail || '';
     if (ordinary?.gpt_share !== 0) {
-      workDetail.textContent += ' 比例表示工作量倾向，实际额度随任务变化。';
+      workDetail.textContent += ' 动态追踪近 24h 实际 Token 占比，偏低时自动放宽 GPT 接单范围，偏高时回落 Gemini。';
       if (state.tools?.exec_enabled === false) {
         workDetail.textContent += ' Magpie 原生工具目前仅可咨询。需要 Codex 操作文件时，在 GemPT 插件选项开启 exec。';
       }
     }
+    renderTokenRatio(state.token_ratio, ordinary);
     $('swarm-detail').textContent = team?.gpt_share === 0
       ? team.detail
       : (team?.label || '') + ' · 协调者拆单和解说，成员按各自职责派单，核验者独立检查。';
+  }
+
+  function formatCompactTokens(n) {
+    const num = Number(n || 0);
+    if (!Number.isFinite(num) || num <= 0) return '0';
+    if (num >= 1e8) return `${(num / 1e8).toFixed(2)} 亿`;
+    if (num >= 1e4) {
+      const w = num / 1e4;
+      return w >= 100 ? `${Math.round(w)} 万` : `${w.toFixed(1)} 万`;
+    }
+    return num.toLocaleString('en-US');
+  }
+
+  const RATIO_KIND_LABELS = {
+    specialist: '专研',
+    engineering: '工程',
+    design: '设计',
+    routine: '常规',
+  };
+
+  const RATIO_ADJ_META = {
+    off: { label: '已关闭自动派单', tone: 'neutral' },
+    disabled: { label: '静态分工', tone: 'neutral' },
+    warming_up: { label: '样本积累中', tone: 'neutral' },
+    balanced: { label: '已平衡', tone: 'ok' },
+    widened: { label: '偏低 · 已放宽派单', tone: 'warn' },
+    widened_strong: { label: '明显偏低 · 强力放宽', tone: 'warn' },
+    under_target: { label: '低于目标 · 少读直派', tone: 'warn' },
+    tightened: { label: '偏高 · 已回落 Gemini', tone: 'info' },
+    over_target: { label: '高于目标 · 仅派专研', tone: 'info' },
+  };
+
+  function renderTokenRatio(ratio, ordinary) {
+    const card = $('token-ratio-card');
+    if (!card) return;
+    if (!ratio || ordinary?.gpt_share === 0) {
+      card.hidden = true;
+      return;
+    }
+    card.hidden = false;
+    const badge = $('token-ratio-badge');
+    const gptBar = $('token-ratio-gpt-bar');
+    const gemBar = $('token-ratio-gem-bar');
+    const tick = $('token-ratio-target-tick');
+    const track = $('token-ratio-track');
+    const gptText = $('token-ratio-gpt-text');
+    const gemText = $('token-ratio-gem-text');
+    const metaEl = $('token-ratio-meta');
+
+    const adj = RATIO_ADJ_META[ratio.adjustment] || { label: ratio.adjustment || '实时追踪', tone: 'neutral' };
+    if (badge) {
+      badge.textContent = adj.label;
+      badge.dataset.tone = adj.tone;
+    }
+    const target = Number(ratio.target_gpt_share || 0);
+    const hasData = typeof ratio.actual_gpt_share === 'number' && Number(ratio.combined_total || 0) > 0;
+    const gptPct = hasData ? Math.max(0, Math.min(100, ratio.actual_gpt_share)) : 0;
+    const gemPct = hasData ? Math.max(0, Math.min(100, 100 - gptPct)) : 0;
+
+    if (gptBar) gptBar.style.width = `${gptPct}%`;
+    if (gemBar) gemBar.style.width = `${gemPct}%`;
+    if (tick) {
+      tick.hidden = !(target > 0 && target < 100);
+      tick.style.left = `${target}%`;
+      tick.title = `目标 GPT ${target}%`;
+    }
+    if (track) {
+      track.setAttribute('aria-label', hasData
+        ? `近 24h GPT 占 ${gptPct.toFixed(1)}%，Gemini 占 ${gemPct.toFixed(1)}%，目标 GPT ${target}%`
+        : `近 24h 暂无足够 Token 样本，目标 GPT ${target}%`);
+    }
+
+    const freshNote = typeof ratio.actual_gpt_fresh_share === 'number'
+      ? `（非缓存 ${ratio.actual_gpt_fresh_share.toFixed(1)}%）`
+      : '';
+    if (gptText) {
+      gptText.textContent = hasData
+        ? `GPT ${gptPct.toFixed(1)}% · ${formatCompactTokens(ratio.gpt_tokens)}`
+        : 'GPT 暂无数据';
+      gptText.title = hasData ? `GPT 总 Token ${formatCompactTokens(ratio.gpt_tokens)}${freshNote}` : '';
+    }
+    if (gemText) {
+      gemText.textContent = hasData
+        ? `Gemini ${gemPct.toFixed(1)}% · ${formatCompactTokens(ratio.gemini_tokens)}`
+        : 'Gemini 暂无数据';
+    }
+    if (metaEl) {
+      const kinds = (ratio.effective_kinds || []).map((k) => RATIO_KIND_LABELS[k] || k).join(' / ') || '无';
+      metaEl.textContent = `目标 GPT ${target}% · 当前接单：${kinds}`;
+      metaEl.title = freshNote ? `按总 Token 计算（含缓存读取）；GPT 非缓存占比${freshNote}` : '';
+    }
   }
 
   function renderPairings(state) {

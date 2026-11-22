@@ -18,6 +18,7 @@ import { correlateGatewayUsage } from './activity-gateway.mjs';
 import { readActivityTimeline } from './activity-timeline.mjs';
 import { buildRequestAnalytics, buildSessionAnalytics } from './activity-analytics.mjs';
 import { isAstraModel } from './routing.mjs';
+import { resolveBudget } from './token-ratio.mjs';
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
@@ -1603,6 +1604,12 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
 
   const { recentSessions, recentRuns } = readRecentActivity(resolvedSessionsDir, 6);
   const { totals: activityTotals } = readDispatchActivity(resolvedSessionsDir);
+  const workSplit = policy.work_split ?? 'balanced';
+  const tokenRatio = resolveBudget(workSplit, {
+    policy,
+    configPath: resolvedConfigPath,
+    magpieConfigDir: resolvedMagpieDir,
+  });
 
   return {
     app_server: appServer?.getStatus() ?? { running: false, ws_url: null, pid: null, gateway_url: null, error: null },
@@ -1610,9 +1617,10 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     features: { ...FEATURES },
     configured,
     config_path: resolvedConfigPath,
-    work_split: policy.work_split ?? 'balanced',
+    work_split: workSplit,
     swarm_split: policy.swarm_split ?? 'inherit',
     work_profiles: WORKLOAD.profiles,
+    token_ratio: tokenRatio,
     pairings: Object.fromEntries(Object.entries(WORKLOAD.pairings).map(([family, model]) =>
       [family, policy.pairings?.[family] ?? model])),
     default_tier: defaultTier,

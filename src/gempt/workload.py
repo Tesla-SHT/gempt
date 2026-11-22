@@ -1,12 +1,37 @@
-"""Apply the user's work split at dispatch time, including fresh Swarm workers."""
+"""Apply the user's work split and closed-loop token budget at dispatch time, including Swarm workers."""
 import re
 
 from .config import WORKLOAD, load_config
 from .runs import ACTIVE_STATES, build_wait_command, dispatch_exec
 from .service import run_consult
 from .sessions import resolve_sessions_dir
+from .token_ratio import resolve_budget
 
 SCHEMA = WORKLOAD["schema"]
+MAX_RECEIPT_TEXT_CHARS = 3200
+
+
+def compact_receipt_text(text: str | None, *, session_id: str | None = None, max_chars: int = MAX_RECEIPT_TEXT_CHARS) -> str:
+    """Keep MCP tool receipts lean so Gemini's conversation prefix does not bloat."""
+    raw = str(text or "")
+    if len(raw) <= max_chars:
+        return raw
+    head_len = int(max_chars * 0.68)
+    tail_len = max_chars - head_len - 120
+    omitted = len(raw) - head_len - tail_len
+    ref = f"session_id={session_id} / GemPT Live" if session_id else "GemPT Live"
+    return f"{raw[:head_len].rstrip()}\n\n...[omitted {omitted} chars; full output in {ref}]...\n\n{raw[-tail_len:].lstrip()}"
+
+
+def _compact_budget(budget: dict) -> dict:
+    return {
+        "target_gpt_share": budget.get("target_gpt_share"),
+        "actual_gpt_share": budget.get("actual_gpt_share"),
+        "actual_gpt_fresh_share": budget.get("actual_gpt_fresh_share"),
+        "adjustment": budget.get("adjustment"),
+        "effective_kinds": budget.get("effective_kinds"),
+        "window_hours": budget.get("window_hours"),
+    }
 
 
 def dispatch_task(args, config_path, *, wait_sec: float | None = None):
@@ -46,7 +71,11 @@ def dispatch_task(args, config_path, *, wait_sec: float | None = None):
             (claims / assignment).mkdir()
         except FileExistsError:
             return {**result, "action": "already_assigned", "text": "Check this assignment on the board with its owner before retrying."}
-    if kind not in plan["kinds"]:
+
+    budget = resolve_budget(profile, policy=policy, config_path=config_path)
+    effective_kinds = budget["effective_kinds"]
+    result["budget"] = _compact_budget(budget)
+    if kind not in effective_kinds:
         return {**result, "action": "gemini", "text": "Handle this part in Gemini. Report to the board if assigned there."}
 
     options = {"goal": goal, "config_path": config_path, "tier": args.get("tier"), "cwd": args.get("cwd")}
@@ -72,6 +101,8 @@ def dispatch_task(args, config_path, *, wait_sec: float | None = None):
                              else f"Run {run_id} is {state}. Run wait_command in background (zero-poll) or query gempt_status with run_id='{run_id}'.")}
     fields = ("model", "served_model", "session_id", "run_id", "worktree_path", "source_cwd", "verification", "usage", "warnings", "text")
     receipt = {key: reply[key] for key in fields if key in reply}
+    if "text" in receipt:
+        receipt["text"] = compact_receipt_text(receipt["text"], session_id=receipt.get("session_id"))
     if "verification" in receipt:
         evidence = receipt["verification"]
         receipt["verification"] = {

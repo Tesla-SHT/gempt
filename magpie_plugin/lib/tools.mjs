@@ -14,6 +14,7 @@
 import { readNativeRun, startNativeRun, waitForNativeRun } from './native-runs.mjs';
 import { findCodexCli } from './app-server-manager.mjs';
 import { runAppServer, TurnInterrupted } from './app-server-run.mjs';
+import { resolveBudget } from './token-ratio.mjs';
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, openSync, readSync, realpathSync, statSync, closeSync } from 'node:fs';
 import http from 'node:http';
@@ -721,7 +722,17 @@ export function createGemptTools({
           return { ...result, action: 'board', text: 'Keep this role on the board. Give each task one owner and summarize the results.' };
         }
         if (kind === 'visual' && access === 'change') throw new Error('Separate visual observation from implementation.');
-        const delegated = plan.kinds.includes(kind);
+        const budget = resolveBudget(profile, { policy, configPath: path, magpieConfigDir: resolvedMagpieDir, env });
+        const effectiveKinds = budget.effective_kinds;
+        result.budget = {
+          target_gpt_share: budget.target_gpt_share,
+          actual_gpt_share: budget.actual_gpt_share,
+          actual_gpt_fresh_share: budget.actual_gpt_fresh_share,
+          adjustment: budget.adjustment,
+          effective_kinds: effectiveKinds,
+          window_hours: budget.window_hours,
+        };
+        const delegated = effectiveKinds.includes(kind);
         const action = access === 'provided' ? 'consult' : 'exec';
         if (delegated && action === 'exec' && !isExecEnabled(options, env)) {
           throw new Error('Codex execution is disabled. Enable the Magpie GemPT exec option for workspace tasks. Report this blocker to the user.');
@@ -750,8 +761,16 @@ export function createGemptTools({
           : await tools.exec.execute({ ...task, run_id: role === 'worker' || role === 'verifier' ? assignment : undefined, verification: args.verification, expected_report: WORKLOAD.report,
             sandbox: access === 'inspect' ? 'read-only' : undefined }, callCtx);
         if (reply.run_id && reply.state !== 'finished') return { ...result, action, ...reply };
+        let leanText = String(reply.text || '');
+        if (leanText.length > 3200) {
+          const head = leanText.slice(0, 2176).trimEnd();
+          const tail = leanText.slice(-900).trimStart();
+          const omitted = leanText.length - head.length - tail.length;
+          const ref = reply.session_id ? `session_id=${reply.session_id} / GemPT Live` : 'GemPT Live';
+          leanText = `${head}\n\n...[omitted ${omitted} chars; full output in ${ref}]...\n\n${tail}`;
+        }
         return { ...result, action, ...(reply.run_id ? { run_id: reply.run_id, state: reply.state } : {}), model: reply.served_model || reply.model, session_id: reply.session_id,
-          text: reply.text, usage: reply.usage, warnings: reply.warnings,
+          text: leanText, usage: reply.usage, warnings: reply.warnings,
           ...(reply.commands ? { commands: reply.commands.map(({ command, exit_code }) => ({ command, exit_code })) } : {}) };
       },
     },

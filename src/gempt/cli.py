@@ -313,6 +313,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _compact_wait_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Return a context-diet view of a waited run record for Gemini wakeups."""
+    from .workload import compact_receipt_text
+
+    if not isinstance(record, dict):
+        return record
+    out = dict(record)
+    sid = out.get("session_id")
+    if isinstance(out.get("text"), str):
+        out["text"] = compact_receipt_text(out["text"], session_id=sid)
+    res = out.get("result")
+    if isinstance(res, dict):
+        lean_res = dict(res)
+        lean_res.pop("formatted", None)
+        if isinstance(lean_res.get("text"), str):
+            lean_res["text"] = compact_receipt_text(lean_res["text"], session_id=lean_res.get("session_id") or sid)
+        ver = lean_res.get("verification")
+        if isinstance(ver, dict):
+            checks = ver.get("checks") or []
+            lean_checks = []
+            for ch in checks:
+                if not isinstance(ch, dict):
+                    continue
+                item = {k: ch.get(k) for k in ("command", "exit_code") if k in ch}
+                if ch.get("exit_code") not in (0, None) and ch.get("output"):
+                    item["output_tail"] = str(ch["output"])[-400:]
+                lean_checks.append(item)
+            lean_res["verification"] = {"status": ver.get("status"), "checks": lean_checks}
+        out["result"] = lean_res
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     _configure_stdio_utf8()
     parser = build_parser()
@@ -403,6 +435,10 @@ def main(argv: list[str] | None = None) -> int:
             ids = [x.strip() for x in args.run_ids.split(",") if x.strip()]
             if args.wait or args.wait_all:
                 batch = wait_for_runs(ids, wait_any=not args.wait_all)
+                batch = {
+                    **batch,
+                    "runs": {rid: _compact_wait_record(rec) for rid, rec in (batch.get("runs") or {}).items()},
+                }
             else:
                 records = {rid: read_run(rid) for rid in ids}
                 batch = {
@@ -415,7 +451,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "status" and args.run_id:
             record = wait_for_run(args.run_id) if args.wait else read_run(args.run_id)
-            print(json.dumps(record, ensure_ascii=False, indent=2))
+            output_rec = _compact_wait_record(record) if args.wait else record
+            print(json.dumps(output_rec, ensure_ascii=False, indent=2))
             return int(args.wait and record.get("state") in {"failed", "outcome_unknown", "interrupted"})
 
         if args.command in {"steer", "interrupt", "reply-tool"}:

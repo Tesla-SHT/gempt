@@ -53,7 +53,7 @@
     "properties": {
       "goal": {
         "type": "string",
-        "description": "User's objective with known constraints and acceptance criteria. Pass it before doing the work."
+        "description": "User's objective with known constraints and acceptance criteria. Dispatch immediately before reading workspace files in Gemini."
       },
       "title": {
         "type": "string",
@@ -105,12 +105,12 @@
       },
       "context": {
         "type": "string",
-        "description": "Relevant findings and context for the worker."
+        "description": "Short verified findings or user constraints only. Do not paste full source files; pass file_paths or let GPT read cwd directly."
       },
       "file_paths": {
         "type": "array",
         "items": {"type": "string"},
-        "description": "Optional workspace files to include."
+        "description": "Optional workspace file paths for GPT to read directly (keeps Gemini context lean)."
       },
       "gemini_family": {
         "type": "string",
@@ -154,5 +154,5 @@
     ],
     "additionalProperties": false
   },
-  "report": "Answer in the user's language, leading with what the result means for them. Include observed evidence, checks and unresolved issues briefly. For workspace tasks discover the relevant files yourself and carry the assigned task through verification. Do not spawn a nested team or call GemPT again."
+  "report": "Answer concisely in the user's language, leading with what the result means for them. List changed files, key checks (pass/fail), and any unresolved decisions briefly — omit raw diffs, file dumps, and verbose command logs (the user already sees live output in GemPT Live). For workspace tasks discover and read all relevant files yourself in cwd and carry the assigned task through verification. Do not spawn a nested team or call GemPT again."
 }

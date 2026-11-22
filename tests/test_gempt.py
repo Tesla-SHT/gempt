@@ -2146,5 +2146,199 @@ class AppServerTests(unittest.TestCase):
             self.assertTrue(remove_share_worktree(self.repo, r2["worktree_path"]))
 
 
+class TokenRatioTests(unittest.TestCase):
+    def _seed_usage(self, root: Path, *, gem_tokens: int, gpt_tokens: int, old_tokens: int = 5_000_000) -> tuple[Path, Path]:
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        recent_iso = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+        stale_iso = (now - timedelta(hours=30)).isoformat().replace("+00:00", "Z")
+
+        brain = root / "brain"
+        log_dir = brain / "conv-1" / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True)
+        gem_fresh = max(1, gem_tokens // 10)
+        gem_cache = max(0, gem_tokens - gem_fresh)
+        (log_dir / "transcript.jsonl").write_text(
+            "\n".join([
+                json.dumps({
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": recent_iso,
+                    "model": "gemini-4-neon-high",
+                    "input_tokens": gem_fresh,
+                    "output_tokens": 0,
+                    "cache_read_tokens": gem_cache,
+                }),
+                json.dumps({
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": stale_iso,
+                    "model": "gemini-4-neon-high",
+                    "input_tokens": old_tokens,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                }),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+
+        magpie = root / "magpie"
+        magpie.mkdir(parents=True)
+        gpt_fresh = max(1, gpt_tokens // 10)
+        gpt_cache = max(0, gpt_tokens - gpt_fresh)
+        (magpie / "usage.jsonl").write_text(
+            "\n".join([
+                json.dumps({
+                    "t": recent_iso,
+                    "provider": "codex",
+                    "model": "gpt-6.2-sol",
+                    "req": "codex/gpt-6.2-sol",
+                    "in": gpt_fresh,
+                    "out": 0,
+                    "cache_read": gpt_cache,
+                }),
+                json.dumps({
+                    "t": recent_iso,
+                    "provider": "westlake-a",
+                    "model": "deepseek-flash",
+                    "req": "westlake-a/deepseek-flash",
+                    "in": 999_999,
+                    "out": 1,
+                    "cache_read": 0,
+                }),
+                json.dumps({
+                    "t": stale_iso,
+                    "provider": "codex",
+                    "model": "gpt-6.2-sol",
+                    "in": old_tokens,
+                    "out": 0,
+                    "cache_read": 0,
+                }),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        return brain, magpie
+
+    def test_token_ratio_read_and_hysteresis_budget(self) -> None:
+        from gempt.token_ratio import evaluate_budget, read_token_ratio
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain, magpie = self._seed_usage(root, gem_tokens=9_000_000, gpt_tokens=1_000_000)
+            snap = read_token_ratio(brain_dir=brain, magpie_dir=magpie, cache_ttl_sec=0)
+            self.assertEqual(snap["gemini"]["total"], 9_000_000)
+            self.assertEqual(snap["gpt"]["total"], 1_000_000)
+            self.assertEqual(snap["other"]["total"], 1_000_000)
+            self.assertEqual(snap["actual_gpt_share"], 10.0)
+            self.assertEqual(snap["actual_gemini_share"], 90.0)
+
+            # 30% target with 10% actual (-20pp) -> widened_strong (+2 kinds: specialist, engineering, design)
+            b30 = evaluate_budget("gemini_first", snap)
+            self.assertEqual(b30["adjustment"], "widened_strong")
+            self.assertEqual(b30["effective_kinds"], ["specialist", "engineering", "design"])
+
+            # 0% target -> always off
+            b0 = evaluate_budget("gemini", snap)
+            self.assertEqual(b0["adjustment"], "off")
+            self.assertEqual(b0["effective_kinds"], [])
+
+            # 80% target with 10% actual -> widened_strong to all 4 kinds
+            b80 = evaluate_budget("gpt", snap)
+            self.assertEqual(b80["adjustment"], "widened_strong")
+            self.assertEqual(b80["effective_kinds"], ["specialist", "engineering", "design", "routine"])
+
+            # Balanced 50% with 65% actual (+15pp > +8pp) -> tightened back to specialist only
+            over_snap = {**snap, "actual_gpt_share": 65.0, "actual_gemini_share": 35.0}
+            b50_over = evaluate_budget("balanced", over_snap)
+            self.assertEqual(b50_over["adjustment"], "tightened")
+            self.assertEqual(b50_over["effective_kinds"], ["specialist"])
+
+            # Balanced 50% with 52% actual (within [-6, +8]) -> balanced
+            in_band = {**snap, "actual_gpt_share": 52.0, "actual_gemini_share": 48.0}
+            b50_ok = evaluate_budget("balanced", in_band)
+            self.assertEqual(b50_ok["adjustment"], "balanced")
+            self.assertEqual(b50_ok["effective_kinds"], ["specialist", "engineering"])
+
+            # Warming up below 200K tokens
+            tiny = {**snap, "combined_total": 50_000}
+            b_warm = evaluate_budget("gemini_first", tiny)
+            self.assertEqual(b_warm["adjustment"], "warming_up")
+            self.assertEqual(b_warm["effective_kinds"], ["specialist"])
+
+    def test_dispatch_dynamic_budget_and_receipt_compaction(self) -> None:
+        from gempt.workload import compact_receipt_text, dispatch_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain, magpie = self._seed_usage(root, gem_tokens=9_000_000, gpt_tokens=1_000_000)
+            cfg_path = root / "config.json"
+            cfg_path.write_text(json.dumps({
+                "version": 2,
+                "magpie": {"base_url": "http://127.0.0.1:3425"},
+                "routing_policy": {"work_split": "gemini_first", "default_tier": "sonnet"},
+            }), encoding="utf-8")
+            huge_text = "HEAD " + ("x" * 6000) + " TAIL"
+            with (
+                mock.patch.dict(os.environ, {"GEMPT_AGY_BRAIN_DIR": str(brain), "MAGPIE_CONFIG_DIR": str(magpie)}),
+                mock.patch("gempt.workload.run_consult", return_value={"session_id": "consult-1", "model": "codex/gpt-6.2-sol", "text": huge_text}) as consult_mock,
+            ):
+                reply = dispatch_task({"goal": "Fix routing bug", "kind": "engineering", "access": "provided"}, cfg_path)
+            self.assertEqual(reply["action"], "consult")
+            self.assertEqual(reply["budget"]["adjustment"], "widened_strong")
+            self.assertIn("omitted", reply["text"])
+            self.assertLess(len(reply["text"]), 3500)
+            consult_mock.assert_called_once()
+
+            self.assertEqual(compact_receipt_text("short"), "short")
+
+    def test_work_split_hook_live_telemetry_and_read_diet_nudge(self) -> None:
+        import importlib.util
+
+        hook_path = Path(__file__).resolve().parent.parent / "plugin" / "work_split_hook.py"
+        spec = importlib.util.spec_from_file_location("test_work_split_hook_mod", hook_path)
+        mod = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(mod)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain, magpie = self._seed_usage(root, gem_tokens=9_000_000, gpt_tokens=1_000_000)
+            cfg_path = root / "config.json"
+            cfg_path.write_text(json.dumps({
+                "routing_policy": {"work_split": "gemini_first", "swarm_split": "inherit"},
+            }), encoding="utf-8")
+            env = {
+                "GEMPT_CONFIG": str(cfg_path),
+                "GEMPT_AGY_BRAIN_DIR": str(brain),
+                "MAGPIE_CONFIG_DIR": str(magpie),
+            }
+            with mock.patch.dict(os.environ, env):
+                rem = mod.reminder("neon")["injectSteps"][0]["ephemeralMessage"]
+                self.assertIn("Live 24h token split: Gemini 90.0% vs GPT 10.0%", rem)
+                self.assertIn("ZERO-PRE-READ", rem)
+
+                conv = "conv-read-diet"
+                # Exempt image & SKILL.md reads never trigger nudge
+                r_img = mod.pre_tool_use({"conversationId": conv, "toolCall": {"name": "read_file", "args": {"Path": "D:/gempt/preview.png"}}}, "neon")
+                self.assertNotIn("injectSteps", r_img)
+                r_skill = mod.pre_tool_use({"conversationId": conv, "toolCall": {"name": "read_file", "args": {"Path": "C:/Users/zyz/.zcode/skills/x/SKILL.md"}}}, "neon")
+                self.assertNotIn("injectSteps", r_skill)
+
+                # First workspace code read -> allowed silently
+                r1 = mod.pre_tool_use({"conversationId": conv, "toolCall": {"name": "read_file", "args": {"Path": "D:/gempt/src/gempt/workload.py"}}}, "neon")
+                self.assertEqual(r1["decision"], "allow")
+                self.assertNotIn("injectSteps", r1)
+
+                # Second consecutive code read while GPT is under target -> injects Context Diet nudge!
+                r2 = mod.pre_tool_use({"conversationId": conv, "toolCall": {"name": "read_file", "args": {"Path": "D:/gempt/src/gempt/service.py"}}}, "neon")
+                self.assertEqual(r2["decision"], "allow")
+                self.assertIn("injectSteps", r2)
+                self.assertIn("[GemPT Context Diet]", r2["injectSteps"][0]["ephemeralMessage"])
+
+                # Dispatch resets the consecutive read counter
+                mod.pre_tool_use({"conversationId": conv, "toolCall": {"name": "call_mcp_tool", "args": {"ServerName": "gempt_gempt", "ToolName": "gempt_dispatch", "Arguments": {"goal": "x"}}}}, "neon")
+                r3 = mod.pre_tool_use({"conversationId": conv, "toolCall": {"name": "read_file", "args": {"Path": "D:/gempt/src/gempt/cli.py"}}}, "neon")
+                self.assertNotIn("injectSteps", r3)
+
+
 if __name__ == "__main__":
     unittest.main()

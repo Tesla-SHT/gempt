@@ -137,6 +137,28 @@
               <legend id="work-label" class="control-legend">普通对话 · 工作分工</legend>
               <div id="work-options" class="work-options"></div>
               <span id="work-detail" class="control-hint" aria-live="polite"></span>
+              <div id="token-ratio-card" class="token-ratio-card" hidden>
+                <div class="token-ratio-head">
+                  <span class="token-ratio-title">近 24h 实际 Token 占比</span>
+                  <span id="token-ratio-badge" class="token-ratio-badge" data-tone="neutral"></span>
+                </div>
+                <div class="token-ratio-track" role="img" id="token-ratio-track" aria-label="近 24h GPT 与 Gemini Token 占比">
+                  <div id="token-ratio-gpt-bar" class="token-ratio-fill is-gpt" style="width: 0%"></div>
+                  <div id="token-ratio-gem-bar" class="token-ratio-fill is-gemini" style="width: 0%"></div>
+                  <span id="token-ratio-target-tick" class="token-ratio-tick" hidden></span>
+                </div>
+                <div class="token-ratio-foot">
+                  <span class="token-ratio-side">
+                    <span class="ratio-dot is-gpt" aria-hidden="true"></span>
+                    <span id="token-ratio-gpt-text">GPT --</span>
+                  </span>
+                  <span id="token-ratio-meta" class="token-ratio-meta"></span>
+                  <span class="token-ratio-side">
+                    <span class="ratio-dot is-gemini" aria-hidden="true"></span>
+                    <span id="token-ratio-gem-text">Gemini --</span>
+                  </span>
+                </div>
+              </div>
             </fieldset>
             <div class="swarm-choice">
               <label for="swarm-split" class="control-legend">Antigravity Swarm</label>

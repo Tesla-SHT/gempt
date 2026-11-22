@@ -782,10 +782,17 @@ def get_status(
         key_source = "unconfigured"
         redacted = None
 
+    from .token_ratio import resolve_budget
+
+    policy = (cfg.get("routing_policy") or {}) if exists else {}
+    profile = str(policy.get("work_split") or "balanced")
+    budget = resolve_budget(profile, policy=policy, config_path=resolved_path)
+
     return {
         "active_runs": active_runs_summary(limit=max(session_limit, 20), root=workspace_root, host_conversation_id=host_conversation_id),
         "roster": session_roster(limit=session_limit, root=workspace_root, host_conversation_id=host_conversation_id),
         "recent_runs": recent_runs(session_limit, workspace_root, host_conversation_id=host_conversation_id),
+        "token_ratio": budget,
         "configured": exists,
         "default_tier": get_default_tier(cfg) if exists else "sonnet",
         "auto_effort": bool((cfg.get("routing_policy") or {}).get("auto_effort", False)) if exists else False,

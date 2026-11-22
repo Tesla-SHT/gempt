@@ -4,11 +4,17 @@
 
 Magpie 面板最左档是 **关闭 GemPT**。选中后从下一轮起停止自动派单，无需重启或卸载。普通对话和 Swarm 可独立设置，Swarm 也可跟随普通对话。对已关闭的模式，Gemini 直接处理任务，跳过 `gempt_dispatch`。只有用户明确要求调用 GPT 时才使用 `gempt_consult` 或 `gempt_exec`。
 
+## 动态 Token 占比闭环与少读直派（Zero-Pre-Read）
+- **真实占比闭环**：`gempt_dispatch` 实时追踪近 24h 的 Gemini vs. GPT 实际 Token 占比，与用户在面板选定的目标占比对比：当 GPT 实际占比明显低于目标时自动放宽接单范围（如自动接管工程实施、代码排查与设计）；偏高时自动回落给 Gemini，避免宣称比例与实际消耗脱节。
+- **少读直派（关键省 Gemini 额度）**：只要任务属于当前分工（或 hook 提示 GPT 低于目标），**不要先在 Gemini 里 `read_file` 读源码、grep 仓库或跑探索命令**——每一轮预读都会把大段文件塞进 Gemini 对话前缀并反复计费。直接把用户目标、约束、验收条件与 `cwd` 交给 `gempt_dispatch`（需要指定文件时只传 `file_paths` 路径，让 GPT 自己读！）。
+- **调查与大日志外包**：仓库摸底、跨文件定位、测试/构建长日志分析优先交给 `gempt_dispatch(access="inspect", ...)` 或 `gempt_consult(tier="chore", file_paths=[...])`，只把精炼结论带回 Gemini；Gemini 专注需求沟通、截图视觉验收与最终把关。
+
+## 一等并发 GPT 子智能体调度
 启用 GemPT 时，**GPT 作为一等异步子智能体由主 Gemini 直接调度**（不再通过 Gemini `gempt-worker` 外壳中转轮询）：
 - 直接通过 `gempt_dispatch` 派发新任务（`goal`、`kind`、`access`，工作区任务传 `cwd` 和 6–15 字短名 `title`）；Antigravity hook 会自动补齐 `host_conversation_id` 和 `gemini_family`。
 - **并发与零轮询等待**：长任务或一次并行派发多个 GPT 时，传 `background=true` 立刻拿到 `run_id`、`session_id` 和 `wait_command`，再用 `run_command(WaitMsBeforeAsync=500)` 在后台执行返回的 `wait_command`（多任务可将 `--run-id <id>` 换为 `--run-ids id1,id2,... --wait` 合并守候，任意一个完成或触发 `ask_gemini` 即刻唤醒）——等待全程不消耗 Gemini 轮询额度，也不受固定短超时截断。
 - **并行改代码隔离**：多个 GPT 同时修改同一 Git 仓库时传 `workspace="share"`，GemPT 会为该 `session_id` 自动创建/复用独立隔离的 `git worktree` 并返回 `worktree_path`，互不覆盖、不触发主仓库热重载。
-- **任意续用与实时控制**：保留每个 GPT 线程的 `session_id`，随时带 `session_id` 继续调 `gempt_dispatch` 复原同一 GPT 上下文与缓存（自动沿用原 worktree）；调无参 `gempt_status()` 可直接查看本会话的 GPT 活跃名册与可续用线程；运行中直接调 `gempt_steer`、`gempt_interrupt` 或 `gempt_reply_tool_call`。
+- **任意续用与实时控制**：保留每个 GPT 线程的 `session_id`，随时带 `session_id` 继续调 `gempt_dispatch` 复原同一 GPT 上下文与缓存（自动沿用原 worktree）；调无参 `gempt_status()` 可直接查看本会话的 GPT 活跃名册、可续用线程与实时 Token 占比；运行中直接调 `gempt_steer`、`gempt_interrupt` 或 `gempt_reply_tool_call`。
 - 收到 `action="gemini"` 时由 Gemini 自行处理；仅需要 Gemini 视觉感知时先提取必要观察再派发后续工作；用户在 Antigravity 侧边栏打开 **GemPT Live** 即可零额度实时查看全部并发 GPT 的执行流。
 
 任务单保留原目标、限制、证据和验收条件，把查文件、定位、实现和检查留给执行者。`kind` 按实际任务选 `routine`、`design`、`engineering` 或 `specialist`。材料齐备用 `access=provided`，检查工作区用 `inspect`，修改用 `change`。

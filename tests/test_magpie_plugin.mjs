@@ -1774,3 +1774,72 @@ test('requests and sessions analytics return buckets, breakdowns, speed board, 5
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('token-ratio closed-loop budget widens dispatch when GPT is below target and exposes token_ratio in /api/state', async () => {
+  const { readTokenRatio, evaluateBudget, resolveBudget } = await import('../magpie_plugin/lib/token-ratio.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-ratio-'));
+  try {
+    const brainDir = join(dir, 'brain');
+    const logDir = join(brainDir, 'conv-a', '.system_generated', 'logs');
+    mkdirSync(logDir, { recursive: true });
+    const recentIso = new Date(Date.now() - 3600_000).toISOString();
+    writeFileSync(join(logDir, 'transcript.jsonl'), JSON.stringify({
+      type: 'PLANNER_RESPONSE',
+      created_at: recentIso,
+      model: 'gemini-4-neon-high',
+      input_tokens: 900_000,
+      output_tokens: 100_000,
+      cache_read_tokens: 8_000_000,
+    }) + '\n', 'utf8');
+
+    const magpieDir = join(dir, 'magpie');
+    mkdirSync(magpieDir, { recursive: true });
+    writeFileSync(join(magpieDir, 'usage.jsonl'), JSON.stringify({
+      t: recentIso,
+      provider: 'codex',
+      model: 'gpt-6.2-sol',
+      req: 'codex/gpt-6.2-sol',
+      in: 100_000,
+      out: 10_000,
+      cache_read: 890_000,
+    }) + '\n', 'utf8');
+
+    const snap = readTokenRatio({ brainDir, magpieConfigDir: magpieDir, cacheTtlMs: 0 });
+    assert.equal(snap.gemini.total, 9_000_000);
+    assert.equal(snap.gpt.total, 1_000_000);
+    assert.equal(snap.actual_gpt_share, 10.0);
+    assert.equal(snap.actual_gemini_share, 90.0);
+
+    const b30 = evaluateBudget('gemini_first', snap);
+    assert.equal(b30.adjustment, 'widened_strong');
+    assert.deepEqual(b30.effective_kinds, ['specialist', 'engineering', 'design']);
+
+    const b50Over = evaluateBudget('balanced', { ...snap, actual_gpt_share: 64.0, actual_gemini_share: 36.0 });
+    assert.equal(b50Over.adjustment, 'tightened');
+    assert.deepEqual(b50Over.effective_kinds, ['specialist']);
+
+    const cfgPath = join(dir, 'config.json');
+    const sessDir = join(dir, 'sessions');
+    mkdirSync(sessDir, { recursive: true });
+    writeFileSync(cfgPath, JSON.stringify({
+      version: 2,
+      magpie: { base_url: 'http://127.0.0.1:3425' },
+      routing_policy: { work_split: 'gemini_first', default_tier: 'sonnet' },
+    }), 'utf8');
+    const prevBrain = process.env.GEMPT_AGY_BRAIN_DIR;
+    process.env.GEMPT_AGY_BRAIN_DIR = brainDir;
+    try {
+      const state = await readState({ configPath: cfgPath, sessionsDir: sessDir, magpieConfigDir: magpieDir, probeTimeoutMs: 50 });
+      assert.equal(state.token_ratio.target_gpt_share, 30);
+      assert.equal(state.token_ratio.actual_gpt_share, 10.0);
+      assert.equal(state.token_ratio.adjustment, 'widened_strong');
+      const resolved = resolveBudget('gemini_first', { configPath: cfgPath, magpieConfigDir: magpieDir, cacheTtlMs: 0 });
+      assert.deepEqual(resolved.effective_kinds, ['specialist', 'engineering', 'design']);
+    } finally {
+      if (prevBrain === undefined) delete process.env.GEMPT_AGY_BRAIN_DIR;
+      else process.env.GEMPT_AGY_BRAIN_DIR = prevBrain;
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
