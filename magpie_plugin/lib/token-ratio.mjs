@@ -6,10 +6,7 @@
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { extname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const REPO_ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
-const WORKLOAD = JSON.parse(readFileSync(join(REPO_ROOT, 'src', 'gempt', 'workload.json'), 'utf8'));
+import { WORKLOAD } from '../../core/assets.mjs';
 
 export const KIND_LADDER = Object.freeze(['specialist', 'engineering', 'design', 'routine']);
 export const MIN_SAMPLE_TOKENS = 20_000;

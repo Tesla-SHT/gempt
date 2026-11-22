@@ -19,11 +19,12 @@ import { readActivityTimeline } from './activity-timeline.mjs';
 import { buildRequestAnalytics, buildSessionAnalytics } from './activity-analytics.mjs';
 import { isAstraModel } from './routing.mjs';
 import { resolveBudget } from './token-ratio.mjs';
+import { WORKLOAD } from '../../core/assets.mjs';
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 
-export const WORKLOAD = JSON.parse(readFileSync(join(REPO_ROOT, 'src', 'gempt', 'workload.json'), 'utf8'));
+export { WORKLOAD };
 
 export const TIER_ORDER = ['sonnet', 'opus', 'fable'];
 export const TIER_ALIASES = { lite: 'sonnet', mid: 'opus', max: 'fable' };

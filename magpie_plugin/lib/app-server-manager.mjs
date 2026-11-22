@@ -5,12 +5,12 @@ import { createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { basename, delimiter, dirname, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { defaultGatewayFromEnv, expandUser, readActiveRuns, readJsonSafe, resolveConfigPath, resolveMagpieApiKey, resolveSessionsDir } from './backend.mjs';
-import { appServerStatePath, connectAppServer, UNAVAILABLE } from './app-server-client.mjs';
+import { defaultGatewayFromEnv, expandUser, readActiveRuns, readJsonSafe, resolveConfigPath, resolveMagpieApiKey } from './backend.mjs';
+import { appServerStatePath, connectAppServer } from './app-server-client.mjs';
+import { interruptRun as interruptCoreRun } from '../../core/runs.mjs';
 
 const STRIPPED_ENV = ['CODEX_WINDOWS_REGISTERED_CORE', 'CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY', 'CODEX_APP_TOOLS_PIPE_PATH',
   'CODEX_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_TOOL_CALL_ID', 'GEMPT_APP_SERVER_GATEWAY_TOKEN'];
-const unavailable = (message, status) => Object.assign(new Error(message), { status });
 
 function executable(candidates) {
   return candidates.find((candidate) => {
@@ -257,21 +257,8 @@ export function createAppServerManager({
     return starting.then(getStatus);
   }
 
-  async function interruptRun(runId, sessionsDir) {
-    if (typeof runId !== 'string' || runId.length !== 32 || !/^[a-f0-9]+$/.test(runId)) {
-      throw unavailable('invalid run_id', 400);
-    }
-    const run = readJsonSafe(join(resolveSessionsDir(sessionsDir), 'runs', runId, 'state.json'));
-    if (!run) throw unavailable('run not found', 404);
-    if (!['running', 'waiting_gemini'].includes(run.state) || !run.codex_thread_id || !run.turn_id
-        || (run.deadline && Date.now() / 1000 > run.deadline)) throw unavailable('run has no active Codex turn', 409);
-    const state = connection || readJsonSafe(stateFile);
-    if (state?.status !== 'running') throw unavailable(UNAVAILABLE, 503);
-    const rpc = await connect(state).catch((err) => { throw unavailable(err.message, 503); });
-    try {
-      await rpc.request('turn/interrupt', { threadId: run.codex_thread_id, turnId: run.turn_id });
-      return { ok: true, run_id: runId, session_id: run.session_id, thread_id: run.codex_thread_id, turn_id: run.turn_id };
-    } finally { rpc.close(); }
+  function interruptRun(runId, sessionsDir) {
+    return interruptCoreRun(runId, { sessionsDir, connect, getState: () => connection || readJsonSafe(stateFile) });
   }
 
   function cleanup({ preserveActive = false } = {}) {

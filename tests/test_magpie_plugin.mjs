@@ -47,12 +47,13 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
   const [{ files }] = JSON.parse(stdout);
   const paths = files.map((file) => file.path);
   for (const path of ['LICENSE', 'src/gempt/mcp_app_live.html', 'src/gempt/host_context.py', 'src/gempt/titles.py',
-    'plugin/hooks.json', 'plugin/work_split_hook.py', 'magpie_plugin/lib/backend.mjs']) {
+    'plugin/hooks.json', 'plugin/work_split_hook.py', 'magpie_plugin/lib/backend.mjs',
+    'core/mcp-server.mjs', 'core/host-context.mjs', 'core/wait.mjs', 'core/assets/mcp_app_live.html', 'core/assets/workload.json']) {
     assert.ok(paths.includes(path), path);
   }
-  const roots = /^(?:LICENSE(?:\.md)?$|README\.md$|install\.(?:sh|ps1)$|package\.json$|pyproject\.toml$|(?:magpie_plugin|mcp_app|plugin|src\/gempt|templates)\/)/;
+  const roots = /^(?:LICENSE(?:\.md)?$|README\.md$|install\.(?:sh|ps1)$|package\.json$|pyproject\.toml$|(?:core|magpie_plugin|mcp_app|plugin|src\/gempt|templates)\/)/;
   const localFiles = /(?:^|\/)(?:\.[^/]+|node_modules|__pycache__|sessions|runs|host-context(?:[.-][^/]*)?|state\.json|config\.json|request\.json|package-lock\.json)(?:\/|$)|\.(?:pyc|log|jsonl|tgz)$/i;
-  assert.deepEqual(paths.filter((path) => !roots.test(path) || localFiles.test(path)), []);
+  assert.deepEqual(paths.filter((path) => !roots.test(path) || (path !== 'core/host-context.mjs' && localFiles.test(path))), []);
   assert.ok(!existsSync(join(REPO_ROOT, 'node_modules')));
   assert.ok(!existsSync(join(REPO_ROOT, 'mcp_app', 'node_modules')));
 });

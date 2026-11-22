@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Magpie tools + control page plugin for Gemini-leads-GPT 3+1 routing tiers (Sonnet / Opus / Fable + Chore) across every Magpie client.",
   "type": "module",
+  "bin": {
+    "gempt-wait": "./core/wait.mjs"
+  },
   "main": "./magpie_plugin/index.mjs",
   "exports": {
     ".": "./magpie_plugin/index.mjs"
@@ -11,6 +14,8 @@
     "build:mcp-app": "node mcp_app/build.mjs"
   },
   "files": [
+    "core/*.mjs",
+    "core/assets/*",
     "magpie_plugin/index.mjs",
     "magpie_plugin/lib/*.mjs",
     "magpie_plugin/page/*.{html,js,svg}",
@@ -40,6 +45,7 @@
     "url": "git+https://github.com/yizhang-dream/gempt.git"
   },
   "engines": {
+    "node": ">=22",
     "magpie": ">=0.1.1340"
   },
   "keywords": [

@@ -1,12 +1,12 @@
 import { appendFileSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { approvalReply, ASK_GEMINI, connectAppServer, DEVELOPER_INSTRUCTIONS, PROVIDER, readAppServerState, SANDBOX_TYPES, textInput } from './app-server-client.mjs';
-import { saveNativeRun } from './native-runs.mjs';
+import { saveRun, toolReplyPath } from '../../core/runs.mjs';
 
 export class TurnInterrupted extends Error {}
 
 export async function runAppServer({ configPath, env, runFile, sessionId, onIdentity, prompt, cwd, model,
-  effort, sandbox, approvalPolicy, threadId, gatewayUrl, timeoutSec }) {
+  effort, sandbox, approvalPolicy, threadId, gatewayUrl, timeoutSec, sandboxUpgraded }) {
   const start = Date.now();
   const deadline = start + timeoutSec * 1000;
   const remaining = () => Math.max(1, deadline - Date.now());
@@ -36,7 +36,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     if (force || Date.now() - lastWrite >= 500) {
       lastWrite = Date.now();
       progress.updated_at = new Date(lastWrite).toISOString();
-      saveNativeRun(runFile, { ...record, session_id: sessionId, progress });
+      saveRun(runFile, { ...record, session_id: sessionId, progress });
     }
   };
   const identity = (id, turnId = progress.turn_id) => {
@@ -44,7 +44,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     record.codex_thread_id = progress.thread_id = id;
     record.turn_id = progress.turn_id = turnId;
     save(true);
-    onIdentity(id, turnId);
+    onIdentity(id, turnId, record.sandbox);
   };
   const pendingChanged = () => {
     const pending = tools.values().next().value;
@@ -153,14 +153,18 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
       ? await client.request('thread/resume', { ...common, threadId, excludeTurns: true }, remaining())
       : await client.request('thread/start', { ...common, dynamicTools: [ASK_GEMINI], allowProviderModelFallback: false }, remaining());
     if (threadId && thread.thread.id !== threadId) throw new Error('Codex returned a different thread on resume.');
-    identity(thread.thread.id);
     const sandboxTypes = Object.values(SANDBOX_TYPES);
     const actual = sandboxTypes.indexOf(thread.sandbox?.type);
     const fold = (path) => process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path);
     if (!thread.cwd || fold(thread.cwd) !== fold(cwd) || actual < 0 || actual > sandboxTypes.indexOf(SANDBOX_TYPES[sandbox])
+        || (sandboxUpgraded && actual !== sandboxTypes.indexOf(SANDBOX_TYPES[sandbox]))
         || thread.modelProvider !== PROVIDER) {
       throw new Error('Codex app-server did not confirm the requested workspace, sandbox and Magpie provider.');
     }
+    record.sandbox = Object.keys(SANDBOX_TYPES)[actual];
+    record.model = model;
+    if (sandboxUpgraded) record.sandbox_upgraded = true;
+    identity(thread.thread.id);
 
     acceptTurn = true;
     const result = await client.request('turn/start', { threadId: progress.thread_id, input: textInput(prompt), model, effort,
@@ -170,7 +174,8 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
       try {
         const [id, pending] = tools.entries().next().value || [];
         if (!pending) return;
-        const reply = JSON.parse(readFileSync(join(directory, 'tool_replies', pending.call_id + '.json'), 'utf8'));
+        const reply = JSON.parse(readFileSync(toolReplyPath(directory, pending.call_id), 'utf8'));
+        if (typeof reply.answer !== 'string' || typeof reply.success !== 'boolean') throw new Error('Invalid ask_gemini reply.');
         client.reply(id, { success: reply.success, contentItems: [{ type: 'inputText', text: reply.answer }] });
         tools.delete(id);
         pendingChanged();

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const source = new URL("./", import.meta.url);
-const output = new URL("../src/gempt/mcp_app_live.html", source);
+const output = new URL("../core/assets/mcp_app_live.html", source);
 const npm = process.env.npm_execpath;
 if (!npm) throw new Error("Run this build with npm run build:mcp-app.");
 

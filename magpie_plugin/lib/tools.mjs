@@ -14,6 +14,7 @@
 import { readNativeRun, startNativeRun, waitForNativeRun } from './native-runs.mjs';
 import { findCodexCli } from './app-server-manager.mjs';
 import { runAppServer, TurnInterrupted } from './app-server-run.mjs';
+import { validateSessionId } from '../../core/state.mjs';
 import { resolveBudget } from './token-ratio.mjs';
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, openSync, readSync, realpathSync, statSync, closeSync } from 'node:fs';
@@ -58,7 +59,6 @@ const CONSULT_TIERS = ['chore', ...TIER_ORDER];
 const VALID_EFFORTS_SET = new Set(VALID_EFFORTS);
 const VALID_API_MODES = new Set(['responses', 'chat']);
 const SANDBOX_RANK = Object.freeze({ 'read-only': 0, 'workspace-write': 1, 'danger-full-access': 2 });
-const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,120}$/;
 const MAX_CONTEXT_FILE_BYTES = 131072;
 const MAX_TOTAL_CONTEXT_BYTES = 393216;
 const EXEC_STRIP_ENV = [
@@ -120,7 +120,7 @@ function isLoopbackUrl(rawUrl) {
   }
 }
 
-function normalizeWorkspaceCwd(rawCwd, { configPath, magpieConfigDir, env = process.env } = {}) {
+export function normalizeWorkspaceCwd(rawCwd, { configPath, magpieConfigDir, env = process.env } = {}) {
   if (typeof rawCwd !== 'string' || !rawCwd.trim()) {
     throw new Error('cwd is required and must be a non-empty directory path.');
   }
@@ -476,10 +476,7 @@ function generateSessionId(mode) {
 }
 
 function sessionPath(sessionsDir, sessionId) {
-  if (!SESSION_ID_RE.test(String(sessionId || ''))) {
-    throw new Error(`Invalid session_id '${String(sessionId || '')}'.`);
-  }
-  return join(sessionsDir, `${sessionId}.json`);
+  return join(sessionsDir, `${validateSessionId(sessionId)}.json`);
 }
 
 function loadSession(sessionsDir, sessionId) {
@@ -688,6 +685,9 @@ export function createGemptTools({
   options = {},
   execRunFile,
   newExecSession,
+  allowSandboxUpgrade,
+  worktreePath,
+  sourceCwd,
   env = process.env,
   probeTimeoutMs = 2000,
 } = {}) {
@@ -1109,11 +1109,8 @@ export function createGemptTools({
         if (!goal) throw new Error('goal is required and must be a non-empty string.');
 
         if (!execRunFile) {
-          const cwd = normalizeWorkspaceCwd(args.cwd, { configPath, magpieConfigDir: resolvedMagpieDir, env });
-          const hostId = args.host_conversation_id || (args.session_id && SESSION_ID_RE.test(args.session_id)
-            ? loadSession(resolvedSessionsDir, args.session_id)?.host_conversation_id : null);
           return startNativeRun({
-            args: { ...args, cwd, host_conversation_id: hostId }, agent: callingAgent(callCtx), env,
+            args, agent: callingAgent(callCtx), env,
             host: { configPath: resolveConfigPath(configPath), sessionsDir: resolvedSessionsDir,
               magpieConfigDir: resolvedMagpieDir, options: { exec: true }, probeTimeoutMs },
           });
@@ -1127,10 +1124,11 @@ export function createGemptTools({
           env,
         });
 
+        if (worktreePath) normalizeWorkspaceCwd(sourceCwd, { configPath, magpieConfigDir: resolvedMagpieDir, env });
         const workdir = normalizeWorkspaceCwd(args?.cwd, {
           configPath,
           magpieConfigDir: resolvedMagpieDir,
-          env,
+          env: worktreePath ? {} : env,
         });
 
         const hostDefaultSandbox = VALID_SANDBOXES.includes(runtime.cfg?.codex?.default_sandbox)
@@ -1158,7 +1156,10 @@ export function createGemptTools({
           }
         }
 
-        const ceiling = priorSession && SANDBOX_RANK[priorSession.sandbox] < SANDBOX_RANK[hostDefaultSandbox]
+        const requestedSandbox = args.sandbox || hostDefaultSandbox;
+        const sandboxUpgraded = Boolean(allowSandboxUpgrade && priorSession?.sandbox === 'read-only'
+          && ['workspace-write', 'danger-full-access'].includes(requestedSandbox));
+        const ceiling = priorSession && !sandboxUpgraded && SANDBOX_RANK[priorSession.sandbox] < SANDBOX_RANK[hostDefaultSandbox]
           ? priorSession.sandbox : hostDefaultSandbox;
         let effectiveSandbox = ceiling;
         if (args?.sandbox) {
@@ -1225,14 +1226,23 @@ export function createGemptTools({
           maxTotalBytes: Number(limits.max_total_context_bytes) || MAX_TOTAL_CONTEXT_BYTES,
         });
 
+        const priorTurns = Array.isArray(priorSession?.turns) ? priorSession.turns : [];
+        let carryover = '';
+        if (sandboxUpgraded) {
+          const latest = priorTurns.slice(-2).flatMap((entry) => {
+            if (typeof entry?.content === 'string') return [`${entry.role || 'Prior turn'}: ${entry.content.slice(0, 1200)}`];
+            return [entry?.goal, entry?.reply ?? entry?.text].filter((text) => typeof text === 'string').map((text) => text.slice(0, 1200));
+          });
+          carryover = ['Carryover from the prior read-only Codex thread (for context):', ...latest].join('\n');
+        }
         const prompt = buildExecPrompt({
           goal,
-          context: args?.context || '',
+          context: [carryover, args.context].filter(Boolean).join('\n\n'),
           fileBlocks: blocks,
           constraints: args?.constraints || '',
           verification: args?.verification || '',
           expectedReport: args?.expected_report || '',
-          isResume,
+          isResume: isResume && !sandboxUpgraded,
         });
 
         const timeoutSec = args?.timeout_sec !== undefined
@@ -1253,18 +1263,22 @@ export function createGemptTools({
           host_conversation_id: hostId,
           paired_model: paired, session_id: sessionId, mode: 'exec', tier: resolved.tier, model: targetModel,
           reasoning_effort: effort, cwd: workdir, sandbox: effectiveSandbox, gateway: runtime.baseUrl, agent,
+          ...(worktreePath ? { worktree_path: worktreePath, source_cwd: sourceCwd } : {}),
+          ...(sandboxUpgraded ? { sandbox_upgraded: true } : {}),
         };
-        saveSession(resolvedSessionsDir, session);
+        if (!sandboxUpgraded) saveSession(resolvedSessionsDir, session);
         let res;
         try {
           res = await runAppServer({
             configPath, env, runFile: execRunFile, sessionId, prompt, cwd: workdir, model: targetModel, effort,
-            sandbox: effectiveSandbox, threadId: priorSession?.codex_thread_id, gatewayUrl: runtime.baseUrl,
+            sandbox: effectiveSandbox, threadId: sandboxUpgraded ? undefined : priorSession?.codex_thread_id,
+            sandboxUpgraded, gatewayUrl: runtime.baseUrl,
             approvalPolicy: effectiveSandbox === 'danger-full-access' ? runtime.cfg?.codex?.approval_policy || 'never' : 'never',
             timeoutSec,
-            onIdentity(threadId, turnId) {
+            onIdentity(threadId, turnId, observedSandbox) {
               session.codex_thread_id = threadId;
               session.turn_id = turnId;
+              session.sandbox = observedSandbox;
               saveSession(resolvedSessionsDir, session);
             },
           });
@@ -1281,7 +1295,6 @@ export function createGemptTools({
           throw new Error(hint && !msg.includes(hint) ? `${msg} | ${hint}` : msg);
         }
 
-        const priorTurns = Array.isArray(priorSession?.turns) ? priorSession.turns : [];
         const turn = priorTurns.filter((entry) => !entry.role || entry.role === 'user').length + 1;
         const timestamp = nowIso();
         saveSession(resolvedSessionsDir, {
@@ -1328,6 +1341,8 @@ export function createGemptTools({
           escalated: resolved.escalated,
           auto_effort: autoEffortInfo,
           sandbox: res.sandbox,
+          ...(worktreePath ? { worktree_path: worktreePath, source_cwd: sourceCwd } : {}),
+          ...(sandboxUpgraded ? { sandbox_upgraded: true } : {}),
           cwd: workdir,
           elapsed_sec: Number(res.elapsedSec.toFixed(2)),
           commands: res.commands,
