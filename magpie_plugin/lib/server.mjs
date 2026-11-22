@@ -14,6 +14,7 @@ import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { RATIO_RANGES } from './token-ratio.mjs';
 import {
   createNativeGroups,
   getDispatchActivity,
@@ -208,6 +209,10 @@ export async function startServer({
           return send(req, res, 200, await appServer.interruptRun(id, sessionsDir));
         }
         if (req.method === 'GET' && pathname === '/api/state') {
+          const ratioRange = url.searchParams.get('ratio_range') ?? '24h';
+          if (!RATIO_RANGES.includes(ratioRange)) {
+            return send(req, res, 400, { error: 'invalid ratio_range' });
+          }
           const state = await readState({
             configPath,
             sessionsDir,
@@ -216,6 +221,7 @@ export async function startServer({
             execEnabled,
             mcpToolsEnabled,
             appServer,
+            ratioRange,
             probeTimeoutMs,
           });
           return send(req, res, 200, state);

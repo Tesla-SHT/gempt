@@ -16,9 +16,8 @@ import { findCodexCli } from './app-server-manager.mjs';
 import { runAppServer, TurnInterrupted } from './app-server-run.mjs';
 import { validateSessionId } from '../../core/state.mjs';
 import { TOOLS } from '../../core/tool-schemas.mjs';
-import { resolveBudget } from './token-ratio.mjs';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, openSync, readSync, realpathSync, statSync, closeSync } from 'node:fs';
+import { existsSync, openSync, readSync, realpathSync, statSync, closeSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import { homedir } from 'node:os';
@@ -721,87 +720,6 @@ export function createExecutionTools({
   const resolvedSessionsDir = resolveSessionsDir(sessionsDir);
 
   const tools = {
-    dispatch: {
-      description: "First action for substantive work. Apply the live ordinary or Antigravity Swarm work split and perform the selected GPT consultation or execution. Supply the goal before investigation.",
-      args: WORKLOAD.schema,
-      async execute(args, callCtx) {
-        const { goal, kind, access, role = 'solo', assignment_id: assignment } = args;
-        if (typeof goal !== 'string' || !goal.trim()) throw new Error('A task goal is required.');
-        for (const [key, value] of Object.entries({ kind, access, role })) {
-          if (!WORKLOAD.schema.properties[key].enum.includes(value)) throw new Error('Invalid ' + key);
-        }
-        const path = resolveConfigPath(configPath);
-        const cfg = readJsonSafe(path);
-        if (!cfg && existsSync(path)) throw new Error('Cannot read GemPT work split from the host configuration.');
-        const policy = cfg?.routing_policy || {};
-        const ordinary = policy.work_split ?? 'balanced';
-        const profile = role !== 'solo' && policy.swarm_split && policy.swarm_split !== 'inherit'
-          ? policy.swarm_split : ordinary;
-        if (!Object.hasOwn(WORKLOAD.profiles, profile)) throw new Error('Invalid work split in host config.');
-        const plan = WORKLOAD.profiles[profile];
-        const result = { profile, role, kind };
-        if (!plan.kinds.length) {
-          return { ...result, action: 'gemini', disabled: true,
-            text: 'GemPT automatic delegation is off. Handle this task directly in Gemini.' };
-        }
-        if (role === 'coordinator' || role === 'narrator') {
-          return { ...result, action: 'board', text: 'Keep this role on the board. Give each task one owner and summarize the results.' };
-        }
-        if (kind === 'visual' && access === 'change') throw new Error('Separate visual observation from implementation.');
-        const budget = resolveBudget(profile, {
-          policy, configPath: path, sessionsDir: resolvedSessionsDir, magpieConfigDir: resolvedMagpieDir, env,
-        });
-        const effectiveKinds = budget.effective_kinds;
-        result.budget = {
-          target_gpt_share: budget.target_gpt_share,
-          actual_gpt_share: budget.actual_gpt_share,
-          actual_gpt_fresh_share: budget.actual_gpt_fresh_share,
-          adjustment: budget.adjustment,
-          effective_kinds: effectiveKinds,
-          window_hours: budget.window_hours,
-        };
-        const delegated = effectiveKinds.includes(kind);
-        const action = access === 'provided' ? 'consult' : 'exec';
-        if (delegated && action === 'exec' && !isExecEnabled(options, env)) {
-          throw new Error('Codex execution is disabled. Enable the Magpie GemPT exec option for workspace tasks. Report this blocker to the user.');
-        }
-        if (delegated && action === 'exec') normalizeWorkspaceCwd(args.cwd, { configPath, magpieConfigDir: resolvedMagpieDir, env });
-        if (role === 'verifier' && access === 'change') throw new Error('Verifier is read-only. Send fixes to the owner.');
-        if (role === 'worker' || role === 'verifier') {
-          if (typeof assignment !== 'string' || !/^[a-f0-9]{32}$/.test(assignment)) {
-            throw new Error('Use the unique 32-hex assignment_id from the board.');
-          }
-          const claims = join(resolvedSessionsDir, 'swarm-claims');
-          mkdirSync(claims, { recursive: true });
-          try { mkdirSync(join(claims, assignment)); } catch (err) {
-            if (err.code !== 'EEXIST') throw err;
-            return { ...result, action: 'already_assigned', text: 'Check the assignment on the board with its owner before retrying.' };
-          }
-        }
-        if (!delegated) {
-          return { ...result, action: 'gemini', text: 'Handle this part in Gemini. Report to the board if assigned there.' };
-        }
-        const task = { goal, cwd: args.cwd, tier: args.tier, gemini_family: args.gemini_family,
-          context: args.context, file_paths: args.file_paths, session_id: args.session_id,
-          title: args.title, host_conversation_id: args.host_conversation_id };
-        const reply = action === 'consult'
-          ? await tools.consult.execute({ ...task, expected_output: WORKLOAD.report }, callCtx)
-          : await tools.exec.execute({ ...task, run_id: role === 'worker' || role === 'verifier' ? assignment : undefined, verification: args.verification, expected_report: WORKLOAD.report,
-            sandbox: access === 'inspect' ? 'read-only' : undefined }, callCtx);
-        if (reply.run_id && reply.state !== 'finished') return { ...result, action, ...reply };
-        let leanText = String(reply.text || '');
-        if (leanText.length > 3200) {
-          const head = leanText.slice(0, 2176).trimEnd();
-          const tail = leanText.slice(-900).trimStart();
-          const omitted = leanText.length - head.length - tail.length;
-          const ref = reply.session_id ? `session_id=${reply.session_id} / GemPT Live` : 'GemPT Live';
-          leanText = `${head}\n\n...[omitted ${omitted} chars; full output in ${ref}]...\n\n${tail}`;
-        }
-        return { ...result, action, ...(reply.run_id ? { run_id: reply.run_id, state: reply.state } : {}), model: reply.served_model || reply.model, session_id: reply.session_id,
-          text: leanText, usage: reply.usage, warnings: reply.warnings,
-          ...(reply.commands ? { commands: reply.commands.map(({ command, exit_code }) => ({ command, exit_code })) } : {}) };
-      },
-    },
     discover: {
       description:
         'Scan local Magpie gateway for available Codex subscription models, Gemini/utility models, native group/gempt-* routing groups, Codex CLI readiness, and active GemPT config.',

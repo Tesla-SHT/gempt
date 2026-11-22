@@ -1,6 +1,5 @@
 /**
- * Live Gemini vs. GPT token-ratio telemetry and closed-loop work-split budget controller.
- * Shared by the MCP server, Antigravity hooks, and Magpie control panel.
+ * Gemini vs. GPT token-ratio telemetry for the MCP server and Magpie control panel.
  */
 import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -8,11 +7,10 @@ import { extname, join, resolve } from 'node:path';
 import { WORKLOAD } from '../../core/assets.mjs';
 import { readJsonSafe, resolveSessionsDir } from '../../core/config.mjs';
 
-export const KIND_LADDER = Object.freeze(['specialist', 'engineering', 'design', 'routine']);
-export const MIN_SAMPLE_TOKENS = 20_000;
-export const UNDER_MARGIN = 6.0;
-export const STRONG_UNDER_MARGIN = 18.0;
-export const OVER_MARGIN = 8.0;
+export const RATIO_RANGES = Object.freeze(['1h', '6h', 'today', '24h', '7d']);
+const ROLLING_HOURS = { '1h': 1, '6h': 6, '24h': 24, '7d': 168 };
+const HOUR_MS = 3_600_000;
+const MIN_SAMPLE_TOKENS = 20_000;
 export const OUTPUT_WEIGHT = 5;
 const MAX_USAGE_TAIL_BYTES = 16 * 1024 * 1024;
 const DEFAULT_CACHE_TTL_MS = 15_000;
@@ -120,7 +118,7 @@ function isGemptToolCall(name, args) {
     || (name === 'invoke_subagent' && args.TypeName === 'gempt-worker');
 }
 
-function scanTranscriptFile(filePath, cutoffMs) {
+function scanTranscriptFile(filePath, cutoffMs, nowMs) {
   let text;
   try {
     text = readFileSync(filePath, 'utf-8');
@@ -143,7 +141,7 @@ function scanTranscriptFile(filePath, cutoffMs) {
     }
     if (!obj || typeof obj !== 'object' || obj.type !== 'PLANNER_RESPONSE') continue;
     const ts = parseTimestampMs(obj.created_at);
-    if (ts !== null && ts < cutoffMs) continue;
+    if (ts !== null && (ts < cutoffMs || ts > nowMs)) continue;
     for (const tc of (Array.isArray(obj.tool_calls) ? obj.tool_calls : [])) {
       const name = String(tc?.name || tc?.tool_name || '').trim();
       const args = tc?.args || tc?.arguments || {};
@@ -170,13 +168,15 @@ function listDirectories(dir) {
   }
 }
 
-function recentRunConversations(sessionsDir, cutoffMs) {
+function recentRunConversations(sessionsDir, cutoffMs, nowMs) {
   const runsDir = join(sessionsDir, 'runs');
   const conversations = new Set();
   for (const entry of listDirectories(runsDir)) {
     const path = join(runsDir, entry.name, 'state.json');
+    let mtimeMs;
     try {
-      if (statSync(path).mtimeMs < cutoffMs) continue;
+      mtimeMs = statSync(path).mtimeMs;
+      if (mtimeMs < cutoffMs) continue;
     } catch {
       continue;
     }
@@ -184,14 +184,16 @@ function recentRunConversations(sessionsDir, cutoffMs) {
     if (typeof run?.host_conversation_id !== 'string' || !run.host_conversation_id) continue;
     const timestamps = [run.created_at, run.started_at, run.finished_at, run.updated_at, run.progress?.updated_at]
       .map(parseTimestampMs).filter((time) => time !== null);
-    if (!timestamps.length || Math.max(...timestamps) >= cutoffMs) conversations.add(run.host_conversation_id);
+    if ((timestamps.length ? timestamps : [Math.trunc(mtimeMs)]).some((time) => time >= cutoffMs && time <= nowMs)) {
+      conversations.add(run.host_conversation_id);
+    }
   }
   return conversations;
 }
 
-function scanAgyBrain(brainDir, sessionsDir, cutoffMs, gemini, gpt) {
+function scanAgyBrain(brainDir, sessionsDir, cutoffMs, nowMs, gemini, gpt) {
   const entries = listDirectories(brainDir);
-  const activeHosts = entries.length ? recentRunConversations(sessionsDir, cutoffMs) : new Set();
+  const activeHosts = entries.length ? recentRunConversations(sessionsDir, cutoffMs, nowMs) : new Set();
   const unmarkedGemini = emptyBucket();
   const unmarkedGpt = emptyBucket();
   let hasGemptActivity = false;
@@ -208,7 +210,7 @@ function scanAgyBrain(brainDir, sessionsDir, cutoffMs, gemini, gpt) {
     }
     if (st.mtimeMs < cutoffMs) continue;
     filesScanned += 1;
-    const usage = scanTranscriptFile(transcript, cutoffMs);
+    const usage = scanTranscriptFile(transcript, cutoffMs, nowMs);
     if (!usage) continue;
     const active = usage.gemptActive || activeHosts.has(entry.name);
     hasGemptActivity ||= active;
@@ -234,7 +236,7 @@ function scanAgyBrain(brainDir, sessionsDir, cutoffMs, gemini, gpt) {
   };
 }
 
-function scanMagpieUsage(magpieDir, cutoffMs, gemini, gpt, other) {
+function scanMagpieUsage(magpieDir, cutoffMs, nowMs, gemini, gpt, other) {
   if (!magpieDir) return 0;
   const usageFile = join(magpieDir, 'usage.jsonl');
   let size = 0;
@@ -279,7 +281,7 @@ function scanMagpieUsage(magpieDir, cutoffMs, gemini, gpt, other) {
     }
     if (!obj || typeof obj !== 'object') continue;
     const ts = parseTimestampMs(obj.t || obj.created_at || obj.timestamp);
-    if (ts !== null && ts < cutoffMs) continue;
+    if (ts !== null && (ts < cutoffMs || ts > nowMs)) continue;
     const model = String(obj.served || obj.model || obj.req || '');
     const provider = String(obj.provider || '');
     const cls = classifyModel(model, provider);
@@ -295,16 +297,9 @@ function scanMagpieUsage(magpieDir, cutoffMs, gemini, gpt, other) {
   return matched;
 }
 
-export function dynamicBudgetEnabled(policy = {}, env = process.env) {
-  const envFlag = String(env?.GEMPT_DYNAMIC_BUDGET || '').trim().toLowerCase();
-  if (['0', 'false', 'no', 'off'].includes(envFlag)) return false;
-  if (['1', 'true', 'yes', 'on'].includes(envFlag)) return true;
-  if (policy && typeof policy === 'object' && policy.dynamic_budget === false) return false;
-  return true;
-}
-
 export function readTokenRatio({
-  windowHours = 24,
+  windowHours,
+  range = windowHours === undefined ? '24h' : 'custom',
   configPath,
   sessionsDir,
   brainDir,
@@ -314,26 +309,33 @@ export function readTokenRatio({
   env = process.env,
 } = {}) {
   const now = Number.isFinite(nowMs) ? Number(nowMs) : Date.now();
+  const customHours = Number(windowHours);
+  const selectedRange = RATIO_RANGES.includes(range) ? range
+    : Number.isFinite(customHours) && customHours > 0 ? 'custom' : '24h';
+  const hours = selectedRange === 'custom' ? Math.max(1, customHours) : ROLLING_HOURS[selectedRange];
+  const localNow = new Date(now);
+  const midnight = selectedRange === 'today'
+    ? new Date(localNow.getFullYear(), localNow.getMonth(), localNow.getDate()).getTime() : null;
+  const cutoffMs = midnight ?? now - hours * HOUR_MS;
   const resolvedBrain = resolveAgyBrainDir({ brainDir, configPath, magpieConfigDir, env });
   const resolvedMagpie = resolveMagpieDir({ magpieConfigDir, configPath, env });
   const resolvedSessions = resolveSessionsDir(sessionsDir || env.GEMPT_SESSIONS_DIR);
-  const cacheKey = `${windowHours}|${resolvedBrain}|${resolvedMagpie}|${resolvedSessions}`;
+  const cacheKey = JSON.stringify([selectedRange, midnight ?? hours, resolvedBrain, resolvedMagpie, resolvedSessions]);
 
   if (cacheTtlMs > 0 && !Number.isFinite(nowMs)) {
     const hit = _memCache.get(cacheKey);
-    if (hit && (now - hit.ts) <= cacheTtlMs) {
+    if (hit && now >= hit.ts && (now - hit.ts) <= cacheTtlMs) {
       return hit.snapshot;
     }
   }
 
-  const cutoffMs = now - Math.max(1, Number(windowHours) || 24) * 3_600_000;
   const gemini = emptyBucket();
   const gpt = emptyBucket();
   const other = emptyBucket();
 
   const { filesScanned: agyFiles, excludedSessions, skippedNonGemptSessions, scope } =
-    scanAgyBrain(resolvedBrain, resolvedSessions, cutoffMs, gemini, gpt);
-  const magpieRecords = scanMagpieUsage(resolvedMagpie, cutoffMs, gemini, gpt, other);
+    scanAgyBrain(resolvedBrain, resolvedSessions, cutoffMs, now, gemini, gpt);
+  const magpieRecords = scanMagpieUsage(resolvedMagpie, cutoffMs, now, gemini, gpt, other);
 
   const combinedWork = gemini.work + gpt.work;
   const combinedFresh = gemini.fresh + gpt.fresh;
@@ -345,7 +347,8 @@ export function readTokenRatio({
   const actualGeminiShare = actualGptShare !== null ? Math.round((100 - actualGptShare) * 10) / 10 : null;
 
   const snapshot = {
-    window_hours: windowHours,
+    range: selectedRange,
+    window_hours: (now - cutoffMs) / HOUR_MS,
     metric: 'attributable_work_in_plus_5out',
     scope,
     gemini,
@@ -372,87 +375,29 @@ export function readTokenRatio({
   return snapshot;
 }
 
-export function evaluateBudget(profile, snapshot, { enabled = true } = {}) {
-  const plan = WORKLOAD.profiles[profile] || WORKLOAD.profiles.balanced;
-  const target = Number(plan.gpt_share || 0);
-  const baseKinds = [...(plan.kinds || [])];
-  const snap = snapshot || {};
-  const gemini = snap.gemini || emptyBucket();
-  const gpt = snap.gpt || emptyBucket();
-  const combinedWork = Number(snap.combined_work ?? (gemini.work + gpt.work));
-  const combinedFresh = Number(snap.combined_fresh ?? (gemini.fresh + gpt.fresh));
-  const combinedTotal = Number(snap.combined_total ?? (gemini.total + gpt.total));
-  const sampleTokens = combinedWork > 0 ? combinedWork : combinedTotal;
-  const actual = typeof snap.actual_gpt_share === 'number' ? snap.actual_gpt_share : null;
-  const actualGem = typeof snap.actual_gemini_share === 'number' ? snap.actual_gemini_share : null;
-  const actualFresh = typeof snap.actual_gpt_fresh_share === 'number' ? snap.actual_gpt_fresh_share : null;
-  const actualTotal = typeof snap.actual_gpt_total_share === 'number' ? snap.actual_gpt_total_share : null;
-  const delta = actual !== null ? Math.round((actual - target) * 10) / 10 : null;
-
-  let effectiveKinds = [...baseKinds];
-  let adjustment = 'balanced';
-
-  if (!baseKinds.length || target <= 0) {
-    effectiveKinds = [];
-    adjustment = 'off';
-  } else if (!enabled) {
-    adjustment = 'disabled';
-  } else if (sampleTokens < MIN_SAMPLE_TOKENS || actual === null) {
-    adjustment = 'warming_up';
-  } else if (baseKinds.length >= KIND_LADDER.length || target >= 80) {
-    effectiveKinds = [...KIND_LADDER];
-    adjustment = actual < (target - UNDER_MARGIN) ? 'under_target' : 'balanced';
-  } else if (delta <= -STRONG_UNDER_MARGIN) {
-    const maxCap = target <= 35 ? 3 : KIND_LADDER.length;
-    const count = Math.min(maxCap, baseKinds.length + 2);
-    effectiveKinds = KIND_LADDER.slice(0, count);
-    adjustment = 'widened_strong';
-  } else if (delta < -UNDER_MARGIN) {
-    const count = Math.min(KIND_LADDER.length, baseKinds.length + 1);
-    effectiveKinds = KIND_LADDER.slice(0, count);
-    adjustment = 'widened';
-  } else if (delta > OVER_MARGIN) {
-    if (baseKinds.length > 1) {
-      effectiveKinds = KIND_LADDER.slice(0, baseKinds.length - 1);
-      adjustment = 'tightened';
-    } else {
-      effectiveKinds = [...baseKinds];
-      adjustment = 'over_target';
-    }
-  } else {
-    effectiveKinds = [...baseKinds];
-    adjustment = 'balanced';
-  }
-
+export function resolveBudget(profile, options = {}) {
+  const snapshot = readTokenRatio(options);
+  const target = (WORKLOAD.profiles[profile] || WORKLOAD.profiles.balanced).gpt_share;
+  const status = target === 0 ? 'off' : snapshot.combined_total === 0 ? 'no_data'
+    : snapshot.combined_work < MIN_SAMPLE_TOKENS ? 'warming_up' : 'observing';
   return {
-    enabled: Boolean(enabled),
-    metric: snap.metric || 'attributable_work_in_plus_5out',
+    status,
+    metric: snapshot.metric,
     profile,
+    range: snapshot.range,
+    scope: snapshot.scope,
     target_gpt_share: target,
-    actual_gpt_share: actual,
-    actual_gemini_share: actualGem,
-    actual_gpt_fresh_share: actualFresh,
-    actual_gpt_total_share: actualTotal,
-    delta,
-    adjustment,
-    base_kinds: baseKinds,
-    effective_kinds: effectiveKinds,
-    gemini_work_tokens: Number(gemini.work || 0),
-    gpt_work_tokens: Number(gpt.work || 0),
-    gemini_tokens: Number(gemini.total || 0),
-    gpt_tokens: Number(gpt.total || 0),
-    gemini_fresh_tokens: Number(gemini.fresh || 0),
-    gpt_fresh_tokens: Number(gpt.fresh || 0),
-    combined_work: combinedWork,
-    combined_fresh: combinedFresh,
-    combined_total: combinedTotal,
-    excluded_sessions: Number(snap.sources?.excluded_sessions || 0),
-    window_hours: snap.window_hours || 24,
+    actual_gpt_share: snapshot.actual_gpt_share,
+    actual_gemini_share: snapshot.actual_gemini_share,
+    actual_gpt_fresh_share: snapshot.actual_gpt_fresh_share,
+    actual_gpt_total_share: snapshot.actual_gpt_total_share,
+    gemini_work_tokens: snapshot.gemini.work,
+    gpt_work_tokens: snapshot.gpt.work,
+    gemini_tokens: snapshot.gemini.total,
+    gpt_tokens: snapshot.gpt.total,
+    combined_work: snapshot.combined_work,
+    combined_total: snapshot.combined_total,
+    skipped_non_gempt_sessions: snapshot.sources.skipped_non_gempt_sessions,
+    window_hours: snapshot.window_hours,
   };
-}
-
-export function resolveBudget(profile, { policy, configPath, sessionsDir, brainDir, magpieConfigDir, windowHours = 24, cacheTtlMs = DEFAULT_CACHE_TTL_MS, env = process.env } = {}) {
-  const enabled = dynamicBudgetEnabled(policy, env);
-  const snapshot = readTokenRatio({ windowHours, configPath, sessionsDir, brainDir, magpieConfigDir, cacheTtlMs, env });
-  return evaluateBudget(profile, snapshot, { enabled });
 }

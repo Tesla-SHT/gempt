@@ -9,6 +9,14 @@
   const POLL_MS = 15000;
   const LIVE_POLL_MS = 2800;
   const MODE_STORAGE_KEY = 'gempt_view_mode';
+  const RATIO_RANGE_STORAGE_KEY = 'gempt-ratio-range';
+  const RATIO_RANGE_TITLES = {
+    '1h': '1 小时内实际 Token 占比',
+    '6h': '6 小时内实际 Token 占比',
+    today: '今天实际 Token 占比',
+    '24h': '近 24h 实际 Token 占比',
+    '7d': '近 7 天实际 Token 占比',
+  };
   const SUPPORTS_HAS = typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('selector(:has(*))');
   const $ = (id) => document.getElementById(id);
   const params = new URLSearchParams(location.search);
@@ -84,6 +92,7 @@
   let currentEffortChoice = 'high';
   let currentAutoEffort = false;
   let currentViewMode = queryViewMode || readStoredMode();
+  let ratioRange = readStoredRatioRange();
   let toastTimer = null;
 
   function readStoredMode() {
@@ -92,6 +101,28 @@
       return saved === 'native' || saved === 'mcp' ? saved : '';
     } catch {
       return '';
+    }
+  }
+
+  function readStoredRatioRange() {
+    try {
+      const saved = window.localStorage?.getItem(RATIO_RANGE_STORAGE_KEY);
+      if (Object.hasOwn(RATIO_RANGE_TITLES, saved)) return saved;
+    } catch {}
+    return '24h';
+  }
+
+  function selectRatioRange(range) {
+    if (!Object.hasOwn(RATIO_RANGE_TITLES, range) || range === ratioRange) return;
+    ratioRange = range;
+    try { window.localStorage?.setItem(RATIO_RANGE_STORAGE_KEY, range); } catch {}
+    updateRatioRangeControls();
+    void refreshState({ ratioChanged: true });
+  }
+
+  function updateRatioRangeControls() {
+    for (const button of $('token-ratio-ranges')?.querySelectorAll('button') || []) {
+      button.setAttribute('aria-pressed', String(button.dataset.ratioRange === ratioRange));
     }
   }
 
@@ -415,13 +446,10 @@
     const team = profiles[state.swarm_split] || ordinary;
     const workDetail = $('work-detail');
     workDetail.textContent = ordinary?.detail || '';
-    if (ordinary?.gpt_share !== 0) {
-      workDetail.textContent += ' 动态追踪近 24h 实际 Token 占比，偏低时自动放宽 GPT 接单范围，偏高时回落 Gemini。';
-      if (state.tools?.exec_enabled === false) {
-        workDetail.textContent += ' Magpie 的 gempt_run 当前允许只读调查。要允许写入，请在 GemPT 插件选项开启 exec。';
-      }
+    if (ordinary?.gpt_share !== 0 && state.tools?.exec_enabled === false) {
+      workDetail.textContent += ' Magpie 的 gempt_run 当前允许只读调查。要允许写入，请在 GemPT 插件选项开启 exec。';
     }
-    renderTokenRatio(state.token_ratio, ordinary);
+    renderTokenRatio(state.token_ratio);
     $('swarm-detail').textContent = team?.gpt_share === 0
       ? team.detail
       : (team?.label || '') + ' · 协调者拆单和解说，成员按各自职责派单，核验者独立检查。';
@@ -438,33 +466,21 @@
     return num.toLocaleString('en-US');
   }
 
-  const RATIO_KIND_LABELS = {
-    specialist: '专研',
-    engineering: '工程',
-    design: '设计',
-    routine: '常规',
+  const RATIO_STATUS = {
+    off: '已关闭',
+    no_data: '暂无数据',
+    warming_up: '样本积累中',
+    observing: '实时观测',
   };
 
-  const RATIO_ADJ_META = {
-    off: { label: '已关闭自动派单', tone: 'neutral' },
-    disabled: { label: '静态分工', tone: 'neutral' },
-    warming_up: { label: '样本积累中', tone: 'neutral' },
-    balanced: { label: '已平衡', tone: 'ok' },
-    widened: { label: '偏低 · 已放宽派单', tone: 'warn' },
-    widened_strong: { label: '明显偏低 · 强力放宽', tone: 'warn' },
-    under_target: { label: '低于目标 · 少读直派', tone: 'warn' },
-    tightened: { label: '偏高 · 已回落 Gemini', tone: 'info' },
-    over_target: { label: '高于目标 · 仅派专研', tone: 'info' },
-  };
-
-  function renderTokenRatio(ratio, ordinary) {
+  function renderTokenRatio(ratio) {
     const card = $('token-ratio-card');
     if (!card) return;
-    if (!ratio || ordinary?.gpt_share === 0) {
-      card.hidden = true;
-      return;
-    }
-    card.hidden = false;
+    card.hidden = !ratio;
+    if (!ratio) return;
+    const rangeTitle = RATIO_RANGE_TITLES[ratio.range] || RATIO_RANGE_TITLES['24h'];
+    const title = $('token-ratio-title');
+    if (title) title.textContent = rangeTitle;
     const badge = $('token-ratio-badge');
     const gptBar = $('token-ratio-gpt-bar');
     const gemBar = $('token-ratio-gem-bar');
@@ -474,10 +490,9 @@
     const gemText = $('token-ratio-gem-text');
     const metaEl = $('token-ratio-meta');
 
-    const adj = RATIO_ADJ_META[ratio.adjustment] || { label: ratio.adjustment || '实时追踪', tone: 'neutral' };
     if (badge) {
-      badge.textContent = adj.label;
-      badge.dataset.tone = adj.tone;
+      badge.textContent = RATIO_STATUS[ratio.status] || RATIO_STATUS.no_data;
+      badge.dataset.tone = ratio.status === 'observing' ? 'ok' : 'neutral';
     }
     const target = Number(ratio.target_gpt_share || 0);
     const hasData = typeof ratio.actual_gpt_share === 'number' && Number(ratio.combined_total || 0) > 0;
@@ -489,22 +504,19 @@
     if (tick) {
       tick.hidden = !(target > 0 && target < 100);
       tick.style.left = `${target}%`;
-      tick.title = `目标 GPT ${target}%`;
+      tick.title = `GPT 参考目标 ${target}%`;
     }
     if (track) {
       track.setAttribute('aria-label', hasData
-        ? `近 24h GPT 占 ${gptPct.toFixed(1)}%，Gemini 占 ${gemPct.toFixed(1)}%，目标 GPT ${target}%`
-        : `近 24h 暂无足够 Token 样本，目标 GPT ${target}%`);
+        ? `${rangeTitle}，GPT 占 ${gptPct.toFixed(1)}%，Gemini 占 ${gemPct.toFixed(1)}%，GPT 参考目标 ${target}%`
+        : `${rangeTitle}，暂无可计算的工作量占比，GPT 参考目标 ${target}%`);
     }
 
-    const freshNote = typeof ratio.actual_gpt_fresh_share === 'number'
-      ? `（非缓存 ${ratio.actual_gpt_fresh_share.toFixed(1)}%）`
-      : '';
     if (gptText) {
       gptText.textContent = hasData
         ? `GPT ${gptPct.toFixed(1)}% · ${formatCompactTokens(ratio.gpt_tokens)}`
         : 'GPT 暂无数据';
-      gptText.title = hasData ? `GPT 总 Token ${formatCompactTokens(ratio.gpt_tokens)}${freshNote}` : '';
+      gptText.title = hasData ? `GPT 总 Token ${formatCompactTokens(ratio.gpt_tokens)}（含缓存）` : '';
     }
     if (gemText) {
       gemText.textContent = hasData
@@ -512,9 +524,9 @@
         : 'Gemini 暂无数据';
     }
     if (metaEl) {
-      const kinds = (ratio.effective_kinds || []).map((k) => RATIO_KIND_LABELS[k] || k).join(' / ') || '无';
-      metaEl.textContent = `目标 GPT ${target}% · 当前接单：${kinds}`;
-      metaEl.title = freshNote ? `按总 Token 计算（含缓存读取）；GPT 非缓存占比${freshNote}` : '';
+      const total = ratio.actual_gpt_total_share;
+      metaEl.textContent = `参考目标 ${target}%${typeof total === 'number' ? ` · 含缓存 ${total.toFixed(1)}%` : ''}`;
+      metaEl.title = '主占比按工作量 in + 5×out 计算，「含缓存」为 GPT 占总 Token 的比例；仅观测，不自动催单或改档';
     }
   }
 
@@ -1017,14 +1029,14 @@
     requestAnimationFrame(() => requestAnimationFrame(() => document.documentElement.classList.add('gp-ready')));
   }
 
-  async function refreshState({ manual = false, live = false } = {}) {
+  async function refreshState({ manual = false, live = false, ratioChanged = false } = {}) {
     if (live && stateFetch) return;
     stateFetch?.abort();
     const abort = stateFetch = new AbortController();
     const refreshBtn = $('refresh-btn');
     if (manual && refreshBtn) refreshBtn.classList.add('is-spinning');
     try {
-      const res = await apiFetch('/api/state', { signal: abort.signal });
+      const res = await apiFetch(`/api/state?ratio_range=${ratioRange}`, { signal: abort.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       if (abort.signal.aborted) return;
@@ -1042,7 +1054,7 @@
       }
       if (manual) showToast('状态已更新');
     } catch (err) {
-      if (manual && !abort.signal.aborted) showToast(`刷新失败: ${err.message}`, 'error');
+      if ((manual || ratioChanged) && !abort.signal.aborted) showToast(`刷新失败: ${err.message}`, 'error');
     } finally {
       if (stateFetch === abort) {
         stateFetch = null;
@@ -2847,6 +2859,10 @@
   document.addEventListener('click', (ev) => {
     const btn = ev.target instanceof Element ? ev.target.closest('button') : null;
     if (!btn) return;
+    if (btn.dataset.ratioRange) {
+      selectRatioRange(btn.dataset.ratioRange);
+      return;
+    }
     if (btn.id === 'refresh-btn') {
       refreshState({ manual: true });
       void refreshActivityView(activityViews[activeTab]);
@@ -2888,6 +2904,7 @@
     syncLivePoll();
   });
 
+  updateRatioRangeControls();
   refreshState();
   setInterval(() => {
     if (document.visibilityState === 'visible') refreshState();

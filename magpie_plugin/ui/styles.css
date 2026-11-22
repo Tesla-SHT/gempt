@@ -2353,7 +2353,7 @@ button.status-chip:focus-visible {
   .active-run-actions { margin-inline-start: auto; }
 }
 
-/* ---------- Live 24h Token Ratio Bar ---------- */
+/* ---------- Token Ratio ---------- */
 .token-ratio-card {
   margin-top: 8px;
   padding: 10px 12px;
@@ -2373,7 +2373,6 @@ button.status-chip:focus-visible {
 .token-ratio-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   flex-wrap: wrap;
   gap: 6px 10px;
 }
@@ -2400,28 +2399,50 @@ button.status-chip:focus-visible {
   color: #047857;
 }
 
-.token-ratio-badge[data-tone="warn"] {
-  background: color-mix(in srgb, var(--gp-warn) 16%, transparent);
-  color: #b45309;
+.token-ratio-ranges {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  padding: 2px;
+  border: 1px solid var(--gp-border);
+  border-radius: 999px;
+  margin-inline-start: auto;
 }
 
-.token-ratio-badge[data-tone="info"] {
-  background: color-mix(in srgb, #6366f1 16%, transparent);
-  color: #4f46e5;
+.token-ratio-ranges button {
+  padding: 2px 8px;
+  min-height: 26px;
+  border: 0;
+  border-radius: 999px;
+  font: inherit;
+  font-size: 11px;
+  white-space: nowrap;
+  background: transparent;
+  color: var(--gp-muted);
+  cursor: pointer;
+}
+
+.token-ratio-ranges button:hover,
+.token-ratio-ranges button[aria-pressed="true"] {
+  background: var(--gp-pill);
+  color: var(--gp-fg);
+}
+
+.token-ratio-ranges button[aria-pressed="true"] {
+  box-shadow: inset 0 0 0 1px var(--gp-focus);
+}
+
+.token-ratio-ranges button:focus-visible {
+  outline: 2px solid var(--gp-focus);
+  outline-offset: 1px;
 }
 
 @media (prefers-color-scheme: dark) {
   .token-ratio-badge[data-tone="ok"] { color: #34d399; }
-  .token-ratio-badge[data-tone="warn"] { color: #fbbf24; }
-  .token-ratio-badge[data-tone="info"] { color: #a5b4fc; }
 }
 
 :root[data-theme="dark"] .token-ratio-badge[data-tone="ok"] { color: #34d399; }
-:root[data-theme="dark"] .token-ratio-badge[data-tone="warn"] { color: #fbbf24; }
-:root[data-theme="dark"] .token-ratio-badge[data-tone="info"] { color: #a5b4fc; }
 :root[data-theme="light"] .token-ratio-badge[data-tone="ok"] { color: #047857; }
-:root[data-theme="light"] .token-ratio-badge[data-tone="warn"] { color: #b45309; }
-:root[data-theme="light"] .token-ratio-badge[data-tone="info"] { color: #4f46e5; }
 
 .token-ratio-track {
   position: relative;
@@ -2500,9 +2521,17 @@ button.status-chip:focus-visible {
 }
 
 @media (max-width: 620px) {
+  .token-ratio-ranges {
+    margin-inline-start: 0;
+  }
+
   .token-ratio-foot {
     flex-direction: column;
     align-items: flex-start;
     gap: 4px;
+  }
+
+  .token-ratio-meta {
+    order: 1;
   }
 }

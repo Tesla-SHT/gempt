@@ -16,7 +16,7 @@ const short = (value, limit) => Array.from(String(value || '')).slice(0, limit).
 const bytes = (value) => Buffer.byteLength(JSON.stringify(value));
 const textResult = (data, extras) => ({ content: [{ type: 'text', text: JSON.stringify(data) }], ...extras });
 const VERSION = readJsonSafe(new URL('../package.json', import.meta.url))?.version
-  || readJsonSafe(new URL('../../plugin.json', import.meta.url))?.version || '0.2.1';
+  || readJsonSafe(new URL('../../plugin.json', import.meta.url))?.version || '0.2.2';
 
 function compact(payload) {
   const data = { ...payload };
@@ -49,11 +49,11 @@ function compactStatus(live, record, options) {
   }
   const policy = readJsonSafe(options.configPath)?.routing_policy || {};
   const profile = String(policy.work_split || 'balanced');
-  const budget = resolveBudget(profile, {
-    policy, configPath: options.configPath, sessionsDir: options.sessionsDir, env: options.env,
+  const ratio = resolveBudget(profile, {
+    configPath: options.configPath, sessionsDir: options.sessionsDir, env: options.env,
   });
   const summary = (run, limit) => ({ id: run.run_id, st: run.state, t: short(run.title, limit) });
-  return compact({ split: profile, target: budget.target_gpt_share, gpt: budget.actual_gpt_share,
+  return compact({ split: profile, target: ratio.target_gpt_share, gpt: ratio.actual_gpt_share,
     active: live.runs.filter((run) => ACTIVE_STATES.has(run.state)).slice(0, 4).map((run) => summary(run, 24)),
     recent: live.runs.filter((run) => !ACTIVE_STATES.has(run.state)).slice(0, 3).map((run) => summary(run, 20)) });
 }

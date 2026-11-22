@@ -47,7 +47,7 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files, version }] = JSON.parse(stdout);
-  assert.equal(version, '0.2.1');
+  assert.equal(version, '0.2.2');
   const paths = files.map((file) => file.path);
   for (const path of ['LICENSE', 'plugin/hooks.json', 'magpie_plugin/lib/backend.mjs',
     'bin/gempt.mjs', 'plugin/work_split_hook.mjs', 'core/agy-install.mjs', 'core/mcp-server.mjs',
@@ -86,26 +86,46 @@ test('UI assets and API requests resolve relative to the direct and proxied page
   }
 });
 
-test('UI token-ratio card renders the calibrated targets and hides when GemPT is off', () => {
+test('UI token-ratio card offers all ranges, shows observation states and has no dispatch nags', () => {
+  const html = readFileSync(join(REPO_ROOT, 'magpie_plugin', 'ui', 'index.html'), 'utf-8');
   const script = readFileSync(join(REPO_ROOT, 'magpie_plugin', 'ui', 'app.js'), 'utf-8');
+  assert.deepEqual([...html.matchAll(/data-ratio-range="([^"]+)" aria-pressed="([^"]+)">([^<]+)/g)].map((match) => match.slice(1)), [
+    ['1h', 'false', '1小时内'], ['6h', 'false', '6小时内'], ['today', 'false', '今天'],
+    ['24h', 'true', '24小时'], ['7d', 'false', '7天'],
+  ]);
+  assert.doesNotMatch(html + script, /放宽派单|强力放宽|低于目标|已回落 Gemini|仅派专研|当前接单|自动放宽|RATIO_ADJ_META|effective_kinds/);
   const renderSource = script.match(/  function renderTokenRatio\([\s\S]+?\r?\n  }/)?.[0];
-  assert.ok(renderSource);
+  const constants = ['RATIO_RANGE_TITLES', 'RATIO_STATUS'].map((name) =>
+    script.match(new RegExp(`  const ${name} = \\{[\\s\\S]+?\\r?\\n  \\};`))?.[0]);
+  assert.ok(renderSource && constants.every(Boolean));
   const card = {};
+  const title = {};
+  const badge = { dataset: {} };
   const tick = { style: {} };
   const meta = {};
-  const elements = { 'token-ratio-card': card, 'token-ratio-target-tick': tick, 'token-ratio-meta': meta };
-  const renderTokenRatio = runInNewContext(`${renderSource}\nrenderTokenRatio`, {
+  const elements = {
+    'token-ratio-card': card, 'token-ratio-title': title, 'token-ratio-badge': badge,
+    'token-ratio-target-tick': tick, 'token-ratio-meta': meta,
+  };
+  const renderTokenRatio = runInNewContext(`${constants.join('\n')}\n${renderSource}\nrenderTokenRatio`, {
     $: (id) => elements[id],
-    RATIO_ADJ_META: {},
   });
-  for (const target of [0, 15, 35, 60, 80]) {
-    renderTokenRatio({ target_gpt_share: target }, { gpt_share: target });
-    assert.equal(card.hidden, target === 0);
-    if (target === 0) continue;
-    assert.equal(tick.hidden, false);
+  for (const [range, titleText, target, status, badgeText] of [
+    ['1h', '1 小时内实际 Token 占比', 0, 'off', '已关闭'],
+    ['6h', '6 小时内实际 Token 占比', 15, 'no_data', '暂无数据'],
+    ['today', '今天实际 Token 占比', 35, 'warming_up', '样本积累中'],
+    ['24h', '近 24h 实际 Token 占比', 60, 'observing', '实时观测'],
+    ['7d', '近 7 天实际 Token 占比', 80, 'observing', '实时观测'],
+  ]) {
+    const total = status === 'observing' ? 66.7 : null;
+    renderTokenRatio({ range, target_gpt_share: target, status, actual_gpt_total_share: total });
+    assert.equal(card.hidden, false);
+    assert.equal(title.textContent, titleText);
+    assert.equal(badge.textContent, badgeText);
+    assert.equal(tick.hidden, target === 0);
     assert.equal(tick.style.left, `${target}%`);
-    assert.equal(tick.title, `目标 GPT ${target}%`);
-    assert.ok(meta.textContent.includes(`目标 GPT ${target}%`));
+    assert.equal(meta.textContent, `参考目标 ${target}%${total === null ? '' : ' · 含缓存 66.7%'}`);
+    assert.match(meta.title, /in \+ 5×out/);
   }
 });
 
@@ -1511,20 +1531,11 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     });
 
 
-    // Routing uses the current settings even for an already registered tool instance.
-    const dispatch = enabledTools.dispatch.execute;
-    const design = { goal: 'Design a form', kind: 'design', access: 'provided' };
+    assert.equal(enabledTools.dispatch, undefined);
+    const consult = enabledTools.consult.execute;
     const config = JSON.parse(readFileSync(cfgPath, 'utf8'));
-    for (const [profile, delegated] of [['gemini', false], ['gemini_first', false], ['balanced', false], ['gpt', true], ['gpt_first', true]]) {
-      config.routing_policy.work_split = profile;
-      writeFileSync(cfgPath, JSON.stringify(config));
-      const before = magpie.requests.length;
-      const reply = await dispatch(design);
-      assert.equal(reply.action, delegated ? 'consult' : 'gemini');
-      assert.equal(magpie.requests.length - before, Number(delegated));
-    }
-    const hydrogenTask = { ...design, gemini_family: 'hydrogen' };
-    const initial = await dispatch({ ...hydrogenTask, title: '  表单\n设计 ', host_conversation_id: 'consult-host' });
+    const hydrogenTask = { goal: 'Design a form', gemini_family: 'hydrogen' };
+    const initial = await consult({ ...hydrogenTask, title: '  表单\n设计 ', host_conversation_id: 'consult-host' });
     const titledConsult = JSON.parse(readFileSync(join(sessDir, `${initial.session_id}.json`), 'utf8'));
     assert.equal(titledConsult.title, '表单 设计');
     assert.equal(titledConsult.host_conversation_id, 'consult-host');
@@ -1533,37 +1544,10 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     writeFileSync(cfgPath, JSON.stringify(config));
     await enabledTools.consult.execute({ goal: 'Continue', session_id: initial.session_id });
     assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6.1-terra');
-    await dispatch(hydrogenTask);
+    await consult(hydrogenTask);
     assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6-luna');
-    await dispatch({ ...hydrogenTask, tier: 'fable' });
+    await consult({ ...hydrogenTask, tier: 'fable' });
     assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6.2-astra');
-    config.routing_policy.swarm_split = 'gemini';
-    writeFileSync(cfgPath, JSON.stringify(config));
-    const beforeOff = magpie.requests.length;
-    for (const payload of [
-      { ...design, role: 'coordinator' },
-      { ...design, role: 'worker', assignment_id: '1'.repeat(32) },
-      { ...hydrogenTask, role: 'worker', kind: 'specialist', access: 'change' },
-    ]) {
-      const offReply = await dispatch(payload);
-      assert.equal(offReply.action, 'gemini');
-      assert.equal(offReply.disabled, true);
-    }
-    assert.equal(magpie.requests.length, beforeOff);
-
-    config.routing_policy.swarm_split = 'gemini_first';
-    writeFileSync(cfgPath, JSON.stringify(config));
-    assert.equal((await dispatch({ ...design, role: 'coordinator' })).action, 'board');
-    assert.equal((await dispatch({ ...design, role: 'worker', assignment_id: '1'.repeat(32) })).action, 'gemini');
-    assert.equal((await dispatch({ ...design, kind: 'engineering', role: 'worker', assignment_id: '3'.repeat(32) })).action, 'gemini');
-    const revision = { ...hydrogenTask, role: 'worker', kind: 'specialist', assignment_id: '2'.repeat(32) };
-    const before = magpie.requests.length;
-    const pair = await Promise.all([dispatch(revision), dispatch(revision)]);
-    assert.deepEqual(pair.map(item => item.action).sort(), ['already_assigned', 'consult']);
-    assert.equal(magpie.requests.length, before + 1);
-    assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6-luna');
-    await assert.rejects(dispatch({ ...revision, role: 'verifier', access: 'change', cwd: repoDir }), /read-only/);
-    await assert.rejects(defaultTools.dispatch.execute({ ...design, access: 'change', cwd: repoDir }), /disabled/);
 
     // Reject widening sandbox above config host ceiling
     await assert.rejects(
@@ -1626,7 +1610,7 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     await assert.rejects(reconnected.exec.execute({ ...job, cwd: outsideDir }), /different workspace/);
     await assert.rejects(reconnected.status.execute({ run_id: '../wrong' }), /Invalid run_id/);
 
-    const pairedExec = await dispatch({ ...hydrogenTask, kind: 'engineering', access: 'inspect', cwd: repoDir });
+    const pairedExec = await enabledTools.exec.execute({ ...hydrogenTask, sandbox: 'read-only', cwd: repoDir });
     assert.equal(pairedExec.model, 'codex/gpt-6-luna');
     assert.equal(app.packets.findLast((p) => p.method === 'turn/start').params.model, 'codex/gpt-6-luna');
 
@@ -1971,8 +1955,8 @@ test('requests and sessions analytics return buckets, breakdowns, speed board, 5
   }
 });
 
-test('token-ratio closed-loop budget widens dispatch when GPT is below target and exposes token_ratio in /api/state', async () => {
-  const { readTokenRatio, evaluateBudget, resolveBudget } = await import('../magpie_plugin/lib/token-ratio.mjs');
+test('token-ratio reports weighted work and cache-inclusive shares independently of the target', async () => {
+  const { readTokenRatio, resolveBudget } = await import('../magpie_plugin/lib/token-ratio.mjs');
   const dir = mkdtempSync(join(tmpdir(), 'gempt-ratio-'));
   try {
     const brainDir = join(dir, 'brain');
@@ -2010,55 +1994,116 @@ test('token-ratio closed-loop budget widens dispatch when GPT is below target an
     assert.equal(snap.actual_gemini_share, 90.3);
     assert.equal(snap.actual_gpt_total_share, 10.0);
 
-    const geminiFirst = evaluateBudget('gemini_first', snap);
-    assert.equal(geminiFirst.adjustment, 'balanced');
-    assert.deepEqual(geminiFirst.effective_kinds, ['specialist']);
-
-    const balancedUnder = evaluateBudget('balanced', snap);
-    assert.equal(balancedUnder.adjustment, 'widened_strong');
-    assert.deepEqual(balancedUnder.effective_kinds, ['specialist', 'engineering', 'design']);
-
-    const balancedOver = evaluateBudget('balanced', { ...snap, actual_gpt_share: 64.0, actual_gemini_share: 36.0 });
-    assert.equal(balancedOver.adjustment, 'tightened');
-    assert.deepEqual(balancedOver.effective_kinds, ['specialist']);
-
-    const gptFirst = evaluateBudget('gpt_first', snap);
-    assert.equal(gptFirst.adjustment, 'under_target');
-    assert.deepEqual(gptFirst.effective_kinds, ['specialist', 'engineering', 'design', 'routine']);
-
-    const cfgPath = join(dir, 'config.json');
-    const sessDir = join(dir, 'sessions');
-    mkdirSync(sessDir, { recursive: true });
-    writeFileSync(cfgPath, JSON.stringify({
-      version: 2,
-      magpie: { base_url: 'http://127.0.0.1:3425' },
-      routing_policy: { work_split: 'balanced', default_tier: 'sonnet' },
-    }), 'utf8');
-    const prevBrain = process.env.GEMPT_AGY_BRAIN_DIR;
-    process.env.GEMPT_AGY_BRAIN_DIR = brainDir;
-    try {
-      const state = await readState({ configPath: cfgPath, sessionsDir: sessDir, magpieConfigDir: magpieDir, probeTimeoutMs: 50 });
-      assert.equal(state.token_ratio.target_gpt_share, 35);
-      assert.equal(state.token_ratio.actual_gpt_share, 9.7);
-      assert.equal(state.token_ratio.adjustment, 'widened_strong');
-      const resolved = resolveBudget('balanced', { configPath: cfgPath, sessionsDir: sessDir, magpieConfigDir: magpieDir, cacheTtlMs: 0 });
-      assert.deepEqual(resolved.effective_kinds, ['specialist', 'engineering', 'design']);
-    } finally {
-      if (prevBrain === undefined) delete process.env.GEMPT_AGY_BRAIN_DIR;
-      else process.env.GEMPT_AGY_BRAIN_DIR = prevBrain;
+    const options = { brainDir, magpieConfigDir: magpieDir, sessionsDir: join(dir, 'sessions'), cacheTtlMs: 0 };
+    for (const [profile, target] of Object.entries({ gemini: 0, gemini_first: 15, balanced: 35, gpt: 60, gpt_first: 80 })) {
+      const ratio = resolveBudget(profile, options);
+      assert.equal(ratio.target_gpt_share, target);
+      assert.equal(ratio.status, target ? 'observing' : 'off');
+      assert.equal(ratio.actual_gpt_share, 9.7);
+      assert.equal(ratio.actual_gpt_fresh_share, 9.9);
+      assert.equal(ratio.actual_gpt_total_share, 10);
+      assert.equal(ratio.scope, 'all_sessions');
+      assert.equal(ratio.skipped_non_gempt_sessions, 0);
+      for (const legacy of ['adjustment', 'effective_kinds', 'base_kinds', 'delta']) assert.equal(legacy in ratio, false);
     }
-
-    // Verify mcpTools: false disables duplicate Magpie gempt__* tool registration (in isolated subprocess)
-    const pluginUrl = pathToFileURL(join(REPO_ROOT, 'magpie_plugin', 'index.mjs')).href;
-    const { stdout: disabledJson } = await execFileAsync(process.execPath, [
-      '--input-type=module', '-e',
-      `import { GemptPlugin } from ${JSON.stringify(pluginUrl)};
-       const out = await GemptPlugin({}, { port: 0, mcpTools: false });
-       console.log(JSON.stringify(out));
-       process.exit(0);`,
-    ], { timeout: 10_000, windowsHide: true });
-    assert.deepEqual(JSON.parse(disabledJson.trim()), {});
+    assert.equal(resolveBudget('balanced', { brainDir: '', magpieConfigDir: '' }).status, 'no_data');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('token-ratio and /api/state apply five timestamp windows and roll today over at local midnight', async (t) => {
+  const { RATIO_RANGES, readTokenRatio, resolveBudget } = await import('../magpie_plugin/lib/token-ratio.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-ratio-ranges-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const brainDir = join(dir, 'brain');
+  const logDir = join(brainDir, 'active', '.system_generated', 'logs');
+  const magpieConfigDir = join(dir, 'magpie');
+  const sessionsDir = join(dir, 'sessions');
+  const configPath = join(dir, 'config.json');
+  mkdirSync(logDir, { recursive: true });
+  mkdirSync(magpieConfigDir);
+  const hour = 3_600_000;
+  const midnight = new Date(2026, 0, 15).getTime();
+  const noon = midnight + 12 * hour;
+  let now = noon;
+  t.mock.method(Date, 'now', () => now);
+  const timestamps = [
+    noon - hour / 2, noon - hour, noon - 2 * hour, noon - 6 * hour, midnight, midnight - 1,
+    noon - 24 * hour, noon - 60 * hour, noon - 168 * hour, noon - 168 * hour - 1, noon + 1,
+  ].map((time) => new Date(time).toISOString());
+  const jsonl = (records) => records.map((record) => JSON.stringify(record)).join('\n') + '\n';
+  writeFileSync(join(logDir, 'transcript.jsonl'), jsonl(timestamps.map((created_at) => ({
+    type: 'PLANNER_RESPONSE', created_at, model: 'gemini-4-neon-high',
+    input_tokens: 4_000, tool_calls: [{ name: 'gpt_run' }],
+  }))));
+  writeFileSync(join(magpieConfigDir, 'usage.jsonl'), jsonl(timestamps.map((time, index) => ({
+    t: time, provider: 'codex', in: (index + 1) * 1_000,
+  }))));
+  const magpie = await startMockMagpie();
+  t.after(() => magpie.close());
+  writeFileSync(configPath, JSON.stringify({ version: 2, magpie: { base_url: magpie.url }, routing_policy: { work_split: 'balanced' } }));
+  const previousBrain = process.env.GEMPT_AGY_BRAIN_DIR;
+  process.env.GEMPT_AGY_BRAIN_DIR = brainDir;
+  t.after(() => {
+    if (previousBrain === undefined) delete process.env.GEMPT_AGY_BRAIN_DIR;
+    else process.env.GEMPT_AGY_BRAIN_DIR = previousBrain;
+  });
+  const svc = await startServer({ port: 0, configPath, sessionsDir, magpieConfigDir });
+  t.after(() => svc.close());
+  const page = await rawHttpGet({ port: svc.port, path: '/' });
+  const headers = { 'x-gempt-key': page.text.match(/name="gempt-key" content="([^"]+)"/)[1] };
+  const get = (query = '') => rawHttpGet({ port: svc.port, path: `/api/state${query}`, headers });
+  const options = { brainDir, magpieConfigDir, sessionsDir };
+  const expected = [
+    ['1h', 1, 3_000, 8_000], ['6h', 6, 10_000, 16_000], ['today', 12, 15_000, 20_000],
+    ['24h', 24, 28_000, 28_000], ['7d', 168, 45_000, 36_000],
+  ];
+  assert.deepEqual(RATIO_RANGES, expected.map(([range]) => range));
+  for (const [range, hours, gpt, gemini] of expected) {
+    const snapshot = readTokenRatio({ ...options, range, nowMs: noon });
+    assert.equal(snapshot.range, range);
+    assert.equal(snapshot.window_hours, hours);
+    assert.equal(snapshot.gpt.work, gpt);
+    assert.equal(snapshot.gemini.work, gemini);
+    const response = await get(`?ratio_range=${range}`);
+    assert.equal(response.status, 200);
+    const ratio = JSON.parse(response.text).token_ratio;
+    assert.equal(ratio.range, range);
+    assert.equal(ratio.window_hours, hours);
+    assert.equal(ratio.gpt_work_tokens, gpt);
+    assert.equal(ratio.gemini_work_tokens, gemini);
+    assert.equal(ratio.combined_work, gpt + gemini);
+    assert.equal(ratio.combined_total, gpt + gemini);
+    assert.equal(ratio.actual_gpt_share, Math.round(gpt / (gpt + gemini) * 1_000) / 10);
+    assert.equal(ratio.status, range === '1h' ? 'warming_up' : 'observing');
+    assert.equal(ratio.scope, 'gempt_active_sessions');
+  }
+  assert.equal(JSON.parse((await get()).text).token_ratio.range, '24h');
+  for (const invalid of ['2h', '', 'TODAY', 'custom']) {
+    const response = await get(`?ratio_range=${invalid}`);
+    assert.equal(response.status, 400);
+    assert.equal(JSON.parse(response.text).error, 'invalid ratio_range');
+  }
+  const custom = resolveBudget('balanced', { ...options, windowHours: 2, nowMs: noon });
+  assert.equal(custom.range, 'custom');
+  assert.equal(custom.window_hours, 2);
+  assert.equal(custom.gpt_work_tokens, 6_000);
+  assert.equal(readTokenRatio({ ...options, range: '1h', windowHours: 2 }).gpt.work, 3_000);
+  now = midnight - 1;
+  assert.equal(readTokenRatio({ ...options, range: 'today' }).gpt.work, 13_000);
+  now = midnight;
+  assert.equal(readTokenRatio({ ...options, range: 'today' }).gpt.work, 5_000);
+});
+
+test('mcpTools false disables duplicate Magpie GemPT tool registration', async () => {
+  const pluginUrl = pathToFileURL(join(REPO_ROOT, 'magpie_plugin', 'index.mjs')).href;
+  const { stdout } = await execFileAsync(process.execPath, [
+    '--input-type=module', '-e',
+    `import { GemptPlugin } from ${JSON.stringify(pluginUrl)};
+     const out = await GemptPlugin({}, { port: 0, mcpTools: false });
+     console.log(JSON.stringify(out));
+     process.exit(0);`,
+  ], { timeout: 10_000, windowsHide: true });
+  assert.deepEqual(JSON.parse(stdout.trim()), {});
 });

@@ -1,4 +1,4 @@
-# GemPT v0.2.1
+# GemPT v0.2.2
 
 GemPT 让 Gemini 通过本机 Magpie 咨询 GPT、委派 Codex 仓库任务，并在 GemPT Live 查看和介入运行。Magpie 插件、Antigravity stdio MCP、hooks、安装器和 CLI 共用一套 Node.js ESM 核心。运行时只使用 Node.js 内置模块。GemPT Live 随包提供预构建资源。
 

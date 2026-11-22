@@ -156,7 +156,7 @@ export function buildMcpSnippet({ antigravityPluginDir, repoRoot = REPO_ROOT, pr
   };
 }
 
-export async function readState({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, execEnabled, mcpToolsEnabled, appServer, probeTimeoutMs = 2000 } = {}) {
+export async function readState({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, execEnabled, mcpToolsEnabled, appServer, ratioRange = '24h', probeTimeoutMs = 2000 } = {}) {
   const resolvedConfigPath = resolveConfigPath(configPath);
   const resolvedSessionsDir = resolveSessionsDir(sessionsDir);
   const resolvedMagpieDir = resolveMagpieConfigDir(magpieConfigDir);
@@ -233,7 +233,7 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
   const { totals: activityTotals } = readDispatchActivity(resolvedSessionsDir);
   const workSplit = policy.work_split ?? 'balanced';
   const tokenRatio = resolveBudget(workSplit, {
-    policy,
+    range: ratioRange,
     configPath: resolvedConfigPath,
     sessionsDir: resolvedSessionsDir,
     magpieConfigDir: resolvedMagpieDir,

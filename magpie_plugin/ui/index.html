@@ -139,8 +139,15 @@
               <span id="work-detail" class="control-hint" aria-live="polite"></span>
               <div id="token-ratio-card" class="token-ratio-card" hidden>
                 <div class="token-ratio-head">
-                  <span class="token-ratio-title">近 24h 实际 Token 占比</span>
+                  <span id="token-ratio-title" class="token-ratio-title">近 24h 实际 Token 占比</span>
                   <span id="token-ratio-badge" class="token-ratio-badge" data-tone="neutral"></span>
+                  <div id="token-ratio-ranges" class="token-ratio-ranges" role="group" aria-label="Token 统计时间范围">
+                    <button type="button" data-ratio-range="1h" aria-pressed="false">1小时内</button>
+                    <button type="button" data-ratio-range="6h" aria-pressed="false">6小时内</button>
+                    <button type="button" data-ratio-range="today" aria-pressed="false">今天</button>
+                    <button type="button" data-ratio-range="24h" aria-pressed="true">24小时</button>
+                    <button type="button" data-ratio-range="7d" aria-pressed="false">7天</button>
+                  </div>
                 </div>
                 <div class="token-ratio-track" role="img" id="token-ratio-track" aria-label="近 24h GPT 与 Gemini Token 占比">
                   <div id="token-ratio-gpt-bar" class="token-ratio-fill is-gpt" style="width: 0%"></div>
