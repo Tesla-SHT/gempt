@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync,
@@ -154,6 +154,17 @@ function syncInPlace(staged, target) {
   }
 }
 
+function resetWindowsAcls(paths) {
+  if (!WINDOWS) return;
+  const icacls = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'icacls.exe');
+  for (const path of paths) {
+    try {
+      const recursive = statSync(path).isDirectory() ? ['/T'] : [];
+      spawnSync(icacls, [path, '/reset', ...recursive, '/C', '/Q'], { stdio: 'ignore', windowsHide: true });
+    } catch {}
+  }
+}
+
 function installWaitShim(target, nodeBin, binDir) {
   mkdirSync(binDir, { recursive: true });
   const helper = join(binDir, 'gempt-wait.mjs');
@@ -226,9 +237,11 @@ export async function installAgy({ target = DEFAULT_AGY_TARGET, source, force = 
         if (!WINDOWS || !['EACCES', 'EBUSY', 'EPERM'].includes(error.code) || !existsSync(target)) throw error;
         syncInPlace(staged, target);
       }
+      resetWindowsAcls([target]);
       let shims = [];
       let shimError;
       try { shims = installWaitShim(target, nodeBin, resolvePath(binDir)); } catch (error) { shimError = error.message; }
+      resetWindowsAcls(shims);
       return { installed: true, plugin_dir: target, mcp_config: config, shims,
         ...(shimError ? { shim_error: shimError } : {}), refresh: await refresh(env) };
     } finally {

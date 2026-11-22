@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync,
   rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -204,6 +206,53 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   writeFileSync(join(source, 'plugin.json'), JSON.stringify({ name: 'wrong-plugin' }));
   await assert.rejects(installAgy({ source, target, binDir, env }), /manifest name 'gempt'/);
   assert.deepEqual(JSON.parse(readFileSync(join(target, 'mcp_config.json'), 'utf8')), config);
+});
+
+test('Antigravity installer resets Windows plugin and shim ACLs after placement, even if icacls is unavailable', async (t) => {
+  const f = fixture(t);
+  const target = join(f.cwd, 'plugin with spaces');
+  const binDir = join(f.cwd, 'bin with spaces');
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  let installWindowsAgy;
+  try {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    ({ installAgy: installWindowsAgy } = await import('../core/agy-install.mjs?test-windows-acls'));
+  } finally {
+    Object.defineProperty(process, 'platform', platform);
+  }
+
+  const calls = [];
+  const mock = t.mock.method(childProcess, 'spawnSync', (command, args, options) => {
+    calls.push({
+      command: basename(command), args, options,
+      exists: existsSync(args[0]), pluginPlaced: existsSync(join(target, 'plugin.json')),
+      shimsWritten: existsSync(join(binDir, 'gempt-wait.cmd')),
+    });
+    return { error: Object.assign(new Error('icacls unavailable'), { code: 'ENOENT' }) };
+  });
+  syncBuiltinESMExports();
+  try {
+    const env = { ...f.env, ANTIGRAVITY_CSRF_TOKEN: '' };
+    const installed = await installWindowsAgy({ target, binDir, env });
+    assert.equal(installed.installed, true);
+    assert.equal(installed.shims.length, 3);
+    assert.deepEqual(calls.map(({ args }) => args), [
+      [installed.plugin_dir, '/reset', '/T', '/C', '/Q'],
+      ...installed.shims.map((path) => [path, '/reset', '/C', '/Q']),
+    ]);
+    assert.deepEqual(calls.map(({ shimsWritten }) => shimsWritten), [false, true, true, true]);
+    assert.ok(calls.every(({ command, exists, pluginPlaced, options }) =>
+      command === 'icacls.exe' && exists && pluginPlaced && options.windowsHide === true));
+
+    if (process.platform !== 'win32') {
+      calls.length = 0;
+      await installAgy({ target, binDir, env });
+      assert.deepEqual(calls, []);
+    }
+  } finally {
+    mock.mock.restore();
+    syncBuiltinESMExports();
+  }
 });
 
 test('Node CLI discovers, updates tiers, prints launchers and installs to an isolated home', async (t) => {
