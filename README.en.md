@@ -1,4 +1,4 @@
-# GemPT v0.3.0
+# GemPT v0.3.1
 
 [中文文档](./README.md) · [Antigravity Plugin README](./plugin/README.md) · [Third-Party Licenses](./THIRD_PARTY_LICENSES.txt)
 
@@ -21,7 +21,7 @@ Runtime code uses only Node.js built-in modules (`>= 20.11.0`). GemPT Live ships
 ```bash
 magpie plugin add gempt
 # Or pin a release tag from GitHub:
-magpie plugin add github:yizhang-dream/gempt#v0.3.0
+magpie plugin add github:yizhang-dream/gempt#v0.3.1
 ```
 
 Open **Plugins → GemPT** in Magpie and click **Enable Subscription Config** (or run `gempt init`).
@@ -30,9 +30,9 @@ Open **Plugins → GemPT** in Magpie and click **Enable Subscription Config** (o
 
 ```bash
 # Recommended pinned install:
-npx --yes gempt@0.3.0 install-agy
+npx --yes gempt@0.3.1 install-agy
 # Or from GitHub release tag:
-npx --yes github:yizhang-dream/gempt#v0.3.0 install-agy
+npx --yes github:yizhang-dream/gempt#v0.3.1 install-agy
 ```
 
 From a local checkout:

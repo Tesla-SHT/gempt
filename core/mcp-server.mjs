@@ -16,7 +16,7 @@ const short = (value, limit) => Array.from(String(value || '')).slice(0, limit).
 const bytes = (value) => Buffer.byteLength(JSON.stringify(value));
 const textResult = (data, extras) => ({ content: [{ type: 'text', text: JSON.stringify(data) }], ...extras });
 const VERSION = readJsonSafe(new URL('../package.json', import.meta.url))?.version
-  || readJsonSafe(new URL('../../plugin.json', import.meta.url))?.version || '0.3.0';
+  || readJsonSafe(new URL('../../plugin.json', import.meta.url))?.version || '0.3.1';
 
 function compact(payload) {
   const data = { ...payload };

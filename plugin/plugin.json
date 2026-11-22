@@ -1,7 +1,7 @@
 {
   "name": "gempt",
   "displayName": "GemPT — Gemini × GPT Orchestrator",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Gemini-leads-GPT orchestrator plugin: Antigravity MCP (gpt_run / gpt_ask / gpt_ctl + GemPT Live) and /gempt-{sonnet,opus,fable,chore} slash skills paired with Magpie's Plugins -> GemPT control page to route GPT/Codex locally.",
   "author": {
     "name": "yizhang-dream",

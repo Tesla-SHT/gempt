@@ -11,7 +11,7 @@ description: >-
 
 # gempt — Gemini × GPT 协作编排手册
 
-GemPT v0.3.0 使用 Node.js（`>= 20.11.0`）。Antigravity 的 `gempt_gempt` MCP 提供 `gpt_run`、`gpt_ask`、`gpt_ctl`；Magpie HTTP MCP 对应 `gempt_run`、`gempt_ask`、`gempt_ctl`，参数一致。下文使用 Antigravity 工具名。
+GemPT v0.3.1 使用 Node.js（`>= 20.11.0`）。Antigravity 的 `gempt_gempt` MCP 提供 `gpt_run`、`gpt_ask`、`gpt_ctl`；Magpie HTTP MCP 对应 `gempt_run`、`gempt_ask`、`gempt_ctl`，参数一致。下文使用 Antigravity 工具名。
 
 > 启用本插件时，`rules/AGENTS.md` 会常驻生效；按 Magpie 面板的 5 档工作分工（0% / 15% / 35% / 60% / 80%）决定何时委派。
 

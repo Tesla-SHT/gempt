@@ -59,7 +59,7 @@ const PKG = (() => {
   }
 })();
 
-const BUILD_ID = `${PKG.version || '0.3.0'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
+const BUILD_ID = `${PKG.version || '0.3.1'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
 const pidAlive = (pid) => {
   if (!Number.isSafeInteger(pid) || pid < 1) return false;
   try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }
@@ -235,6 +235,13 @@ export async function startServer({
           if (req.headers.origin === 'null') return send(req, res, 403, { error: 'invalid origin' });
           return send(req, res, 200, await installAgy({ target: antigravityPluginDir, binDir: agyBinDir }));
         }
+        if (req.method === 'POST' && pathname === '/api/app-server/restart') {
+          if (req.headers.origin === 'null') return send(req, res, 403, { error: 'invalid origin' });
+          if (!appServer) return send(req, res, 503, { error: 'shared Codex app-server management is disabled' });
+          const body = await readJsonBody(req);
+          const result = await appServer.restart({ force: body?.force === true });
+          return send(req, res, result.status || (result.ok ? 200 : 500), result);
+        }
         const interrupt = /^\/api\/runs\/(.*?)\/interrupt$/.exec((req.url || '/').split('?', 1)[0]);
         if (req.method === 'POST' && interrupt) {
           if (req.headers.origin === 'null') return send(req, res, 403, { error: 'invalid origin' });
@@ -247,6 +254,9 @@ export async function startServer({
           const ratioRange = url.searchParams.get('ratio_range') ?? '24h';
           if (!RATIO_RANGES.includes(ratioRange)) {
             return send(req, res, 400, { error: 'invalid ratio_range' });
+          }
+          if (url.searchParams.get('probe') === '1' && appServer) {
+            await appServer.ensureRunning({ probe: true });
           }
           const state = await readState({
             configPath,

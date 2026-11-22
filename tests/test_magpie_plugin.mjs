@@ -13,6 +13,7 @@ import { promisify } from 'node:util';
 import { runInNewContext } from 'node:vm';
 import { buildMcpSnippet, findMagpieCli, listDispatchActivity, normalizeTitle, readActiveRuns, readState, setDefaultSandbox, setDefaultTier } from '../magpie_plugin/lib/backend.mjs';
 import { createAppServerManager, resolveCodexInvocation } from '../magpie_plugin/lib/app-server-manager.mjs';
+import { buildEscalationSuggestion } from '../magpie_plugin/lib/routing.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
 import { createExecutionTools, createGemptTools } from '../magpie_plugin/lib/tools.mjs';
 import { TOOLS } from '../core/mcp-server.mjs';
@@ -47,7 +48,7 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files, version }] = JSON.parse(stdout);
-  assert.equal(version, '0.3.0');
+  assert.equal(version, '0.3.1');
   const paths = files.map((file) => file.path);
   for (const path of ['LICENSE', 'THIRD_PARTY_LICENSES.txt', 'README.en.md', 'plugin/README.md', 'plugin/assets/logo.svg', 'scripts/build-agy-plugin.mjs', 'plugin/hooks.json', 'magpie_plugin/lib/backend.mjs',
     'bin/gempt.mjs', 'plugin/work_split_hook.mjs', 'core/agy-install.mjs', 'core/mcp-server.mjs',
@@ -2110,7 +2111,7 @@ test('mcpTools false disables duplicate Magpie GemPT tool registration', async (
 
 test('Magpie marketplace check shape and inspect+share guard hold', async () => {
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '0.3.0');
+  assert.equal(pkg.version, '0.3.1');
   assert.ok(pkg.keywords.includes('magpie-plugin'));
   assert.ok(pkg.files.includes('THIRD_PARTY_LICENSES.txt'));
   assert.ok(pkg.magpie?.summary?.en && pkg.magpie?.summary?.zh);
@@ -2147,4 +2148,110 @@ test('Windows Codex shim resolution supports non-npm shims and server probe reje
     startServer({ port: spoofPort, configPath: join(dir, 'config.json'), manageAppServer: false }),
     /in use by another program/,
   );
+});
+
+test('transport disconnects yield recovery hint and app-server self-heals on wedge, config drift, and restart API', async (t) => {
+  const hint = buildEscalationSuggestion({ mode: 'exec', tier: 'fable', effort: 'xhigh', errorMessage: 'read ECONNRESET' });
+  assert.match(hint, /transport disconnected/i);
+  assert.doesNotMatch(hint, /Already at xhigh\/fable/);
+
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-selfheal-'));
+  const managers = [];
+  t.after(async () => {
+    for (const m of managers) await m.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const configPath = join(dir, 'config.json');
+  const sessionsDir = join(dir, 'sessions');
+  mkdirSync(join(sessionsDir, 'runs'), { recursive: true });
+  const fakeCli = join(dir, process.platform === 'win32' ? 'codex.exe' : 'codex');
+  writeFileSync(fakeCli, 'fake');
+  if (process.platform !== 'win32') chmodSync(fakeCli, 0o755);
+  writeFileSync(configPath, JSON.stringify({
+    magpie: { base_url: 'http://127.0.0.1:3425' },
+    codex: { cli_path: fakeCli },
+  }));
+
+  let spawnCount = 0;
+  let healthy = true;
+  const fakeSpawn = () => {
+    spawnCount++;
+    const child = new EventEmitter();
+    child.pid = process.pid;
+    child.stderr = new EventEmitter();
+    child.kill = () => {
+      child.exitCode = 0;
+      child.emit('exit', 0, null);
+    };
+    return child;
+  };
+  const fakeConnect = async () => {
+    if (!healthy) throw new Error('wedged');
+    return { close() {}, request: async () => ({}) };
+  };
+
+  const mgr = createAppServerManager({
+    configPath,
+    sessionsDir,
+    env: { ...process.env, GEMPT_APP_SERVER_STATE: join(dir, 'app-server.json') },
+    port: 0,
+    spawnProcess: fakeSpawn,
+    connect: fakeConnect,
+    startupMs: 2000,
+    backoffMs: [20],
+  });
+  managers.push(mgr);
+
+  const first = await mgr.ensureRunning();
+  assert.equal(first.running, true);
+  assert.equal(spawnCount, 1);
+
+  // 1. Config change (gateway_url) triggers automatic restart when idle
+  writeFileSync(configPath, JSON.stringify({
+    magpie: { base_url: 'http://127.0.0.1:3426' },
+    codex: { cli_path: fakeCli },
+  }));
+  const afterConfig = await mgr.ensureRunning();
+  assert.equal(afterConfig.running, true);
+  assert.equal(afterConfig.gateway_url, 'http://127.0.0.1:3426');
+  assert.equal(spawnCount, 2);
+
+  // 2. Wedged process (alive PID, failing WS probe) triggers automatic restart on probe
+  healthy = false;
+  let probeCalls = 0;
+  const mgr2 = createAppServerManager({
+    configPath,
+    sessionsDir,
+    env: { ...process.env, GEMPT_APP_SERVER_STATE: join(dir, 'app-server-2.json') },
+    port: 0,
+    spawnProcess: fakeSpawn,
+    connect: async () => {
+      probeCalls++;
+      if (probeCalls === 2) throw new Error('wedged');
+      return { close() {}, request: async () => ({}) };
+    },
+    startupMs: 2000,
+    backoffMs: [20],
+  });
+  managers.push(mgr2);
+  await mgr2.ensureRunning();
+  const spawnsBeforeProbe = spawnCount;
+  const healed = await mgr2.ensureRunning({ probe: true });
+  assert.equal(healed.running, true);
+  assert.equal(spawnCount, spawnsBeforeProbe + 1);
+
+  // 3. Manual restart returns 409 when active runs exist unless force: true
+  const runId = 'a'.repeat(32);
+  mkdirSync(join(sessionsDir, 'runs', runId), { recursive: true });
+  writeFileSync(join(sessionsDir, 'runs', runId, 'state.json'), JSON.stringify({
+    run_id: runId, source: 'magpie_exec', state: 'running', pid: process.pid,
+    deadline: Date.now() / 1000 + 600, cwd: dir, goal: 'busy',
+  }));
+  const blocked = await mgr.restart({ force: false });
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.status, 409);
+  healthy = true;
+  const forced = await mgr.restart({ force: true });
+  assert.equal(forced.ok, true);
+  assert.equal(forced.status, 200);
 });

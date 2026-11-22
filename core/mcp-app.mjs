@@ -7,7 +7,7 @@ import { readHostContext } from './host-context.mjs';
 import { resolvePath, withinPath } from './state.mjs';
 
 const APP_VERSION = readJsonSafe(new URL('../package.json', import.meta.url))?.version
-  || readJsonSafe(new URL('../../plugin.json', import.meta.url))?.version || '0.3.0';
+  || readJsonSafe(new URL('../../plugin.json', import.meta.url))?.version || '0.3.1';
 
 export const APP_URI = 'ui://gempt/live.html';
 export const APP_RESOURCE = {

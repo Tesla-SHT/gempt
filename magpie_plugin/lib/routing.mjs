@@ -187,6 +187,8 @@ export function classifyTaskEffort({
   };
 }
 
+const TRANSPORT_ERROR_RE = /ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|socket hang up|WebSocket|app-server|未检测到\s*Magpie|网关与\s*GemPT\s*配置不一致/i;
+
 export function buildEscalationSuggestion({
   mode = 'exec',
   tier = 'sonnet',
@@ -199,6 +201,13 @@ export function buildEscalationSuggestion({
     timedOut || errorMessage || (mode === 'exec' && (verificationStatus === 'failed' || verificationStatus === 'unverified')),
   );
   if (!needsHelp) return '';
+
+  if (errorMessage && TRANSPORT_ERROR_RE.test(String(errorMessage))) {
+    return (
+      'Codex app-server transport disconnected (e.g., Magpie plugin reload or local service restart). '
+      + 'Retry this run, or click "重启 Codex 服务" in Magpie Plugins -> GemPT without restarting Magpie.'
+    );
+  }
 
   const cleanTier = String(tier || 'sonnet').trim().toLowerCase();
   const cleanEffort = String(effort || 'medium').trim().toLowerCase();

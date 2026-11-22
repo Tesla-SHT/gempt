@@ -1,4 +1,4 @@
-# GemPT — Antigravity Plugin (v0.3.0)
+# GemPT — Antigravity Plugin (v0.3.1)
 
 GemPT lets Gemini in Antigravity consult GPT models (`gpt_ask`), delegate repository inspection and coding tasks to Codex (`gpt_run`), and monitor or steer live runs in the **GemPT Live** side pane (`gpt_ctl`), routed through your local [Magpie](https://github.com/yetone/magpie) gateway.
 

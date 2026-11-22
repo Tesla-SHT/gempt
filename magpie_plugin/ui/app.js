@@ -1036,7 +1036,7 @@
     const refreshBtn = $('refresh-btn');
     if (manual && refreshBtn) refreshBtn.classList.add('is-spinning');
     try {
-      const res = await apiFetch(`/api/state?ratio_range=${ratioRange}`, { signal: abort.signal });
+      const res = await apiFetch(`/api/state?ratio_range=${ratioRange}${manual ? '&probe=1' : ''}`, { signal: abort.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       if (abort.signal.aborted) return;
@@ -2039,10 +2039,64 @@
     return line;
   }
 
+  let restartConfirmTimer = null;
+  let restartConfirmPending = false;
+  let restartInFlight = false;
+
+  function clearRestartConfirm() {
+    restartConfirmPending = false;
+    if (restartConfirmTimer) {
+      clearTimeout(restartConfirmTimer);
+      restartConfirmTimer = null;
+    }
+  }
+
+  async function restartAppServerAction() {
+    if (restartInFlight) return;
+    const chip = $('chip-app-server');
+    const val = $('chip-app-server-val');
+    const force = restartConfirmPending;
+    clearRestartConfirm();
+    restartInFlight = true;
+    if (chip) chip.disabled = true;
+    if (val) val.textContent = '重启中…';
+    try {
+      const res = await apiFetch('/api/app-server/restart', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ force }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (res.status === 409 && !force) {
+        restartConfirmPending = true;
+        if (val) val.textContent = '再点强制重启';
+        showToast(payload.error || '当前有运行中任务，再点一次将强制重启 Codex 服务', 'error');
+        restartConfirmTimer = setTimeout(() => {
+          clearRestartConfirm();
+          if (latestState) renderLiveOverview(latestState);
+        }, 5000);
+        return;
+      }
+      if (!res.ok || !payload.ok) {
+        throw new Error(payload.error || `HTTP ${res.status}`);
+      }
+      showToast('共享 Codex app-server 已重启');
+      await refreshState({ manual: false });
+    } catch (err) {
+      showToast(`重启失败: ${err.message}`, 'error');
+      await refreshState({ manual: false });
+    } finally {
+      restartInFlight = false;
+      if (chip) chip.disabled = false;
+    }
+  }
+
   function renderLiveOverview(state) {
     const server = state.app_server;
     $('chip-app-server').dataset.tone = server?.error ? 'warn' : server?.running ? 'ok' : 'neutral';
-    $('chip-app-server-val').textContent = server?.error ? '异常' : server?.running ? '运行中' : '未运行';
+    if (!restartInFlight && !restartConfirmPending) {
+      $('chip-app-server-val').textContent = server?.error ? '异常 · 点此重启' : server?.running ? '运行中 · 重启' : '未运行 · 启动';
+    }
     const error = $('app-server-error');
     error.textContent = server?.error || '';
     error.hidden = !server?.error;
@@ -2882,6 +2936,10 @@
     }
     if (btn.id === 'copy-rules-btn') {
       copyRulesConfig();
+      return;
+    }
+    if (btn.id === 'chip-app-server') {
+      restartAppServerAction();
       return;
     }
     if (btn.id === 'chip-native') {

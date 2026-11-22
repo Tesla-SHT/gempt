@@ -98,15 +98,25 @@ export async function openAppServerSocket(url, token, timeoutMs, onMessage, onDi
     }
   }
 
+  socket.setKeepAlive?.(true, 15_000);
+  socket.setNoDelay?.(true);
+  const pingTimer = setInterval(() => {
+    if (!socket.destroyed && socket.writable) {
+      try { send(9, Buffer.alloc(0)); } catch { /* Disconnect handler will fire. */ }
+    }
+  }, 20_000);
+  pingTimer.unref?.();
+  const stopPing = () => clearInterval(pingTimer);
+
   socket.on('data', consume);
-  socket.on('error', onDisconnect);
-  socket.once('close', () => onDisconnect(new Error('Codex app-server closed the WebSocket.')));
+  socket.on('error', (err) => { stopPing(); onDisconnect(err); });
+  socket.once('close', () => { stopPing(); onDisconnect(new Error('Codex app-server closed the WebSocket.')); });
   setImmediate(() => {
     if (head.length) consume(Buffer.alloc(0));
     socket.resume();
   });
   return {
     send(text) { send(1, Buffer.from(text)); },
-    close() { socket.destroy(); },
+    close() { stopPing(); socket.destroy(); },
   };
 }
