@@ -1,0 +1,89 @@
+# GemPT v0.3.0
+
+[中文文档](./README.md) · [Antigravity Plugin README](./plugin/README.md) · [Third-Party Licenses](./THIRD_PARTY_LICENSES.txt)
+
+GemPT enables Gemini to consult GPT models (`gpt_ask`), delegate repository inspection and coding tasks to Codex (`gpt_run`), and observe or steer runs in real time inside **GemPT Live** (`gpt_ctl`), routed through your local [Magpie](https://github.com/yetone/magpie) gateway.
+
+Runtime code uses only Node.js built-in modules (`>= 20.11.0`). GemPT Live ships prebuilt with full third-party license notices in [THIRD_PARTY_LICENSES.txt](./THIRD_PARTY_LICENSES.txt).
+
+## Prerequisites
+
+- **Node.js `>= 20.11.0`**
+- **Magpie `>= 0.1.1340`** ([yetone/magpie](https://github.com/yetone/magpie) / [usemagpie.ai](https://usemagpie.ai)), running locally (default `http://127.0.0.1:3425`) and signed in to ChatGPT/Codex (or configured with API fallback).
+- **Magpie-side GemPT plugin**: hosts the `Plugins → GemPT` control page and manages the shared Codex `app-server` (installing Codex CLI alone cannot replace it).
+- **Codex CLI** (`npm install -g @openai/codex`, tested with `0.164.0`): required for `gpt_run` repository execution (optional if you only use `gpt_ask`).
+- **Git**: required when using `workspace="share"` for isolated worktrees.
+
+## Quick Start (From Scratch)
+
+### 1. Install the Magpie Plugin
+
+```bash
+magpie plugin add gempt
+# Or pin a release tag from GitHub:
+magpie plugin add github:yizhang-dream/gempt#v0.3.0
+```
+
+Open **Plugins → GemPT** in Magpie and click **Enable Subscription Config** (or run `gempt init`).
+
+### 2. Install the Antigravity Plugin
+
+```bash
+# Recommended pinned install:
+npx --yes gempt@0.3.0 install-agy
+# Or from GitHub release tag:
+npx --yes github:yizhang-dream/gempt#v0.3.0 install-agy
+```
+
+From a local checkout:
+- **Linux / macOS**: `bash install.sh`
+- **Windows PowerShell**: `powershell -ExecutionPolicy Bypass -File .\install.ps1`
+- **Build a portable Marketplace bundle**: `npm run build:agy-plugin` (outputs self-contained `dist/agy-plugin/` using `${PLUGIN_ROOT}` and relative hook paths)
+
+If `~/bin` is not on your `PATH`, add it to invoke bare `gempt-wait`, or execute the exact `wait_command` returned by `gpt_run` (which includes a fully-quoted fallback).
+
+> **Note:** When the Antigravity plugin is enabled, `rules/AGENTS.md` stays active for conversations. Disable the plugin in Customizations to turn it off.
+
+### 3. Verify First Run
+
+```bash
+gempt discover
+gempt init --non-interactive
+```
+
+Then verify in Antigravity:
+1. Consultation: `gpt_ask(goal="Reply with OK", tier="sonnet")`
+2. Read-only delegation: `gpt_run(goal="Summarize repository layout", cwd="/path/to/repo", access="inspect")`, then wait using the returned `wait_command`.
+
+## MCP Tools
+
+| Antigravity stdio (`gempt_gempt`) | Magpie HTTP | Purpose |
+| --- | --- | --- |
+| `gpt_run` | `gempt_run` | Async Codex execution. Use `access="inspect"` (read-only) or `access="change"` (edits/tests). For parallel edits on the same Git repo, pass `access="change"` + `workspace="share"` (checked out from committed `HEAD`; disallowed with `access="inspect"`). |
+| `gpt_ask` | `gempt_ask` | Synchronous consultation with optional `cwd`, `file_paths`, `tier` (`sonnet`/`opus`/`fable`/`chore`), and `session_id`. |
+| `gpt_ctl` | `gempt_ctl` | `status`, `steer`, `interrupt`, or `reply` to `ask_gemini`. Call `gpt_ctl({})` in Antigravity to open **GemPT Live**. |
+
+## Work Split & Model Tiers
+
+- **5 Work-Split Profiles** (Magpie control page): `0%` off / `15%` heavy-task hints / `35%` source-write gate / `60%` source-write + 5-step read stop-loss / `80%` direct delegation + 2-step read stop-loss.
+- **3 Execution Tiers + `chore`**: `sonnet` (~75%), `opus` (~20%), `fable` (~5%), plus `chore` (free fast utility model for `gpt_ask` summaries/classification). Model labels such as `Sol` (`codex/gpt-6.2-sol`) and `Astra` (`codex/gpt-6.2-astra`) are configurable Magpie gateway model identifiers in `~/.config/gempt/config.json` and [templates/magpie-groups.template.json](./templates/magpie-groups.template.json).
+
+## Security & Permissions
+
+- Magpie HTTP MCP defaults to `exec: false` (read-only `inspect`, `ask`, and `ctl`). Enable `exec: true` explicitly to allow HTTP clients to write.
+- Antigravity stdio `gpt_run` defaults to `access="change"` under the configured Codex sandbox (default `workspace-write`). Set `GEMPT_WORKSPACE_ROOT` to restrict allowed directories.
+- `workspace="share"` is blocked for `access="inspect"`, disables target repository Git hooks during `git worktree add`, checks out committed `HEAD` (uncommitted edits stay in the source tree), and verifies worktree ownership. Reclaim clean merged worktrees safely with `gempt prune-worktrees <repo>`.
+- GemPT Live defaults to `scope="session"` and does not leak other conversations' runs when unbound (pass `scope="all"` explicitly to list all workspace runs).
+
+## Upgrade & Uninstall
+
+- **Upgrade**: re-run `magpie plugin add gempt@<version>` and `npx --yes gempt@<version> install-agy`.
+- **Uninstall**: remove `gempt` from Magpie Plugins, uninstall `gempt` from Antigravity Customizations (or delete `~/.gemini/config/plugins/gempt`), remove `~/bin/gempt-wait*`, and optionally delete `~/.config/gempt/`.
+
+## Development & Verification
+
+```sh
+npm test
+npm run build:agy-plugin
+npm pack --dry-run
+```

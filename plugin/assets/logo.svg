@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="GemPT Logo">
+  <defs>
+    <linearGradient id="bg" x1="28" y1="28" x2="228" y2="228" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#141824"/>
+      <stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="68" y1="176" x2="192" y2="72" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="55%" stop-color="#e2e8f0"/>
+      <stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+  </defs>
+  <!-- ~10% safe margin baked in (26px on 256px canvas), high contrast on both light & dark themes -->
+  <rect x="26" y="26" width="204" height="204" rx="48" fill="url(#bg)" stroke="#64748b" stroke-width="4" stroke-opacity="0.65"/>
+  <!-- Dual-engine routing glyph: Gemini diamond leads GPT execution ridge -->
+  <path d="M68 176 L112 90 L142 138 L178 100 L158 176 Z" fill="none" stroke="url(#accent)" stroke-width="13" stroke-linejoin="round" stroke-linecap="round"/>
+  <!-- Gemini star spark -->
+  <path d="M180 62 L185 75 L198 80 L185 85 L180 98 L175 85 L162 80 L175 75 Z" fill="#34d399"/>
+  <!-- Core node dot -->
+  <circle cx="112" cy="90" r="7" fill="#38bdf8"/>
+</svg>

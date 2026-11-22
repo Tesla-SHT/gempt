@@ -12,7 +12,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { runInNewContext } from 'node:vm';
 import { buildMcpSnippet, findMagpieCli, listDispatchActivity, normalizeTitle, readActiveRuns, readState, setDefaultSandbox, setDefaultTier } from '../magpie_plugin/lib/backend.mjs';
-import { createAppServerManager } from '../magpie_plugin/lib/app-server-manager.mjs';
+import { createAppServerManager, resolveCodexInvocation } from '../magpie_plugin/lib/app-server-manager.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
 import { createExecutionTools, createGemptTools } from '../magpie_plugin/lib/tools.mjs';
 import { TOOLS } from '../core/mcp-server.mjs';
@@ -23,9 +23,9 @@ const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
 test('short titles prefer the explicit value and clean historical goals', () => {
   for (const [title, goal, cwd, expected] of [
-    ['  侧栏\n绑定　与命名 ', 'ignored', 'D:\\gempt', '侧栏 绑定 与命名'],
+    ['  侧栏\n绑定　与命名 ', 'ignored', 'C:\\work\\gempt', '侧栏 绑定 与命名'],
     [null, 'You are executing a task delegated by Gemini.\nRead carefully.\n\n# Goal\n'
-      + '- 用户反馈：请在工作区 D:/gempt 中修复侧栏绑定。跟进测试。', 'D:\\gempt', 'gempt · 修复侧栏绑定'],
+      + '- 用户反馈：请在工作区 C:/work/gempt 中修复侧栏绑定。跟进测试。', 'C:\\work\\gempt', 'gempt · 修复侧栏绑定'],
     [' ', '请在你当前分配的隔离工作区中请先修复命名', '/code/gempt/', 'gempt · 修复命名'],
     [null, '```text\nnot the task\n```\n# 请帮我整理 `session.json`。', '', '整理 session.json'],
     [null, '1. "C:/My Projects/gempt": clean titles. Verify tests.', '/code/gempt', 'gempt · clean titles'],
@@ -47,14 +47,14 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files, version }] = JSON.parse(stdout);
-  assert.equal(version, '0.2.2');
+  assert.equal(version, '0.3.0');
   const paths = files.map((file) => file.path);
-  for (const path of ['LICENSE', 'plugin/hooks.json', 'magpie_plugin/lib/backend.mjs',
+  for (const path of ['LICENSE', 'THIRD_PARTY_LICENSES.txt', 'README.en.md', 'plugin/README.md', 'plugin/assets/logo.svg', 'scripts/build-agy-plugin.mjs', 'plugin/hooks.json', 'magpie_plugin/lib/backend.mjs',
     'bin/gempt.mjs', 'plugin/work_split_hook.mjs', 'core/agy-install.mjs', 'core/mcp-server.mjs',
     'core/host-context.mjs', 'core/wait.mjs', 'core/assets/mcp_app_live.html', 'core/assets/workload.json']) {
     assert.ok(paths.includes(path), path);
   }
-  const roots = /^(?:LICENSE(?:\.md)?$|README\.md$|install\.(?:sh|ps1)$|package\.json$|(?:bin|core|magpie_plugin|mcp_app|plugin|templates)\/)/;
+  const roots = /^(?:LICENSE(?:\.md)?$|THIRD_PARTY_LICENSES\.txt$|README(?:\.en)?\.md$|install\.(?:sh|ps1)$|package\.json$|(?:bin|core|magpie_plugin|mcp_app|plugin|scripts|templates)\/)/;
   const localFiles = /(?:^|\/)(?:\.[^/]+|node_modules|__pycache__|sessions|runs|host-context(?:[.-][^/]*)?|state\.json|config\.json|request\.json|package-lock\.json)(?:\/|$)|\.(?:py|pyc|log|jsonl|tgz)$/i;
   assert.deepEqual(paths.filter((path) => !roots.test(path) || (path !== 'core/host-context.mjs' && localFiles.test(path))), []);
   assert.ok(!existsSync(join(REPO_ROOT, 'node_modules')));
@@ -1899,7 +1899,7 @@ test('requests and sessions analytics return buckets, breakdowns, speed board, 5
     writeFileSync(sessionFile, JSON.stringify({
       session_id: 'exec-20261121-analytics1',
       mode: 'exec',
-      cwd: 'D:\\gempt',
+      cwd: 'C:\\work\\gempt',
       model: 'codex/gpt-6.2-sol',
       tier: 'sonnet',
       created_at: yesterdayIso,
@@ -2106,4 +2106,45 @@ test('mcpTools false disables duplicate Magpie GemPT tool registration', async (
      process.exit(0);`,
   ], { timeout: 10_000, windowsHide: true });
   assert.deepEqual(JSON.parse(stdout.trim()), {});
+});
+
+test('Magpie marketplace check shape and inspect+share guard hold', async () => {
+  const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
+  assert.equal(pkg.version, '0.3.0');
+  assert.ok(pkg.keywords.includes('magpie-plugin'));
+  assert.ok(pkg.files.includes('THIRD_PARTY_LICENSES.txt'));
+  assert.ok(pkg.magpie?.summary?.en && pkg.magpie?.summary?.zh);
+  const tools = createGemptTools({ options: { exec: false } });
+  for (const [name, tool] of Object.entries(tools)) {
+    assert.match(name, /^[A-Za-z0-9_-]{1,48}$/);
+    assert.equal(typeof tool.execute, 'function');
+    assert.equal(typeof tool.description, 'string');
+    assert.ok(tool.description.length > 0);
+    assert.equal(typeof tool.args, 'object');
+  }
+  await assert.rejects(
+    tools.run.execute({ goal: 'read', cwd: REPO_ROOT, access: 'inspect', workspace: 'share' }),
+    /workspace='share' is not allowed with read-only access/,
+  );
+});
+
+test('Windows Codex shim resolution supports non-npm shims and server probe rejects spoofed ping', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-shim-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const customCmd = join(dir, 'codex.cmd');
+  writeFileSync(customCmd, '@echo off\r\necho fake\r\n');
+  const resolved = resolveCodexInvocation(customCmd, { ComSpec: process.env.ComSpec || 'C:\\Windows\\System32\\cmd.exe', SystemRoot: process.env.SystemRoot || 'C:\\Windows' }, 'win32');
+  assert.equal(resolved.at(-1), customCmd);
+
+  const spoof = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, service: 'gempt-magpie-plugin', build: 'fake', port: 0, instance_id: 'forged' }));
+  });
+  await new Promise((ok) => spoof.listen(0, '127.0.0.1', ok));
+  t.after(() => new Promise((ok) => spoof.close(ok)));
+  const spoofPort = spoof.address().port;
+  await assert.rejects(
+    startServer({ port: spoofPort, configPath: join(dir, 'config.json'), manageAppServer: false }),
+    /in use by another program/,
+  );
 });

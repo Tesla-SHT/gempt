@@ -687,6 +687,9 @@ export function createGemptTools({ options = {}, env = process.env, ...host } = 
       description,
       args: inputSchema,
       async execute(args = {}, callCtx) {
+        if (key === 'run' && args.access === 'inspect' && args.workspace === 'share') {
+          throw new Error("workspace='share' is not allowed with read-only access ('inspect'); use workspace='inherit' for read-only inspection.");
+        }
         if (key === 'run' && args.access !== 'inspect' && !isExecEnabled(options, env)) {
           throw new Error('Writable gempt_run is disabled. Enable the GemPT plugin option `exec: true`.');
         }

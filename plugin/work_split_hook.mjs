@@ -25,7 +25,7 @@ const milestones = [120, 200, 280];
 const banners = {
   gemini_first: 'Handle routine edits/reads in Gemini; route heavy debugging, long test loops, expert review, or Swarm verification to gpt_run / gpt_ask.',
   gpt: "Route repo investigation & code changes directly to gpt_run(cwd, access='inspect'|'change') or gpt_ask(file_paths); keep quick Gemini checks <=5 steps.",
-  gpt_first: 'Delegate this turn to a persistent gpt_run(cwd, session_id=...) thread immediately; reserve Gemini for <=2 quick checks/visuals (for coding-only workspaces, use Codex CLI / codex-lab directly).',
+  gpt_first: 'Delegate this turn to a persistent gpt_run(cwd, session_id=...) thread immediately; reserve Gemini for <=2 quick checks/visuals (for coding-only workspaces, consider using Codex CLI directly).',
 };
 const now = () => Date.now() / 1000;
 const text = (value) => typeof value === 'string' ? value.trim() : '';
@@ -199,7 +199,7 @@ async function handle(payload) {
     const count = await updateState(conversationId, (state) => setCount(state, key,
       1 + (key && state.turn_key && key !== state.turn_key ? 0 : Number(state.explore_count) || 0)));
     if (count <= limit) return allow;
-    const extra = ordinary === 'gpt_first' ? ' For coding-only workspaces, prefer Codex CLI / codex-lab directly.' : '';
+    const extra = ordinary === 'gpt_first' ? ' For coding-only workspaces, prefer Codex CLI directly.' : '';
     return { decision: 'deny', reason: `[GemPT ${pct}% Explore Stop-Loss] ${count} non-exempt workspace reads/searches this turn (limit ${limit}). `
       + `Dispatch deep inspection to Codex: call_mcp_tool(ServerName="gempt_gempt", ToolName="gpt_run", Arguments={"goal": "<what to inspect>", "cwd": "${cwd}", "access": "inspect"}) `
       + `then run returned \`gempt-wait <id>\` via run_command(WaitMsBeforeAsync=500).${extra} (Say "自己查" to bypass.)` };

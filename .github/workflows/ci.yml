@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Syntax check all JS/MJS files
+        shell: bash
+        run: |
+          for f in $(git ls-files '*.mjs' '*.js'); do
+            node --check "$f"
+          done
+
+      - name: Verify version consistency and third-party licenses
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const plugin = JSON.parse(fs.readFileSync("plugin/plugin.json", "utf8"));
+            const ver = pkg.version;
+            if (!ver || plugin.version !== ver) throw new Error(`Version mismatch: package.json=${ver}, plugin.json=${plugin.version}`);
+            for (const [file, pattern] of [
+              ["README.md", `# GemPT v${ver}`],
+              ["README.en.md", `# GemPT v${ver}`],
+              ["plugin/README.md", `(v${ver})`],
+              ["plugin/skills/gempt/SKILL.md", `GemPT v${ver}`],
+            ]) {
+              const text = fs.readFileSync(file, "utf8");
+              if (!text.includes(pattern)) throw new Error(`${file} missing expected version marker: ${pattern}`);
+            }
+            const licenses = fs.readFileSync("THIRD_PARTY_LICENSES.txt", "utf8");
+            for (const dep of ["@modelcontextprotocol/ext-apps", "@modelcontextprotocol/client", "@modelcontextprotocol/core", "zod", "pkce-challenge"]) {
+              if (!licenses.includes(dep)) throw new Error(`THIRD_PARTY_LICENSES.txt missing ${dep}`);
+            }
+            const liveHtml = fs.readFileSync("core/assets/mcp_app_live.html", "utf8");
+            if (liveHtml.length < 1000) throw new Error("Prebuilt GemPT Live HTML is missing or unexpectedly small");
+            console.log(`Version ${ver} and third-party license checks passed.`);
+          '
+
+      - name: Run full test suite
+        run: npm test
+
+      - name: Build and validate portable Antigravity plugin bundle
+        run: npm run build:agy-plugin
+
+      - name: Verify npm pack manifest
+        shell: bash
+        run: npm pack --dry-run --cache "$(mktemp -d)"

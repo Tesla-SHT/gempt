@@ -5,9 +5,10 @@ import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
 import { DEFAULT_AGY_TARGET, installAgy } from '../core/agy-install.mjs';
 import { serveStdio } from '../core/mcp-server.mjs';
-import { interruptRun, replyToolCall, steerRun } from '../core/runs.mjs';
+import { interruptRun, listActiveRoster, replyToolCall, steerRun } from '../core/runs.mjs';
 import { resolvePath } from '../core/state.mjs';
 import { runWait } from '../core/wait.mjs';
+import { pruneShareWorktrees } from '../core/worktrees.mjs';
 import { findCodexCli } from '../magpie_plugin/lib/app-server-manager.mjs';
 import {
   DEFAULT_TIERS, TIER_ORDER, VALID_FAILOVER_MODES, VALID_SANDBOXES, buildMcpSnippet, createNativeGroups,
@@ -23,7 +24,8 @@ const commands = {
   init: { 'non-interactive': flag, failover: string, strategy: string, sandbox: string,
     'utility-model': string, 'sync-magpie': flag, 'use-groups': flag, 'dry-run': flag },
   tier: {}, sandbox: {}, effort: { tier: string }, steer: {}, interrupt: {},
-  'reply-tool': { failure: flag }, presets: { preview: flag, apply: flag }, 'print-mcp': { installed: flag, target: string },
+  'reply-tool': { failure: flag }, 'prune-worktrees': { 'max-age-hours': string },
+  presets: { preview: flag, apply: flag }, 'print-mcp': { installed: flag, target: string },
 };
 const print = (value) => console.log(JSON.stringify(value, null, 2));
 
@@ -56,7 +58,7 @@ async function main([command, ...args]) {
   if (!Object.hasOwn(commands, command)) throw new Error(`Unknown command '${command}'.`);
   const { values, positionals } = parseArgs({ args, allowPositionals: true,
     options: { ...commands[command], config: string, json: flag } });
-  const sizes = { tier: [0, 1], sandbox: [0, 1], effort: [0, 1], steer: [2], interrupt: [1], 'reply-tool': [3] };
+  const sizes = { tier: [0, 1], sandbox: [0, 1], effort: [0, 1], steer: [2], interrupt: [1], 'reply-tool': [3], 'prune-worktrees': [0, 1] };
   if (!(sizes[command] || [0]).includes(positionals.length)) throw new Error(`Unexpected arguments for gempt ${command}.`);
   const configPath = resolveConfigPath(values.config);
   const config = readJsonSafe(configPath);
@@ -130,6 +132,14 @@ async function main([command, ...args]) {
     case 'reply-tool':
       result = replyToolCall(value, second, third, { success: !values.failure });
       break;
+    case 'prune-worktrees': {
+      const repoPath = resolvePath(value || process.cwd());
+      const hours = values['max-age-hours'] !== undefined ? Number(values['max-age-hours']) : 168;
+      if (!Number.isFinite(hours) || hours < 0) throw new Error('Invalid --max-age-hours value.');
+      const activePaths = new Set(listActiveRoster({ limit: 100 }).map((item) => item.worktree_path).filter(Boolean));
+      result = pruneShareWorktrees(repoPath, { activePaths, maxAgeMs: hours * 3600 * 1000 });
+      break;
+    }
     case 'presets':
       if (values.apply && values.preview) throw new Error('Choose --preview or --apply.');
       result = values.apply ? await createNativeGroups({ configPath }) : previewNativeGroups();

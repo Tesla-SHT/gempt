@@ -1,10 +1,13 @@
 import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { workspaceName } from '../magpie_plugin/lib/backend.mjs';
+import { readJsonSafe, workspaceName } from '../magpie_plugin/lib/backend.mjs';
 import { ACTIVE_STATES, interruptRun, readRun, runDirectory, stateEntries, steerRun } from './runs.mjs';
 import { readHostContext } from './host-context.mjs';
 import { resolvePath, withinPath } from './state.mjs';
+
+const APP_VERSION = readJsonSafe(new URL('../package.json', import.meta.url))?.version
+  || readJsonSafe(new URL('../../plugin.json', import.meta.url))?.version || '0.3.0';
 
 export const APP_URI = 'ui://gempt/live.html';
 export const APP_RESOURCE = {
@@ -158,7 +161,7 @@ function listRuns(args, { root, configPath, sessionsDir }) {
   const context = readHostContext(configPath);
   const active = typeof context.conversation_id === 'string' ? context.conversation_id : null;
   const bound = args.host_conversation_id || active || null;
-  const scope = bound ? args.scope ?? 'session' : 'all';
+  const scope = args.scope ?? 'session';
   const workspace = bound && bound === active ? workspaceName(array(context.workspace_paths)[0]) : '';
   let sessionCount = 0;
   const items = [];
@@ -175,9 +178,10 @@ function listRuns(args, { root, configPath, sessionsDir }) {
   }
   items.sort((left, right) => Number(ACTIVE_STATES.has(right.state)) - Number(ACTIVE_STATES.has(left.state)));
   return {
-    bound_conversation_id: bound, scope, bound_workspace_name: workspace, session_count: sessionCount,
+    bound_conversation_id: bound, scope, unbound_session: !bound && scope === 'session',
+    bound_workspace_name: workspace, session_count: sessionCount,
     runs: withinBudget(items.slice(0, args.limit ?? 20), TEXT_BYTES),
-    app_server: { name: 'gempt', version: '0.2.0' },
+    app_server: { name: 'gempt', version: APP_VERSION },
   };
 }
 

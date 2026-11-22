@@ -13,7 +13,8 @@ try {
   saveRun(file, running);
   const tools = createExecutionTools({ ...host, execRunFile: file, newExecSession: record.session_id });
   const result = await withLock(join(host.sessionsDir, `${record.session_id}.node.lock`),
-    () => tools.exec.execute({ ...args, run_id: record.run_id }, { agent }));
+    () => tools.exec.execute({ ...args, run_id: record.run_id }, { agent }),
+    { attempts: 240, delayMs: 25 });
   outcome = { state: 'finished', result };
 } catch (err) {
   outcome = { state: err instanceof TurnInterrupted ? 'interrupted' : 'failed', error: String(err?.message || err) };

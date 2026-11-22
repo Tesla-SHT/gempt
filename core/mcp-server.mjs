@@ -16,7 +16,7 @@ const short = (value, limit) => Array.from(String(value || '')).slice(0, limit).
 const bytes = (value) => Buffer.byteLength(JSON.stringify(value));
 const textResult = (data, extras) => ({ content: [{ type: 'text', text: JSON.stringify(data) }], ...extras });
 const VERSION = readJsonSafe(new URL('../package.json', import.meta.url))?.version
-  || readJsonSafe(new URL('../../plugin.json', import.meta.url))?.version || '0.2.2';
+  || readJsonSafe(new URL('../../plugin.json', import.meta.url))?.version || '0.3.0';
 
 function compact(payload) {
   const data = { ...payload };
@@ -107,9 +107,12 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
   }
   const access = String(args.access || 'change').trim();
   if (!['inspect', 'change'].includes(access)) throw new Error(`Invalid access: ${access}`);
+  if (access === 'inspect' && args.workspace === 'share') {
+    throw new Error("workspace='share' is not allowed with read-only access ('inspect'); use workspace='inherit' for read-only inspection.");
+  }
   const syncBudget = Number(env.GEMPT_GPT_RUN_SYNC_SEC);
   const waitSec = Number.isFinite(syncBudget) && syncBudget > 0 ? Math.min(syncBudget, 10) : 0;
-  const res = await dispatchRun({ goal, cwd, workspace: args.workspace, title: args.title, tier: args.tier,
+  const res = await dispatchRun({ goal, cwd, access, workspace: args.workspace, title: args.title, tier: args.tier,
     host_conversation_id: hostId, gemini_family: family, session_id: sessionId,
     background: args.background ?? waitSec === 0, sandbox: access === 'inspect' ? 'read-only' : undefined,
     expected_report: 'Report concisely: changed files, verification commands/results, and any remaining blockers. Omit verbose raw logs.',

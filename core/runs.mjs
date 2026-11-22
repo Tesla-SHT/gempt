@@ -8,7 +8,7 @@ import { connectAppServer, readAppServerState, textInput, UNAVAILABLE } from '..
 import { normalizeTitle, readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
 import { resolveNodeExecutable } from './node-executable.mjs';
 import { readHostContext } from './host-context.mjs';
-import { atomicJson, resolvePath, validateSessionId, withinPath } from './state.mjs';
+import { atomicJson, resolvePath, validateSessionId, withLock, withinPath } from './state.mjs';
 import { ensureShareWorktree } from './worktrees.mjs';
 
 export const ACTIVE_STATES = new Set(['queued', 'running', 'waiting_gemini']);
@@ -87,9 +87,18 @@ export function buildWaitCommand(runIds, { waitAll = false, env = process.env } 
   const onPath = (env.PATH || env.Path || '').split(delimiter).filter(Boolean).some((dir) =>
     shims.some((shim) => executable(join(dir, shim))));
   if (onPath && !['1', 'true', 'yes'].includes(env.GEMPT_DISABLE_WAIT_SHIM?.trim())) return `gempt-wait ${args}`;
-  const quote = process.platform === 'win32' ? (text) => `'${text.replaceAll("'", "''")}'`
-    : (text) => `'${text.replaceAll("'", "'\\''")}'`;
-  return `${process.platform === 'win32' ? '& ' : ''}${quote(resolveNodeExecutable({ env }))} ${quote(waitPath)} ${args}`;
+  const nodeBin = resolveNodeExecutable({ env });
+  if (process.platform === 'win32') {
+    const shell = String(env.GEMPT_SHELL || '').trim().toLowerCase();
+    if (shell === 'cmd') {
+      const q = (text) => `"${text.replaceAll('"', '""')}"`;
+      return `${q(nodeBin)} ${q(waitPath)} ${args}`;
+    }
+    const q = (text) => `'${text.replaceAll("'", "''")}'`;
+    return `& ${q(nodeBin)} ${q(waitPath)} ${args}`;
+  }
+  const quote = (text) => `'${text.replaceAll("'", "'\\''")}'`;
+  return `${quote(nodeBin)} ${quote(waitPath)} ${args}`;
 }
 
 export async function waitForRuns(runIds, { waitAll = false, timeoutSec, sessionsDir, pollInterval = 0.25 } = {}) {
@@ -221,6 +230,10 @@ export async function dispatchRun(args, {
   if (typeof args.goal !== 'string' || !args.goal.trim()) throw new Error('goal is required and must be a non-empty string.');
   const workspace = args.workspace || 'inherit';
   if (!['inherit', 'share'].includes(workspace)) throw new Error(`Invalid workspace: ${workspace}`);
+  const isReadOnly = args.access === 'inspect' || args.sandbox === 'read-only';
+  if (workspace === 'share' && isReadOnly) {
+    throw runError("workspace='share' is not allowed with read-only access ('inspect'); use workspace='inherit' for read-only inspection.", 400);
+  }
   const config = resolveConfigPath(configPath || env.GEMPT_CONFIG);
   const sessions = resolveSessionsDir(sessionsDir || env.GEMPT_SESSIONS_DIR);
   const { normalizeWorkspaceCwd } = await import('../magpie_plugin/lib/tools.mjs');
@@ -257,24 +270,32 @@ export async function dispatchRun(args, {
   let worktreePath = null;
   let record;
   try {
-    if (prior?.worktree_path && statSync(prior.worktree_path, { throwIfNoEntry: false })?.isDirectory()) {
-      sourceCwd = resolvePath(prior.source_cwd || requestedCwd);
-      cwd = resolvePath(prior.cwd || prior.worktree_path);
-      worktreePath = resolvePath(prior.worktree_path);
-      if ((requestedCwd !== sourceCwd && requestedCwd !== cwd) || !withinPath(cwd, worktreePath)) {
-        throw new Error(`Exec resume must stay in the original workspace '${sourceCwd}'.`);
+    await withLock(join(sessions, `${sessionId}.dispatch.lock`), async () => {
+      if (args.session_id) {
+        const busy = listActiveRoster({ limit: 50, sessionsDir: sessions }).find((entry) => entry.session_id === sessionId);
+        if (busy) {
+          throw runError(`Session '${sessionId}' already has an active run (${busy.run_id}); wait for it to finish, steer it, or omit session_id to start a new thread.`, 409);
+        }
       }
-    } else if (workspace === 'share') {
-      ({ cwd, source_cwd: sourceCwd, worktree_root: worktreePath } = ensureShareWorktree(cwd, sessionId, env));
-    }
-    record = {
-      source: 'magpie_exec', run_id: id, cwd, state: 'queued', created_at: new Date().toISOString(),
-      worktree_path: worktreePath, source_cwd: worktreePath ? sourceCwd : null, goal: args.goal,
-      title: normalizeTitle(args.title, args.goal, sourceCwd), tier: args.tier, agent,
-      host_conversation_id: hostId, session_id: sessionId, config_path: config, progress: null,
-      verification: args.verification, deadline: now() + 900 + (Number(args.timeout_sec) || 3600),
-    };
-    saveRun(file, record);
+      if (prior?.worktree_path && statSync(prior.worktree_path, { throwIfNoEntry: false })?.isDirectory()) {
+        sourceCwd = resolvePath(prior.source_cwd || requestedCwd);
+        cwd = resolvePath(prior.cwd || prior.worktree_path);
+        worktreePath = resolvePath(prior.worktree_path);
+        if ((requestedCwd !== sourceCwd && requestedCwd !== cwd) || !withinPath(cwd, worktreePath)) {
+          throw new Error(`Exec resume must stay in the original workspace '${sourceCwd}'.`);
+        }
+      } else if (workspace === 'share') {
+        ({ cwd, source_cwd: sourceCwd, worktree_root: worktreePath } = ensureShareWorktree(cwd, sessionId, env));
+      }
+      record = {
+        source: 'magpie_exec', run_id: id, cwd, state: 'queued', created_at: new Date().toISOString(),
+        worktree_path: worktreePath, source_cwd: worktreePath ? sourceCwd : null, goal: args.goal,
+        title: normalizeTitle(args.title, args.goal, sourceCwd), tier: args.tier, agent,
+        host_conversation_id: hostId, session_id: sessionId, config_path: config, progress: null,
+        verification: args.verification, deadline: now() + 900 + (Number(args.timeout_sec) || 3600),
+      };
+      saveRun(file, record);
+    }, { attempts: 80, delayMs: 25 });
   } catch (error) {
     try { rmdirSync(directory); } catch { /* The claim may already contain state. */ }
     throw error;

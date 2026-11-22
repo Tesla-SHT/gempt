@@ -2,7 +2,7 @@
   "mcpServers": {
     "gempt": {
       "command": "node",
-      "args": ["./runtime/core/mcp-server.mjs"]
+      "args": ["${PLUGIN_ROOT}/runtime/core/mcp-server.mjs"]
     }
   }
 }

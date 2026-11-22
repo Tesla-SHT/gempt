@@ -87,7 +87,9 @@ function reclaimLock(path, staleMs) {
   }
 }
 
-export async function withLock(path, operation, { attempts = 25, staleMs = 60_000 } = {}) {
+const syncWaitBuf = new Int32Array(new SharedArrayBuffer(4));
+
+export function withLockSync(path, operation, { attempts = 80, delayMs = 25, staleMs = 60_000 } = {}) {
   const parent = dirname(path);
   mkdirSync(parent, { recursive: true });
   const temp = join(parent, `.gempt-${randomUUID()}.tmp`);
@@ -104,7 +106,39 @@ export async function withLock(path, operation, { attempts = 25, staleMs = 60_00
       } catch (error) {
         if (attempt >= attempts || !['EEXIST', 'EPERM', 'EACCES'].includes(error.code)) throw error;
         if (error.code === 'EEXIST' && reclaimLock(path, staleMs)) continue;
-        await sleep(25);
+        Atomics.wait(syncWaitBuf, 0, 0, delayMs);
+      }
+    }
+    unlinkSync(temp);
+    return operation();
+  } finally {
+    try {
+      if (owner) unlinkOwnedLock(path, owner);
+    } finally {
+      closeSync(fd);
+      rmSync(temp, { force: true });
+    }
+  }
+}
+
+export async function withLock(path, operation, { attempts = 25, delayMs = 25, staleMs = 60_000 } = {}) {
+  const parent = dirname(path);
+  mkdirSync(parent, { recursive: true });
+  const temp = join(parent, `.gempt-${randomUUID()}.tmp`);
+  const fd = openSync(temp, 'wx', 0o600);
+  let owner;
+  try {
+    writeFileSync(fd, `${process.pid}:${Date.now()}\n`);
+    const info = fstatSync(fd);
+    for (let attempt = 1; ; attempt++) {
+      try {
+        linkSync(temp, path);
+        owner = info;
+        break;
+      } catch (error) {
+        if (attempt >= attempts || !['EEXIST', 'EPERM', 'EACCES'].includes(error.code)) throw error;
+        if (error.code === 'EEXIST' && reclaimLock(path, staleMs)) continue;
+        await sleep(delayMs);
       }
     }
     unlinkSync(temp);

@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { isAstraModel } from '../magpie_plugin/lib/routing.mjs';
 import { WORKLOAD } from './assets.mjs';
+import { withLockSync } from './state.mjs';
 
 export const TIER_ORDER = ['sonnet', 'opus', 'fable'];
 export const TIER_ALIASES = { lite: 'sonnet', mid: 'opus', max: 'fable' };
@@ -209,6 +210,28 @@ export function writeConfigAtomic(resolvedConfigPath, nextObj) {
   }
 }
 
+export function withConfigTransaction(configPath, mutator) {
+  const resolved = resolveConfigPath(configPath);
+  const lockPath = `${resolved}.lock`;
+  try {
+    return withLockSync(lockPath, () => {
+      const loaded = readExistingConfigObject(resolved);
+      if (!loaded.ok) return loaded;
+      const result = mutator(loaded);
+      if (!result || result.ok === false || !result.next) return result;
+      const written = writeConfigAtomic(loaded.path, result.next);
+      if (!written.ok) return written;
+      return result.response || written;
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      status: 503,
+      error: `Failed to acquire gempt config lock: ${err.message}`,
+    };
+  }
+}
+
 export function setDefaultTier(tier, { configPath } = {}) {
   const normalized = normalizeDefaultTier(tier);
   if (!normalized) {
@@ -219,25 +242,21 @@ export function setDefaultTier(tier, { configPath } = {}) {
     };
   }
 
-  const loaded = readExistingConfigObject(configPath);
-  if (!loaded.ok) return loaded;
-
-  const next = {
-    ...loaded.data,
-    routing_policy: {
-      ...(loaded.data.routing_policy && typeof loaded.data.routing_policy === 'object' ? loaded.data.routing_policy : {}),
-      default_tier: normalized,
+  return withConfigTransaction(configPath, (loaded) => ({
+    next: {
+      ...loaded.data,
+      routing_policy: {
+        ...(loaded.data.routing_policy && typeof loaded.data.routing_policy === 'object' ? loaded.data.routing_policy : {}),
+        default_tier: normalized,
+      },
     },
-  };
-  const written = writeConfigAtomic(loaded.path, next);
-  if (!written.ok) return written;
-
-  return {
-    ok: true,
-    status: 200,
-    default_tier: normalized,
-    config_path: loaded.path,
-  };
+    response: {
+      ok: true,
+      status: 200,
+      default_tier: normalized,
+      config_path: loaded.path,
+    },
+  }));
 }
 
 export function setPairing(family, model, { configPath } = {}) {
@@ -245,11 +264,11 @@ export function setPairing(family, model, { configPath } = {}) {
       (model !== 'default' && (typeof model !== 'string' || !isCodexModelId(model) || model.trim() !== model))) {
     return { ok: false, status: 400, error: '请选择有效的 Gemini 档位和 Codex 订阅模型。' };
   }
-  const config = readExistingConfigObject(configPath);
-  if (!config.ok) return config;
-  const policy = config.data.routing_policy ||= {};
-  policy.pairings = { ...policy.pairings, [family]: model };
-  return writeConfigAtomic(config.path, config.data);
+  return withConfigTransaction(configPath, (config) => {
+    const policy = config.data.routing_policy ||= {};
+    policy.pairings = { ...policy.pairings, [family]: model };
+    return { next: config.data };
+  });
 }
 
 export function setWorkSplit(key, profile, { configPath } = {}) {
@@ -257,10 +276,10 @@ export function setWorkSplit(key, profile, { configPath } = {}) {
       !(Object.hasOwn(WORKLOAD.profiles, profile) || (key === 'swarm_split' && profile === 'inherit'))) {
     return { ok: false, status: 400, error: '请选择有效的工作分工档位。' };
   }
-  const config = readExistingConfigObject(configPath);
-  if (!config.ok) return config;
-  config.data.routing_policy = { ...config.data.routing_policy, [key]: profile };
-  return writeConfigAtomic(config.path, config.data);
+  return withConfigTransaction(configPath, (config) => {
+    config.data.routing_policy = { ...config.data.routing_policy, [key]: profile };
+    return { next: config.data };
+  });
 }
 
 export function setDefaultSandbox(sandbox, { configPath } = {}) {
@@ -273,109 +292,105 @@ export function setDefaultSandbox(sandbox, { configPath } = {}) {
     };
   }
 
-  const loaded = readExistingConfigObject(configPath);
-  if (!loaded.ok) return loaded;
-
-  const next = {
-    ...loaded.data,
-    codex: {
-      ...(loaded.data.codex && typeof loaded.data.codex === 'object' ? loaded.data.codex : {}),
-      default_sandbox: normalized,
+  return withConfigTransaction(configPath, (loaded) => ({
+    next: {
+      ...loaded.data,
+      codex: {
+        ...(loaded.data.codex && typeof loaded.data.codex === 'object' ? loaded.data.codex : {}),
+        default_sandbox: normalized,
+      },
     },
-  };
-  const written = writeConfigAtomic(loaded.path, next);
-  if (!written.ok) return written;
-
-  return {
-    ok: true,
-    status: 200,
-    default_sandbox: normalized,
-    config_path: loaded.path,
-  };
+    response: {
+      ok: true,
+      status: 200,
+      default_sandbox: normalized,
+      config_path: loaded.path,
+    },
+  }));
 }
 
 export function setEffortSettings({ tierEffort, tier, autoEffort } = {}, { configPath } = {}) {
-  const loaded = readExistingConfigObject(configPath);
-  if (!loaded.ok) return loaded;
+  return withConfigTransaction(configPath, (loaded) => {
+    const existingPolicy = loaded.data.routing_policy && typeof loaded.data.routing_policy === 'object'
+      ? loaded.data.routing_policy
+      : {};
+    const existingTiers = loaded.data.tiers && typeof loaded.data.tiers === 'object'
+      ? loaded.data.tiers
+      : {};
 
-  const existingPolicy = loaded.data.routing_policy && typeof loaded.data.routing_policy === 'object'
-    ? loaded.data.routing_policy
-    : {};
-  const existingTiers = loaded.data.tiers && typeof loaded.data.tiers === 'object'
-    ? loaded.data.tiers
-    : {};
+    const targetTier = normalizeDefaultTier(tier || existingPolicy.default_tier || 'sonnet');
+    if (!targetTier) {
+      return {
+        ok: false,
+        status: 400,
+        error: `Invalid target tier '${String(tier ?? '')}'. Expected one of: ${TIER_ORDER.join(', ')}.`,
+      };
+    }
 
-  const targetTier = normalizeDefaultTier(tier || existingPolicy.default_tier || 'sonnet');
-  if (!targetTier) {
-    return {
-      ok: false,
-      status: 400,
-      error: `Invalid target tier '${String(tier ?? '')}'. Expected one of: ${TIER_ORDER.join(', ')}.`,
+    let nextAutoEffort = Boolean(existingPolicy.auto_effort);
+    if (autoEffort !== undefined) {
+      if (typeof autoEffort !== 'boolean') {
+        return { ok: false, status: 400, error: 'auto_effort must be a boolean.' };
+      }
+      nextAutoEffort = autoEffort;
+    }
+
+    const nextTiers = { ...existingTiers };
+    const targetTierCfg = { ...DEFAULT_TIERS[targetTier], ...(existingTiers[targetTier] || {}) };
+
+    if (tierEffort !== undefined && tierEffort !== null && String(tierEffort).trim() !== '') {
+      const cleanEffort = String(tierEffort).trim().toLowerCase();
+      if (!VALID_EFFORTS.includes(cleanEffort)) {
+        return {
+          ok: false,
+          status: 400,
+          error: `Invalid reasoning_effort '${String(tierEffort)}'. Expected one of: ${VALID_EFFORTS.join(', ')}.`,
+        };
+      }
+      if (cleanEffort === 'ultra') {
+        return {
+          ok: false,
+          status: 400,
+          error: "默认档位禁止设为 ultra（避免高倍并发配额消耗），仅在极端个案单次手动传参。",
+        };
+      }
+      const usesAstra = targetTier === 'fable'
+        || isAstraModel(targetTierCfg.consult_model)
+        || isAstraModel(targetTierCfg.exec_model)
+        || (Array.isArray(targetTierCfg.magpie_group_members) && targetTierCfg.magpie_group_members.some((m) => isAstraModel(m)));
+      if (usesAstra && EFFORT_RANK[cleanEffort] < EFFORT_RANK.medium) {
+        return {
+          ok: false,
+          status: 400,
+          error: 'Astra 模型禁止降到 low 档思考，请保持 high / xhigh 或切换到 Sol 档。',
+        };
+      }
+      targetTierCfg.reasoning_effort = cleanEffort;
+      nextTiers[targetTier] = targetTierCfg;
+      if (autoEffort === undefined) {
+        nextAutoEffort = false;
+      }
+    }
+
+    const next = {
+      ...loaded.data,
+      routing_policy: {
+        ...existingPolicy,
+        auto_effort: nextAutoEffort,
+      },
+      tiers: nextTiers,
     };
-  }
 
-  let nextAutoEffort = Boolean(existingPolicy.auto_effort);
-  if (autoEffort !== undefined) {
-    if (typeof autoEffort !== 'boolean') {
-      return { ok: false, status: 400, error: 'auto_effort must be a boolean.' };
-    }
-    nextAutoEffort = autoEffort;
-  }
-
-  const nextTiers = { ...existingTiers };
-  const targetTierCfg = { ...DEFAULT_TIERS[targetTier], ...(existingTiers[targetTier] || {}) };
-
-  if (tierEffort !== undefined && tierEffort !== null && String(tierEffort).trim() !== '') {
-    const cleanEffort = String(tierEffort).trim().toLowerCase();
-    if (!VALID_EFFORTS.includes(cleanEffort)) {
-      return {
-        ok: false,
-        status: 400,
-        error: `Invalid reasoning_effort '${String(tierEffort)}'. Expected one of: ${VALID_EFFORTS.join(', ')}.`,
-      };
-    }
-    if (cleanEffort === 'ultra') {
-      return {
-        ok: false,
-        status: 400,
-        error: "默认档位禁止设为 ultra（避免高倍并发配额消耗），仅在极端个案单次手动传参。",
-      };
-    }
-    const usesAstra = targetTier === 'fable'
-      || isAstraModel(targetTierCfg.consult_model)
-      || isAstraModel(targetTierCfg.exec_model)
-      || (Array.isArray(targetTierCfg.magpie_group_members) && targetTierCfg.magpie_group_members.some((m) => isAstraModel(m)));
-    if (usesAstra && EFFORT_RANK[cleanEffort] < EFFORT_RANK.medium) {
-      return {
-        ok: false,
-        status: 400,
-        error: 'Astra 模型禁止降到 low 档思考，请保持 high / xhigh 或切换到 Sol 档。',
-      };
-    }
-    targetTierCfg.reasoning_effort = cleanEffort;
-    nextTiers[targetTier] = targetTierCfg;
-    if (autoEffort === undefined) {
-      nextAutoEffort = false;
-    }
-  }
-
-  const next = {
-    ...loaded.data,
-    routing_policy: {
-      ...existingPolicy,
-      auto_effort: nextAutoEffort,
-    },
-    tiers: nextTiers,
-  };
-  const written = writeConfigAtomic(loaded.path, next);
-  if (!written.ok) return written;
-
-  return {
-    ok: true,
-    status: 200,
-    auto_effort: nextAutoEffort,
-    tier: targetTier,
-    reasoning_effort: String(nextTiers[targetTier]?.reasoning_effort || targetTierCfg.reasoning_effort || 'medium'),
-    config_path: loaded.path,
-  };
+    return {
+      next,
+      response: {
+        ok: true,
+        status: 200,
+        auto_effort: nextAutoEffort,
+        tier: targetTier,
+        reasoning_effort: String(nextTiers[targetTier]?.reasoning_effort || targetTierCfg.reasoning_effort || 'medium'),
+        config_path: loaded.path,
+      },
+    };
+  });
 }

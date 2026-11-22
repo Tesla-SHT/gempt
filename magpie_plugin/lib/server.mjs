@@ -9,10 +9,10 @@
  * - Reuses and seamlessly takes over the port across Magpie plugin reloads.
  */
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { extname, join, resolve, sep } from 'node:path';
+import { dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { RATIO_RANGES } from './token-ratio.mjs';
 import {
@@ -21,7 +21,9 @@ import {
   initSubscriptionConfig,
   isActivityId,
   listDispatchActivity,
+  readJsonSafe,
   readState,
+  resolveConfigPath,
   setDefaultSandbox,
   setDefaultTier,
   setWorkSplit,
@@ -57,7 +59,11 @@ const PKG = (() => {
   }
 })();
 
-const BUILD_ID = `${PKG.version || '0.2.0'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
+const BUILD_ID = `${PKG.version || '0.3.0'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
+const pidAlive = (pid) => {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }
+};
 const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 const sleepUnref = (ms) => new Promise((resolveSleep) => {
   const timer = setTimeout(resolveSleep, ms);
@@ -108,6 +114,34 @@ export async function startServer({
   appServerOptions,
 } = {}) {
   const KEY = randomBytes(24).toString('base64url');
+  const INSTANCE_ID = randomBytes(16).toString('hex');
+  const resolvedConfigDir = dirname(resolveConfigPath(configPath));
+  const identityFile = (p) => join(resolvedConfigDir, `page-server-${p}.json`);
+  let publishedIdentityPath = null;
+  const publishIdentity = (p) => {
+    try {
+      mkdirSync(resolvedConfigDir, { recursive: true, mode: 0o700 });
+      const file = identityFile(p);
+      writeFileSync(file, JSON.stringify({
+        service: 'gempt-magpie-plugin',
+        instance_id: INSTANCE_ID,
+        pid: process.pid,
+        port: p,
+        build: BUILD_ID,
+      }) + '\n', { mode: 0o600 });
+      publishedIdentityPath = file;
+    } catch { /* Best effort when config dir is read-only. */ }
+  };
+  const clearIdentity = () => {
+    if (!publishedIdentityPath) return;
+    try {
+      const current = readJsonSafe(publishedIdentityPath);
+      if (current?.instance_id === INSTANCE_ID && existsSync(publishedIdentityPath)) {
+        unlinkSync(publishedIdentityPath);
+      }
+    } catch { /* Ignore cleanup errors. */ }
+    publishedIdentityPath = null;
+  };
   let actualPort = 0;
   let appServer;
   let OWN = new Set();
@@ -189,6 +223,7 @@ export async function startServer({
           service: 'gempt-magpie-plugin',
           build: BUILD_ID,
           port: actualPort,
+          instance_id: INSTANCE_ID,
         }, undefined, false);
       }
 
@@ -341,7 +376,14 @@ export async function startServer({
       const r = await fetch(`http://127.0.0.1:${p}/api/ping`, { signal: AbortSignal.timeout(800) });
       if (!r.ok) return null;
       const body = await r.json();
-      return body && body.service === 'gempt-magpie-plugin' ? body : null;
+      if (!body || body.service !== 'gempt-magpie-plugin') return null;
+      const expected = readJsonSafe(identityFile(p));
+      if (!expected || expected.service !== 'gempt-magpie-plugin' || expected.port !== p
+          || typeof expected.instance_id !== 'string' || !expected.instance_id
+          || body.instance_id !== expected.instance_id || !pidAlive(expected.pid)) {
+        return null;
+      }
+      return body;
     } catch {
       return null;
     }
@@ -355,6 +397,7 @@ export async function startServer({
     const onOk = () => {
       cleanup();
       own(server.address().port);
+      publishIdentity(actualPort);
       resolveBind(true);
     };
     const onErr = (err) => {
@@ -377,6 +420,7 @@ export async function startServer({
       port: actualPort, listening, reused, server, appServer,
       async close() {
         closed = true;
+        clearIdentity();
         await Promise.all([
           appServer?.stop(),
           new Promise((done) => (server.listening ? server.close(done) : done())),

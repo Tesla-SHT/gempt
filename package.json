@@ -1,7 +1,15 @@
 {
   "name": "gempt",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Magpie tools + control page plugin for Gemini-leads-GPT 3+1 routing tiers (Sonnet / Opus / Fable + Chore) across every Magpie client.",
+  "author": {
+    "name": "yizhang-dream",
+    "url": "https://github.com/yizhang-dream"
+  },
+  "homepage": "https://github.com/yizhang-dream/gempt#readme",
+  "bugs": {
+    "url": "https://github.com/yizhang-dream/gempt/issues"
+  },
   "type": "module",
   "bin": {
     "gempt": "./bin/gempt.mjs",
@@ -12,7 +20,9 @@
     ".": "./magpie_plugin/index.mjs"
   },
   "scripts": {
-    "build:mcp-app": "node mcp_app/build.mjs"
+    "build:mcp-app": "node mcp_app/build.mjs",
+    "build:agy-plugin": "node scripts/build-agy-plugin.mjs",
+    "test": "node --test tests/test_core_node.mjs tests/test_magpie_plugin.mjs"
   },
   "files": [
     "bin/gempt.mjs",
@@ -24,6 +34,7 @@
     "magpie_plugin/ui/*.{html,js,css}",
     "mcp_app/*.{mjs,js,html,css}",
     "plugin/plugin.json",
+    "plugin/README.md",
     "plugin/mcp_config.json",
     "plugin/hooks.json",
     "plugin/work_split_hook.mjs",
@@ -32,11 +43,14 @@
     "plugin/agents/*.md",
     "plugin/skills/*/SKILL.md",
     "plugin/skills/*/references/*.md",
+    "scripts/build-agy-plugin.mjs",
     "templates/*",
     "install.sh",
     "install.ps1",
     "README.md",
-    "LICENSE"
+    "README.en.md",
+    "LICENSE",
+    "THIRD_PARTY_LICENSES.txt"
   ],
   "repository": {
     "type": "git",

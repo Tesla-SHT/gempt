@@ -34,14 +34,41 @@ export function findCodexCli(configuredPath = '', env = process.env) {
   return found ? resolve(found) : '';
 }
 
-function invocation(cli, env) {
-  if (process.platform !== 'win32' || !/\.(cmd|ps1|bat)$/i.test(cli)) return [cli];
+export function resolveCodexInvocation(cli, env = process.env, platform = process.platform) {
+  if (platform !== 'win32' || !/\.(cmd|ps1|bat)$/i.test(cli)) return [cli];
   const directory = dirname(cli);
-  const entry = join(directory, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
-  const node = executable([join(directory, 'node.exe'), ...(env.PATH || env.Path || '').split(delimiter)
+  const findNode = () => executable([join(directory, 'node.exe'), ...(env.PATH || env.Path || '').split(delimiter)
     .filter(Boolean).map((dir) => join(dir, 'node.exe'))]);
-  if (!node || !existsSync(entry)) throw new Error('Cannot resolve the Codex npm wrapper to Node and @openai/codex/bin/codex.js.');
-  return [node, entry];
+  const npmEntry = join(directory, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+  if (existsSync(npmEntry)) {
+    const node = findNode();
+    if (node) return [node, npmEntry];
+  }
+  try {
+    const shim = readFileSync(cli, 'utf8');
+    const match = shim.match(/(?:%~dp0|%dp0%|\$basedir)[\\/]+([^\r\n"']+?\.(?:js|mjs|cjs|exe))/i);
+    if (match?.[1]) {
+      const target = resolve(directory, match[1].replaceAll('\\', '/'));
+      if (existsSync(target)) {
+        if (/\.exe$/i.test(target)) return [target];
+        const node = findNode();
+        if (node) return [node, target];
+      }
+    }
+  } catch { /* Fall through to shell launcher. */ }
+  if (/\.ps1$/i.test(cli)) {
+    const ps = executable([join(env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')]);
+    if (ps) return [ps, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', cli];
+  }
+  const comspec = env.ComSpec || join(env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe');
+  if (/\.(cmd|bat)$/i.test(cli) && existsSync(comspec)) {
+    return [comspec, '/d', '/s', '/c', cli];
+  }
+  throw new Error(`Cannot resolve the Windows Codex shim (${cli}) to Node, @openai/codex, or a shell launcher.`);
+}
+
+function invocation(cli, env) {
+  return resolveCodexInvocation(cli, env, process.platform);
 }
 
 function freePort(port) {
@@ -119,13 +146,36 @@ export function createAppServerManager({
         // Multiple hosts may race during reload. A separate exclusive claim
         // elects one stale-lock cleaner and is released as soon as it exits.
         const recovery = `${lockFile}.recover`;
-        try { writeFileSync(recovery, owner, { flag: 'wx', mode: 0o600 }); } catch (err) {
-          if (err.code === 'EEXIST') return false;
-          throw err;
+        let claimedRecovery = false;
+        for (let rAttempt = 0; rAttempt < 2; rAttempt++) {
+          try {
+            writeFileSync(recovery, owner, { flag: 'wx', mode: 0o600 });
+            claimedRecovery = true;
+            break;
+          } catch (err) {
+            if (err.code !== 'EEXIST') throw err;
+            let recInfo;
+            try {
+              const recContent = readFileSync(recovery, 'utf8');
+              const recStat = statSync(recovery);
+              const recPid = Number(recContent.split(' ')[0]);
+              recInfo = { stale: !alive(recPid) || (Date.now() - recStat.mtimeMs > 5000) };
+            } catch (readErr) {
+              if (readErr.code === 'ENOENT') continue;
+              return false;
+            }
+            if (!recInfo.stale) return false;
+            try { unlinkSync(recovery); } catch (uErr) { if (uErr.code !== 'ENOENT') return false; }
+          }
         }
+        if (!claimedRecovery) return false;
         try {
           if (readFileSync(lockFile, 'utf8') === current) unlinkSync(lockFile);
-        } finally { unlinkSync(recovery); }
+        } catch (err) {
+          if (err.code !== 'ENOENT') throw err;
+        } finally {
+          try { unlinkSync(recovery); } catch {}
+        }
       }
     }
     return false;
@@ -181,62 +231,75 @@ export function createAppServerManager({
       cleanup();
       return;
     }
-    const picked = await freePort(port);
-    if (stopped) return;
-    const wsUrl = `ws://127.0.0.1:${picked}`;
-    const token = randomBytes(32).toString('base64url');
-    writeFileSync(tokenFile, token, { mode: 0o600, flag: 'wx' });
-    const childEnv = { ...env };
-    for (const key of Object.keys(childEnv)) if (STRIPPED_ENV.includes(key.toUpperCase())) delete childEnv[key];
-    childEnv.NO_PROXY = childEnv.no_proxy = '127.0.0.1,localhost,::1';
-    const [bin, ...prefix] = invocation(cli, env);
-    const args = [...prefix, 'app-server', '--listen', wsUrl, '--ws-auth', 'capability-token', '--ws-token-file', tokenFile,
-      '-c', 'model_providers.gempt_gateway.name="Magpie"',
-      '-c', 'model_providers.gempt_gateway.base_url=' + JSON.stringify(gatewayUrl + '/v1'),
-      '-c', 'model_providers.gempt_gateway.wire_api="responses"', '-c', 'model_provider="gempt_gateway"'];
-    const gatewayKey = resolveMagpieApiKey({ magpie: { ...raw.magpie, base_url: gatewayUrl } });
-    if (gatewayKey) {
-      childEnv.GEMPT_APP_SERVER_GATEWAY_TOKEN = gatewayKey;
-      args.push('-c', 'model_providers.gempt_gateway.env_key="GEMPT_APP_SERVER_GATEWAY_TOKEN"');
-    }
-    const spawned = child = spawnProcess(bin, args, { cwd: homedir(), env: childEnv, windowsHide: true,
-      detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
-    spawned.unref?.();
-    startedAt = Date.now();
-    let stderr = '';
-    let startupError;
-    spawned.stderr?.on('data', (chunk) => { stderr = (stderr + String(chunk)).slice(-2048); });
-    const exit = (message) => {
-      if (child !== spawned) return;
-      child = undefined;
-      try { if (existsSync(tokenFile)) unlinkSync(tokenFile); } catch { /* Retried on stop. */ }
+    const maxBindAttempts = port === 0 ? 3 : 1;
+    let lastStartupError;
+    for (let bindAttempt = 0; bindAttempt < maxBindAttempts; bindAttempt++) {
+      const picked = await freePort(port);
       if (stopped) return;
-      if (Date.now() - startedAt > 30000) failures = 0;
-      startupError = error = message;
-      try { clearPublished('stopped'); } catch { connection = undefined; }
-      retry();
-    };
-    spawned.once('error', (err) => exit(err.message));
-    spawned.once('exit', (code, signal) => exit(`Codex app-server exited (${signal || code}): ${stderr.trim().replaceAll(token, '[redacted]')}`));
-
-    const next = { ws_url: wsUrl, auth_token: token, auth_header: 'Authorization', pid: spawned.pid,
-      port: picked, gateway_url: gatewayUrl, started_at: new Date(startedAt).toISOString(), status: 'running' };
-    while (!stopped && child === spawned && Date.now() - startedAt < startupMs) {
-      let probe;
-      try { probe = await connect(next, undefined, { timeoutMs: 450 }); } catch { /* Still starting. */ }
-      if (probe) {
-        probe.close();
-        if (!stopped && child === spawned) {
-          atomicState(stateFile, next);
-          connection = next;
-          error = null;
-          unlinkSync(tokenFile);
-        }
-        return;
+      const wsUrl = `ws://127.0.0.1:${picked}`;
+      const token = randomBytes(32).toString('base64url');
+      try { if (existsSync(tokenFile)) unlinkSync(tokenFile); } catch {}
+      writeFileSync(tokenFile, token, { mode: 0o600, flag: 'wx' });
+      const childEnv = { ...env };
+      for (const key of Object.keys(childEnv)) if (STRIPPED_ENV.includes(key.toUpperCase())) delete childEnv[key];
+      childEnv.NO_PROXY = childEnv.no_proxy = '127.0.0.1,localhost,::1';
+      const [bin, ...prefix] = invocation(cli, env);
+      const args = [...prefix, 'app-server', '--listen', wsUrl, '--ws-auth', 'capability-token', '--ws-token-file', tokenFile,
+        '-c', 'model_providers.gempt_gateway.name="Magpie"',
+        '-c', 'model_providers.gempt_gateway.base_url=' + JSON.stringify(gatewayUrl + '/v1'),
+        '-c', 'model_providers.gempt_gateway.wire_api="responses"', '-c', 'model_provider="gempt_gateway"'];
+      const gatewayKey = resolveMagpieApiKey({ magpie: { ...raw.magpie, base_url: gatewayUrl } });
+      if (gatewayKey) {
+        childEnv.GEMPT_APP_SERVER_GATEWAY_TOKEN = gatewayKey;
+        args.push('-c', 'model_providers.gempt_gateway.env_key="GEMPT_APP_SERVER_GATEWAY_TOKEN"');
       }
-      await sleep(60);
+      const spawned = child = spawnProcess(bin, args, { cwd: homedir(), env: childEnv, windowsHide: true,
+        detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
+      spawned.unref?.();
+      startedAt = Date.now();
+      let stderr = '';
+      let startupError;
+      spawned.stderr?.on('data', (chunk) => { stderr = (stderr + String(chunk)).slice(-2048); });
+      const exit = (message) => {
+        if (child !== spawned) return;
+        child = undefined;
+        try { if (existsSync(tokenFile)) unlinkSync(tokenFile); } catch { /* Retried on stop. */ }
+        if (stopped) return;
+        if (Date.now() - startedAt > 30000) failures = 0;
+        startupError = error = message;
+        try { clearPublished('stopped'); } catch { connection = undefined; }
+        retry();
+      };
+      spawned.once('error', (err) => exit(err.message));
+      spawned.once('exit', (code, signal) => exit(`Codex app-server exited (${signal || code}): ${stderr.trim().replaceAll(token, '[redacted]')}`));
+
+      const next = { ws_url: wsUrl, auth_token: token, auth_header: 'Authorization', pid: spawned.pid,
+        port: picked, gateway_url: gatewayUrl, started_at: new Date(startedAt).toISOString(), status: 'running' };
+      while (!stopped && child === spawned && Date.now() - startedAt < startupMs) {
+        let probe;
+        try { probe = await connect(next, undefined, { timeoutMs: 450 }); } catch { /* Still starting. */ }
+        if (probe) {
+          probe.close();
+          if (!stopped && child === spawned) {
+            atomicState(stateFile, next);
+            connection = next;
+            error = null;
+            unlinkSync(tokenFile);
+          }
+          return;
+        }
+        await sleep(60);
+      }
+      if (stopped) return;
+      lastStartupError = startupError || 'Codex app-server startup timed out.';
+      const bindCollision = /EADDRINUSE|address already in use|10048/i.test(lastStartupError);
+      if (bindAttempt + 1 < maxBindAttempts && bindCollision) {
+        clearTimeout(restart);
+        restart = undefined;
+        continue;
+      }
+      throw new Error(lastStartupError);
     }
-    if (!stopped) throw new Error(startupError || 'Codex app-server startup timed out.');
   }
 
   function ensureRunning() {

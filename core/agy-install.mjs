@@ -5,7 +5,7 @@ import {
   readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, delimiter, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { APP_RESOURCE, APP_TOOLS, APP_URI } from './mcp-app.mjs';
 import { resolveNodeExecutable } from './node-executable.mjs';
@@ -25,11 +25,15 @@ export function buildMcpConfig(runtime, nodeBin = resolveNodeExecutable()) {
   return { mcpServers: { gempt: { command: nodeBin, args: [join(runtime, 'core', 'mcp-server.mjs')] } } };
 }
 
-function stage(staged, target, source, nodeBin) {
+export function buildPortableMcpConfig() {
+  return { mcpServers: { gempt: { command: 'node', args: ['${PLUGIN_ROOT}/runtime/core/mcp-server.mjs'] } } };
+}
+
+export function stagePluginBundle(staged, { target, source, nodeBin, portable = false } = {}) {
   const projectSource = source && existsSync(join(source, 'plugin', 'plugin.json')) ? source : ROOT;
   const plugin = source === projectSource || !source ? join(projectSource, 'plugin') : source;
   const runtime = join(staged, 'runtime');
-  mkdirSync(staged);
+  mkdirSync(staged, { recursive: true });
   for (const name of ['plugin.json', 'mcp_config.json', 'hooks.json', 'work_split_hook.mjs']) {
     copyFileSync(join(plugin, name), join(staged, name));
   }
@@ -38,17 +42,20 @@ function stage(staged, target, source, nodeBin) {
   }
   copyTree(existsSync(join(plugin, 'templates')) ? join(plugin, 'templates') : join(projectSource, 'templates'),
     join(staged, 'templates'));
-  for (const name of ['README.md', 'LICENSE']) {
-    copyFileSync(existsSync(join(plugin, name)) ? join(plugin, name) : join(projectSource, name), join(staged, name));
+  for (const name of ['README.md', 'LICENSE', 'THIRD_PARTY_LICENSES.txt']) {
+    const src = existsSync(join(plugin, name)) ? join(plugin, name) : join(projectSource, name);
+    if (existsSync(src)) copyFileSync(src, join(staged, name));
   }
   copyTree(join(projectSource, 'core'), join(runtime, 'core'));
   copyTree(join(projectSource, 'magpie_plugin', 'lib'), join(runtime, 'magpie_plugin', 'lib'));
-  atomicJson(join(runtime, 'package.json'), { type: 'module' });
-  const config = buildMcpConfig(join(target, 'runtime'), nodeBin);
+  let pkgVersion;
+  try { pkgVersion = JSON.parse(readFileSync(join(plugin, 'plugin.json'), 'utf8')).version; } catch {}
+  atomicJson(join(runtime, 'package.json'), { type: 'module', ...(pkgVersion ? { version: pkgVersion } : {}) });
+  const config = portable ? buildPortableMcpConfig() : buildMcpConfig(join(target, 'runtime'), nodeBin);
   atomicJson(join(staged, 'mcp_config.json'), config);
   const hookFile = join(staged, 'hooks.json');
   const hooks = JSON.parse(readFileSync(hookFile, 'utf8'));
-  const command = [nodeBin, join(target, 'work_split_hook.mjs')].map(quote).join(' ');
+  const command = portable ? 'node ./work_split_hook.mjs' : [nodeBin, join(target, 'work_split_hook.mjs')].map(quote).join(' ');
   for (const entries of Object.values(hooks['gempt-work-split'])) {
     for (const entry of entries) {
       for (const handler of entry.hooks || [entry]) {
@@ -58,6 +65,10 @@ function stage(staged, target, source, nodeBin) {
   }
   atomicJson(hookFile, hooks);
   return config;
+}
+
+function stage(staged, target, source, nodeBin) {
+  return stagePluginBundle(staged, { target, source, nodeBin, portable: false });
 }
 
 function stageLegacyHook(staged, target, nodeBin) {
@@ -88,40 +99,60 @@ function nodeRequest(nodeBin, entry, cwd, env, requests) {
   });
 }
 
-async function validate(staged, nodeBin, env) {
+export async function validatePluginBundle(staged, nodeBin, env = process.env, { portable = false } = {}) {
   const manifest = JSON.parse(readFileSync(join(staged, 'plugin.json'), 'utf8'));
   if (manifest.name !== 'gempt') throw new Error("Expected Antigravity plugin manifest name 'gempt'.");
   for (const file of readdirSync(join(staged, 'templates')).filter((name) => name.endsWith('.json'))) {
     JSON.parse(readFileSync(join(staged, 'templates', file), 'utf8'));
   }
-  for (const file of ['hooks.json', 'mcp_config.json', 'rules/AGENTS.md', 'agents/gempt-worker.md',
+  for (const file of ['README.md', 'LICENSE', 'THIRD_PARTY_LICENSES.txt', 'assets/logo.svg',
+    'hooks.json', 'mcp_config.json', 'rules/AGENTS.md', 'agents/gempt-worker.md',
     'skills/gempt/SKILL.md', 'runtime/core/assets/workload.json', 'runtime/core/assets/mcp_app_live.html']) {
-    if (!statSync(join(staged, file)).isFile() || !statSync(join(staged, file)).size) {
+    if (!statSync(join(staged, file), { throwIfNoEntry: false })?.isFile() || !statSync(join(staged, file)).size) {
       throw new Error(`Missing or empty Antigravity plugin asset: ${file}`);
     }
   }
-  const childEnv = { ...env, GEMPT_CONFIG: join(staged, 'validation-config.json') };
+  if (portable) {
+    const mcp = JSON.parse(readFileSync(join(staged, 'mcp_config.json'), 'utf8'));
+    if (!String(mcp?.mcpServers?.gempt?.args?.[0] || '').startsWith('${PLUGIN_ROOT}/')) {
+      throw new Error('Portable Antigravity plugin mcp_config.json must use ${PLUGIN_ROOT}.');
+    }
+    const hookText = readFileSync(join(staged, 'hooks.json'), 'utf8');
+    if (!hookText.includes('node ./work_split_hook.mjs')) {
+      throw new Error('Portable Antigravity plugin hooks.json must use relative ./work_split_hook.mjs.');
+    }
+  }
+  const validationWorkspace = mkdtempSync(join(dirname(staged), '.gempt-validate-'));
+  const childEnv = { ...env, GEMPT_CONFIG: join(validationWorkspace, 'validation-config.json') };
   delete childEnv.GEMPT_APP_HTML;
   const requests = [
     { id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' } },
     { id: 2, method: 'tools/list' },
     { id: 3, method: 'resources/read', params: { uri: APP_URI } },
   ].map((request) => ({ jsonrpc: '2.0', ...request }));
-  const [packets, [hook]] = await Promise.all([
-    nodeRequest(nodeBin, join(staged, 'runtime', 'core', 'mcp-server.mjs'), staged, childEnv, requests),
-    nodeRequest(nodeBin, join(staged, 'work_split_hook.mjs'), staged, childEnv,
-      [{ hookEventName: 'SessionStart', modelName: 'gemini-4-neon-high' }]),
-  ]);
-  const results = new Map(packets.map(({ id, result }) => [id, result]));
-  if (results.get(1)?.serverInfo?.name !== 'gempt') throw new Error('Staged MCP server did not identify itself as gempt.');
-  const tools = results.get(2)?.tools;
-  const expected = ['gpt_run', 'gpt_ask', 'gpt_ctl', ...Object.keys(APP_TOOLS)].sort();
-  if (JSON.stringify(tools?.map(({ name }) => name).sort()) !== JSON.stringify(expected)) {
-    throw new Error('Staged MCP server did not advertise the seven GemPT tools.');
+  try {
+    const [packets, [hook]] = await Promise.all([
+      nodeRequest(nodeBin, join(staged, 'runtime', 'core', 'mcp-server.mjs'), staged, childEnv, requests),
+      nodeRequest(nodeBin, join(staged, 'work_split_hook.mjs'), staged, childEnv,
+        [{ hookEventName: 'SessionStart', modelName: 'gemini-4-neon-high' }]),
+    ]);
+    const results = new Map(packets.map(({ id, result }) => [id, result]));
+    if (results.get(1)?.serverInfo?.name !== 'gempt') throw new Error('Staged MCP server did not identify itself as gempt.');
+    const tools = results.get(2)?.tools;
+    const expected = ['gpt_run', 'gpt_ask', 'gpt_ctl', ...Object.keys(APP_TOOLS)].sort();
+    if (JSON.stringify(tools?.map(({ name }) => name).sort()) !== JSON.stringify(expected)) {
+      throw new Error('Staged MCP server did not advertise the seven GemPT tools.');
+    }
+    const resource = results.get(3)?.contents?.[0];
+    if (resource?.mimeType !== APP_RESOURCE.mimeType || !resource.text) throw new Error('Staged MCP server could not read GemPT Live.');
+    if (!hook?.injectSteps?.[0]?.systemMessage?.systemMessage) throw new Error('Staged SessionStart hook did not inject a system message.');
+  } finally {
+    try { rmSync(validationWorkspace, { recursive: true, force: true }); } catch {}
   }
-  const resource = results.get(3)?.contents?.[0];
-  if (resource?.mimeType !== APP_RESOURCE.mimeType || !resource.text) throw new Error('Staged MCP server could not read GemPT Live.');
-  if (!hook?.injectSteps?.[0]?.systemMessage?.systemMessage) throw new Error('Staged SessionStart hook did not inject a system message.');
+}
+
+async function validate(staged, nodeBin, env) {
+  return validatePluginBundle(staged, nodeBin, env, { portable: false });
 }
 
 function syncInPlace(staged, target) {
@@ -238,12 +269,39 @@ export async function installAgy({ target = DEFAULT_AGY_TARGET, source, force = 
         syncInPlace(staged, target);
       }
       resetWindowsAcls([target]);
+      const resolvedBinDir = resolvePath(binDir);
       let shims = [];
       let shimError;
-      try { shims = installWaitShim(target, nodeBin, resolvePath(binDir)); } catch (error) { shimError = error.message; }
+      try { shims = installWaitShim(target, nodeBin, resolvedBinDir); } catch (error) { shimError = error.message; }
       resetWindowsAcls(shims);
-      return { installed: true, plugin_dir: target, mcp_config: config, shims,
-        ...(shimError ? { shim_error: shimError } : {}), refresh: await refresh(env) };
+      const pathEntries = String(env.PATH || env.Path || '').split(delimiter).filter(Boolean).map((dir) => {
+        try { return resolvePath(dir); } catch { return dir; }
+      });
+      const fold = (p) => (WINDOWS ? p.toLowerCase() : p);
+      const binOnPath = pathEntries.some((dir) => fold(dir) === fold(resolvedBinDir));
+      const warnings = [];
+      if (shimError) {
+        warnings.push(`Could not install gempt-wait shim in ${resolvedBinDir}: ${shimError}. gpt_run will return an explicit fallback wait_command.`);
+      } else if (!binOnPath) {
+        warnings.push(`${resolvedBinDir} is not on PATH; add it to PATH to run \`gempt-wait\` directly, or execute the exact \`wait_command\` returned by gpt_run.`);
+      }
+      return {
+        installed: !shimError,
+        plugin_installed: true,
+        shim_installed: !shimError,
+        plugin_dir: target,
+        mcp_config: config,
+        shims,
+        wait_shim: {
+          installed: !shimError,
+          on_path: binOnPath,
+          bin_dir: resolvedBinDir,
+          ...(shimError ? { error: shimError } : {}),
+        },
+        ...(shimError ? { shim_error: shimError } : {}),
+        ...(warnings.length ? { warnings } : {}),
+        refresh: await refresh(env),
+      };
     } finally {
       if (!keepBackup) {
         try { rmSync(workspace, { recursive: true, force: true }); } catch {}

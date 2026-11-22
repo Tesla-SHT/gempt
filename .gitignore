@@ -4,5 +4,11 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+node_modules/
 .gempt.json
+.env
+.env.*
+*.local.json
+*.key
+*.pem
 .venv/

@@ -14,13 +14,15 @@ import { test } from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { installAgy, resolveNodeExecutable } from '../core/agy-install.mjs';
+import { installAgy, resolveNodeExecutable, stagePluginBundle, validatePluginBundle } from '../core/agy-install.mjs';
 import { contextPath, readHostContext, updateHostContext } from '../core/host-context.mjs';
 import { APP_RESOURCE, APP_URI, callAppTool, readAppResource } from '../core/mcp-app.mjs';
+import { handleTool } from '../core/mcp-server.mjs';
 import { buildWaitCommand, dispatchRun, interruptRun, listActiveRoster, readRun, replyToolCall, runDirectory,
   saveRun, steerRun, waitForRun, waitForRuns } from '../core/runs.mjs';
 import { withLock } from '../core/state.mjs';
-import { ensureShareWorktree, removeShareWorktree, worktreesRoot } from '../core/worktrees.mjs';
+import { assertShareWorktree, ensureShareWorktree, pruneShareWorktrees,
+  removeShareWorktree, worktreesRoot } from '../core/worktrees.mjs';
 
 const execFileAsync = promisify(execFile);
 const hookPath = fileURLToPath(new URL('../plugin/work_split_hook.mjs', import.meta.url));
@@ -158,7 +160,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const bridge = join(target, 'work_split_hook.py');
   assert.equal(readFileSync(bridge, 'utf8').trimEnd().split('\n').length, 7);
   assert.ok(!existsSync(join(target, 'runtime', 'gempt')));
-  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module' });
+  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.3.0' });
   const config = JSON.parse(readFileSync(join(target, 'mcp_config.json'), 'utf8'));
   const { command, args } = config.mcpServers.gempt;
   assert.equal(command, process.execPath);
@@ -166,7 +168,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const initialized = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' },
   }) });
-  assert.equal(initialized.result.serverInfo.version, '0.2.2');
+  assert.equal(initialized.result.serverInfo.version, '0.3.0');
   const response = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'resources/read', params: { uri: APP_URI },
   }) });
@@ -294,6 +296,32 @@ test('Node CLI discovers, updates tiers, prints launchers and installs to an iso
   assert.ok(!existsSync(join(target, 'work_split_hook.py')));
   assert.ok(existsSync(join(f.root, 'bin', 'gempt-wait.mjs')));
   assert.deepEqual(await cli('print-mcp', '--installed', '--target', target), installed.mcp_config);
+});
+
+test('portable Antigravity bundle validates and a shim failure reports a partial install', async (t) => {
+  const f = fixture(t);
+  const bundleDir = join(f.root, 'bundle');
+  stagePluginBundle(bundleDir, { portable: true });
+  await validatePluginBundle(bundleDir, resolveNodeExecutable(), f.env, { portable: true });
+  const manifest = JSON.parse(readFileSync(join(bundleDir, 'plugin.json'), 'utf8'));
+  assert.equal(manifest.logo, 'assets/logo.svg');
+  assert.equal(typeof manifest.author?.name, 'string');
+  assert.ok(manifest.author.name.trim());
+  for (const name of ['assets/logo.svg', 'THIRD_PARTY_LICENSES.txt', 'README.md']) {
+    assert.ok(readFileSync(join(bundleDir, name), 'utf8').trim(), name);
+  }
+
+  const target = join(f.root, 'installed-plugin');
+  const binDir = join(f.root, 'bin-file');
+  writeFileSync(binDir, 'keep this file');
+  const result = await installAgy({ target, binDir, env: f.env });
+  assert.equal(result.plugin_installed, true);
+  assert.equal(result.shim_installed, false);
+  assert.equal(result.installed, false);
+  assert.ok(result.shim_error);
+  assert.ok(result.warnings.some((warning) => warning.includes(result.shim_error)));
+  assert.equal(JSON.parse(readFileSync(join(target, 'plugin.json'), 'utf8')).name, 'gempt');
+  assert.equal(readFileSync(binDir, 'utf8'), 'keep this file');
 });
 
 function git(cwd, ...args) {
@@ -504,9 +532,49 @@ test('shared worktrees use detached Git HEAD, preserve subdirectories, reuse, an
   assert.equal(readFileSync(join(worktree.cwd, 'new.txt'), 'utf8'), 'work in progress');
   assert.throws(() => ensureShareWorktree(cwd, '../unsafe', env), /Invalid session_id/);
   assert.equal(removeShareWorktree(cwd, cwd, env), false);
+  rmSync(join(worktree.cwd, 'new.txt'));
   assert.equal(removeShareWorktree(cwd, worktree.worktree_root, env), true);
   assert.equal(existsSync(worktree.worktree_root), false);
   assert.doesNotMatch(git(cwd, 'worktree', 'list'), /session-a/);
+});
+
+test('shared worktree entry points reject inspect and cleanup protects foreign and dirty worktrees', async (t) => {
+  const f = fixture(t);
+  const subdir = initRepo(f.cwd);
+  const request = { goal: 'Inspect the project', access: 'inspect', workspace: 'share', cwd: subdir };
+  const readOnlyError = /workspace='share' is not allowed with read-only access/;
+  const originalWorktrees = git(f.cwd, 'worktree', 'list', '--porcelain');
+  await assert.rejects(dispatchRun(request, f), readOnlyError);
+  assert.equal(existsSync(worktreesRoot(f.env)), false);
+  await assert.rejects(handleTool('gpt_run', request, f.env), readOnlyError);
+  assert.equal(existsSync(worktreesRoot(f.env)), false);
+  assert.equal(git(f.cwd, 'worktree', 'list', '--porcelain'), originalWorktrees);
+
+  const otherRepo = join(f.root, 'other-repo');
+  mkdirSync(otherRepo);
+  initRepo(otherRepo);
+  const foreign = ensureShareWorktree(otherRepo, 'foreign', f.env).worktree_root;
+  assert.throws(() => assertShareWorktree(f.cwd, foreign, f.env), /does not belong to the requested Git repository/);
+
+  const dirty = ensureShareWorktree(subdir, 'dirty', f.env);
+  const edited = join(dirty.cwd, 'readme.txt');
+  writeFileSync(edited, 'uncommitted edit\n');
+  assert.equal(removeShareWorktree(f.cwd, dirty.worktree_root, f.env), false);
+
+  const clean = ensureShareWorktree(subdir, 'clean', f.env);
+  writeFileSync(join(clean.cwd, 'merged.txt'), 'merged change\n');
+  git(clean.cwd, 'add', 'merged.txt');
+  git(clean.cwd, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+    '-c', 'commit.gpgsign=false', 'commit', '-qm', 'worktree change');
+  const commit = git(clean.cwd, 'rev-parse', 'HEAD');
+  assert.equal(removeShareWorktree(f.cwd, clean.worktree_root, f.env), false);
+  git(f.cwd, 'merge', '--ff-only', commit);
+  assert.deepEqual(pruneShareWorktrees(f.cwd, { env: f.env, maxAgeMs: 0 }),
+    { removed: [clean.worktree_root], kept: [dirty.worktree_root] });
+  assert.equal(existsSync(clean.worktree_root), false);
+  assert.doesNotMatch(git(f.cwd, 'worktree', 'list', '--porcelain'), /\/clean(?:\r?\n|$)/);
+  assert.equal(readFileSync(edited, 'utf8'), 'uncommitted edit\n');
+  assert.equal(assertShareWorktree(otherRepo, foreign, f.env), foreign);
 });
 
 test('background dispatch reuses a shared worktree and upgrades inspect to a fresh writable thread', async (t) => {
@@ -514,17 +582,17 @@ test('background dispatch reuses a shared worktree and upgrades inspect to a fre
   const subdir = initRepo(f.cwd);
   const packets = await appFixture(t, f);
   await updateHostContext('host-main', [f.cwd], f);
-  const first = await dispatchRun({ goal: 'Read-only inspection', cwd: subdir, workspace: 'share',
+  const first = await dispatchRun({ goal: 'Read-only inspection', cwd: subdir, workspace: 'inherit',
     background: true, sandbox: 'read-only' }, f);
   assert.equal(first.state, 'queued');
   assert.equal(first.host_conversation_id, 'host-main');
-  assert.equal(first.cwd, join(first.worktree_path, 'project'));
+  assert.equal(first.worktree_path, null);
   const done = await waitForRun(first.run_id, { ...f, timeoutSec: 5 });
   assert.equal(done.state, 'finished', done.error);
   assert.equal(done.sandbox, 'read-only');
   const second = await dispatchRun({ goal: 'Make the change', cwd: subdir, session_id: done.session_id,
     workspace: 'inherit', background: true }, f);
-  assert.equal(second.worktree_path, first.worktree_path);
+  assert.equal(second.worktree_path, null);
   const upgraded = await waitForRun(second.run_id, { ...f, timeoutSec: 5 });
   assert.equal(upgraded.state, 'finished', upgraded.error);
   assert.equal(upgraded.sandbox_upgraded, true);
@@ -541,6 +609,16 @@ test('background dispatch reuses a shared worktree and upgrades inspect to a fre
   assert.deepEqual(input.sandboxPolicy, { type: 'workspaceWrite' });
   assert.match(input.input[0].text, /Carryover from the prior read-only Codex thread/);
   assert.match(input.input[0].text, /Prior finding: verify the result/);
+
+  const sharedFirst = await dispatchRun({ goal: 'Edit in shared worktree', cwd: subdir, workspace: 'share',
+    background: true }, f);
+  assert.equal(sharedFirst.cwd, join(sharedFirst.worktree_path, 'project'));
+  const sharedDone = await waitForRun(sharedFirst.run_id, { ...f, timeoutSec: 5 });
+  assert.equal(sharedDone.state, 'finished', sharedDone.error);
+  const sharedSecond = await dispatchRun({ goal: 'Follow up in shared worktree', cwd: subdir,
+    session_id: sharedDone.session_id, workspace: 'inherit', background: true }, f);
+  assert.equal(sharedSecond.worktree_path, sharedFirst.worktree_path);
+  assert.equal((await waitForRun(sharedSecond.run_id, { ...f, timeoutSec: 5 })).state, 'finished');
 
   const priorId = 'exec-python-example';
   writeFileSync(join(f.sessionsDir, `${priorId}.json`), JSON.stringify({ mode: 'exec', session_id: priorId,
@@ -644,6 +722,26 @@ test('Live resource and run list bind to the active conversation and workspace',
   await assert.rejects(callAppTool('gempt_app_stream', { run_id: '3'.repeat(32) }, opts), /outside host workspace/);
 });
 
+test('Live run list defaults to an empty unbound session and can list all workspace runs', async (t) => {
+  const f = fixture(t);
+  const first = '1'.repeat(32);
+  const second = '2'.repeat(32);
+  state(f, first, { host_conversation_id: 'previous' });
+  state(f, second, { host_conversation_id: 'another', state: 'finished' });
+  const opts = { ...f, root: f.cwd };
+  const { structuredContent: scoped } = await callAppTool('gempt_app_runs', {}, opts);
+  assert.equal(scoped.scope, 'session');
+  assert.equal(scoped.unbound_session, true);
+  assert.deepEqual(scoped.runs, []);
+  assert.equal(scoped.app_server.version, '0.3.0');
+
+  const { structuredContent: all } = await callAppTool('gempt_app_runs', { scope: 'all' }, opts);
+  assert.equal(all.scope, 'all');
+  assert.equal(all.unbound_session, false);
+  assert.deepEqual(all.runs.map(({ run_id }) => run_id).sort(), [first, second]);
+  assert.equal(all.app_server.version, '0.3.0');
+});
+
 test('Live journal filters other turns, bounds events, and pages stable Unicode text and goals', async (t) => {
   const f = fixture(t);
   const id = '4'.repeat(32);
@@ -705,7 +803,7 @@ test('standalone NDJSON MCP advertises three model tools and four app tools and 
   const started = await request('initialize', { protocolVersion: '2026-test' });
   assert.equal(started.result.protocolVersion, '2026-test');
   assert.equal(started.result.serverInfo.name, 'gempt');
-  assert.equal(started.result.serverInfo.version, '0.2.2');
+  assert.equal(started.result.serverInfo.version, '0.3.0');
   send({ method: 'notifications/initialized' });
   assert.deepEqual((await request('ping')).result, {});
   const { tools } = (await request('tools/list')).result;
