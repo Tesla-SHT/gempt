@@ -56,7 +56,7 @@ const PKG = (() => {
   }
 })();
 
-const BUILD_ID = `${PKG.version || '0.1.0'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
+const BUILD_ID = `${PKG.version || '0.2.0'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
 const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 const sleepUnref = (ms) => new Promise((resolveSleep) => {
   const timer = setTimeout(resolveSleep, ms);

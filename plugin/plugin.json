@@ -1,7 +1,7 @@
 {
   "name": "gempt",
   "displayName": "gempt — Gemini × GPT Orchestrator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Human ↔ Gemini, Gemini leads GPT orchestrator plugin: Antigravity MCP + /gempt-{sonnet,opus,fable,chore} slash skills paired with Magpie's Plugins -> GemPT control page to route GPT/Codex via local Magpie.",
   "suggestedPrompts": [
     "初始化 gempt 配置，自动扫描本机 Magpie、GPT 模型和 Codex CLI",

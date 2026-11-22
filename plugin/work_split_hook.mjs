@@ -19,7 +19,7 @@ const exemptParts = [
   '/.zcode/skills/', '/agent-skills/', '/.config/gempt/',
 ];
 const override = /自己改|自己查|自己做|不用\s*gpt|别用\s*gpt|别派\s*gpt|不要\s*gpt|别转\s*gpt|gemini\s*(?:自己|直接)?(?:做|改|查|处理)|\b(?:no\s+gpt|skip\s+gempt|bypass\s+gempt|don'?t\s+use\s+gpt)\b/i;
-const waitCommand = /\bgempt-wait\b|\bgempt\.cli\b[^\n]*--wait\b|\bgempt\s+status\b[^\n]*--wait\b/i;
+const waitCommand = /\bgempt-wait\b|\bgempt\s+status\b[^\n]*--wait\b/i;
 const readCommand = /(?:^|[;&|\r\n]\s*)(?:(?:sudo|command|time)\s+)?(?:Get-Content|Select-String|Get-ChildItem|gc|sls|gci|cat|head|tail|rg|ripgrep|grep|findstr|find|ls|dir|tree|sed|awk|wc|git\s+(?:diff|show|log|grep|status)|type)(?:\.exe)?(?=\s|$)/i;
 const milestones = [120, 200, 280];
 const banners = {
@@ -172,26 +172,13 @@ async function handle(payload) {
     }
     if (name === 'call_mcp_tool') {
       if (input.ServerName !== 'gempt_gempt') return allow;
-      const tool = String(input.ToolName || '');
-      const delegation = ['gempt_dispatch', 'gempt_exec', 'gempt_consult'].includes(tool);
-      if (delegation || ['gpt_run', 'gpt_ask'].includes(tool)) {
+      if (['gpt_run', 'gpt_ask'].includes(input.ToolName)) {
         await updateState(conversationId, (state) => setCount(state, key, 0));
-      }
-      const task = input.Arguments;
-      if (!tool.startsWith('gempt_') || !task || typeof task !== 'object' || Array.isArray(task)) return allow;
-      const updates = {};
-      if (text(conversationId) && ['gempt_dispatch', 'gempt_exec', 'gempt_live_view', 'gempt_status'].includes(tool)) {
-        const parentId = task.host_conversation_id;
-        if (!parentId && (tool !== 'gempt_status' || !task.run_id)) updates.host_conversation_id = conversationId;
-        else if (typeof parentId === 'string' && parentId !== conversationId && delegation) {
+        const parentId = text(input.Arguments?.host_conversation_id);
+        if (parentId && parentId !== conversationId) {
           await updateHostContext(conversationId, workspacePaths, { parentId, geminiFamily: family, configPath });
         }
       }
-      if (delegation && family && !task.tier && !task.session_id &&
-          [null, 'solo', 'coordinator', 'narrator'].includes(task.role ?? null) && task.gemini_family !== family) {
-        updates.gemini_family = family;
-      }
-      if (Object.keys(updates).length) allow.overwrite = { Arguments: { ...task, ...updates } };
       return allow;
     }
     if (['gemini', 'gemini_first'].includes(ordinary) || override.test(userInput) || !healthy()) return allow;

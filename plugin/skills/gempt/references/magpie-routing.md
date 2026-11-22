@@ -1,11 +1,11 @@
 # Magpie 三档路由组参考模板（`gempt`）
 
-本文件列出与 `templates/magpie-groups.template.json` 对应的本地 Magpie CLI 配置方法，供 `gempt_configure(..., sync_magpie_groups=True)` 或手工调整 Magpie 路由时参考。模板随 Antigravity 插件一同安装。
+本文件列出与 `templates/magpie-groups.template.json` 对应的本地 Magpie CLI 配置方法。可用 `gempt init --sync-magpie --use-groups` 同步 harness 路由组。模板随 Antigravity 插件一同安装。
 
 > 注意：
 > - **Antigravity 原生用户**：Antigravity 里的 Gemini 使用官方原路，不需要也不能通过 Magpie 反代；在 Antigravity UI 内自选 Gemini 档位即可。
-> - **外部客户端用户（通过 Magpie 用 Gemini）**：运行 `gempt presets --apply` 可创建原生预设 `group/gempt-{sonnet,opus,fable}`。Magpie 原生插件通过 HTTP MCP 提供同回合的 GPT/Codex 调度。独立 stdio 客户端可从已安装的 Antigravity 插件导出配置，命令为 `gempt print-mcp --installed`。
-> - **命名隔离与共存**：本插件可选同步的 `group/gempt-harness-{sonnet,opus,fable}` 仅包含 GPT/Codex（及可选 `compact` 规则），与根目录 `install.sh` 的 `group/gempt-*`（含 Gemini + GPT + Flash）完全独立、互不冲突；日常默认不新建组也可直接使用具体 GPT 模型 ID。
+> - **外部客户端用户（通过 Magpie 用 Gemini）**。运行 `gempt presets --apply` 可创建原生预设 `group/gempt-{sonnet,opus,fable}`。Magpie HTTP MCP 提供 `gempt_run`、`gempt_ask`、`gempt_ctl`。独立 stdio 客户端可用 `gempt print-mcp --installed` 导出配置，调用 `gpt_run`、`gpt_ask`、`gpt_ctl`。
+> - **命名隔离与共存**。`group/gempt-harness-{sonnet,opus,fable}` 仅包含 GPT/Codex 和可选 `compact` 规则。`gempt presets --apply` 创建的 `group/gempt-*` 可包含 Gemini、GPT 和 Flash。默认可直接使用具体 GPT 模型 ID。
 
 ---
 
@@ -52,7 +52,6 @@ magpie group rule add gempt-harness-fable use=group/auto-deepseek-v4-1-flash com
 
 ## 3. 已验证的常见坑位
 
-1. **回环请求被系统代理劫持**：访问 `127.0.0.1:3425` 必须绕过代理（`gempt` 内置 `ProxyHandler({})`；手动用 curl 测试请加 `--noproxy 127.0.0.1`）。
+1. GemPT 的本地网关探测绕过系统代理。手动用 `curl` 检查 `127.0.0.1:3425` 时可加 `--noproxy 127.0.0.1`。
 2. **思考模型输出为空**：`max_output_tokens` 给太小会被 reasoning token 吃光；`gempt` 默认按档位给 `8192`~`32768`。
-3. **`codex exec` vs `codex exec resume` 参数差异**：`codex exec` 支持 `-C` 和 `-s`；`codex exec resume` 不支持 `-C`/`-s` 参数（由 `gempt` 的 `codex_runner.py` 自动处理）。
-4. **Codex 固定注入开销**：每次 `codex exec` 会带入约 18K–50K input tokens 的系统工具上下文；纯审方案、纯数学/算法推导务必用 `gempt_consult`。
+3. `gpt_run` 通过共享 Codex app-server 启动和续接线程。只需要审方案或做推导时用 `gpt_ask`，可省去 Codex 工具上下文。

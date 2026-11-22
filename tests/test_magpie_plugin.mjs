@@ -4,7 +4,7 @@ import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { execFile, spawnSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
@@ -46,16 +46,16 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
   const { stdout } = await execFileAsync(npmCli ? process.execPath : 'npm', [
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
-  const [{ files }] = JSON.parse(stdout);
+  const [{ files, version }] = JSON.parse(stdout);
+  assert.equal(version, '0.2.0');
   const paths = files.map((file) => file.path);
-  for (const path of ['LICENSE', 'src/gempt/mcp_app_live.html', 'src/gempt/host_context.py', 'src/gempt/titles.py',
-    'plugin/hooks.json', 'plugin/work_split_hook.py', 'magpie_plugin/lib/backend.mjs',
+  for (const path of ['LICENSE', 'plugin/hooks.json', 'magpie_plugin/lib/backend.mjs',
     'bin/gempt.mjs', 'plugin/work_split_hook.mjs', 'core/agy-install.mjs', 'core/mcp-server.mjs',
     'core/host-context.mjs', 'core/wait.mjs', 'core/assets/mcp_app_live.html', 'core/assets/workload.json']) {
     assert.ok(paths.includes(path), path);
   }
-  const roots = /^(?:LICENSE(?:\.md)?$|README\.md$|install\.(?:sh|ps1)$|package\.json$|pyproject\.toml$|(?:bin|core|magpie_plugin|mcp_app|plugin|src\/gempt|templates)\/)/;
-  const localFiles = /(?:^|\/)(?:\.[^/]+|node_modules|__pycache__|sessions|runs|host-context(?:[.-][^/]*)?|state\.json|config\.json|request\.json|package-lock\.json)(?:\/|$)|\.(?:pyc|log|jsonl|tgz)$/i;
+  const roots = /^(?:LICENSE(?:\.md)?$|README\.md$|install\.(?:sh|ps1)$|package\.json$|(?:bin|core|magpie_plugin|mcp_app|plugin|templates)\/)/;
+  const localFiles = /(?:^|\/)(?:\.[^/]+|node_modules|__pycache__|sessions|runs|host-context(?:[.-][^/]*)?|state\.json|config\.json|request\.json|package-lock\.json)(?:\/|$)|\.(?:py|pyc|log|jsonl|tgz)$/i;
   assert.deepEqual(paths.filter((path) => !roots.test(path) || (path !== 'core/host-context.mjs' && localFiles.test(path))), []);
   assert.ok(!existsSync(join(REPO_ROOT, 'node_modules')));
   assert.ok(!existsSync(join(REPO_ROOT, 'mcp_app', 'node_modules')));
@@ -85,18 +85,6 @@ test('UI assets and API requests resolve relative to the direct and proxied page
     assert.equal((await apiFetch('/api/requests?q=a%2Fb')).status, 200);
   }
 });
-
-function findPythonBin() {
-  const candidates = [
-    process.env.PYTHON_BIN,
-    ...(process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python']),
-  ].filter(Boolean);
-  for (const cand of candidates) {
-    const run = spawnSync(cand, ['-I', '-c', 'import sys; sys.exit(sys.version_info < (3, 10))'], { windowsHide: true });
-    if (run.status === 0) return cand;
-  }
-  return '';
-}
 
 function startMockMagpie(modelsData, { onRequest } = {}) {
   const payloadData = modelsData ?? [
@@ -342,7 +330,7 @@ test('package.json Magpie manifest fields and single plugin factory export exist
   assert.equal(pkg.name, 'gempt');
   assert.equal(pkg.type, 'module');
   assert.equal(pkg.exports['.'], './magpie_plugin/index.mjs');
-  for (const item of [pkg.main.slice(2), 'src/gempt/workload.json', 'plugin/rules/AGENTS.md', 'install.sh', 'install.ps1', 'README.md']) {
+  for (const item of [pkg.main.slice(2), 'core/assets/*', 'plugin/rules/AGENTS.md', 'install.sh', 'install.ps1', 'README.md']) {
     assert.ok(pkg.files.includes(item), `files missing ${item}`);
   }
   assert.ok(existsSync(join(REPO_ROOT, pkg.main)));
@@ -592,7 +580,7 @@ test('backend readState exposes multi-client state, native groups, MCP snippet, 
   }
 });
 
-test('page server supports native-groups, lossless api_fallback <-> subscription_only round-trip, and Python cross-check', async () => {
+test('page server supports native groups and lossless failover round-trip with a unified MCP consultation', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'gempt-magpie-srv-'));
   const magpie = await startMockMagpie();
   const cfgPath = join(dir, 'config.json');
@@ -735,22 +723,9 @@ test('page server supports native-groups, lossless api_fallback <-> subscription
     assert.deepEqual(subCfg.tiers.opus.fallback_models, []);
     assert.ok(subCfg.routing_policy.api_fallback_snapshot);
 
-    // Cross-check in Python: resolve_tier under subscription_only must succeed without ConfigError.
-    const pyBin = findPythonBin();
-    if (pyBin) {
-      const pyCheck = await execFileAsync(
-        pyBin,
-        [
-          '-c',
-          'import sys; from gempt.config import load_config, resolve_tier; '
-          + 'c,_=load_config(explicit=sys.argv[1]); '
-          + 'print(resolve_tier(c,"sonnet")["model"], resolve_tier(c,"opus",escalate=True)["model"], resolve_tier(c,"fable")["model"])',
-          cfgPath,
-        ],
-        { env: { ...process.env, PYTHONPATH: join(REPO_ROOT, 'src') } },
-      );
-      assert.equal(pyCheck.stdout.trim(), 'codex/gpt-6.2-sol codex/gpt-6.2-astra codex/gpt-6.2-astra');
-    }
+    const { ask } = createGemptTools({ configPath: cfgPath, sessionsDir: join(dir, 'sessions') });
+    await ask.execute({ goal: 'Check the active subscription tier.', tier: 'fable' });
+    assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6.2-astra');
 
     // Restore subscription_only -> api_fallback losslessly
     const toApiRes = await fetch(`${origin}/api/settings`, {
@@ -1735,7 +1710,7 @@ test('shared app-server manager reports missing Codex CLI without scheduling ret
     try {
       const state = await manager.ensureRunning();
       assert.equal(state.running, false);
-      assert.match(state.error, /未找到 Codex CLI.*gempt_consult/);
+      assert.match(state.error, /未找到 Codex CLI.*gempt_ask/);
       await sleep(50);
       assert.deepEqual(manager.getStatus(), state);
       assert.equal(scheduled, 0);

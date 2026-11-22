@@ -150,7 +150,8 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   assert.ok(installed.refresh.refreshed);
   assert.deepEqual(refreshCalls, [{ url: '/exa.language_server_pb.LanguageServerService/RefreshMcpServers',
     method: 'POST', token: 'fixture', data: { serverName: 'gempt_gempt' } }]);
-  assert.ok(!existsSync(join(target, 'work_split_hook.py')));
+  const bridge = join(target, 'work_split_hook.py');
+  assert.equal(readFileSync(bridge, 'utf8').trimEnd().split('\n').length, 7);
   assert.ok(!existsSync(join(target, 'runtime', 'gempt')));
   assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module' });
   const config = JSON.parse(readFileSync(join(target, 'mcp_config.json'), 'utf8'));
@@ -169,6 +170,13 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
     ? jsonProcess(command, [join(target, 'work_split_hook.mjs')], { cwd: f.root, env, input: '{"hookEventName":"SessionStart"}' })
     : jsonProcess('sh', ['-c', hook], { cwd: f.root, env, input: '{"hookEventName":"SessionStart"}' });
   assert.match(hookResult.injectSteps[0].systemMessage.systemMessage, /GemPT v2 active/);
+  await t.test('cached Python hook forwards SessionStart to Node', (t) => {
+    const python = [process.env.PYTHON_BIN, 'python3', 'python'].filter(Boolean)
+      .find((candidate) => spawnSync(candidate, ['-I', '-c', 'import sys'], { windowsHide: true }).status === 0);
+    if (!python) return t.skip('A legacy Python launcher is needed to exercise the compatibility bridge.');
+    const throughBridge = jsonProcess(python, ['-I', bridge], { cwd: f.root, env, input: '{"hookEventName":"SessionStart"}' });
+    assert.deepEqual(throughBridge, hookResult);
+  });
   const first = 'a'.repeat(32);
   const second = 'b'.repeat(32);
   state(f, first, { state: 'finished' });
@@ -227,6 +235,7 @@ test('Node CLI discovers, updates tiers, prints launchers and installs to an iso
   const target = join(f.root, 'cli plugin');
   const installed = await cli('install-agy', '--target', target);
   assert.equal(installed.plugin_dir, target);
+  assert.ok(!existsSync(join(target, 'work_split_hook.py')));
   assert.ok(existsSync(join(f.root, 'bin', 'gempt-wait.mjs')));
   assert.deepEqual(await cli('print-mcp', '--installed', '--target', target), installed.mcp_config);
 });
@@ -640,6 +649,7 @@ test('standalone NDJSON MCP advertises three model tools and four app tools and 
   const started = await request('initialize', { protocolVersion: '2026-test' });
   assert.equal(started.result.protocolVersion, '2026-test');
   assert.equal(started.result.serverInfo.name, 'gempt');
+  assert.equal(started.result.serverInfo.version, '0.2.0');
   send({ method: 'notifications/initialized' });
   assert.deepEqual((await request('ping')).result, {});
   const { tools } = (await request('tools/list')).result;

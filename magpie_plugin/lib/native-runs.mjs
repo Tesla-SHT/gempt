@@ -27,6 +27,6 @@ export async function startNativeRun({ args, host, agent, env }) {
     text: record.state === 'outcome_unknown'
       ? 'The worker stopped reporting. Inspect workspace evidence before deciding whether to retry.'
       : record.state === 'waiting_gemini' ? 'Codex is waiting for a reply to ask_gemini.'
-      : 'Codex is working. Poll gempt_status with this run_id and wait_sec=20 until finished or failed. Do not submit the task again.',
+      : 'Codex is working. Use gempt-wait with this run_id to await completion or gempt_ctl for a status snapshot.',
   };
 }

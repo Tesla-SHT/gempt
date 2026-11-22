@@ -11,7 +11,9 @@ description: >-
 
 # gempt — Gemini × GPT 协作编排手册
 
-当前工作分工由 Magpie 面板选择，可分别设置普通对话和 Antigravity Swarm。对新实质任务先调用 `gempt_dispatch(goal, kind, access, cwd?)`，工具会完成相应的 GPT 委派或明确把该部分留给 Gemini。Gemini 根据返回的证据向用户解释结果。Swarm 成员必须带上角色和公开 brief 的 assignment_id。详见插件协作规则。
+GemPT v0.2.0 使用 Node.js。Antigravity 的 `gempt_gempt` MCP 提供 `gpt_run`、`gpt_ask`、`gpt_ctl`。Magpie HTTP MCP 对应 `gempt_run`、`gempt_ask`、`gempt_ctl`，参数一致。下文使用 Antigravity 工具名。
+
+按 Magpie 面板的工作分工决定何时委派。现成材料用 `gpt_ask`，需要查仓库或运行检查用 `gpt_run(access="inspect")`，获得写入授权后用 `gpt_run(access="change")`。Swarm 成员把公开 brief 的角色和任务 ID 写进 `goal`。Gemini 核对返回的证据并向用户汇报。
 
 ---
 
@@ -20,9 +22,8 @@ description: >-
 当 `~/.config/gempt/config.json` 尚未初始化，或用户说“初始化 gempt / 配一下 gempt / 换模型或容灾策略”时，优先推荐无门槛的 **Codex 订阅直连（`subscription_only`）**，并在当前分支支持按需开启个人 **API 兜底（`api_fallback`）**：
 
 1. **最简一键开启**：如果用户已经打开 Magpie 客户端的 **`Plugins → GemPT`** 页面，只要 Magpie 里已登录 ChatGPT/Codex 订阅，页面会自动检测到 `codex/*` 模型，直接点 **“一键启用订阅配置”** 即可完成初始化；后续也可在页面里一键切换 `仅订阅 | API 兜底` 与 `Codex 执行权限`。
-2. **命令行 / 对话内探测与初始化**：调用 `gempt_discover`（不要让用户手工翻配置文件路径或模型 ID）。
-   - 检查输出里的 `magpie.gateway.reachable`、`subscription_ready`、`codex_subscription_models`、`openai_api_models`、`utility_candidates`、`codex` CLI 与 `recommendations`。
-   - 如果 `magpie.gateway.reachable` 为 `false`，提示用户先启动本地 Magpie（默认 `127.0.0.1:3425`）。
+2. **命令行探测**。运行 `gempt discover`，检查 `magpie.reachable`、`subscription`、`magpie.codex_models`、`magpie.openai_models`、`magpie.utility_candidates` 与 `codex` CLI。
+   - 如果 `magpie.reachable` 为 `false`，先启动本地 Magpie（默认 `127.0.0.1:3425`）。
 3. **确认三档甜点映射与容灾策略**：
    - `sonnet`（~75% 日常高频）：`Sol @ medium`（`codex/gpt-6.2-sol`，`medium`）
    - `opus`（~20% 复杂工程）：`Sol @ high` 主力 + 疑难 `@ xhigh` 自动升 `Astra`（`codex/gpt-6.2-sol` → `codex/gpt-6.2-astra`）
@@ -31,23 +32,23 @@ description: >-
    - **容灾策略（`failover_mode`）**：
      1. `subscription_only`（推荐默认）：仅用 Codex 订阅号（不自动切按量 API，防意外扣费）；多订阅号由 Magpie 自动轮转。
      2. `api_fallback`：订阅优先，限流或失败时自动切换按量 `openai/*` API 兜底（页面支持随时无损切换）。
-     3. `effort_only`：单模型 `Sol` 仅靠 `reasoning_effort`（`medium` / `high` / `xhigh`）区分三档（不降级使用 `Astra@low`）。
    - **思考定档策略**：可选开启 `auto_effort`（页面点选 **`智能`** 或 CLI 设 `gempt effort auto`）。
-   - **可选：同步独立隔离路由组**：默认直接调用具体 GPT 模型 ID 即可工作。仅当用户需要在 Magpie 侧使用多号轮转、`effort=xhigh` 自动切 Astra 或 `compact` 规则时，才开启 `sync_magpie_groups: true` 与 `use_magpie_group_ids: true`。
+   - **可选：同步独立路由组**。默认直接使用具体模型 ID。需要 harness 路由组时运行 `gempt init --sync-magpie --use-groups`。
    - **默认 Codex 沙箱（`default_sandbox`）**：推荐 `workspace-write`（只在目标工作区可写），可在 Magpie `Plugins → GemPT` 页面随手切换 `只读 / 工作区 / 全权限`。
 4. **落盘并验收**：
-   - 调用 `gempt_configure` 保存配置，调用 `gempt_status` 验证生效；必要时用 `gempt_consult(tier="chore", goal="Reply with OK")` 或 `sonnet` 跑一次极短连通性测试后汇报。
+   - 运行 `gempt init` 保存配置，再用 `gempt status` 验证。必要时调用 `gpt_ask(tier="sonnet", goal="Reply with OK")` 做简短连通性测试。
 
 ---
 
 ## 2. Mode & 3+1 Tier Decision Matrix（选模式与选档位）
 
-### 模式选择：`gempt_consult` vs `gempt_exec`
+### 模式选择
 
 | 模式 | 底层机制 | 固定开销 | 适用场景 |
 | :--- | :--- | :--- | :--- |
-| **`gempt_consult`** | 直连 Magpie HTTP (`/v1/responses` 或 `/v1/chat/completions`) | 极低（无 Codex 工具注入） | 架构评审、算法/数学推导、定位复杂 bug 根因、对指定文件做深度 code review、免费摘要/分类 |
-| **`gempt_exec`** | 调本机 `codex exec`（经 Magpie 路由） | 较高（每次约 18K–50K tok 工具上下文） | 跨文件改代码、重构、需要 GPT 自己跑测试并修到通过的完整任务 |
+| **`gpt_ask`** | Magpie HTTP (`/v1/responses` 或 `/v1/chat/completions`) | 低 | 架构评审、算法推导、审阅指定文件、摘要或分类 |
+| **`gpt_run`** | 本机共享 Codex app-server，经 Magpie 路由 | 较高 | 仓库调查、改代码、跑测试 |
+| **`gpt_ctl`** | 现有任务状态和控制 | 低 | `status`、`steer`、`interrupt`、`reply`，或用 `{}` 打开 GemPT Live |
 
 派单时按所需能力选 access。材料齐备可直接咨询；需要调查或改代码时，让 Codex 从查找入口做到验证。
 
@@ -55,16 +56,15 @@ description: >-
 
 | 档位 / 快捷命令 | 推荐占比 | 默认甜点模型 × 强度 | 典型场景与升档约束 |
 | :--- | :--- | :--- | :--- |
-| **`chore`** (`/gempt-chore`) | 旁路打杂 | `DeepSeek-V4.1-Flash` | 日志提纯、大文本摘要、粗分类（仅限 `gempt_consult`） |
+| **`chore`** (`/gempt-chore`) | 旁路打杂 | `DeepSeek-V4.1-Flash` | 日志提纯、大文本摘要、粗分类（仅限 `gpt_ask`） |
 | **`sonnet`** (`/gempt-sonnet`) | **~75%** | `Sol @ medium` | 日常实现、单测、UI 交互逻辑与常规审阅 |
-| **`opus`** (`/gempt-opus`) | **~20%** | `Sol @ high` | 跨文件重构、大仓库排查、复杂设计；`escalate=true` 或 `xhigh` 自动升 `Astra` |
+| **`opus`** (`/gempt-opus`) | **~20%** | `Sol @ high` | 跨文件重构、大仓库排查、复杂设计 |
 | **`fable`** (`/gempt-fable`) | **~5%** | `Astra @ xhigh` | 极难 Bug、数学/算法推导、核心架构；禁止降级 `Astra` 到 `low` |
 
 - **思考强度纪律（防踩坑）**：
   1. **新线程开局定好强度，严禁中途 `resume` 加码**：开启 `auto_effort`（页面「智能」）时，首轮按任务风险在 `low..xhigh` 间确定；`resume` 续跑强制锁定原强度（规避 Codex 中途改 effort 导致实际推理缩水的问题）。
-  2. **失败升级必开新线程（不传 `session_id`）**：首轮失败、超时或未验证通过，用 `opus`/`escalate=true`/`fable` 另起新线程，而不是在同一 `session_id` 上加档硬磨。
+  2. **失败升级必开新线程**。首轮失败、超时或未验证通过时，省略 `session_id`。咨询可指定 `tier`，执行档位由共享配置决定。
   3. **禁用 `ultra` 与高强度子代理扇出**：默认配置与自动定档最高止步 `xhigh`，禁止并行扇出多个高思考 Codex 子代理以免配额雪崩。
-  4. **匹配思考超时下限**：未显式指定超时时，`high` 自动保护至少 `900s`（exec）/ `240s`（consult），`xhigh` 至少 `1200s` / `300s`。
 
 > **控制面板与单回合快捷命令**：保持 Antigravity 原生 Gemini 官方登录不变，在 **Magpie 左侧栏 `Plugins → GemPT`**（或终端 `gempt tier` / `gempt sandbox` / `gempt effort [medium|high|xhigh|auto]`）统一切换共享默认档位、沙箱与思考强度；`/gempt-sonnet`、`/gempt-opus`、`/gempt-fable`、`/gempt-chore` 可单回合锁定档位。
 
@@ -72,13 +72,9 @@ description: >-
 
 ## 3. Gemini → GPT Task Packet Protocol（给 GPT 下任务单规范）
 
-直接调用底层工具时，提供已经知道的目标和约束。下列字段按需填写；尚未掌握的文件、根因和验证命令由执行者调查。
+调用工具时把已知背景、约束、验收命令和回报格式写进 `goal`。咨询时用 `file_paths` 附上要审阅的文件。执行时提供 `cwd` 与 `access`，并发编辑同一 Git 仓库时用 `workspace="share"`。
 
-1. **`goal`（唯一明确目标）**：一句话写清边界与完成定义（禁止“帮我看看顺便优化一下”）。
-2. **`context` + `file_paths`（已核实事实）**：给出实际文件绝对/相对路径、相关符号名、已观察到的报错或限制。
-3. **`constraints`（硬约束与红线）**：明确哪些文件/接口/行为**不准改**，禁止引入多余依赖或破坏既有协议。
-4. **`verification`（可运行验收命令，用于 `exec`）**：给出明确命令（如 `pytest tests/test_x.py`），要求 GPT/Codex 跑完并贴实测结果。
-5. **`expected_output` / `expected_report`（回报结构）**：要求按“结论 / 改动文件 / 实测证据 / 遗留风险”返回。
+给出已核实的路径、符号和报错，明确哪些接口必须保留。执行任务可在目标中给出独立的测试命令，例如 `node --test tests/test_core_node.mjs`，并要求回报实际结果和剩余风险。
 
 详细好坏示例见 [task-packet-examples.md](./references/task-packet-examples.md)，Magpie 路由组命令模板见 [magpie-routing.md](./references/magpie-routing.md)。
 
@@ -86,8 +82,8 @@ description: >-
 
 ## 4. AI-to-AI Steering & Review Loop（内部纠偏闭环）
 
-1. 收到 `gempt_consult` 或 `gempt_exec` 返回后，**检查返回的证据**：
-   - 对 `exec` 任务，核对执行者报告中的实际文件、命令和结果。证据不足时安排有针对性的独立复核。
+1. `gpt_run` 返回 `wait_command` 时，用 `run_command(WaitMsBeforeAsync=500)` 后台等待唤醒。用 `gpt_ctl` 随时查看或介入，收到 `ask_gemini` 时用 `action="reply"` 原回合续跑。
+   - 核对实际文件、命令和结果。证据不足时安排有针对性的独立复核。
 2. **发现漏项、逻辑漏洞或测试未过**：
    - 不要把半成品甩给人类；带着具体技术证据和返回的 `session_id` 继续追问/返工。
    - **硬上限**：同一子任务内部 AI-to-AI 拉扯不超过配置中的 `max_internal_rounds`（默认 3 轮）。超过上限仍未收敛，或出现需要产品/架构拍板的取舍、破坏性操作、渠道报错/额度耗尽，立即停下向人类汇报。

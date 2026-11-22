@@ -418,7 +418,7 @@
     if (ordinary?.gpt_share !== 0) {
       workDetail.textContent += ' 动态追踪近 24h 实际 Token 占比，偏低时自动放宽 GPT 接单范围，偏高时回落 Gemini。';
       if (state.tools?.exec_enabled === false) {
-        workDetail.textContent += ' Magpie 原生工具目前仅可咨询。需要 Codex 操作文件时，在 GemPT 插件选项开启 exec。';
+        workDetail.textContent += ' Magpie 的 gempt_run 当前允许只读调查。要允许写入，请在 GemPT 插件选项开启 exec。';
       }
     }
     renderTokenRatio(state.token_ratio, ordinary);
@@ -560,7 +560,7 @@
     if (sbxHint) {
       const baseHint = SANDBOX_HINTS[currentDefaultSandbox] || currentDefaultSandbox;
       sbxHint.textContent = state.tools?.exec_enabled === false
-        ? `${baseHint} · gempt_exec 默认关闭（插件选项设 exec: true 后生效）`
+        ? `${baseHint} · gempt_run 仅限只读（插件选项设 exec: true 后可写）`
         : baseHint;
     }
 

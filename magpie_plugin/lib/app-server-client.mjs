@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { expandUser, resolveConfigPath } from './backend.mjs';
+import { openAppServerSocket } from './app-server-socket.mjs';
 
 export const UNAVAILABLE = '未检测到 Magpie 插件托管的共享 codex app-server（请先启动 Magpie 并确认 GemPT 插件已启用）。';
 export const PROVIDER = 'gempt_gateway';
@@ -40,22 +41,6 @@ export function readAppServerState(configPath, env) {
 
 export async function connectAppServer(state, onEvent = () => {}, { timeoutMs = 3000 } = {}) {
   let socket;
-  try {
-    const url = new URL(state.ws_url);
-    if (url.protocol !== 'ws:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password
-        || url.hash || state.auth_header?.toLowerCase() !== 'authorization'
-        || typeof state.auth_token !== 'string' || !/^[A-Za-z0-9_-]+$/.test(state.auth_token)) throw new Error('Invalid endpoint.');
-    socket = new WebSocket(url, { headers: { Authorization: `Bearer ${state.auth_token}` } });
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('WebSocket upgrade timed out.')), timeoutMs);
-      socket.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
-      socket.addEventListener('error', () => { clearTimeout(timer); reject(new Error('WebSocket upgrade failed.')); }, { once: true });
-    });
-  } catch (err) {
-    socket?.close();
-    throw new Error(UNAVAILABLE, { cause: err });
-  }
-
   let id = 0;
   const pending = new Map();
   let failure;
@@ -65,11 +50,9 @@ export async function connectAppServer(state, onEvent = () => {}, { timeoutMs = 
     failure = err;
     for (const request of pending.values()) request.reject(err);
     onFailure?.(err);
-    socket.close();
+    socket?.close();
   };
-  socket.addEventListener('close', () => disconnected(new Error('Codex app-server closed the WebSocket.')));
-  socket.addEventListener('error', () => disconnected(new Error('Codex app-server WebSocket failed.')));
-  socket.addEventListener('message', ({ data }) => {
+  const received = (data) => {
     try {
       const message = JSON.parse(data);
       if (message.method) {
@@ -84,7 +67,7 @@ export async function connectAppServer(state, onEvent = () => {}, { timeoutMs = 
     } catch (err) {
       disconnected(err);
     }
-  });
+  };
 
   const send = (message) => {
     if (failure) throw failure;
@@ -106,12 +89,17 @@ export async function connectAppServer(state, onEvent = () => {}, { timeoutMs = 
   };
 
   try {
+    const url = new URL(state.ws_url);
+    if (url.protocol !== 'ws:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password
+        || url.hash || state.auth_header?.toLowerCase() !== 'authorization'
+        || typeof state.auth_token !== 'string' || !/^[A-Za-z0-9_-]+$/.test(state.auth_token)) throw new Error('Invalid endpoint.');
+    socket = await openAppServerSocket(url, state.auth_token, timeoutMs, received, disconnected);
     await request('initialize', {
       clientInfo: { name: 'gempt', version: '2.0' }, capabilities: { experimentalApi: true },
     }, timeoutMs);
     send({ method: 'initialized' });
   } catch (err) {
-    socket.close();
+    socket?.close();
     throw new Error(UNAVAILABLE, { cause: err });
   }
   return {

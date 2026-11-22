@@ -177,7 +177,7 @@ function listRuns(args, { root, configPath, sessionsDir }) {
   return {
     bound_conversation_id: bound, scope, bound_workspace_name: workspace, session_count: sessionCount,
     runs: withinBudget(items.slice(0, args.limit ?? 20), TEXT_BYTES),
-    app_server: { name: 'gempt', version: '0.1.0' },
+    app_server: { name: 'gempt', version: '0.2.0' },
   };
 }
 

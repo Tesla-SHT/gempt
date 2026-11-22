@@ -1,7 +1,6 @@
 /**
  * Live Gemini vs. GPT token-ratio telemetry and closed-loop work-split budget controller.
- * Mirrors src/gempt/token_ratio.py so Python MCP, Antigravity hooks, Magpie tools,
- * and the Magpie Overview UI always agree on the exact same numbers and thresholds.
+ * Shared by the MCP server, Antigravity hooks, and Magpie control panel.
  */
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';

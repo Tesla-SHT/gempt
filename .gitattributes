@@ -1,2 +1,2 @@
 *.sh text eol=lf
-src/gempt/mcp_app_live.html text eol=lf
+core/assets/mcp_app_live.html text eol=lf

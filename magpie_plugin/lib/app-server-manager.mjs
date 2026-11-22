@@ -177,7 +177,7 @@ export function createAppServerManager({
     }
     const cli = findCodexCli(raw.codex?.cli_path, env);
     if (!cli) {
-      error = '未找到 Codex CLI，共享 app-server 未启动。gempt_consult 与 Magpie 原生路由组仍可使用。';
+      error = '未找到 Codex CLI，共享 app-server 未启动。gempt_ask 与 Magpie 原生路由组仍可使用。';
       cleanup();
       return;
     }

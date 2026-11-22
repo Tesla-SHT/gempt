@@ -1120,7 +1120,7 @@ export function createExecutionTools({
           session_id: { type: 'string', description: 'Optional exec session_id to resume.' },
           sandbox: { type: 'string', enum: VALID_SANDBOXES },
           reasoning_effort: { type: 'string', enum: [...VALID_EFFORTS_SET] },
-          background: { type: 'boolean', description: 'Return a run_id immediately. Long jobs return a run_id automatically; poll gempt_status.' },
+          background: { type: 'boolean', description: 'Return a run_id immediately. Use gempt-wait to await completion or gempt_ctl for a status snapshot.' },
           run_id: { type: 'string', pattern: '^[a-f0-9]{32}$', description: 'Optional caller-generated ID; repeat delivery of the same job will not start another worker.' },
           timeout_sec: { type: 'number', description: 'Execution timeout seconds (30-3600).' },
         },
@@ -1129,7 +1129,7 @@ export function createExecutionTools({
       async execute(args = {}, callCtx = {}) {
         if (!isExecEnabled(options, env)) {
           throw new Error(
-            'gempt_exec is disabled by default for safety because Magpie plugin tools can be called by any client holding a gateway key. '
+            'Writable gempt_run is disabled by default because Magpie plugin tools can be called by any client holding a gateway key. '
               + 'To enable it, set plugin option `"exec": true` (`magpie plugin options gempt \'{"exec":true}\'`) or `GEMPT_MAGPIE_TOOLS_EXEC=1`.',
           );
         }

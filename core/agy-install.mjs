@@ -60,6 +60,22 @@ function stage(staged, target, source, nodeBin) {
   return config;
 }
 
+function stageLegacyHook(staged, target, nodeBin) {
+  const entry = join(target, 'work_split_hook.mjs');
+  const args = Buffer.from(JSON.stringify([nodeBin, entry])).toString('base64');
+  writeFileSync(join(staged, 'work_split_hook.py'), [
+    'import base64, json, os, subprocess, sys',
+    '',
+    `args = json.loads(base64.b64decode("${args}"))`,
+    'if os.name == "nt":',
+    '    sys.exit(subprocess.run(args).returncode)',
+    'else:',
+    '    os.execv(args[0], args)',
+    '',
+    '',
+  ].join('\n'));
+}
+
 function nodeRequest(nodeBin, entry, cwd, env, requests) {
   return new Promise((resolve, reject) => {
     const child = execFile(nodeBin, [entry], { cwd, env, windowsHide: true, timeout: 20_000, maxBuffer: 4 * 1024 * 1024 },
@@ -195,6 +211,7 @@ export async function installAgy({ target = DEFAULT_AGY_TARGET, source, force = 
     try {
       const config = stage(staged, target, source, nodeBin);
       await validate(staged, nodeBin, env);
+      if (existsSync(join(target, 'work_split_hook.py'))) stageLegacyHook(staged, target, nodeBin);
       try {
         if (existsSync(target)) renameSync(target, backup);
         renameSync(staged, target);

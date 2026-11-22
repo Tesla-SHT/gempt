@@ -1,6 +1,5 @@
 /**
  * Deterministic, auditable effort routing, timeout floors, and escalation hints.
- * Kept 1:1 with src/gempt/routing.py.
  */
 
 export const AUTO_EFFORT_CANDIDATES = Object.freeze(['low', 'medium', 'high', 'xhigh']);
@@ -217,7 +216,7 @@ export function buildEscalationSuggestion({
     );
   }
   return (
-    'Already at xhigh/fable; decompose into smaller verified steps or isolate root cause via gempt_consult '
+    'Already at xhigh/fable; decompose into smaller verified steps or isolate root cause via gempt_ask '
     + 'before starting a fresh thread (omit session_id; avoid ultra).'
   );
 }
