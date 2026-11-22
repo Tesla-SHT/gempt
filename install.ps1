@@ -2,8 +2,11 @@ $ErrorActionPreference = 'Stop'
 
 $node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 if (!$node) { throw 'Node.js 20.11.0 or later is required.' }
-& $node.Source -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major < 20 || (major === 20 && minor < 11) ? 1 : 0)'
-if ($LASTEXITCODE -ne 0) { throw 'Node.js 20.11.0 or later is required.' }
+$nodeVersion = & $node.Source -v
+if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v(\d+)\.(\d+)' -or
+    [int]$Matches[1] -lt 20 -or ([int]$Matches[1] -eq 20 -and [int]$Matches[2] -lt 11)) {
+    throw 'Node.js 20.11.0 or later is required.'
+}
 
 $cliArgs = @('install-agy') + $args
 if ($args.Count) {
