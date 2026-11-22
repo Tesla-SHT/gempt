@@ -3,8 +3,7 @@
  *
  * Exports a single OpenCode/Magpie plugin factory (`GemptPlugin`) that:
  * 1. Starts the sandboxed localhost GemPT control page service non-blockingly.
- * 2. Registers native Magpie MCP tools (`gempt_dispatch`, `gempt_discover`, `gempt_status`,
- *    `gempt_consult`, `gempt_exec`) for every client Magpie connects.
+ * 2. Registers native Magpie MCP tools (`gempt_run`, `gempt_ask`, `gempt_ctl`).
  */
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';

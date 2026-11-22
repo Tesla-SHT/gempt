@@ -1,5 +1,8 @@
 #!/usr/bin/env node
-import { ACTIVE_STATES, compactReceiptText, waitForRuns } from './runs.mjs';
+import { existsSync, realpathSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+import { parseArgs } from 'node:util';
+import { ACTIVE_STATES, compactReceiptText, readRun, waitForRuns } from './runs.mjs';
 
 function compactRecord(record) {
   const { before, after, goal, progress, result, ...receipt } = record;
@@ -31,17 +34,34 @@ function compactRecord(record) {
   return receipt;
 }
 
-const args = process.argv.slice(2);
-const waitAll = args[0] === '--all';
-if (waitAll) args.shift();
-try {
-  if (args.length !== 1) throw new Error('Usage: gempt-wait [--all] RUN_ID[,RUN_ID...]');
-  const result = await waitForRuns(args[0], { waitAll });
-  const runs = Object.fromEntries(Object.entries(result.runs).map(([id, record]) => [id, compactRecord(record)]));
-  const records = Object.values(runs);
-  console.log(JSON.stringify(records.length === 1 ? records[0] : { ...result, runs }));
-  if (records.length === 1 && ['failed', 'interrupted', 'outcome_unknown'].includes(records[0].state)) process.exitCode = 1;
-} catch (error) {
-  console.error(error.message);
-  process.exitCode = 1;
+export async function runWait(args, { sessionsDir, readOnly = false } = {}) {
+  const legacy = args[0] === 'status';
+  try {
+    const { values, positionals } = parseArgs({ args: legacy ? args.slice(1) : args, allowPositionals: !legacy,
+      options: legacy ? { 'run-id': { type: 'string' }, 'run-ids': { type: 'string' },
+        wait: { type: 'boolean' }, 'wait-all': { type: 'boolean' } }
+        : { all: { type: 'boolean' } } });
+    const ids = legacy ? values['run-id'] || values['run-ids'] : positionals[0];
+    if (!ids || positionals.length > 1 || (values['run-id'] && values['run-ids'])) {
+      throw new Error('Usage: gempt-wait [--all] RUN_ID[,RUN_ID...]');
+    }
+    const wait = !readOnly || values.wait || values['wait-all'];
+    const result = wait ? await waitForRuns(ids, { waitAll: values.all || values['wait-all'], sessionsDir }) : (() => {
+      const runs = Object.fromEntries(ids.split(',').map((id) => id.trim()).filter(Boolean).map((id) => [id, readRun(id, sessionsDir)]));
+      const active = Object.keys(runs).filter((id) => ['queued', 'running'].includes(runs[id].state));
+      return { active, ready: Object.keys(runs).filter((id) => !active.includes(id)), runs };
+    })();
+    const runs = wait ? Object.fromEntries(Object.entries(result.runs).map(([id, record]) => [id, compactRecord(record)])) : result.runs;
+    const records = Object.values(runs);
+    const single = !values['run-ids'] && records.length === 1;
+    console.log(JSON.stringify(single ? records[0] : { ...result, runs }));
+    return Number(wait && single && ['failed', 'interrupted', 'outcome_unknown'].includes(records[0].state));
+  } catch (error) {
+    console.error(error.message);
+    return 1;
+  }
+}
+
+if (process.argv[1] && existsSync(process.argv[1]) && pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url) {
+  process.exitCode = await runWait(process.argv.slice(2));
 }

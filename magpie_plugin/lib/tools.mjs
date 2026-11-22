@@ -1,12 +1,12 @@
 /**
  * Zero-dependency native Magpie tool definitions for GemPT.
  *
- * Exposes `discover`, `status`, `consult`, and `exec` (registered by Magpie as
- * `gempt_discover`, `gempt_status`, `gempt_consult`, `gempt_exec` at
+ * Exposes `run`, `ask`, and `ctl` (registered by Magpie as
+ * `gempt_run`, `gempt_ask`, `gempt_ctl` at
  * `http://127.0.0.1:3425/mcp/magpie/tools/gempt`).
  *
  * Safety defaults follow `@magpie-community/tools-layerfs`:
- * - `gempt_exec` is disabled unless plugin option `exec: true` (or env override) is set.
+ * - Writable `gempt_run` requires plugin option `exec: true` (or env override).
  * - Gateway HTTP requests talk directly via node:http/https (bypassing proxies) and refuse 3xx redirects.
  * - Workspace paths reject sensitive roots (~/.ssh, ~/.aws, ~/.gnupg, ~/.config/{magpie,gempt}, ~, /)
  *   and file attachments enforce realpath containment + secret-file filtering.
@@ -15,6 +15,7 @@ import { readNativeRun, startNativeRun, waitForNativeRun } from './native-runs.m
 import { findCodexCli } from './app-server-manager.mjs';
 import { runAppServer, TurnInterrupted } from './app-server-run.mjs';
 import { validateSessionId } from '../../core/state.mjs';
+import { TOOLS } from '../../core/tool-schemas.mjs';
 import { resolveBudget } from './token-ratio.mjs';
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, openSync, readSync, realpathSync, statSync, closeSync } from 'node:fs';
@@ -35,6 +36,7 @@ import {
   expandUser,
   explicitTitle,
   isCodexModelId,
+  isHarnessGroup,
   normalizeDefaultTier,
   normalizeTitle,
   pickSubscriptionPlan,
@@ -47,6 +49,7 @@ import {
   resolveMagpieConfigDir,
   resolveSessionsDir,
   sessionGoal,
+  verifySubscriptionGroup,
   writeConfigAtomic,
 } from './backend.mjs';
 import {
@@ -590,9 +593,10 @@ function pairedModel(cfg, args, session) {
   const family = args.gemini_family;
   const saved = session?.paired_model;
   if (!session && !Object.hasOwn(WORKLOAD.pairings, family)) return '';
-  const model = session ? saved : cfg.routing_policy?.pairings?.[family] ?? WORKLOAD.pairings[family];
+  const group = cfg.tiers?.[family === 'carbon' ? 'fable' : 'sonnet']?.consult_model;
+  const model = session ? saved : cfg.routing_policy?.pairings?.[family] ?? (isHarnessGroup(group) ? group : WORKLOAD.pairings[family]);
   if (!model || model === 'default') return '';
-  if (!isCodexModelId(model)) throw new Error('Gemini pairing requires a Codex subscription model.');
+  if (!isCodexModelId(model) && !isHarnessGroup(model)) throw new Error('Gemini pairing requires a Codex subscription model.');
   if (resolveExcludedTokens(cfg).some(token => model.toLowerCase().includes(token))) {
     throw new Error('The paired Codex model is excluded. Change the pairing in GemPT.');
   }
@@ -645,7 +649,7 @@ function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = 
   }
 
   if (failoverMode === 'subscription_only') {
-    if (!isCodexModelId(model)) {
+    if (!isCodexModelId(model) && !isHarnessGroup(model)) {
       throw new Error(`Subscription-only mode requires a codex/* model for tier '${effectiveTier}', got '${model}'.`);
     }
   } else if (!isAllowedFallbackTarget(model)) {
@@ -676,7 +680,29 @@ function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = 
   };
 }
 
-export function createGemptTools({
+export function createGemptTools({ options = {}, env = process.env, ...host } = {}) {
+  return Object.fromEntries(TOOLS.filter(({ name }) => name.startsWith('gpt_')).map((tool) => {
+    const { name, description, inputSchema } = tool;
+    const key = name.slice(4);
+    return [key, {
+      description,
+      args: inputSchema,
+      async execute(args = {}, callCtx) {
+        if (key === 'run' && args.access !== 'inspect' && !isExecEnabled(options, env)) {
+          throw new Error('Writable gempt_run is disabled. Enable the GemPT plugin option `exec: true`.');
+        }
+        const overrides = { ...host, configPath: resolveConfigPath(host.configPath || env.GEMPT_CONFIG),
+          sessionsDir: resolveSessionsDir(host.sessionsDir || env.GEMPT_SESSIONS_DIR) };
+        const { handleTool } = await import('../../core/mcp-server.mjs');
+        const result = await handleTool(name, args, env, overrides, callCtx);
+        const receipt = JSON.parse(result.content[0].text);
+        return result.isError ? { ...receipt, isError: true } : receipt;
+      },
+    }];
+  }));
+}
+
+export function createExecutionTools({
   configPath,
   sessionsDir,
   magpieConfigDir,
@@ -931,6 +957,9 @@ export function createGemptTools({
         }
 
         const effort = resolved.effort;
+        if (resolved.failoverMode === 'subscription_only' && resolved.tier !== 'chore' && isHarnessGroup(resolved.model)) {
+          await verifySubscriptionGroup(runtime.cfg, resolved.model);
+        }
         const apiMode = args?.api_mode
           ? (VALID_API_MODES.has(args.api_mode) ? args.api_mode : (() => { throw new Error(`Invalid api_mode '${args.api_mode}'.`); })())
           : resolved.apiMode;
@@ -1211,7 +1240,9 @@ export function createGemptTools({
 
         const targetModel = resolved.execModel || resolved.model;
         if (resolved.failoverMode === 'subscription_only') {
-          if (!isCodexModelId(targetModel)) {
+          if (isHarnessGroup(targetModel)) {
+            await verifySubscriptionGroup(runtime.cfg, targetModel);
+          } else if (!isCodexModelId(targetModel)) {
             throw new Error(`Subscription-only exec requires a codex/* model, got '${targetModel}'.`);
           }
         } else if (!isAllowedFallbackTarget(targetModel)) {

@@ -3,50 +3,13 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
 import { resolveBudget } from '../magpie_plugin/lib/token-ratio.mjs';
-import { createGemptTools } from '../magpie_plugin/lib/tools.mjs';
+import { createExecutionTools } from '../magpie_plugin/lib/tools.mjs';
 import { readHostContext } from './host-context.mjs';
-import { APP_RESOURCE, APP_TOOLS, APP_URI, callAppTool, LIVE_META, readAppResource } from './mcp-app.mjs';
+import { APP_RESOURCE, APP_TOOLS, APP_URI, callAppTool, readAppResource } from './mcp-app.mjs';
 import { ACTIVE_STATES, buildWaitCommand, compactReceiptText, dispatchRun, interruptRun, readRun, replyToolCall, runWithinRoot, steerRun } from './runs.mjs';
 import { resolvePath, validateSessionId, withLock } from './state.mjs';
-
-function tool(name, description, properties, required, meta) {
-  return { name, description, inputSchema: { type: 'object', properties, additionalProperties: false,
-    ...(required ? { required } : {}) }, ...(meta ? { _meta: meta } : {}) };
-}
-
-export const TOOLS = [
-  tool('gpt_run',
-    "Async-first headless Codex execution inside cwd. Returns immediately with run_id, session_id, and short wait_command (`gempt-wait <run_id>`). Execute wait_command via run_command(WaitMsBeforeAsync=500) for zero-poll wakeup; pass workspace='share' for parallel repo edits and session_id to resume.",
-    {
-      goal: { type: 'string', description: 'Task objective, constraints, and verification criteria.' },
-      cwd: { type: 'string', description: 'Absolute path to the target workspace directory.' },
-      access: { type: 'string', enum: ['change', 'inspect'], default: 'change',
-        description: "'change' edits/tests workspace; 'inspect' runs read-only investigation." },
-      workspace: { type: 'string', enum: ['inherit', 'share'], default: 'inherit',
-        description: "'share' creates/reuses an isolated git worktree bound to session_id." },
-      session_id: { type: 'string', description: 'Optional GPT session_id to continue.' },
-    }, ['goal', 'cwd']),
-  tool('gpt_ask',
-    "Fast synchronous GPT HTTP consultation via Magpie (no Codex CLI overhead; receipt <= 3200 chars). Pass file_paths for GPT to read directly; use tier='chore' for free/fast summarization.",
-    {
-      goal: { type: 'string', description: 'Question, review, summary, or reasoning prompt.' },
-      file_paths: { type: 'array', items: { type: 'string' }, description: 'Optional workspace file paths for GPT to read directly.' },
-      cwd: { type: 'string', description: 'Optional base directory for relative file_paths.' },
-      tier: { type: 'string', enum: ['chore', 'sonnet', 'opus', 'fable'], description: 'Optional tier (chore/sonnet/opus/fable).' },
-      session_id: { type: 'string', description: 'Optional consult session_id to continue.' },
-    }, ['goal']),
-  tool('gpt_ctl',
-    'Control runs (steer/interrupt/reply) or read a compact status snapshot (<=500B, no polling) and open GemPT Live. Call with {} to view current session runs in GemPT Live.',
-    {
-      action: { type: 'string', enum: ['status', 'steer', 'interrupt', 'reply'], default: 'status',
-        description: 'Control action (default: status / open GemPT Live).' },
-      run_id: { type: 'string', pattern: '^[0-9a-f]{32}$' },
-      message: { type: 'string', description: 'Steering message (steer) or answer text (reply).' },
-      call_id: { type: 'string', description: 'Pending ask_gemini call_id (reply only).' },
-      scope: { type: 'string', enum: ['session', 'all'], default: 'session', description: 'Run listing scope for status / GemPT Live.' },
-    }, undefined, LIVE_META),
-  ...Object.values(APP_TOOLS),
-];
+import { TOOLS } from './tool-schemas.mjs';
+export { TOOLS };
 
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const short = (value, limit) => Array.from(String(value || '')).slice(0, limit).join('');
@@ -113,10 +76,11 @@ async function control(args, options) {
   return textResult(compactStatus(structuredContent, record, options), { structuredContent });
 }
 
-async function handleTool(name, args, env) {
+export async function handleTool(name, args, env = process.env, overrides = {}, callCtx) {
   const options = {
     configPath: resolveConfigPath(env.GEMPT_CONFIG), sessionsDir: resolveSessionsDir(env.GEMPT_SESSIONS_DIR),
     root: env.GEMPT_WORKSPACE_ROOT?.trim() ? resolvePath(env.GEMPT_WORKSPACE_ROOT.trim()) : null, env,
+    magpieConfigDir: env.MAGPIE_CONFIG_DIR, ...overrides,
   };
   if (Object.hasOwn(APP_TOOLS, name)) return callAppTool(name, args, options);
   if (name === 'gpt_ctl') return control(args, options);
@@ -130,10 +94,10 @@ async function handleTool(name, args, env) {
   const family = args.gemini_family || context.gemini_family;
   const sessionId = String(args.session_id || '').trim();
   if (name === 'gpt_ask') {
-    const consult = createGemptTools({ ...options, magpieConfigDir: env.MAGPIE_CONFIG_DIR }).consult;
+    const consult = createExecutionTools(options).consult;
     if (!cwd && args.file_paths != null) throw new Error('cwd is required when providing file_paths.');
     const execute = () => consult.execute({ goal, tier: args.tier, cwd, file_paths: args.file_paths,
-      session_id: sessionId, gemini_family: family, host_conversation_id: context.conversation_id });
+      session_id: sessionId, gemini_family: family, host_conversation_id: hostId }, callCtx);
     const res = sessionId ? await withLock(join(options.sessionsDir, `${validateSessionId(sessionId)}.node.lock`), execute) : await execute();
     return textResult({ session_id: res.session_id, model: res.served_model, tier: res.tier,
       text: compactReceiptText(res.text, res.session_id) });
@@ -146,7 +110,7 @@ async function handleTool(name, args, env) {
     host_conversation_id: hostId, gemini_family: family, session_id: sessionId,
     background: args.background ?? waitSec === 0, sandbox: access === 'inspect' ? 'read-only' : undefined,
     expected_report: 'Report concisely: changed files, verification commands/results, and any remaining blockers. Omit verbose raw logs.',
-  }, { ...options, waitSec, magpieConfigDir: env.MAGPIE_CONFIG_DIR });
+  }, { ...options, waitSec, agent: typeof callCtx?.agent === 'string' ? callCtx.agent : undefined });
   if (ACTIVE_STATES.has(res.state) || res.state === 'interrupted') {
     const wait = buildWaitCommand(res.run_id, options);
     return textResult({ run_id: res.run_id, session_id: res.session_id, state: res.state, wait_command: wait,

@@ -1,20 +1,26 @@
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import { execFile, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+import { installAgy, resolveNodeExecutable } from '../core/agy-install.mjs';
 import { contextPath, readHostContext, updateHostContext } from '../core/host-context.mjs';
 import { APP_RESOURCE, APP_URI, callAppTool, readAppResource } from '../core/mcp-app.mjs';
 import { buildWaitCommand, dispatchRun, interruptRun, listActiveRoster, readRun, replyToolCall, runDirectory,
   saveRun, steerRun, waitForRun, waitForRuns } from '../core/runs.mjs';
 import { ensureShareWorktree, removeShareWorktree, worktreesRoot } from '../core/worktrees.mjs';
+
+const execFileAsync = promisify(execFile);
+const hookPath = fileURLToPath(new URL('../plugin/work_split_hook.mjs', import.meta.url));
+const cliPath = fileURLToPath(new URL('../bin/gempt.mjs', import.meta.url));
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'gempt-node-'));
@@ -26,6 +32,194 @@ function fixture(t) {
   return { root, cwd, configPath, sessionsDir, env: { ...process.env, GEMPT_CONFIG: configPath,
     GEMPT_SESSIONS_DIR: sessionsDir, GEMPT_WORKTREES_DIR: join(root, 'worktrees'), GEMPT_WORKSPACE_ROOT: cwd } };
 }
+
+function jsonProcess(command, args, options = {}) {
+  const result = spawnSync(command, args, { encoding: 'utf8', timeout: 15_000, windowsHide: true, ...options });
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
+  return JSON.parse(result.stdout);
+}
+
+test('Node hook emits entry banners and one user-only alert per context milestone', (t) => {
+  const f = fixture(t);
+  mkdirSync(dirname(f.configPath));
+  writeFileSync(join(dirname(f.configPath), 'app-server.json'),
+    JSON.stringify({ status: 'running', pid: process.pid, ws_url: 'ws://127.0.0.1:1' }));
+  const env = { ...f.env, GEMPT_APP_SERVER_STATE: join(dirname(f.configPath), 'app-server.json') };
+  const invoke = (payload) => jsonProcess(process.execPath, [hookPath], { env, input: JSON.stringify(payload) });
+  for (const [profile, share] of [['gemini', 0], ['gemini_first', 30], ['balanced', 50], ['gpt', 80], ['gpt_first', 95]]) {
+    writeFileSync(f.configPath, JSON.stringify({ routing_policy: { work_split: profile } }));
+    const payload = { conversationId: profile, workspacePaths: [f.cwd], modelName: 'gemini-4-neon-high' };
+    const start = invoke({ ...payload, hookEventName: 'SessionStart' });
+    if (share) assert.match(start.injectSteps[0].systemMessage.systemMessage, new RegExp(`${share}% GPT, family=neon`));
+    else assert.deepEqual(start, {});
+    const turn = { ...payload, hookEventName: 'PreInvocation', initialNumSteps: 31, lastUserInput: 'Review this' };
+    const entry = invoke({ ...turn, invocationNum: 0 });
+    if ([30, 80, 95].includes(share)) assert.match(entry.injectSteps[0].systemMessage.systemMessage, new RegExp(`${share}%`));
+    else assert.deepEqual(entry, {});
+    assert.deepEqual(invoke({ ...turn, invocationNum: 1 }), {});
+  }
+  assert.equal(readHostContext(f.configPath).conversation_id, 'gpt_first');
+  const transcriptPath = join(f.root, 'transcript.jsonl');
+  const turn = { hookEventName: 'PreInvocation', conversationId: 'long-chat', invocationNum: 7, transcriptPath };
+  for (const tokens of [120, 200, 280]) {
+    writeFileSync(transcriptPath, `${'x'.repeat(70_000)}\n${JSON.stringify({ type: 'PLANNER_RESPONSE', cache_read_tokens: tokens * 1000 })}\n`);
+    const { systemMessage } = invoke(turn).injectSteps[0];
+    assert.equal(systemMessage.systemMessage, '');
+    assert.match(systemMessage.metadata.user_markdown, new RegExp(`${tokens}k.*\\/compact`));
+    assert.deepEqual(invoke(turn), {});
+  }
+});
+
+test('Node hook applies write and explore gates with exemptions, resets and fail-open', (t) => {
+  const f = fixture(t);
+  mkdirSync(dirname(f.configPath));
+  const health = join(f.root, 'app-server.json');
+  const env = { ...f.env, GEMPT_APP_SERVER_STATE: health, GEMPT_CIRCUIT_WINDOW_SEC: '600' };
+  const set = (work_split) => writeFileSync(f.configPath, JSON.stringify({ routing_policy: { work_split } }));
+  const allow = (name, args, payload) => jsonProcess(process.execPath, [hookPath], { env,
+    input: JSON.stringify({ hookEventName: 'PreToolUse', conversationId: 'turn', workspacePaths: [f.cwd],
+      lastUserInput: 'Change this', toolCall: { name, args }, ...payload }) });
+  const edit = (TargetFile = join(f.cwd, 'app.mjs'), Content = 'code', payload) => allow('edit_file', { TargetFile, Content }, payload);
+  set('balanced');
+  assert.equal(edit().decision, 'allow');
+  writeFileSync(health, JSON.stringify({ status: 'running', pid: process.pid, ws_url: 'ws://127.0.0.1:1' }));
+  assert.match(edit().reason, /50% Write Gate/);
+  assert.equal(edit(join(f.cwd, 'app.json'), 'line\n'.repeat(15)).decision, 'allow');
+  assert.match(edit(join(f.cwd, 'app.json'), 'line\n'.repeat(16)).reason, /Write Gate/);
+  assert.equal(edit(join(f.cwd, 'README.md')).decision, 'allow');
+  assert.equal(edit(join(f.cwd, '.gemini', 'antigravity', 'brain', 'prototype.js')).decision, 'allow');
+  assert.equal(edit(undefined, undefined, { lastUserInput: '这里你自己改' }).decision, 'allow');
+  for (const profile of ['gemini', 'gemini_first']) {
+    set(profile);
+    assert.equal(edit().decision, 'allow');
+  }
+  for (const [profile, limit] of [['gpt', 5], ['gpt_first', 2]]) {
+    set(profile);
+    const read = () => allow('read_file', { Path: join(f.cwd, 'app.mjs') }, { lastUserInput: profile });
+    for (let count = 0; count < limit; count++) assert.equal(read().decision, 'allow');
+    assert.match(read().reason, new RegExp(`limit ${limit}`));
+    assert.equal(allow('run_command', { CommandLine: 'gempt status --run-id 123 --wait' }).decision, 'allow');
+    for (const delegation of [
+      ['call_mcp_tool', { ServerName: 'gempt_gempt', ToolName: 'gpt_run' }],
+      ['invoke_subagent', { TypeName: 'gempt-worker', Prompt: 'Do it', Role: 'Example' }],
+    ]) {
+      assert.equal(allow(...delegation, { lastUserInput: profile }).decision, 'allow');
+      for (let count = 0; count < limit; count++) assert.equal(read().decision, 'allow');
+      assert.equal(read().decision, 'deny');
+    }
+  }
+  state(f, 'a'.repeat(32), { state: 'failed' });
+  assert.equal(edit().decision, 'deny');
+  state(f, 'b'.repeat(32), { state: 'outcome_unknown' });
+  assert.equal(edit().decision, 'allow');
+});
+
+test('Antigravity installer replaces a legacy target and stages a runnable Node-only plugin and wait shims', async (t) => {
+  const f = fixture(t);
+  const target = join(f.root, "plugin with spaces");
+  const binDir = join(f.root, 'bin with spaces');
+  mkdirSync(join(target, 'runtime', 'gempt'), { recursive: true });
+  writeFileSync(join(target, 'plugin.json'), JSON.stringify({ name: 'gempt' }));
+  writeFileSync(join(target, 'work_split_hook.py'), 'legacy');
+  writeFileSync(join(target, 'runtime', 'gempt', 'mcp_server.py'), 'legacy');
+  const refreshCalls = [];
+  const languageServer = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    refreshCalls.push({ url: req.url, method: req.method, token: req.headers['x-codeium-csrf-token'],
+      data: JSON.parse(Buffer.concat(chunks)) });
+    res.end('{}');
+  });
+  languageServer.listen(0, '127.0.0.1');
+  await once(languageServer, 'listening');
+  t.after(() => languageServer.close());
+  const env = { ...f.env, ANTIGRAVITY_CSRF_TOKEN: 'fixture', ANTIGRAVITY_LS_ADDRESS: `127.0.0.1:${languageServer.address().port}` };
+  assert.equal(resolveNodeExecutable({ execPath: join(f.root, 'magpie-bun'), env: { PATH: dirname(process.execPath) } }), process.execPath);
+  const installed = await installAgy({ target, binDir, env });
+  assert.equal(installed.installed, true);
+  assert.ok(installed.refresh.refreshed);
+  assert.deepEqual(refreshCalls, [{ url: '/exa.language_server_pb.LanguageServerService/RefreshMcpServers',
+    method: 'POST', token: 'fixture', data: { serverName: 'gempt_gempt' } }]);
+  assert.ok(!existsSync(join(target, 'work_split_hook.py')));
+  assert.ok(!existsSync(join(target, 'runtime', 'gempt')));
+  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module' });
+  const config = JSON.parse(readFileSync(join(target, 'mcp_config.json'), 'utf8'));
+  const { command, args } = config.mcpServers.gempt;
+  assert.equal(command, process.execPath);
+  assert.deepEqual(args, [join(target, 'runtime', 'core', 'mcp-server.mjs')]);
+  const response = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
+    jsonrpc: '2.0', id: 1, method: 'resources/read', params: { uri: APP_URI },
+  }) });
+  assert.match(response.result.contents[0].text, /GemPT/);
+  const hooks = JSON.parse(readFileSync(join(target, 'hooks.json'), 'utf8'));
+  const hook = hooks['gempt-work-split'].SessionStart[0].command;
+  assert.ok(hook.includes('work_split_hook.mjs'));
+  assert.doesNotMatch(hook, /python/i);
+  const hookResult = process.platform === 'win32'
+    ? jsonProcess(command, [join(target, 'work_split_hook.mjs')], { cwd: f.root, env, input: '{"hookEventName":"SessionStart"}' })
+    : jsonProcess('sh', ['-c', hook], { cwd: f.root, env, input: '{"hookEventName":"SessionStart"}' });
+  assert.match(hookResult.injectSteps[0].systemMessage.systemMessage, /GemPT v2 active/);
+  const first = 'a'.repeat(32);
+  const second = 'b'.repeat(32);
+  state(f, first, { state: 'finished' });
+  state(f, second, { state: 'finished' });
+  const shim = join(binDir, 'gempt-wait');
+  const runShim = (args) => process.platform === 'win32'
+    ? jsonProcess(command, [`${shim}.mjs`, ...args], { cwd: f.root, env })
+    : jsonProcess(shim, args, { cwd: f.root, env });
+  assert.equal(runShim([first]).run_id, first);
+  assert.equal(runShim(['status', '--run-id', first, '--wait']).state, 'finished');
+  assert.deepEqual(runShim([`${first},${second}`]).ready, [first, second]);
+  assert.deepEqual(runShim(['--all', `${first},${second}`]).ready, [first, second]);
+  const source = join(f.root, 'invalid plugin');
+  mkdirSync(source);
+  for (const name of ['hooks.json', 'mcp_config.json', 'work_split_hook.mjs']) {
+    copyFileSync(join(dirname(hookPath), name), join(source, name));
+  }
+  writeFileSync(join(source, 'plugin.json'), JSON.stringify({ name: 'wrong-plugin' }));
+  await assert.rejects(installAgy({ source, target, binDir, env }), /manifest name 'gempt'/);
+  assert.deepEqual(JSON.parse(readFileSync(join(target, 'mcp_config.json'), 'utf8')), config);
+});
+
+test('Node CLI discovers, updates tiers, prints launchers and installs to an isolated home', async (t) => {
+  const f = fixture(t);
+  await appFixture(t, f);
+  const gateway = JSON.parse(readFileSync(f.configPath, 'utf8')).magpie.base_url;
+  rmSync(f.configPath);
+  const env = { ...f.env, HOME: f.root, USERPROFILE: f.root, MAGPIE_ADDR: gateway,
+    ANTIGRAVITY_CSRF_TOKEN: '' };
+  const cli = async (...args) => JSON.parse((await execFileAsync(process.execPath, [cliPath, ...args], {
+    env, cwd: f.root, timeout: 15_000, windowsHide: true,
+  })).stdout);
+  const discovery = await cli('discover');
+  assert.equal(discovery.config.path, f.configPath);
+  assert.equal(typeof discovery.codex.found, 'boolean');
+  const preview = await cli('init', '--non-interactive', '--sandbox', 'read-only', '--strategy', 'pace',
+    '--utility-model', 'fixture/utility', '--sync-magpie', '--use-groups', '--dry-run');
+  assert.equal(preview.saved, false);
+  assert.equal(preview.config.codex.default_sandbox, 'read-only');
+  assert.equal(preview.config.utility.model, 'fixture/utility');
+  assert.equal(preview.config.tiers.opus.consult_model, 'group/gempt-harness-opus');
+  assert.match(preview.magpie_groups_sync[0].commands[0].join(' '), /routing=pace/);
+  assert.ok(!existsSync(f.configPath));
+  await cli('init', '--non-interactive');
+  assert.equal((await cli('tier')).default_tier, 'sonnet');
+  assert.equal((await cli('tier', 'opus')).default_tier, 'opus');
+  assert.equal((await cli('tier')).default_tier, 'opus');
+  assert.equal((await cli('sandbox', 'read-only')).default_sandbox, 'read-only');
+  assert.equal((await cli('effort', 'auto')).auto_effort, true);
+  const id = 'a'.repeat(32);
+  state(f, id, { state: 'finished' });
+  assert.equal((await cli('wait', '--all', id)).run_id, id);
+  assert.equal((await cli('status', '--run-id', id, '--wait')).state, 'finished');
+  assert.match((await cli('print-mcp')).mcpServers.gempt.args[0], /core[/\\]mcp-server\.mjs$/);
+  assert.equal((await cli('presets', '--preview')).commands.filter((args) => args[2] === 'add').length, 3);
+  const target = join(f.root, 'cli plugin');
+  const installed = await cli('install-agy', '--target', target);
+  assert.equal(installed.plugin_dir, target);
+  assert.ok(existsSync(join(f.root, 'bin', 'gempt-wait.mjs')));
+  assert.deepEqual(await cli('print-mcp', '--installed', '--target', target), installed.mcp_config);
+});
 
 function git(cwd, ...args) {
   const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });

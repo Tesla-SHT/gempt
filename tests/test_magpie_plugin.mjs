@@ -14,7 +14,9 @@ import { runInNewContext } from 'node:vm';
 import { buildMcpSnippet, findMagpieCli, listDispatchActivity, normalizeTitle, readActiveRuns, readState, setDefaultSandbox, setDefaultTier } from '../magpie_plugin/lib/backend.mjs';
 import { createAppServerManager } from '../magpie_plugin/lib/app-server-manager.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
-import { createGemptTools } from '../magpie_plugin/lib/tools.mjs';
+import { createExecutionTools, createGemptTools } from '../magpie_plugin/lib/tools.mjs';
+import { TOOLS } from '../core/mcp-server.mjs';
+import { waitForRun } from '../core/runs.mjs';
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -48,10 +50,11 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
   const paths = files.map((file) => file.path);
   for (const path of ['LICENSE', 'src/gempt/mcp_app_live.html', 'src/gempt/host_context.py', 'src/gempt/titles.py',
     'plugin/hooks.json', 'plugin/work_split_hook.py', 'magpie_plugin/lib/backend.mjs',
-    'core/mcp-server.mjs', 'core/host-context.mjs', 'core/wait.mjs', 'core/assets/mcp_app_live.html', 'core/assets/workload.json']) {
+    'bin/gempt.mjs', 'plugin/work_split_hook.mjs', 'core/agy-install.mjs', 'core/mcp-server.mjs',
+    'core/host-context.mjs', 'core/wait.mjs', 'core/assets/mcp_app_live.html', 'core/assets/workload.json']) {
     assert.ok(paths.includes(path), path);
   }
-  const roots = /^(?:LICENSE(?:\.md)?$|README\.md$|install\.(?:sh|ps1)$|package\.json$|pyproject\.toml$|(?:core|magpie_plugin|mcp_app|plugin|src\/gempt|templates)\/)/;
+  const roots = /^(?:LICENSE(?:\.md)?$|README\.md$|install\.(?:sh|ps1)$|package\.json$|pyproject\.toml$|(?:bin|core|magpie_plugin|mcp_app|plugin|src\/gempt|templates)\/)/;
   const localFiles = /(?:^|\/)(?:\.[^/]+|node_modules|__pycache__|sessions|runs|host-context(?:[.-][^/]*)?|state\.json|config\.json|request\.json|package-lock\.json)(?:\/|$)|\.(?:pyc|log|jsonl|tgz)$/i;
   assert.deepEqual(paths.filter((path) => !roots.test(path) || (path !== 'core/host-context.mjs' && localFiles.test(path))), []);
   assert.ok(!existsSync(join(REPO_ROOT, 'node_modules')));
@@ -372,7 +375,7 @@ test('package.json Magpie manifest fields and single plugin factory export exist
     timeout: 10000,
     windowsHide: true,
   });
-  assert.deepEqual(JSON.parse(stdout.trim()), ['consult', 'discover', 'dispatch', 'exec', 'status']);
+  assert.deepEqual(JSON.parse(stdout.trim()), ['ask', 'ctl', 'run']);
 });
 
 test('backend discovery uses overrides, PATH and installed MCP configuration', () => {
@@ -395,11 +398,12 @@ test('backend discovery uses overrides, PATH and installed MCP configuration', (
     process.env.PYTHON_BIN = python;
     assert.equal(findMagpieCli(magpie), magpie);
     assert.equal(findMagpieCli(), override);
-    assert.equal(buildMcpSnippet({ antigravityPluginDir: root }).config.mcpServers.gempt.command, python);
+    assert.equal(buildMcpSnippet({ antigravityPluginDir: root }).config.mcpServers.gempt.command, process.execPath);
     delete process.env.MAGPIE_BIN;
     delete process.env.PYTHON_BIN;
     assert.equal(findMagpieCli(), magpie);
-    assert.equal(buildMcpSnippet({ antigravityPluginDir: root }).config.mcpServers.gempt.command, python);
+    assert.deepEqual(buildMcpSnippet({ antigravityPluginDir: root }).config.mcpServers.gempt,
+      { command: process.execPath, args: [join(REPO_ROOT, 'core', 'mcp-server.mjs')] });
 
     const runtime = join(root, 'runtime', 'gempt');
     mkdirSync(runtime, { recursive: true });
@@ -481,7 +485,7 @@ test('backend readState exposes multi-client state, native groups, MCP snippet, 
     );
     writeFileSync(
       join(magpieDir, 'plugin-tools.json'),
-      JSON.stringify({ gempt: ['consult', 'discover', 'exec', 'status'] }),
+      JSON.stringify({ gempt: ['run', 'ask', 'ctl'] }),
       'utf-8',
     );
     writeFileSync(
@@ -540,7 +544,7 @@ test('backend readState exposes multi-client state, native groups, MCP snippet, 
     assert.equal(state.clients.magpie_mcp_registered, true);
     assert.equal(state.clients.native_tools_registered, true);
     assert.deepEqual(state.clients.native_tools_agents, ['ZCode', 'Claude Code']);
-    assert.deepEqual(state.clients.native_tools_list, ['gempt_consult', 'gempt_discover', 'gempt_exec', 'gempt_status']);
+    assert.deepEqual(state.clients.native_tools_list, ['gempt_run', 'gempt_ask', 'gempt_ctl']);
     assert.deepEqual(state.clients.external_clients, ['ZCode', 'Claude Code', 'Codex CLI']);
     assert.equal(state.tools.enabled, true);
     assert.equal(state.tools.exec_enabled, false);
@@ -556,7 +560,7 @@ test('backend readState exposes multi-client state, native groups, MCP snippet, 
     assert.equal(fablePreview.installed, false);
     assert.equal(fablePreview.members.some((m) => m.includes('gemini-4-argon')), false);
 
-    assert.equal(state.mcp_snippet.config.mcpServers.gempt.env.PYTHONUTF8, '1');
+    assert.equal(state.mcp_snippet.config.mcpServers.gempt.args[0], join(REPO_ROOT, 'core', 'mcp-server.mjs'));
     assert.equal(state.recent_group_calls.length, 1);
     assert.equal(state.recent_group_calls[0].tier, 'opus');
     assert.equal(state.recent_group_calls[0].agent, 'zcode');
@@ -645,6 +649,7 @@ test('page server supports native-groups, lossless api_fallback <-> subscription
     sessionsDir: join(dir, 'sessions'),
     magpieConfigDir: magpieDir,
     antigravityPluginDir: join(dir, 'missing-agy'),
+    agyBinDir: join(dir, 'bin'),
     magpieCliPath: mockCli,
     mcpToolsEnabled: false,
   });
@@ -677,6 +682,15 @@ test('page server supports native-groups, lossless api_fallback <-> subscription
     assert.match(pageRes.text, /id="create-native-btn"/);
     assert.match(pageRes.text, /id="effort-control-group"/);
     const key = pageRes.text.match(/<meta name="gempt-key" content="([^"]+)">/)[1];
+    const installUrl = `${origin}/api/install-agy`;
+    assert.equal((await fetch(installUrl, { method: 'POST' })).status, 401);
+    assert.equal((await fetch(installUrl, { method: 'POST', headers: { ...opaque, 'x-gempt-key': key } })).status, 403);
+    const installation = await fetch(installUrl, { method: 'POST', headers: { origin, 'x-gempt-key': key } });
+    assert.equal(installation.status, 200);
+    const installed = await installation.json();
+    assert.equal(installed.plugin_dir, join(dir, 'missing-agy'));
+    assert.equal(installed.mcp_config.mcpServers.gempt.command, process.execPath);
+    assert.ok(existsSync(join(dir, 'bin', 'gempt-wait.mjs')));
     const disabledStateRes = await fetch(`${origin}/api/state`, { headers: { ...opaque, 'x-gempt-key': key } });
     assert.equal(disabledStateRes.status, 200);
     assert.equal(disabledStateRes.headers.get('access-control-allow-origin'), 'null');
@@ -1333,7 +1347,7 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
   process.env.HTTP_PROXY = 'http://127.0.0.1:9999';
 
   try {
-    const defaultTools = createGemptTools({
+    const defaultTools = createExecutionTools({
       configPath: cfgPath,
       sessionsDir: sessDir,
       magpieConfigDir: magpieDir,
@@ -1435,13 +1449,14 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
       'utf-8',
     );
 
-    const enabledTools = createGemptTools({
+    const enabledTools = createExecutionTools({
       configPath: cfgPath,
       sessionsDir: sessDir,
       magpieConfigDir: magpieDir,
       antigravityPluginDir: join(dir, 'missing-agy'),
       options: { exec: true }, env,
     });
+
 
     // Routing uses the current settings even for an already registered tool instance.
     const dispatch = enabledTools.dispatch.execute;
@@ -1548,7 +1563,7 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     const job = { goal: 'Edit one file', cwd: repoDir, run_id: '3'.repeat(32), background: true };
     const first = await enabledTools.exec.execute(job);
     assert.equal(first.run_id, job.run_id);
-    const reconnected = createGemptTools({ sessionsDir: sessDir, configPath: cfgPath, options: { exec: true }, env });
+    const reconnected = createExecutionTools({ sessionsDir: sessDir, configPath: cfgPath, options: { exec: true }, env });
     const finished = await reconnected.status.execute({ run_id: job.run_id, wait_sec: 5 });
     assert.equal(finished.state, 'finished', finished.error);
     assert.equal(finished.result.sandbox, 'workspace-write');
@@ -1595,6 +1610,29 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     });
     assert.equal(autoResume.reasoning_effort, 'xhigh');
     assert.equal(autoResume.auto_effort, null);
+
+    const host = { configPath: cfgPath, sessionsDir: sessDir, magpieConfigDir: magpieDir,
+      env: { ...env, GEMPT_MAGPIE_TOOLS_EXEC: '0', GEMPT_GPT_RUN_SYNC_SEC: '0' } };
+    const unified = createGemptTools(host);
+    assert.deepEqual(Object.keys(unified).sort(), ['ask', 'ctl', 'run']);
+    for (const { name, inputSchema } of TOOLS.slice(0, 3)) {
+      assert.deepEqual(unified[name.slice(4)].args, inputSchema);
+    }
+    for (const access of [undefined, 'change']) {
+      await assert.rejects(unified.run.execute({ access, goal: 'Edit', cwd: repoDir }), /disabled/);
+    }
+    const inspection = await unified.run.execute({ access: 'inspect', goal: 'Inspect the project', cwd: repoDir });
+    assert.ok(inspection.wait_command);
+    const inspected = await waitForRun(inspection.run_id, { sessionsDir: sessDir, timeoutSec: 5 });
+    assert.equal(inspected.state, 'finished', inspected.error);
+    assert.equal(inspected.sandbox, 'read-only');
+    const ask = await unified.ask.execute({ goal: 'Review the project', cwd: repoDir, tier: 'sonnet' });
+    assert.ok(ask.text && ask.session_id);
+    const status = await unified.ctl.execute({ action: 'status', run_id: inspection.run_id });
+    assert.equal(status.st, 'finished');
+    const writable = createGemptTools({ ...host, options: { exec: true } });
+    const change = await writable.run.execute({ access: 'change', goal: 'Normal change', cwd: repoDir });
+    assert.equal((await waitForRun(change.run_id, { sessionsDir: sessDir, timeoutSec: 5 })).state, 'finished');
   } finally {
     if (prevMagpieAddr === undefined) delete process.env.MAGPIE_ADDR;
     else process.env.MAGPIE_ADDR = prevMagpieAddr;
@@ -1654,7 +1692,7 @@ test('native tool.consult fails over to openai/* backup on HTTP 429 when failove
   );
 
   try {
-    const tools = createGemptTools({
+    const tools = createExecutionTools({
       configPath: cfgPath,
       sessionsDir: sessDir,
       magpieConfigDir: magpieDir,
@@ -1769,7 +1807,7 @@ test('shared app-server manager launches once, authenticates, restarts and serve
   const readApi = async (path) => (await fetch(origin + path, { headers })).json();
   const repo = join(dir, 'workspace');
   mkdirSync(repo);
-  const tools = createGemptTools({ configPath, sessionsDir, options: { exec: true }, env });
+  const tools = createExecutionTools({ configPath, sessionsDir, options: { exec: true }, env });
   const receipt = await tools.exec.execute({ goal: 'Ask Gemini', cwd: repo, background: true });
   const runId = receipt.run_id;
   await eventually(async () => (await tools.status.execute({ run_id: runId })).state === 'waiting_gemini');

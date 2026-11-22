@@ -1,0 +1,256 @@
+import { createHash } from 'node:crypto';
+import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
+import { basename, dirname, extname, join } from 'node:path';
+
+const runtime = existsSync(new URL('./runtime/core/host-context.mjs', import.meta.url)) ? './runtime/' : '../';
+const [{ WORKLOAD }, { updateHostContext }, { atomicJson, resolvePath, withLock }, backend] = await Promise.all([
+  import(`${runtime}core/assets.mjs`), import(`${runtime}core/host-context.mjs`),
+  import(`${runtime}core/state.mjs`), import(`${runtime}magpie_plugin/lib/backend.mjs`),
+]);
+const { explicitTitle, readJsonSafe, resolveConfigPath, resolveSessionsDir } = backend;
+const configPath = resolveConfigPath();
+const readTools = new Set('read_file view_file view_file_outline view_code_item grep_search find_by_name list_dir'.split(' '));
+const assetExts = new Set('png jpg jpeg webp gif bmp ico svg mp4 mov webm wav mp3 pdf'.split(' '));
+const docExts = new Set('md mdx txt rst adoc'.split(' '));
+const configExts = new Set('json toml yaml yml ini cfg conf env'.split(' '));
+const sourceExts = new Set('py pyi js mjs cjs ts tsx jsx go rs java kt scala c cc cpp cxx h hpp cs rb php sh bash zsh ps1 psm1 bat cmd css scss less html htm vue svelte sql lua gd swift m mm r jl dart ex exs zig'.split(' '));
+const exemptParts = [
+  '/.gemini/antigravity/mcp/', '/.gemini/antigravity/brain/', '/.gemini/config/plugins/',
+  '/.zcode/skills/', '/agent-skills/', '/.config/gempt/',
+];
+const override = /自己改|自己查|自己做|不用\s*gpt|别用\s*gpt|别派\s*gpt|不要\s*gpt|别转\s*gpt|gemini\s*(?:自己|直接)?(?:做|改|查|处理)|\b(?:no\s+gpt|skip\s+gempt|bypass\s+gempt|don'?t\s+use\s+gpt)\b/i;
+const waitCommand = /\bgempt-wait\b|\bgempt\.cli\b[^\n]*--wait\b|\bgempt\s+status\b[^\n]*--wait\b/i;
+const readCommand = /(?:^|[;&|\r\n]\s*)(?:(?:sudo|command|time)\s+)?(?:Get-Content|Select-String|Get-ChildItem|gc|sls|gci|cat|head|tail|rg|ripgrep|grep|findstr|find|ls|dir|tree|sed|awk|wc|git\s+(?:diff|show|log|grep|status)|type)(?:\.exe)?(?=\s|$)/i;
+const milestones = [120, 200, 280];
+const banners = {
+  gemini_first: '[GemPT 30%] Handle routine edits/reads in Gemini; route heavy debugging, long test loops, expert review, or Swarm verification to gpt_run / gpt_ask.',
+  gpt: "[GemPT 80%] Route repo investigation & code changes directly to gpt_run(cwd, access='inspect'|'change') or gpt_ask(file_paths); keep quick Gemini checks <=5 steps.",
+  gpt_first: '[GemPT 95%] Delegate this turn to a persistent gpt_run(cwd, session_id=...) thread immediately; reserve Gemini for <=2 quick checks/visuals (for pure 95% coding workspaces, use Codex CLI / codex-lab directly).',
+};
+const now = () => Date.now() / 1000;
+const text = (value) => typeof value === 'string' ? value.trim() : '';
+const step = (systemMessage) => ({ systemMessage: { systemMessage } });
+
+function profile() {
+  try {
+    return JSON.parse(readFileSync(configPath, 'utf8').replace(/^\uFEFF/, ''))?.routing_policy?.work_split ?? 'balanced';
+  } catch {
+    return 'balanced';
+  }
+}
+
+async function updateState(conversation, operation) {
+  if (!text(conversation)) return operation({});
+  const file = join(dirname(configPath), 'hook-state', `${conversation.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80)}.json`);
+  try {
+    return await withLock(`${file}.node.lock`, () => {
+      const stored = readJsonSafe(file);
+      const state = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+      const previous = state.updated_at;
+      const result = operation(state);
+      if (state.updated_at !== previous) {
+        try { atomicJson(file, state); } catch {}
+      }
+      return result;
+    });
+  } catch {
+    return operation({});
+  }
+}
+
+function setCount(state, key, count) {
+  state.explore_count = count;
+  if (key) state.turn_key = key;
+  state.updated_at = now();
+  return count;
+}
+
+function healthy() {
+  const overridePath = text(process.env.GEMPT_APP_SERVER_STATE);
+  let state;
+  try {
+    state = readJsonSafe(overridePath ? resolvePath(overridePath) : join(dirname(configPath), 'app-server.json'));
+  } catch {
+    return false;
+  }
+  const pid = Math.trunc(Number(state?.pid));
+  if (state?.status !== 'running' || !state.ws_url || !(pid > 0)) return false;
+  try { process.kill(pid, 0); } catch (error) { if (error.code !== 'EPERM') return false; }
+  const runs = join(resolveSessionsDir(), 'runs');
+  let files;
+  try {
+    files = readdirSync(runs, { withFileTypes: true }).filter((entry) => entry.isDirectory())
+      .map((entry) => {
+        const path = join(runs, entry.name, 'state.json');
+        return { path, mtime: statSync(path, { throwIfNoEntry: false })?.mtimeMs };
+      }).filter(({ mtime }) => mtime !== undefined).sort((left, right) => right.mtime - left.mtime);
+  } catch {
+    return true;
+  }
+  const configuredWindow = Number(text(process.env.GEMPT_CIRCUIT_WINDOW_SEC) || 600);
+  const window = Number.isNaN(configuredWindow) ? 600 : configuredWindow;
+  let failures = 0;
+  for (const { path, mtime } of files.slice(0, 10)) {
+    const record = readJsonSafe(path);
+    if (!['finished', 'failed', 'outcome_unknown'].includes(record?.state)) continue;
+    const finished = typeof record.finished_at === 'number' ? record.finished_at : mtime / 1000;
+    if (now() - finished > window || record.state === 'finished') break;
+    if (++failures >= 2) return false;
+  }
+  return true;
+}
+
+function normalizedPath(path) {
+  return path.replaceAll('\\', '/').toLowerCase();
+}
+
+function exemptPath(path) {
+  const normalized = normalizedPath(path);
+  return basename(normalized) === 'skill.md' || exemptParts.some((part) => normalized.includes(part))
+    || assetExts.has(extname(normalized).slice(1));
+}
+
+function sourceWrite(path, args) {
+  if (!path || exemptPath(path)) return false;
+  const normalized = normalizedPath(path);
+  const suffix = extname(normalized).slice(1);
+  if (docExts.has(suffix)) return false;
+  if (configExts.has(suffix)) {
+    return ['Target', 'Replacement', 'Content', 'OldString', 'NewString'].some((key) => {
+      if (typeof args[key] !== 'string' || !args[key]) return false;
+      const lines = args[key].split(/\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]/);
+      return lines.length - (lines.at(-1) === '' ? 1 : 0) > 15;
+    });
+  }
+  return sourceExts.has(suffix) || ['dockerfile', 'makefile', 'cmakelists.txt', 'justfile', 'procfile'].includes(basename(normalized));
+}
+
+function contextTokens(path) {
+  if (!text(path)) return 0;
+  let fd;
+  try {
+    fd = openSync(path, 'r');
+    const size = fstatSync(fd).size;
+    const tail = Buffer.alloc(Math.min(size, 65_536));
+    const length = readSync(fd, tail, 0, tail.length, size - tail.length);
+    for (const line of tail.toString('utf8', 0, length).split(/\r?\n/).reverse()) {
+      if (!line.includes('PLANNER_RESPONSE')) continue;
+      let value;
+      try { value = JSON.parse(line); } catch { continue; }
+      if (value?.type === 'PLANNER_RESPONSE') {
+        return ['input_tokens', 'output_tokens', 'cache_read_tokens']
+          .reduce((sum, key) => sum + (Math.trunc(Number(value[key])) || 0), 0);
+      }
+    }
+  } catch {
+    return 0;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  return 0;
+}
+
+async function handle(payload) {
+  const { conversationId, workspacePaths, modelName, hookEventName, toolCall } = payload;
+  const family = modelName === 'gemini-pro-orchestrator' ? 'carbon'
+    : /(?:^|[^a-z0-9])(hydrogen|neon|carbon)(?:$|[^a-z0-9])/i.exec(String(modelName))?.[1]?.toLowerCase();
+  await updateHostContext(conversationId, workspacePaths, { geminiFamily: family, configPath });
+  const ordinary = profile();
+  const userInput = String(payload.lastUserInput || '');
+  const key = userInput.trim() ? createHash('sha1').update(userInput.trim()).digest('hex').slice(0, 16) : '';
+  if (Object.hasOwn(payload, 'toolCall') || hookEventName === 'PreToolUse') {
+    const allow = { decision: 'allow' };
+    const { name, args = {} } = toolCall || {};
+    const input = args || {};
+    if (name === 'invoke_subagent' && input.TypeName === 'gempt-worker') {
+      await updateState(conversationId, (state) => setCount(state, key, 0));
+      if (text(conversationId) && typeof input.Prompt === 'string' && !/^GemPT metadata: /m.test(input.Prompt)) {
+        const meta = { host_conversation_id: conversationId, title: explicitTitle(input.Role) };
+        allow.overwrite = { Prompt: `${input.Prompt}\nGemPT metadata: ${JSON.stringify(meta)}` };
+      }
+      return allow;
+    }
+    if (name === 'call_mcp_tool') {
+      if (input.ServerName !== 'gempt_gempt') return allow;
+      const tool = String(input.ToolName || '');
+      const delegation = ['gempt_dispatch', 'gempt_exec', 'gempt_consult'].includes(tool);
+      if (delegation || ['gpt_run', 'gpt_ask'].includes(tool)) {
+        await updateState(conversationId, (state) => setCount(state, key, 0));
+      }
+      const task = input.Arguments;
+      if (!tool.startsWith('gempt_') || !task || typeof task !== 'object' || Array.isArray(task)) return allow;
+      const updates = {};
+      if (text(conversationId) && ['gempt_dispatch', 'gempt_exec', 'gempt_live_view', 'gempt_status'].includes(tool)) {
+        const parentId = task.host_conversation_id;
+        if (!parentId && (tool !== 'gempt_status' || !task.run_id)) updates.host_conversation_id = conversationId;
+        else if (typeof parentId === 'string' && parentId !== conversationId && delegation) {
+          await updateHostContext(conversationId, workspacePaths, { parentId, geminiFamily: family, configPath });
+        }
+      }
+      if (delegation && family && !task.tier && !task.session_id &&
+          [null, 'solo', 'coordinator', 'narrator'].includes(task.role ?? null) && task.gemini_family !== family) {
+        updates.gemini_family = family;
+      }
+      if (Object.keys(updates).length) allow.overwrite = { Arguments: { ...task, ...updates } };
+      return allow;
+    }
+    if (['gemini', 'gemini_first'].includes(ordinary) || override.test(userInput) || !healthy()) return allow;
+    const target = ['Path', 'TargetFile', 'AbsolutePath', 'SearchPath', 'DirectoryPath'].map((key) => text(input[key])).find(Boolean) || '';
+    const cwd = text(payload.cwd) || text(workspacePaths?.[0]) || (extname(target) ? dirname(target) : target) || '.';
+    const pct = { gpt: 80, gpt_first: 95 }[ordinary] || 50;
+    if (['edit_file', 'write_file'].includes(name)) {
+      if (!sourceWrite(target, input)) return allow;
+      return { decision: 'deny', reason: `[GemPT ${pct}% Write Gate] Source edit (${basename(target)}) routed to Codex. `
+        + `Call call_mcp_tool(ServerName="gempt_gempt", ToolName="gpt_run", Arguments={"goal": "Edit ${target}: <change & verify>", "cwd": "${cwd}", "access": "change"}) `
+        + 'then run the returned `gempt-wait <id>` via run_command(WaitMsBeforeAsync=500). (User can say "自己改" to bypass.)' };
+    }
+    if (ordinary === 'balanced') return allow;
+    const command = String(input.CommandLine || '').trim();
+    if (!(readTools.has(name) && !exemptPath(target)) &&
+        !(name === 'run_command' && !waitCommand.test(command) && readCommand.test(command))) return allow;
+    const limit = ordinary === 'gpt' ? 5 : 2;
+    const count = await updateState(conversationId, (state) => setCount(state, key,
+      1 + (key && state.turn_key && key !== state.turn_key ? 0 : Number(state.explore_count) || 0)));
+    if (count <= limit) return allow;
+    const extra = pct === 95 ? ' For pure 95% coding workspaces, prefer Codex CLI / codex-lab directly.' : '';
+    return { decision: 'deny', reason: `[GemPT ${ordinary === 'gpt' ? 80 : 95}% Explore Stop-Loss] ${count} non-exempt workspace reads/searches this turn (limit ${limit}). `
+      + `Dispatch deep inspection to Codex: call_mcp_tool(ServerName="gempt_gempt", ToolName="gpt_run", Arguments={"goal": "<what to inspect>", "cwd": "${cwd}", "access": "inspect"}) `
+      + `then run returned \`gempt-wait <id>\` via run_command(WaitMsBeforeAsync=500).${extra} (Say "自己查" to bypass.)` };
+  }
+  if (hookEventName === 'SessionStart') {
+    const target = (WORKLOAD.profiles[ordinary] || WORKLOAD.profiles.balanced).gpt_share;
+    if (target <= 0) return {};
+    return { injectSteps: [step(`GemPT v2 active: ${ordinary} (${target}% GPT${family ? `, family=${family}` : ''}).\n`
+      + 'Tools (ServerName="gempt_gempt"): gpt_run(goal,cwd,access="change"|"inspect",workspace="inherit"|"share",session_id?) | '
+      + 'gpt_ask(goal,file_paths?,cwd?,tier?,session_id?) | gpt_ctl(action="status"|"steer"|"interrupt"|"reply",run_id?,message?,call_id?).\n'
+      + "Run gpt_run's returned `gempt-wait <id>` via run_command(WaitMsBeforeAsync=500); never poll status.")] };
+  }
+  const tokens = Math.floor(contextTokens(payload.transcriptPath) / 1000);
+  const steps = await updateState(conversationId, (state) => {
+    const result = [];
+    const shown = new Set((Array.isArray(state.milestones_shown) ? state.milestones_shown : []).filter(Number.isFinite));
+    const highest = milestones.findLast((value) => tokens >= value && !shown.has(value));
+    if (highest) {
+      milestones.filter((value) => value <= highest).forEach((value) => shown.add(value));
+      state.milestones_shown = [...shown].sort((left, right) => left - right);
+      state.updated_at = now();
+      result.push({ systemMessage: { systemMessage: '', metadata: {
+        user_markdown: `⚠️ 当前会话上下文已达 **${tokens}k tokens**（越过 ${highest}k 里程碑），继续多轮对话将成倍重放 Gemini 缓存。建议输入 \`/compact\` 压缩上下文，或开新对话继续。`,
+      } } });
+    }
+    const entry = `${payload.initialNumSteps ?? ''}:${key}`;
+    if ([0, 1].includes(payload.invocationNum) &&
+        !(conversationId && state.last_entry_key === entry && (entry !== ':' || now() - state.last_entry_at < 15))) {
+      setCount(state, key, 0);
+      state.last_entry_key = entry;
+      state.last_entry_at = now();
+      if (Object.hasOwn(banners, ordinary) && !override.test(userInput) && healthy()) result.push(step(banners[ordinary]));
+    }
+    return result;
+  });
+  return steps.length ? { injectSteps: steps } : {};
+}
+
+const chunks = [];
+for await (const chunk of process.stdin) chunks.push(chunk);
+console.log(JSON.stringify(await handle(JSON.parse(Buffer.concat(chunks).toString('utf8')))));

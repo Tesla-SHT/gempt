@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { connectAppServer, readAppServerState, textInput, UNAVAILABLE } from '../magpie_plugin/lib/app-server-client.mjs';
 import { normalizeTitle, readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
+import { resolveNodeExecutable } from './node-executable.mjs';
 import { readHostContext } from './host-context.mjs';
 import { atomicJson, resolvePath, validateSessionId, withinPath } from './state.mjs';
 import { ensureShareWorktree } from './worktrees.mjs';
@@ -88,7 +89,7 @@ export function buildWaitCommand(runIds, { waitAll = false, env = process.env } 
   if (onPath && !['1', 'true', 'yes'].includes(env.GEMPT_DISABLE_WAIT_SHIM?.trim())) return `gempt-wait ${args}`;
   const quote = process.platform === 'win32' ? (text) => `'${text.replaceAll("'", "''")}'`
     : (text) => `'${text.replaceAll("'", "'\\''")}'`;
-  return `${process.platform === 'win32' ? '& ' : ''}${quote(process.execPath)} ${quote(waitPath)} ${args}`;
+  return `${process.platform === 'win32' ? '& ' : ''}${quote(resolveNodeExecutable({ env }))} ${quote(waitPath)} ${args}`;
 }
 
 export async function waitForRuns(runIds, { waitAll = false, timeoutSec, sessionsDir, pollInterval = 0.25 } = {}) {
@@ -283,7 +284,7 @@ export async function dispatchRun(args, {
   const request = { ...args, cwd, session_id: args.session_id ? sessionId : undefined,
     host_conversation_id: hostId, gemini_family: args.gemini_family || hostContext.gemini_family };
   try {
-    const child = spawn(process.execPath, [workerPath], {
+    const child = spawn(resolveNodeExecutable({ env }), [workerPath], {
       env, windowsHide: true, detached: true, stdio: ['pipe', 'ignore', 'ignore'],
     });
     const packet = JSON.stringify({ file, record, args: request, host, agent });

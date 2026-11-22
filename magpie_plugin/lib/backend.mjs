@@ -20,6 +20,7 @@ import { buildRequestAnalytics, buildSessionAnalytics } from './activity-analyti
 import { isAstraModel } from './routing.mjs';
 import { resolveBudget } from './token-ratio.mjs';
 import { WORKLOAD } from '../../core/assets.mjs';
+import { resolveNodeExecutable } from '../../core/node-executable.mjs';
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
@@ -297,9 +298,13 @@ function dedupe(items) {
 export function pickSubscriptionPlan(probe) {
   const codexIds = Array.isArray(probe?.codex_models) ? probe.codex_models : [];
   const utilityIds = Array.isArray(probe?.utility_candidates) ? probe.utility_candidates : [];
-  if (!codexIds.length) return null;
-  const sonnetModel = pickBest(codexIds, [['6.2-sol', 300], ['sol', 240], ['terra', 140], ['luna', 100]]);
-  const fableModel = pickBest(codexIds, [['6.2-astra', 320], ['astra', 260], ['pro', 180], ['sol', 100]]);
+  return pickTierPlan(codexIds, utilityIds);
+}
+
+function pickTierPlan(models, utilityIds) {
+  if (!models.length) return null;
+  const sonnetModel = pickBest(models, [['6.2-sol', 300], ['sol', 240], ['terra', 140], ['luna', 100]]);
+  const fableModel = pickBest(models, [['6.2-astra', 320], ['astra', 260], ['pro', 180], ['sol', 100]]);
   const utilityModel = utilityIds[0] || DEFAULT_UTILITY.model;
 
   return {
@@ -1399,36 +1404,14 @@ export function buildRulesSnippet() {
   return readFileSync(join(REPO_ROOT, 'plugin', 'rules', 'AGENTS.md'), 'utf8');
 }
 
-function resolvePythonBin() {
-  const envBin = String(process.env.PYTHON_BIN || '').trim();
-  if (envBin) return envBin;
-  const windows = process.platform === 'win32';
-  const names = windows ? ['python.exe', 'python3.exe'] : ['python3', 'python'];
-  const dirs = executablePathDirs().filter((dir) => !windows || !/[/\\]WindowsApps(?:[/\\]|$)/i.test(dir));
-  if (windows && process.env.LOCALAPPDATA) {
-    const base = join(process.env.LOCALAPPDATA, 'Programs', 'Python');
-    try {
-      const installs = readdirSync(base).filter((name) => /^Python3\d+$/i.test(name));
-      installs.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
-      dirs.push(...installs.map((name) => join(base, name)));
-    } catch {
-      // The per-user Python installation directory may be absent.
-    }
-  }
-  return findExecutable(dirs.flatMap((dir) => names.map((name) => join(dir, name)))) || names[0];
-}
-
 const SAFE_MCP_ENV_KEYS = new Set(['PYTHONPATH', 'PYTHONUTF8', 'PYTHONIOENCODING', 'LANG', 'LC_ALL', 'GEMPT_CONFIG']);
 
-export function buildMcpSnippet({ antigravityPluginDir, repoRoot = REPO_ROOT } = {}) {
+export function buildMcpSnippet({ antigravityPluginDir, repoRoot = REPO_ROOT, preferInstalled = true } = {}) {
   const agyDir = antigravityPluginDir
     ? resolve(expandUser(antigravityPluginDir))
     : resolve(join(homedir(), '.gemini', 'config', 'plugins', 'gempt'));
   const installedRuntime = join(agyDir, 'runtime');
-  const targetRoot = existsSync(join(installedRuntime, 'gempt', 'mcp_server.py'))
-    ? installedRuntime
-    : resolve(join(repoRoot, 'src'));
-  const installedConfig = targetRoot === installedRuntime ? readJsonSafe(join(agyDir, 'mcp_config.json')) : null;
+  const installedConfig = preferInstalled ? readJsonSafe(join(agyDir, 'mcp_config.json')) : null;
   if (installedConfig?.mcpServers?.gempt?.command) {
     const json = JSON.stringify(installedConfig, (key, value) => {
       if (key !== 'env' || !value || typeof value !== 'object') return value;
@@ -1436,29 +1419,13 @@ export function buildMcpSnippet({ antigravityPluginDir, repoRoot = REPO_ROOT } =
         name, SAFE_MCP_ENV_KEYS.has(name) ? entry : '[REDACTED]',
       ]));
     }, 2);
-    return { target_root: targetRoot, config: JSON.parse(json), json };
+    return { target_root: installedRuntime, config: JSON.parse(json), json };
   }
 
-  const pythonBin = resolvePythonBin();
-  const config = {
-    mcpServers: {
-      gempt: {
-        command: pythonBin,
-        args: [
-          '-I',
-          '-X',
-          'utf8',
-          '-c',
-          "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_module('gempt.mcp_server',run_name='__main__')",
-          targetRoot,
-        ],
-        env: {
-          PYTHONPATH: targetRoot,
-          PYTHONUTF8: '1',
-        },
-      },
-    },
-  };
+  const targetRoot = resolve(repoRoot);
+  const config = { mcpServers: { gempt: {
+    command: resolveNodeExecutable(), args: [join(targetRoot, 'core', 'mcp-server.mjs')],
+  } } };
   return {
     target_root: targetRoot,
     config,
@@ -1897,7 +1864,10 @@ export function setEffortSettings({ tierEffort, tier, autoEffort } = {}, { confi
   };
 }
 
-export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000 } = {}) {
+export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000, sandbox, strategy,
+  utilityModel, failover = 'subscription_only', useGroups = false, syncGroups = false, dryRun = false,
+  chooseSettings,
+} = {}) {
   const resolvedConfigPath = resolveConfigPath(configPath);
   const existing = readJsonSafe(resolvedConfigPath) || {};
   const existingMagpie = existing.magpie && typeof existing.magpie === 'object' ? existing.magpie : {};
@@ -1918,7 +1888,9 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
     };
   }
 
-  const plan = pickSubscriptionPlan(probe);
+  const subscription = pickSubscriptionPlan(probe);
+  const plan = subscription || ((chooseSettings || failover === 'api_fallback')
+    ? pickTierPlan(probe.openai_models || [], probe.utility_candidates || []) : null);
   if (!plan) {
     return {
       ok: false,
@@ -1927,7 +1899,13 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
     };
   }
 
-  const currentSandbox = String(existingCodex.default_sandbox || '').trim();
+  if (chooseSettings) ({ sandbox, utilityModel, failover, syncGroups, useGroups } = await chooseSettings({
+    sandbox, utilityModel, failover: subscription ? failover : 'api_fallback', syncGroups, useGroups, plan,
+  }));
+  if (failover === 'subscription_only' && !subscription) {
+    return { ok: false, status: 400, error: '未检测到可用的 Codex 订阅模型。' };
+  }
+  const currentSandbox = String(sandbox || existingCodex.default_sandbox || '').trim();
   const safeSandbox = VALID_SANDBOXES.includes(currentSandbox) ? currentSandbox : 'workspace-write';
   const defaultTier = normalizeDefaultTier(existingPolicy.default_tier) || 'sonnet';
   const excludedList = Array.isArray(existingPolicy.excluded_models)
@@ -1955,15 +1933,15 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
       swarm_split: existingPolicy.swarm_split ?? 'inherit',
       pairings: existingPolicy.pairings ?? {},
       default_tier: defaultTier,
-      failover_mode: 'subscription_only',
+      failover_mode: failover,
       auto_effort: Boolean(existingPolicy.auto_effort),
-      magpie_group_strategy: String(existingPolicy.magpie_group_strategy || 'pace'),
+      magpie_group_strategy: strategy || String(existingPolicy.magpie_group_strategy || 'pace'),
       excluded_models: excludedList,
     },
     tiers: plan.tiers,
     utility: {
       ...DEFAULT_UTILITY,
-      model: plan.utility_model,
+      model: utilityModel ?? plan.utility_model,
     },
     limits: {
       max_internal_rounds: 3,
@@ -1974,8 +1952,23 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
     },
   };
 
-  const written = writeConfigAtomic(resolvedConfigPath, next);
-  if (!written.ok) return written;
+  let config = next;
+  if (failover === 'api_fallback' && subscription && probe.openai_models?.length) {
+    const result = await setFailoverMode(failover, { configPath: resolvedConfigPath, candidate: next, probe });
+    if (!result.ok) return result;
+    config = result.config;
+  }
+  if (useGroups) {
+    config.tiers = Object.fromEntries(TIER_ORDER.map((tier) => {
+      const group = `group/gempt-harness-${tier}`;
+      return [tier, { ...config.tiers[tier], consult_model: group, exec_model: group }];
+    }));
+  }
+  const magpieGroups = syncGroups ? await syncHarnessGroups(config, { dryRun }) : [];
+  if (!dryRun) {
+    const written = writeConfigAtomic(resolvedConfigPath, config);
+    if (!written.ok) return written;
+  }
 
   return {
     ok: true,
@@ -1984,6 +1977,9 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
     default_tier: defaultTier,
     default_sandbox: safeSandbox,
     plan,
+    saved: !dryRun,
+    ...(dryRun ? { config: { ...config, magpie: { ...config.magpie, api_key: config.magpie.api_key ? '[REDACTED]' : '' } } } : {}),
+    ...(syncGroups ? { magpie_groups_sync: magpieGroups } : {}),
   };
 }
 
@@ -2107,15 +2103,72 @@ export async function createNativeGroups({ configPath, magpieConfigDir, magpieCl
     return { ok: false, status: 400, error: '未找到 Magpie CLI（请确认安装路径或设置 MAGPIE_BIN）。' };
   }
 
-  const h = normalizeGroupMember(plan.models.hydrogen);
-  const n = normalizeGroupMember(plan.models.neon);
-  const a = normalizeGroupMember(plan.models.argon);
-  const terra = normalizeGroupMember(plan.models.terra);
-  const s = normalizeGroupMember(plan.models.sol);
-  const t = normalizeGroupMember(plan.models.astra);
-  const f = plan.models.flash ? normalizeGroupMember(plan.models.flash) : '';
+  const tierCommands = nativeGroupCommands(plan.models);
+  const created = [];
+  const skipped = [];
+  for (const spec of NATIVE_GROUP_SPECS) {
+    const showRes = await execMagpieCli(cliPath, ['group', 'show', spec.name]);
+    if (showRes.ok) {
+      skipped.push(spec.group_id);
+      continue;
+    }
+    const detail = `${showRes.stderr}\n${showRes.stdout}`.trim();
+    if (!detail.includes(`no group "${spec.name}"`) && showRes.code !== 1) {
+      return { ok: false, status: 500, error: `检查路由组 ${spec.group_id} 失败: ${detail || 'unknown error'}` };
+    }
+    for (const cmd of tierCommands[spec.name]) {
+      const runRes = await execMagpieCli(cliPath, cmd);
+      if (!runRes.ok) {
+        return {
+          ok: false,
+          status: 500,
+          error: `创建路由组 ${spec.group_id} 失败: ${(runRes.stderr || runRes.stdout).trim()}`,
+        };
+      }
+    }
+    created.push(spec.group_id);
+  }
 
-  const tierCommands = {
+  return { ok: true, status: 200, created, skipped, groups: NATIVE_GROUP_SPECS.map((spec) => spec.group_id), models: plan.models };
+}
+
+export function isHarnessGroup(model) {
+  return /^group\/gempt-harness-(sonnet|opus|fable)$/.test(model);
+}
+
+function groupMemberRows(report) {
+  return (report.match(/^[ \t]*models[ \t]+([^\r\n]+(?:\r?\n[ \t]+\d+[ \t]+[^\r\n]+)*)/m)?.[1] || '')
+    .split(/\r?\n/).filter(Boolean);
+}
+
+function groupRules(report) {
+  return [...report.matchAll(/^[ \t]*(?:rules[ \t]+)?\d+[ \t]+(.+ → .+)$/gm)].map((match) => match[1].trim());
+}
+
+export async function verifySubscriptionGroup(config, model) {
+  if (!isHarnessGroup(model) || String(config.magpie?.base_url || DEFAULT_MAGPIE_URL).replace(/\/+$/, '') !== DEFAULT_MAGPIE_URL) {
+    throw new Error(`Cannot verify subscription group '${model}' against the local Magpie gateway.`);
+  }
+  const cli = findMagpieCli(config.magpie?.cli_path);
+  if (!cli) throw new Error('Subscription group verification requires Magpie CLI.');
+  const result = await execMagpieCli(cli, ['group', 'show', model.slice('group/'.length)]);
+  if (!result.ok) throw new Error(`Unable to verify subscription group '${model}'.`);
+  const members = groupMemberRows(result.stdout).map((row) => row.match(/^\s*\d+\s+(\S+)\s+.+ · .+$/)?.[1]);
+  const targets = groupRules(result.stdout).map((rule) => rule.split(' → ').at(-1));
+  if (!members.length || ![...members, ...targets].every(isCodexModelId)) {
+    throw new Error(`Subscription group '${model}' must contain only concrete codex/* models.`);
+  }
+}
+
+function nativeGroupCommands(models) {
+  const h = normalizeGroupMember(models.hydrogen);
+  const n = normalizeGroupMember(models.neon);
+  const a = normalizeGroupMember(models.argon);
+  const terra = normalizeGroupMember(models.terra);
+  const s = normalizeGroupMember(models.sol);
+  const t = normalizeGroupMember(models.astra);
+  const f = models.flash ? normalizeGroupMember(models.flash) : '';
+  return {
     'gempt-sonnet': [
       ['group', 'add', 'gempt-sonnet', `models=${dedupe([h, terra, f]).join(',')}`, 'routing=order', 'stays=turn'],
       ...(f ? [
@@ -2150,39 +2203,99 @@ export async function createNativeGroups({ configPath, magpieConfigDir, magpieCl
     ],
   };
 
-  const created = [];
-  const skipped = [];
-  for (const spec of NATIVE_GROUP_SPECS) {
-    const showRes = await execMagpieCli(cliPath, ['group', 'show', spec.name]);
-    if (showRes.ok) {
-      skipped.push(spec.group_id);
-      continue;
-    }
-    const detail = `${showRes.stderr}\n${showRes.stdout}`.trim();
-    if (!detail.includes(`no group "${spec.name}"`) && showRes.code !== 1) {
-      return { ok: false, status: 500, error: `检查路由组 ${spec.group_id} 失败: ${detail || 'unknown error'}` };
-    }
-    for (const cmd of tierCommands[spec.name]) {
-      const runRes = await execMagpieCli(cliPath, cmd);
-      if (!runRes.ok) {
-        return {
-          ok: false,
-          status: 500,
-          error: `创建路由组 ${spec.group_id} 失败: ${(runRes.stderr || runRes.stdout).trim()}`,
-        };
-      }
-    }
-    created.push(spec.group_id);
-  }
+}
 
-  return {
-    ok: true,
-    status: 200,
-    created,
-    skipped,
-    groups: NATIVE_GROUP_SPECS.map((s) => s.group_id),
-    models: plan.models,
+export function previewNativeGroups(env = process.env) {
+  const models = {
+    hydrogen: env.GEMPT_HYDROGEN?.trim() || 'antigravity/gemini-4-hydrogen',
+    neon: env.GEMPT_NEON?.trim() || 'antigravity/gemini-4-neon',
+    argon: env.GEMPT_ARGON?.trim() || 'antigravity/gemini-4-carbon',
+    terra: env.GEMPT_TERRA?.trim() || env.GEMPT_SOL?.trim() || 'codex/gpt-6.1-terra',
+    sol: env.GEMPT_SOL?.trim() || 'codex/gpt-6.2-sol',
+    astra: env.GEMPT_ASTRA?.trim() || 'codex/gpt-6.2-astra',
+    flash: env.DEEPSEEK_FLASH?.trim() || DEFAULT_UTILITY.model,
   };
+  return { applied: false, models, commands: Object.values(nativeGroupCommands(models)).flat()
+    .map((args) => [env.MAGPIE_BIN?.trim() || 'magpie', ...args]) };
+}
+
+async function syncHarnessGroups(config, { dryRun }) {
+  const cli = findMagpieCli(config.magpie.cli_path);
+  if (!cli && !dryRun) throw new Error('Magpie CLI not found. Set MAGPIE_BIN to sync routing groups.');
+  const { failover_mode: mode, magpie_group_strategy: strategy } = config.routing_policy;
+  const utility = config.utility.use_for_magpie_compact ? normalizeGroupMember(config.utility.model) : '';
+  const compact = mode === 'subscription_only' && !isCodexModelId(utility) ? '' : utility;
+  const plans = TIER_ORDER.map((tier) => {
+    const data = config.tiers[tier];
+    const name = `gempt-harness-${tier}`;
+    const members = dedupe([...(data.magpie_group_members || []), compact].filter(Boolean).map(normalizeGroupMember));
+    const note = `gempt ${tier} (${data.label || tier})`;
+    const settings = [`models=${members.join(',')}`, `routing=${strategy}`, 'stays=session'];
+    const commands = [['group', 'add', name, ...settings, `note=${note}`]];
+    const escalation = normalizeGroupMember(data.escalate_model);
+    if (tier === 'opus' && escalation && members.includes(escalation) && escalation !== members[0]) {
+      commands.push(['group', 'rule', 'add', name, `use=${escalation}`, `effort=${data.escalate_effort_threshold || 'high'}`]);
+    }
+    if (compact) commands.push(['group', 'rule', 'add', name, `use=${compact}`, 'compact']);
+    return { tier, name, note, settings, members, commands };
+  });
+  if (!dryRun) {
+    const run = async (args) => {
+      const result = await execMagpieCli(cli, args);
+      if (!result.ok) throw new Error(result.stderr.trim() || result.stdout.trim() || `Magpie ${args.join(' ')} failed.`);
+      return result.stdout;
+    };
+    const { withLock } = await import('../../core/state.mjs');
+    await withLock(join(resolveSessionsDir(), '.groups.lock'), async () => {
+      for (const { name, note, settings, members, commands } of plans) {
+        const show = await execMagpieCli(cli, ['group', 'show', name]);
+        let report = show.stdout;
+        if (!show.ok) {
+          if (!`${show.stdout}\n${show.stderr}`.includes(`no group "${name}"`)) {
+            throw new Error(show.stderr.trim() || `Unable to inspect group/${name}.`);
+          }
+          await run(commands[0]);
+          report = await run(['group', 'show', name]);
+        }
+        const lines = report.split(/\r?\n/).map((line) => line.trim());
+        if (!lines.some((line) => line.startsWith('note') && line.replace(/^note\s+/, '') === note)) {
+          throw new Error(`Existing group/${name} has a different owner.`);
+        }
+        const groupMembers = (output) => groupMemberRows(output).map((line) => line.match(/^\s*\d+\s+(\S+)/)?.[1]).filter(Boolean);
+        const rules = groupRules(report);
+        const current = groupMembers(report);
+        if (!current.length) throw new Error(`Cannot read members for group/${name}.`);
+        if (rules.some((rule) => !members.includes(rule.split(' → ').at(-1)))) {
+          throw new Error(`Changing members would invalidate an existing rule on group/${name}.`);
+        }
+        const expectedRules = [];
+        const additions = commands.slice(1).filter((command) => {
+          const target = command.at(-2).slice(4);
+          const condition = command.at(-1) === 'compact' ? 'compacting' : `effort ≥ ${command.at(-1).slice(7)}`;
+          const expected = `${condition} → ${target}`;
+          expectedRules.push(expected);
+          if (rules.includes(expected)) return false;
+          if (rules.some((rule) => rule.startsWith(`${condition} → `))) throw new Error(`Conflicting rule on group/${name}: ${condition}`);
+          return true;
+        });
+        const hasSettings = (output) => settings.slice(1).every((setting) => {
+          const [key, value] = setting.split('=');
+          return new RegExp(`^\\s*${key}\\s+${value}\\s*$`, 'm').test(output);
+        });
+        const sameMembers = (values) => values.join(',') === members.join(',');
+        const update = !sameMembers(current) || !hasSettings(report);
+        if (update) await run(['group', 'set', name, ...settings]);
+        for (const command of additions) await run(command);
+        const final = update || additions.length ? await run(['group', 'show', name]) : report;
+        if (!hasSettings(final) || !sameMembers(groupMembers(final)) ||
+            !expectedRules.every((rule) => groupRules(final).includes(rule))) {
+          throw new Error(`Group readback differs for group/${name}.`);
+        }
+      }
+    });
+  }
+  return plans.map(({ tier, name, commands }) => ({ tier, group: `group/${name}`,
+    commands: commands.map((command) => [cli || 'magpie', ...command]) }));
 }
 
 function findApiBackup(subModel, openaiModels) {
@@ -2196,7 +2309,7 @@ function findApiBackup(subModel, openaiModels) {
   return pickBest(openaiModels, [['terra', 200], ['mini', 150], ['sol', 100]]);
 }
 
-export async function setFailoverMode(mode, { configPath, probeTimeoutMs = 2000 } = {}) {
+export async function setFailoverMode(mode, { configPath, probeTimeoutMs = 2000, candidate, probe } = {}) {
   const normalized = String(mode || '').trim();
   if (!VALID_FAILOVER_MODES.includes(normalized)) {
     return {
@@ -2206,7 +2319,7 @@ export async function setFailoverMode(mode, { configPath, probeTimeoutMs = 2000 
     };
   }
 
-  const loaded = readExistingConfigObject(configPath);
+  const loaded = candidate ? { ok: true, data: candidate, path: resolveConfigPath(configPath) } : readExistingConfigObject(configPath);
   if (!loaded.ok) return loaded;
 
   const current = loaded.data;
@@ -2218,7 +2331,7 @@ export async function setFailoverMode(mode, { configPath, probeTimeoutMs = 2000 
   const baseUrl = String(current.magpie?.base_url || defaultGatewayFromEnv()).replace(/\/+$/, '');
   const apiKey = resolveMagpieApiKey({ magpie: { ...(current.magpie || {}), base_url: baseUrl } });
   const excludedTokens = resolveExcludedTokens(current);
-  let cachedProbe = null;
+  let cachedProbe = probe || null;
   const ensureProbe = async () => {
     if (!cachedProbe) {
       cachedProbe = await probeMagpie(baseUrl, apiKey, probeTimeoutMs, excludedTokens);
@@ -2367,6 +2480,7 @@ export async function setFailoverMode(mode, { configPath, probeTimeoutMs = 2000 
     routing_policy: nextPolicy,
     tiers: nextTiers,
   };
+  if (candidate) return { ok: true, config: next };
   const written = writeConfigAtomic(loaded.path, next);
   if (!written.ok) return written;
 

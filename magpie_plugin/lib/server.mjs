@@ -30,6 +30,7 @@ import {
 } from './backend.mjs';
 
 import { createAppServerManager } from './app-server-manager.mjs';
+import { installAgy } from '../../core/agy-install.mjs';
 
 export const DEFAULT_PORT = 3498;
 const MAX_POST_BYTES = 8192;
@@ -97,6 +98,7 @@ export async function startServer({
   sessionsDir,
   magpieConfigDir,
   antigravityPluginDir,
+  agyBinDir,
   magpieCliPath,
   execEnabled = false,
   mcpToolsEnabled,
@@ -192,6 +194,10 @@ export async function startServer({
       if (pathname.startsWith('/api/')) {
         if (!keyOK(req)) {
           return send(req, res, 401, { error: 'unauthorized: send the x-gempt-key header' });
+        }
+        if (req.method === 'POST' && pathname === '/api/install-agy') {
+          if (req.headers.origin === 'null') return send(req, res, 403, { error: 'invalid origin' });
+          return send(req, res, 200, await installAgy({ target: antigravityPluginDir, binDir: agyBinDir }));
         }
         const interrupt = /^\/api\/runs\/(.*?)\/interrupt$/.exec((req.url || '/').split('?', 1)[0]);
         if (req.method === 'POST' && interrupt) {

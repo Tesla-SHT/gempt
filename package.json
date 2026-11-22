@@ -4,6 +4,7 @@
   "description": "Magpie tools + control page plugin for Gemini-leads-GPT 3+1 routing tiers (Sonnet / Opus / Fable + Chore) across every Magpie client.",
   "type": "module",
   "bin": {
+    "gempt": "./bin/gempt.mjs",
     "gempt-wait": "./core/wait.mjs"
   },
   "main": "./magpie_plugin/index.mjs",
@@ -14,7 +15,8 @@
     "build:mcp-app": "node mcp_app/build.mjs"
   },
   "files": [
-    "core/*.mjs",
+    "bin/gempt.mjs",
+    "core/**/*.mjs",
     "core/assets/*",
     "magpie_plugin/index.mjs",
     "magpie_plugin/lib/*.mjs",
@@ -28,6 +30,8 @@
     "plugin/mcp_config.json",
     "plugin/hooks.json",
     "plugin/work_split_hook.py",
+    "plugin/work_split_hook.mjs",
+    "plugin/assets/**/*",
     "plugin/rules/AGENTS.md",
     "plugin/agents/*.md",
     "plugin/skills/*/SKILL.md",
@@ -63,8 +67,8 @@
   "magpie": {
     "name": "GemPT",
     "summary": {
-      "en": "Gemini-leads-GPT 3+1 orchestration tools (gempt_dispatch / gempt_consult / gempt_exec / gempt_discover / gempt_status) and routing control panel for all Magpie clients.",
-      "zh": "为所有 Magpie 客户端提供 Gemini 主导 GPT 五档工作分工与编排工具（gempt_dispatch / gempt_consult / gempt_exec / gempt_discover / gempt_status）与订阅路由控制面板。"
+      "en": "Gemini-leads-GPT orchestration tools (gempt_run / gempt_ask / gempt_ctl) and routing control panel for all Magpie clients.",
+      "zh": "为所有 Magpie 客户端提供 Gemini 主导的 GPT 编排工具（gempt_run / gempt_ask / gempt_ctl）与订阅路由控制面板。"
     },
     "page": {
       "title": "GemPT",
