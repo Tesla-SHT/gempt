@@ -48,8 +48,10 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files, version }] = JSON.parse(stdout);
-  assert.equal(version, '0.3.1');
+  assert.equal(version, '0.4.0');
   const paths = files.map((file) => file.path);
+  assert.deepEqual(paths.filter((path) => /^plugin\/skills\/[^/]+\/SKILL\.md$/.test(path)).sort(),
+    ['plugin/skills/gempt-chore/SKILL.md', 'plugin/skills/gempt/SKILL.md']);
   for (const path of ['LICENSE', 'THIRD_PARTY_LICENSES.txt', 'README.en.md', 'plugin/README.md', 'plugin/assets/logo.svg', 'scripts/build-agy-plugin.mjs', 'plugin/hooks.json', 'magpie_plugin/lib/backend.mjs',
     'bin/gempt.mjs', 'plugin/work_split_hook.mjs', 'core/agy-install.mjs', 'core/mcp-server.mjs',
     'core/host-context.mjs', 'core/wait.mjs', 'core/assets/mcp_app_live.html', 'core/assets/workload.json']) {
@@ -128,6 +130,48 @@ test('UI token-ratio card offers all ranges, shows observation states and has no
     assert.equal(meta.textContent, `参考目标 ${target}%${total === null ? '' : ' · 含缓存 66.7%'}`);
     assert.match(meta.title, /in \+ 5×out/);
   }
+});
+
+test('UI shows tiers only for direct routing and offers exactly two Antigravity shortcuts', () => {
+  const html = readFileSync(join(REPO_ROOT, 'magpie_plugin', 'ui', 'index.html'), 'utf-8');
+  const script = readFileSync(join(REPO_ROOT, 'magpie_plugin', 'ui', 'app.js'), 'utf-8');
+  assert.match(html, /<section id="tiers-section"[^>]*\bhidden>/);
+  const slashStrip = html.match(/<div id="strip-agy-slash"[\s\S]+?<\/div>/)?.[0];
+  assert.ok(slashStrip);
+  assert.deepEqual([...slashStrip.matchAll(/data-copy="([^"]+)"/g)].map((match) => match[1].trim()), ['/gempt', '/gempt-chore']);
+  assert.match(html, /id="active-slash-btn"[^>]*data-copy="\/gempt\s*"/);
+  assert.doesNotMatch(html + script, /(?<!group)\/gempt-(?:sonnet|opus|fable)\b/);
+
+  const renderSource = script.match(/  function renderState\([\s\S]+?\r?\n  }/)?.[0];
+  assert.ok(renderSource);
+  const elements = {
+    'tiers-section': { querySelectorAll: () => [] },
+    'strip-native-ids': {},
+    'strip-agy-slash': {},
+  };
+  const routeModes = [];
+  const noop = () => {};
+  const renderState = runInNewContext(`let latestState, currentViewMode, nativePreviewTier;\n${renderSource}\nrenderState`, {
+    $: (id) => elements[id],
+    document: { querySelectorAll: () => [] },
+    resolveEffectiveViewMode: (state) => state.mode,
+    renderSetupBanner: noop,
+    renderControls: noop,
+    renderReadiness: noop,
+    renderActiveRoute: (_state, tier, mode) => routeModes.push([tier?.group_id, mode]),
+    renderActivity: noop,
+    syncHasFallbackClasses: noop,
+    markUiReady: noop,
+  });
+  const state = { default_tier: 'fable', clients: { antigravity_installed: true },
+    native_groups: { tiers: [{ id: 'fable', group_id: 'group/gempt-fable' }] } };
+  for (const mode of ['mcp', 'native', 'mcp']) {
+    renderState({ ...state, mode });
+    assert.equal(elements['tiers-section'].hidden, mode === 'mcp');
+    assert.equal(elements['strip-native-ids'].hidden, mode === 'mcp');
+    assert.equal(elements['strip-agy-slash'].hidden, mode === 'native');
+  }
+  assert.deepEqual(routeModes[1], ['group/gempt-fable', 'native']);
 });
 
 function startMockMagpie(modelsData, { onRequest } = {}) {
@@ -860,6 +904,25 @@ test('page server supports native groups and lossless failover round-trip with a
     assert.equal(effSetJson.auto_effort, false);
     assert.equal(effSetJson.reasoning_effort, 'xhigh');
 
+    const mcpEffort = await fetch(`${origin}/api/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'null', 'x-gempt-key': key },
+      body: JSON.stringify({ mcp_effort: 'high' }),
+    });
+    assert.equal(mcpEffort.status, 200);
+    assert.equal((await mcpEffort.json()).mcp_effort, 'high');
+    const defaultPairing = await fetch(`${origin}/api/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'null', 'x-gempt-key': key },
+      body: JSON.stringify({ pairing: { family: 'hydrogen', model: 'default' } }),
+    });
+    assert.equal(defaultPairing.status, 200);
+    const pairedReceipt = await ask.execute({ goal: 'Check the default subscription model.', gemini_family: 'hydrogen' });
+    assert.equal(pairedReceipt.tier, 'paired:hydrogen');
+    assert.equal(pairedReceipt.reasoning_effort, 'high');
+    assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6.2-sol');
+    assert.equal(magpie.requests.at(-1).body.reasoning.effort, 'high');
+
     const postUltraRejected = await fetch(`${origin}/api/settings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Origin: 'null', 'x-gempt-key': key },
@@ -892,6 +955,9 @@ test('page server supports native groups and lossless failover round-trip with a
     assert.equal(stateJson.swarm_split, 'gemini_first');
     assert.deepEqual(Object.values(stateJson.work_profiles).map(({ gpt_share }) => gpt_share), [0, 15, 35, 60, 80]);
     assert.equal(stateJson.auto_effort, false);
+    assert.equal(stateJson.mcp_effort, 'high');
+    assert.equal(stateJson.pairings.hydrogen, 'default');
+    assert.equal(stateJson.mcp_default_model, 'codex/gpt-6.2-sol');
     assert.equal(stateJson.tiers.find((t) => t.id === 'opus').reasoning_effort, 'xhigh');
   } finally {
     await svc.close();
@@ -1537,6 +1603,8 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     const config = JSON.parse(readFileSync(cfgPath, 'utf8'));
     const hydrogenTask = { goal: 'Design a form', gemini_family: 'hydrogen' };
     const initial = await consult({ ...hydrogenTask, title: '  表单\n设计 ', host_conversation_id: 'consult-host' });
+    assert.equal(initial.tier, 'paired:hydrogen');
+    assert.equal(initial.auto_effort?.effort, initial.reasoning_effort);
     const titledConsult = JSON.parse(readFileSync(join(sessDir, `${initial.session_id}.json`), 'utf8'));
     assert.equal(titledConsult.title, '表单 设计');
     assert.equal(titledConsult.host_conversation_id, 'consult-host');
@@ -1547,8 +1615,13 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6.1-terra');
     await consult(hydrogenTask);
     assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6-luna');
-    await consult({ ...hydrogenTask, tier: 'fable' });
+    const explicitFable = await consult({ ...hydrogenTask, tier: 'fable' });
+    assert.equal(explicitFable.tier, 'fable');
     assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6.2-astra');
+    const astra = await consult({ goal: 'Return a short answer', gemini_family: 'carbon', reasoning_effort: 'low' });
+    assert.equal(astra.tier, 'paired:carbon');
+    assert.equal(astra.reasoning_effort, 'medium');
+    assert.equal(magpie.requests.at(-1).body.reasoning.effort, 'medium');
 
     // Reject widening sandbox above config host ceiling
     await assert.rejects(
@@ -1611,9 +1684,17 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     await assert.rejects(reconnected.exec.execute({ ...job, cwd: outsideDir }), /different workspace/);
     await assert.rejects(reconnected.status.execute({ run_id: '../wrong' }), /Invalid run_id/);
 
+    config.routing_policy.mcp_effort = 'xhigh';
+    config.routing_policy.auto_effort = false;
+    writeFileSync(cfgPath, JSON.stringify(config));
     const pairedExec = await enabledTools.exec.execute({ ...hydrogenTask, sandbox: 'read-only', cwd: repoDir });
     assert.equal(pairedExec.model, 'codex/gpt-6-luna');
+    assert.equal(pairedExec.tier, 'paired:hydrogen');
+    assert.equal(pairedExec.reasoning_effort, 'xhigh');
     assert.equal(app.packets.findLast((p) => p.method === 'turn/start').params.model, 'codex/gpt-6-luna');
+    assert.equal(app.packets.findLast((p) => p.method === 'turn/start').params.effort, 'xhigh');
+    config.routing_policy.auto_effort = true;
+    writeFileSync(cfgPath, JSON.stringify(config));
 
     const waiting = await enabledTools.exec.execute({ goal: 'Ask Gemini', cwd: repoDir });
     assert.equal(waiting.state, 'waiting_gemini');
@@ -2111,7 +2192,7 @@ test('mcpTools false disables duplicate Magpie GemPT tool registration', async (
 
 test('Magpie marketplace check shape and inspect+share guard hold', async () => {
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '0.3.1');
+  assert.equal(pkg.version, '0.4.0');
   assert.ok(pkg.keywords.includes('magpie-plugin'));
   assert.ok(pkg.files.includes('THIRD_PARTY_LICENSES.txt'));
   assert.ok(pkg.magpie?.summary?.en && pkg.magpie?.summary?.zh);

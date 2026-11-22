@@ -7,12 +7,12 @@ import { WORKLOAD } from '../../core/assets.mjs';
 import { resolveNodeExecutable } from '../../core/node-executable.mjs';
 import {
   DEFAULT_TIERS, DEFAULT_UTILITY, FEATURES, TIER_ORDER, VALID_FAILOVER_MODES, VALID_SANDBOXES,
-  buildTierView, expandUser, hasApiSnapshot, isCodexModelId, normalizeDefaultTier,
+  buildTierView, expandUser, getMcpEffort, getPairing, hasApiSnapshot, isCodexModelId, normalizeDefaultTier,
   readExistingConfigObject, readJsonSafe, readPluginExecOption, readPluginMcpToolsOption,
   resolveConfigPath, resolveMagpieConfigDir, resolveSessionsDir, writeConfigAtomic,
 } from '../../core/config.mjs';
 import {
-  NATIVE_GROUP_SPECS, dedupe, defaultGatewayFromEnv, findApiBackup, pickNativeGroupPlan,
+  NATIVE_GROUP_SPECS, dedupe, defaultGatewayFromEnv, findApiBackup, pickDefaultSubscriptionModel, pickNativeGroupPlan,
   pickSubscriptionPlan, pickTierPlan, probeMagpie, readMagpieNativeGroups, resolveExcludedTokens,
   resolveMagpieApiKey, syncHarnessGroups,
 } from '../../core/magpie.mjs';
@@ -170,6 +170,8 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
   const excludedTokens = resolveExcludedTokens(rawCfg);
   const magpie = await probeMagpie(baseUrl, apiKey, probeTimeoutMs, excludedTokens);
   const recommended = pickSubscriptionPlan(magpie);
+  const defaultModel = pickDefaultSubscriptionModel(magpie) || WORKLOAD.pairings.neon;
+  const pairings = Object.fromEntries(Object.keys(WORKLOAD.pairings).map((family) => [family, getPairing(policy, family)]));
   const nativePlan = pickNativeGroupPlan(magpie);
   const liveNativeGroups = readMagpieNativeGroups(resolvedMagpieDir);
   const clients = detectClients({ magpieConfigDir: resolvedMagpieDir, antigravityPluginDir });
@@ -249,8 +251,9 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     swarm_split: policy.swarm_split ?? 'inherit',
     work_profiles: WORKLOAD.profiles,
     token_ratio: tokenRatio,
-    pairings: Object.fromEntries(Object.entries(WORKLOAD.pairings).map(([family, model]) =>
-      [family, policy.pairings?.[family] ?? model])),
+    pairings,
+    mcp_default_model: defaultModel,
+    mcp_effort: getMcpEffort(policy),
     default_tier: defaultTier,
     failover_mode: String(policy.failover_mode || 'subscription_only'),
     auto_effort: Boolean(rawCfg?.routing_policy?.auto_effort),
@@ -362,6 +365,7 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
       default_tier: defaultTier,
       failover_mode: failover,
       auto_effort: Boolean(existingPolicy.auto_effort),
+      mcp_effort: getMcpEffort(existingPolicy),
       magpie_group_strategy: strategy || String(existingPolicy.magpie_group_strategy || 'pace'),
       excluded_models: excludedList,
     },

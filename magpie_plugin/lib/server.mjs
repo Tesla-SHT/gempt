@@ -59,7 +59,7 @@ const PKG = (() => {
   }
 })();
 
-const BUILD_ID = `${PKG.version || '0.3.1'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
+const BUILD_ID = `${PKG.version || '0.4.0'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
 const pidAlive = (pid) => {
   if (!Number.isSafeInteger(pid) || pid < 1) return false;
   try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }
@@ -310,7 +310,7 @@ export async function startServer({
           }
           const hasSbx = has('default_sandbox');
           const hasMode = has('failover_mode');
-          const hasEffort = has('auto_effort') || has('tier_effort');
+          const hasEffort = has('auto_effort') || has('tier_effort') || has('mcp_effort');
           if (!hasSbx && !hasMode && !hasEffort) {
             return send(req, res, 400, { ok: false, error: '未提供有效设置项。' });
           }
@@ -329,6 +329,7 @@ export async function startServer({
             const effRes = setEffortSettings(
               {
                 autoEffort: has('auto_effort') ? body.auto_effort : undefined,
+                mcpEffort: has('mcp_effort') ? body.mcp_effort : undefined,
                 tierEffort: has('tier_effort') ? body.tier_effort : undefined,
                 tier: has('tier') ? body.tier : undefined,
               },

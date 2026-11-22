@@ -1,9 +1,8 @@
 /*
  * GemPT Magpie Page Plugin UI controller.
  * Applies Magpie theme/tokens from boot query parameters, authenticates API
- * calls with the injected <meta name="gempt-key"> secret, supports both universal
- * MCP orchestration and native Magpie routing groups for any client, and
- * persists default_tier, default_sandbox, optional failover_mode, and native group creation.
+ * calls with the injected <meta name="gempt-key"> secret and controls Antigravity
+ * MCP orchestration and native Magpie routing groups for other clients.
  */
 (() => {
   const POLL_MS = 15000;
@@ -25,12 +24,6 @@
     return m === 'mcp' || m === 'native' ? m : '';
   })();
   const apiKey = document.querySelector('meta[name="gempt-key"]')?.getAttribute('content') || '';
-
-  const ROLE_TEXT = {
-    sonnet: '日常高频 · ~75%',
-    opus: '复杂工程 · ~20%',
-    fable: '顶配攻坚 · ~5%',
-  };
 
   const EFFORT_LABELS = {
     none: '思考：关',
@@ -61,14 +54,14 @@
 
   const FAILOVER_HINTS = {
     subscription_only: '仅用 ChatGPT/Codex 订阅额度，不走按量付费 API',
-    api_fallback: '按档位路由时，订阅失败可转按量 API。指定配对的任务只用所选订阅模型。',
+    api_fallback: '兼容调用可按原配置使用按量 API 兜底。Gemini 配对使用指定的订阅模型。',
   };
 
   const EFFORT_HINTS = {
-    medium: '当前档固定中等思考（适合日常开发、UI 与常规修改）',
-    high: '当前档固定高思考（适合跨文件排查与复杂工程；Opus 甜点档）',
-    xhigh: '当前档固定极高思考（适合算法/数学与核心攻坚；Opus 自动升 Astra）',
-    auto: '按任务风险自动定档（low..xhigh，Astra 兜底 ≥ 高；续跑锁档不中途加码）',
+    medium: '中等思考，适合日常开发与常规修改',
+    high: '高强度思考，适合跨文件排查与复杂工程',
+    xhigh: '极高强度思考，适合复杂算法与核心攻坚',
+    auto: '按任务复杂度调整强度。Astra 至少为高，续跑沿用原强度。',
   };
 
   const EFFORT_NAMES = {
@@ -86,11 +79,10 @@
 
   let latestState = null;
   let stateFetch = null;
-  let currentDefaultTier = 'sonnet';
+  let nativePreviewTier = '';
   let currentDefaultSandbox = 'workspace-write';
   let currentFailoverMode = 'subscription_only';
   let currentEffortChoice = 'high';
-  let currentAutoEffort = false;
   let currentViewMode = queryViewMode || readStoredMode();
   let ratioRange = readStoredRatioRange();
   let toastTimer = null;
@@ -210,24 +202,16 @@
 
   function titleCaseTier(id) {
     if (!id) return 'Sonnet';
+    if (id === 'mcp') return 'MCP';
+    if (id === 'paired') return 'Gemini 配对';
+    if (id.startsWith('paired:')) return `${titleCaseTier(id.slice(7))} 配对`;
     return id.charAt(0).toUpperCase() + id.slice(1);
   }
 
-  function formatEffortLabel(effort, { detailed = true, escalated = false, threshold = 'high', auto = false } = {}) {
+  function formatEffortLabel(effort, auto) {
+    if (auto) return '智能思考';
     const raw = String(effort || 'medium').trim().toLowerCase();
-    const shortWord = (EFFORT_LABELS[raw] || `思考：${raw}`).replace(/^思考：/, '');
-    const threshRaw = String(threshold || 'high').trim().toLowerCase();
-    const threshWord = (EFFORT_LABELS[threshRaw] || `思考：${threshRaw}`).replace(/^思考：/, '');
-    const showEscalation = Boolean(escalated && threshWord && threshWord !== shortWord);
-    if (auto) {
-      return showEscalation
-        ? `智能定档 · 基准${shortWord} → ${threshWord}`
-        : `智能定档 · 基准${shortWord}`;
-    }
-    if (showEscalation) {
-      return detailed ? `思考深度：${shortWord} → ${threshWord}` : `思考：${shortWord} → ${threshWord}`;
-    }
-    return detailed ? `思考深度：${shortWord}` : `思考：${shortWord}`;
+    return EFFORT_LABELS[raw] || `思考：${raw}`;
   }
 
   function humanizeModel(rawId) {
@@ -261,39 +245,13 @@
     return 'mcp';
   }
 
-  function buildMcpChain(tier) {
-    const nodes = [];
-    const seen = new Set();
-    const pushNode = (raw, role) => {
-      const id = String(raw || '').trim();
-      if (!id || seen.has(id)) return;
-      seen.add(id);
-      nodes.push({ id, human: humanizeModel(id), role });
-    };
-
-    const members = Array.isArray(tier.magpie_group_members) ? tier.magpie_group_members : [];
-    const consult = String(tier.consult_model || '').trim();
-    const isGroup = consult.startsWith('group/');
-
-    if (isGroup && members.length) {
-      members.forEach((m, idx) => {
-        if (idx === 0) pushNode(m, 'primary');
-        else if (tier.escalate_model && m === tier.escalate_model) pushNode(m, 'escalate');
-        else pushNode(m, 'fallback');
-      });
-    } else {
-      pushNode(consult, 'primary');
-      if (tier.exec_model && tier.exec_model !== consult) {
-        pushNode(tier.exec_model, 'exec');
-      }
-      if (tier.escalate_model) {
-        pushNode(tier.escalate_model, 'escalate');
-      }
-      for (const fb of tier.fallback_models || []) {
-        pushNode(fb, 'fallback');
-      }
-    }
-    return nodes;
+  function buildMcpChain(state) {
+    return Object.entries(state.pairings || {}).map(([family, model]) => ({
+      id: model === 'default' ? state.mcp_default_model : model,
+      human: `${titleCaseTier(family)} →`,
+      role: model === 'default' ? '默认模型' : '',
+      pairing: true,
+    }));
   }
 
   function buildNativeChain(nativeTier) {
@@ -307,19 +265,6 @@
       }));
   }
 
-  function formatMcpSummary(tier) {
-    const chain = buildMcpChain(tier);
-    if (!chain.length) return formatEffortLabel(tier.reasoning_effort, { detailed: false });
-    let summary = chain[0].human;
-    const escNode = chain.slice(1).find((n) => n.role === 'escalate');
-    const fbCount = chain.slice(1).filter((n) => n.role !== 'escalate').length;
-    if (escNode) summary += ` ↗ 升级 ${escNode.human}`;
-    else if (fbCount === 1) summary += ` → 备用 ${chain[1].human}`;
-    if (escNode && fbCount > 0) summary += ` · +${fbCount} 备用`;
-    else if (!escNode && fbCount > 1) summary += ` · +${fbCount} 备用`;
-    return summary;
-  }
-
   function formatNativeSummary(nativeTier) {
     const chain = buildNativeChain(nativeTier);
     if (!chain.length) return '尚未检测到 Gemini + Codex 订阅模型';
@@ -331,18 +276,6 @@
       : (coders.join(' / ') || planner);
     if (hasUtil) text += ' · DeepSeek 压缩';
     return text;
-  }
-
-  function formatMcpClientSubtitle(clients) {
-    const parts = [];
-    if (clients?.antigravity_installed) parts.push('Antigravity（官方 Gemini）');
-    for (const ext of clients?.external_clients || []) {
-      if (!parts.includes(ext)) parts.push(ext);
-      if (parts.length >= 4) break;
-    }
-    if (!parts.length) return 'Claude Code · ZCode · Cursor · CLI';
-    if (parts.length === 1) return `${parts[0]} · CLI · 任意 MCP 客户端`;
-    return parts.join(' · ');
   }
 
   function formatNativeClientSubtitle(clients) {
@@ -396,13 +329,7 @@
       btn.hidden = true;
     } else {
       banner.dataset.tone = 'ready';
-      const rec = state.subscription?.recommended;
-      const sonnetHuman = humanizeModel(rec?.tiers?.sonnet?.consult_model);
-      const fableHuman = humanizeModel(rec?.tiers?.fable?.consult_model);
-      const modelNote = sonnetHuman && fableHuman && sonnetHuman !== fableHuman
-        ? `${sonnetHuman} / ${fableHuman}`
-        : (sonnetHuman || 'Codex 订阅模型');
-      textEl.textContent = `已检测到 Codex 订阅（${modelNote}），点击即可启用全客户端共享的 MCP / CLI 配置：`;
+      textEl.textContent = '已检测到 Codex 订阅，可以启用 Antigravity MCP 编排。';
       btn.hidden = false;
       btn.disabled = false;
     }
@@ -544,7 +471,7 @@
         label.append(select);
         list.append(label);
       }
-      const choices = [new Option('沿用默认档位', 'default')];
+      const choices = [new Option('默认模型', 'default')];
       for (const id of models) choices.push(new Option(humanizeModel(id), id));
       if (current !== 'default' && !models.includes(current)) {
         choices.push(new Option(humanizeModel(current) + '（未检测到）', current));
@@ -576,24 +503,14 @@
         : baseHint;
     }
 
-    const activeTier = (state.tiers || []).find((t) => t.id === currentDefaultTier) || state.tiers?.[0];
-    currentAutoEffort = Boolean(state.auto_effort);
-    const activeTierEffort = String(activeTier?.reasoning_effort || 'medium').trim().toLowerCase();
-    currentEffortChoice = currentAutoEffort ? 'auto' : activeTierEffort;
+    currentEffortChoice = state.auto_effort ? 'auto' : state.mcp_effort || 'medium';
     for (const radio of document.querySelectorAll('input[name="active_effort"]')) {
       radio.checked = radio.value === currentEffortChoice;
       radio.disabled = !configured;
     }
     const effHint = $('effort-hint');
     if (effHint) {
-      if (!configured) {
-        effHint.textContent = '未初始化配置前默认按订阅甜点档执行';
-      } else if (currentAutoEffort) {
-        effHint.textContent = EFFORT_HINTS.auto;
-      } else {
-        effHint.textContent = EFFORT_HINTS[activeTierEffort]
-          || `当前 ${titleCaseTier(currentDefaultTier)} 档思考深度：${activeTierEffort}`;
-      }
+      effHint.textContent = EFFORT_HINTS[currentEffortChoice] || formatEffortLabel(currentEffortChoice);
     }
 
     const failoverGroup = $('failover-control-group');
@@ -676,7 +593,7 @@
       const isPrimaryLike = node.role === 'primary' || node.role === 'planner';
       const isDashedLike = node.role === 'fallback' || node.role === 'utility';
       const li = document.createElement('li');
-      li.className = `route-node${isPrimaryLike ? ' is-primary' : ''}${isDashedLike ? ' is-fallback' : ''}`;
+      li.className = `route-node${isPrimaryLike ? ' is-primary' : ''}${isDashedLike ? ' is-fallback' : ''}${node.pairing ? ' is-pairing' : ''}`;
 
       const left = document.createElement('span');
       left.className = 'node-left';
@@ -689,18 +606,20 @@
       const code = document.createElement('code');
       code.className = 'pill-code';
       code.textContent = node.id;
-      left.append(dot, human, code);
+      if (!node.pairing) left.append(dot);
+      left.append(human, code);
 
       const role = document.createElement('span');
       role.className = 'node-role';
       role.textContent = NODE_ROLE_LABELS[node.role] || node.role;
 
-      li.append(left, role);
+      li.append(left);
+      if (node.role) li.append(role);
       chainEl.appendChild(li);
     }
   }
 
-  function renderActiveRoute(state, activeTier, activeNativeTier, viewMode) {
+  function renderActiveRoute(state, activeNativeTier, viewMode) {
     const nameEl = $('active-tier-name');
     const targetBtn = $('active-tier-target');
     const readyBadge = $('active-tier-ready-badge');
@@ -714,13 +633,12 @@
     const hubModeText = $('hub-mode-text');
     const chainEl = $('route-chain');
 
-    const tierId = activeTier?.id || state.default_tier || 'sonnet';
-    if (nameEl) nameEl.textContent = titleCaseTier(tierId);
     if (hubBox) hubBox.title = state.magpie?.url || 'http://127.0.0.1:3425';
 
     if (viewMode === 'native') {
-      const groupId = activeNativeTier?.group_id || `group/gempt-${tierId}`;
+      const groupId = activeNativeTier?.group_id || `group/gempt-${nativePreviewTier}`;
       const installed = Boolean(activeNativeTier?.installed);
+      if (nameEl) nameEl.textContent = titleCaseTier(nativePreviewTier);
       if (targetBtn) {
         targetBtn.textContent = groupId;
         targetBtn.setAttribute('data-copy', groupId);
@@ -737,58 +655,25 @@
       if (sourceSub) sourceSub.textContent = formatNativeClientSubtitle(state.clients);
       if (copyMcpBtn) copyMcpBtn.hidden = true;
       if (copyRulesBtn) copyRulesBtn.hidden = true;
-      if (slashBtn) {
-        slashBtn.hidden = false;
-        slashBtn.textContent = groupId;
-        slashBtn.setAttribute('data-copy', groupId);
-        slashBtn.title = `点击复制 ${groupId}`;
-      }
+      if (slashBtn) slashBtn.hidden = true;
       if (hubModeText) hubModeText.textContent = '意图路由分流';
+      chainEl?.setAttribute('aria-label', '直连路由组成员');
       renderChainNodes(chainEl, buildNativeChain(activeNativeTier), '需先在 Magpie 接入 Gemini 与 Codex 模型');
       return;
     }
 
-    const consultModel = String(activeTier?.consult_model || 'codex/gpt-6.2-sol');
-    const isGroup = consultModel.startsWith('group/');
-    if (targetBtn) {
-      targetBtn.textContent = consultModel;
-      targetBtn.setAttribute('data-copy', consultModel);
-      targetBtn.title = `点击复制 ${consultModel}`;
-      targetBtn.hidden = !isGroup;
-    }
+    if (nameEl) nameEl.textContent = 'Antigravity MCP';
+    if (targetBtn) targetBtn.hidden = true;
     if (readyBadge) readyBadge.hidden = true;
-    if (effortEl) {
-      effortEl.textContent = formatEffortLabel(activeTier?.reasoning_effort, {
-        detailed: true,
-        escalated: Boolean(activeTier?.escalate_model),
-        threshold: activeTier?.escalate_effort_threshold || 'high',
-        auto: currentAutoEffort,
-      });
-    }
-    if (sourceTitle) sourceTitle.textContent = 'MCP 客户端';
-    if (sourceSub) sourceSub.textContent = formatMcpClientSubtitle(state.clients);
+    if (effortEl) effortEl.textContent = formatEffortLabel(state.mcp_effort, state.auto_effort);
+    if (sourceTitle) sourceTitle.textContent = 'Antigravity';
+    if (sourceSub) sourceSub.textContent = '原生 Gemini 按配对调用 GPT/Codex';
     if (copyMcpBtn) copyMcpBtn.hidden = false;
     if (copyRulesBtn) copyRulesBtn.hidden = false;
-    if (slashBtn) {
-      const hasAgy = Boolean(state.clients?.antigravity_installed);
-      slashBtn.hidden = !hasAgy;
-      if (hasAgy) {
-        const cmd = `/gempt-${tierId}`;
-        slashBtn.textContent = cmd;
-        slashBtn.setAttribute('data-copy', `${cmd} `);
-        slashBtn.title = '点击复制 Antigravity 单轮快捷指令';
-      }
-    }
-    if (hubModeText) {
-      if (state.features?.api_fallback && state.failover_mode === 'api_fallback') {
-        hubModeText.textContent = '订阅优先 · API 兜底';
-      } else if (state.features?.api_fallback) {
-        hubModeText.textContent = '仅用 Codex 订阅';
-      } else {
-        hubModeText.textContent = 'Codex 订阅直连';
-      }
-    }
-    renderChainNodes(chainEl, buildMcpChain(activeTier), '尚未配置模型');
+    if (slashBtn) slashBtn.hidden = !state.clients?.antigravity_installed;
+    if (hubModeText) hubModeText.textContent = 'Codex 订阅';
+    chainEl?.setAttribute('aria-label', 'Gemini 与 GPT 配对');
+    renderChainNodes(chainEl, buildMcpChain(state), '尚未配置 Gemini 配对');
   }
 
   function renderReadiness(state) {
@@ -915,9 +800,7 @@
   function renderState(state) {
     if (!state) return;
     latestState = state;
-    if (!currentDefaultTier || state.configured) {
-      currentDefaultTier = state.default_tier || 'sonnet';
-    }
+    nativePreviewTier ||= state.default_tier || 'sonnet';
     const viewMode = resolveEffectiveViewMode(state);
     currentViewMode = viewMode;
 
@@ -947,59 +830,25 @@
     renderControls(state, viewMode);
     renderReadiness(state);
 
-    const tiersMeta = $('tiers-section-meta');
-    if (tiersMeta) {
-      tiersMeta.textContent = viewMode === 'native'
-        ? '点击切换预览 · 外部客户端模型栏直选 group/gempt-*'
-        : '所有 MCP 客户端与 CLI 共享 · 点击切换默认档位';
-    }
-
-    const tiersById = new Map((state.tiers || []).map((t) => [t.id, t]));
+    const tiersSection = $('tiers-section');
+    tiersSection.hidden = viewMode !== 'native';
     const nativeById = new Map((state.native_groups?.tiers || []).map((t) => [t.id, t]));
-    const allowRowSelect = Boolean(state.configured) || viewMode === 'native';
-
-    for (const row of document.querySelectorAll('.tier-row')) {
-      const tierId = row.dataset.tier;
-      const radio = row.querySelector('.tier-radio');
-      if (radio) {
-        radio.checked = tierId === currentDefaultTier;
-        radio.disabled = !allowRowSelect;
-      }
-      const info = tiersById.get(tierId);
-      const nativeInfo = nativeById.get(tierId);
-
-      const nameEl = row.querySelector('[data-field="short_name"]');
-      const pillEl = row.querySelector('[data-field="target_pill"]');
-      const subEl = row.querySelector('[data-field="chain_summary"]');
-      const roleEl = row.querySelector('[data-field="role_desc"]');
-      const effortEl = row.querySelector('[data-field="effort_tag"]');
-
-      if (nameEl) nameEl.textContent = titleCaseTier(tierId);
-      if (roleEl) roleEl.textContent = ROLE_TEXT[tierId] || '';
-
-      if (viewMode === 'native') {
+    if (viewMode === 'native') {
+      for (const row of tiersSection.querySelectorAll('.tier-row')) {
+        const tierId = row.dataset.tier;
+        const nativeInfo = nativeById.get(tierId);
+        const radio = row.querySelector('.tier-radio');
+        const pillEl = row.querySelector('[data-field="target_pill"]');
+        const subEl = row.querySelector('[data-field="chain_summary"]');
+        const effortEl = row.querySelector('[data-field="effort_tag"]');
+        if (radio) radio.checked = tierId === nativePreviewTier;
         if (pillEl) pillEl.textContent = nativeInfo?.group_id || `group/gempt-${tierId}`;
         if (subEl) subEl.textContent = formatNativeSummary(nativeInfo);
         if (effortEl) effortEl.textContent = nativeInfo?.installed ? '已就绪' : '未创建';
-      } else if (info) {
-        if (pillEl) pillEl.textContent = info.consult_model;
-        if (subEl) subEl.textContent = formatMcpSummary(info);
-        if (effortEl) {
-          effortEl.textContent = formatEffortLabel(info.reasoning_effort, {
-            detailed: false,
-            escalated: Boolean(info.escalate_model),
-            threshold: info.escalate_effort_threshold || 'high',
-          });
-        }
       }
     }
 
-    renderActiveRoute(
-      state,
-      tiersById.get(currentDefaultTier) || state.tiers?.[0],
-      nativeById.get(currentDefaultTier) || state.native_groups?.tiers?.[0],
-      viewMode,
-    );
+    renderActiveRoute(state, nativeById.get(nativePreviewTier), viewMode);
 
     const choreModel = $('chore-model');
     const choreSub = $('chore-sub');
@@ -1016,8 +865,8 @@
     const stripNative = $('strip-native-ids');
     const stripAgy = $('strip-agy-slash');
     const hasAgy = Boolean(state.clients?.antigravity_installed);
-    if (stripNative) stripNative.hidden = !(viewMode === 'native' || !hasAgy);
-    if (stripAgy) stripAgy.hidden = !hasAgy;
+    if (stripNative) stripNative.hidden = viewMode !== 'native';
+    if (stripAgy) stripAgy.hidden = viewMode !== 'mcp' || !hasAgy;
 
     renderActivity(state);
     syncHasFallbackClasses();
@@ -1105,44 +954,6 @@
       showToast(`创建失败: ${err.message}`, 'error');
     } finally {
       if (btn) btn.disabled = false;
-      await refreshState();
-    }
-  }
-
-  async function switchDefaultTier(nextTier) {
-    const previous = currentDefaultTier;
-    if (!latestState?.configured) {
-      currentDefaultTier = nextTier;
-      renderState(latestState);
-      return;
-    }
-
-    const radios = [...document.querySelectorAll('input[name="default_tier"]')];
-    for (const r of radios) r.disabled = true;
-    syncHasFallbackClasses();
-
-    try {
-      const res = await apiFetch('/api/tier', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tier: nextTier }),
-      });
-      const payload = await res.json().catch(() => ({}));
-      if (!res.ok || !payload.ok) {
-        throw new Error(payload.error || `HTTP ${res.status}`);
-      }
-      currentDefaultTier = payload.default_tier || nextTier;
-      showToast(`默认档位已切换为 ${titleCaseTier(currentDefaultTier)}`);
-    } catch (err) {
-      for (const r of radios) {
-        r.checked = r.value === previous;
-      }
-      syncHasFallbackClasses();
-      showToast(`切换失败: ${err.message}`, 'error');
-    } finally {
-      const allow = Boolean(latestState?.configured) || currentViewMode === 'native';
-      for (const r of radios) r.disabled = !allow;
-      syncHasFallbackClasses();
       await refreshState();
     }
   }
@@ -2885,8 +2696,9 @@
       currentViewMode = target.value === 'native' ? 'native' : 'mcp';
       writeStoredMode(currentViewMode);
       renderState(latestState);
-    } else if (target.name === 'default_tier') {
-      switchDefaultTier(target.value);
+    } else if (target.name === 'native_preview_tier') {
+      nativePreviewTier = target.value;
+      renderState(latestState);
     } else if (target.name === 'work_split' || target.name === 'swarm_split') {
       updateSetting(target.name, { [target.name]: target.value }, latestState[target.name], '工作分工已保存，下次派单生效');
     } else if (target.dataset.family) {
@@ -2898,11 +2710,11 @@
     } else if (target.name === 'active_effort') {
       const payload = target.value === 'auto'
         ? { auto_effort: true }
-        : { auto_effort: false, tier_effort: target.value, tier: currentDefaultTier };
+        : { auto_effort: false, mcp_effort: target.value };
       const label = EFFORT_NAMES[target.value] || target.value;
       const toastMsg = target.value === 'auto'
         ? '已开启智能定档（low..xhigh，续跑锁档）'
-        : `${titleCaseTier(currentDefaultTier)} 思考强度已切为${label}`;
+        : `思考强度已切为${label}`;
       updateSetting('active_effort', payload, currentEffortChoice, toastMsg);
     } else if (target.name === 'failover_mode') {
       const label = target.value === 'api_fallback' ? 'API 兜底' : '仅订阅';

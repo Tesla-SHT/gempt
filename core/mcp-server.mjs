@@ -16,7 +16,7 @@ const short = (value, limit) => Array.from(String(value || '')).slice(0, limit).
 const bytes = (value) => Buffer.byteLength(JSON.stringify(value));
 const textResult = (data, extras) => ({ content: [{ type: 'text', text: JSON.stringify(data) }], ...extras });
 const VERSION = readJsonSafe(new URL('../package.json', import.meta.url))?.version
-  || readJsonSafe(new URL('../../plugin.json', import.meta.url))?.version || '0.3.1';
+  || readJsonSafe(new URL('../../plugin.json', import.meta.url))?.version || '0.4.0';
 
 function compact(payload) {
   const data = { ...payload };
@@ -100,9 +100,9 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
     const consult = createExecutionTools(options).consult;
     if (!cwd && args.file_paths != null) throw new Error('cwd is required when providing file_paths.');
     const execute = () => consult.execute({ goal, tier: args.tier, cwd, file_paths: args.file_paths,
-      session_id: sessionId, gemini_family: family, host_conversation_id: hostId }, callCtx);
+      session_id: sessionId, gemini_family: family, mcp: true, host_conversation_id: hostId }, callCtx);
     const res = sessionId ? await withLock(join(options.sessionsDir, `${validateSessionId(sessionId)}.node.lock`), execute) : await execute();
-    return textResult({ session_id: res.session_id, model: res.served_model, tier: res.tier,
+    return textResult({ session_id: res.session_id, model: res.served_model, tier: res.tier, reasoning_effort: res.reasoning_effort,
       text: compactReceiptText(res.text, res.session_id) });
   }
   const access = String(args.access || 'change').trim();
@@ -113,7 +113,7 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
   const syncBudget = Number(env.GEMPT_GPT_RUN_SYNC_SEC);
   const waitSec = Number.isFinite(syncBudget) && syncBudget > 0 ? Math.min(syncBudget, 10) : 0;
   const res = await dispatchRun({ goal, cwd, access, workspace: args.workspace, title: args.title, tier: args.tier,
-    host_conversation_id: hostId, gemini_family: family, session_id: sessionId,
+    host_conversation_id: hostId, gemini_family: family, mcp: true, session_id: sessionId,
     background: args.background ?? waitSec === 0, sandbox: access === 'inspect' ? 'read-only' : undefined,
     expected_report: 'Report concisely: changed files, verification commands/results, and any remaining blockers. Omit verbose raw logs.',
   }, { ...options, waitSec, agent: typeof callCtx?.agent === 'string' ? callCtx.agent : undefined });
@@ -126,8 +126,8 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
       ...(res.worktree_path ? { worktree_path: res.worktree_path } : {}),
     }, { isError: res.state === 'interrupted' });
   }
-  const { run_id, session_id, model, worktree_path, verification, usage, text } = res;
-  return textResult({ run_id, session_id, model, worktree_path, verification, usage,
+  const { run_id, session_id, model, tier, reasoning_effort, worktree_path, verification, usage, text } = res;
+  return textResult({ run_id, session_id, model, tier, reasoning_effort, worktree_path, verification, usage,
     text: compactReceiptText(text, session_id) }, { isError: ['failed', 'unverified'].includes(verification?.status) });
 }
 

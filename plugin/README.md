@@ -1,6 +1,8 @@
-# GemPT — Antigravity Plugin (v0.3.1)
+# GemPT — Antigravity Plugin (v0.4.0)
 
 GemPT lets Gemini in Antigravity consult GPT models (`gpt_ask`), delegate repository inspection and coding tasks to Codex (`gpt_run`), and monitor or steer live runs in the **GemPT Live** side pane (`gpt_ctl`), routed through your local [Magpie](https://github.com/yetone/magpie) gateway.
+
+Use **MCP 编排** under **Plugins → GemPT** to pair Hydrogen, Neon, and Carbon with GPT/Codex models and set work split, reasoning effort, and execution permissions. Other agents can select `group/gempt-{sonnet,opus,fable}` in their model picker after creating the groups under **路由组直连** or running `gempt presets --apply`.
 
 ## Prerequisites
 
@@ -12,7 +14,7 @@ GemPT lets Gemini in Antigravity consult GPT models (`gpt_ask`), delegate reposi
 ## What This Bundle Includes
 
 - **MCP Server (`gempt_gempt`)**: `gpt_run`, `gpt_ask`, `gpt_ctl`, plus the prebuilt **GemPT Live** MCP App (`ui://gempt/live.html`).
-- **Slash Skills**: `/gempt`, `/gempt-sonnet`, `/gempt-opus`, `/gempt-fable`, `/gempt-chore`.
+- **Slash Skills**: `/gempt` for orchestration and `/gempt-chore` for summaries and other utility consultations.
 - **Subagent**: `gempt-worker`.
 - **Work-Split Hooks & Rules**: `hooks.json` (`SessionStart`, `PreInvocation`, `PreToolUse`) and `rules/AGENTS.md`.
   > **Note:** `rules/AGENTS.md` remains active for Antigravity conversations whenever this plugin is enabled. Disable the plugin in Customizations to turn it off.

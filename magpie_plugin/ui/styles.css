@@ -705,6 +705,15 @@ code {
   flex: 1 1 auto;
 }
 
+.route-node.is-pairing .node-left {
+  flex-wrap: wrap;
+}
+
+.route-node.is-pairing .pill-code {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .node-dot {
   width: 6px;
   height: 6px;

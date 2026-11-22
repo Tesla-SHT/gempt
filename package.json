@@ -1,7 +1,7 @@
 {
   "name": "gempt",
-  "version": "0.3.1",
-  "description": "Magpie tools + control page plugin for Gemini-leads-GPT 3+1 routing tiers (Sonnet / Opus / Fable + Chore) across every Magpie client.",
+  "version": "0.4.0",
+  "description": "Antigravity MCP orchestration with Gemini-to-Codex pairing and Magpie direct routing groups for other clients.",
   "author": {
     "name": "yizhang-dream",
     "url": "https://github.com/yizhang-dream"
@@ -75,8 +75,8 @@
   "magpie": {
     "name": "GemPT",
     "summary": {
-      "en": "Gemini-leads-GPT orchestration tools (gempt_run / gempt_ask / gempt_ctl) and routing control panel for all Magpie clients.",
-      "zh": "为所有 Magpie 客户端提供 Gemini 主导的 GPT 编排工具（gempt_run / gempt_ask / gempt_ctl）与订阅路由控制面板。"
+      "en": "Gemini-to-Codex pairing and MCP controls for Antigravity, plus direct Magpie routing groups for other clients.",
+      "zh": "为 Antigravity 提供 Gemini 与 Codex 配对及 MCP 精细控制，为其他客户端提供 Magpie 直连路由组。"
     },
     "page": {
       "title": "GemPT",

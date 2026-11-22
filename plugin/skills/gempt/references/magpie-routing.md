@@ -1,15 +1,15 @@
-# Magpie 三档路由组参考模板（`gempt`）
+# Magpie 直连路由组与旧版兼容模板
 
 本文件列出与 `templates/magpie-groups.template.json` 对应的本地 Magpie CLI 配置方法。可用 `gempt init --sync-magpie --use-groups` 同步 harness 路由组。模板随 Antigravity 插件一同安装。
 
 > 注意：
-> - **Antigravity 原生用户**：Antigravity 里的 Gemini 使用官方原路，不需要也不能通过 Magpie 反代；在 Antigravity UI 内自选 Gemini 档位即可。
-> - **外部客户端用户（通过 Magpie 用 Gemini）**。运行 `gempt presets --apply` 可创建原生预设 `group/gempt-{sonnet,opus,fable}`。Magpie HTTP MCP 提供 `gempt_run`、`gempt_ask`、`gempt_ctl`。独立 stdio 客户端可用 `gempt print-mcp --installed` 导出配置，调用 `gpt_run`、`gpt_ask`、`gpt_ctl`。
+> - **Antigravity 原生用户**。在 **Plugins → GemPT → MCP 编排** 给 Hydrogen、Neon、Carbon 配对 GPT/Codex，并设置思考强度与执行权限。
+> - **其他 Agent 和客户端**。在 **路由组直连** 或用 `gempt presets --apply` 创建 `group/gempt-{sonnet,opus,fable}`，再从客户端模型栏直接选用。已有的 Magpie HTTP MCP 和独立 stdio 接入方式仍受支持。
 > - **命名隔离与共存**。`group/gempt-harness-{sonnet,opus,fable}` 仅包含 GPT/Codex 和可选 `compact` 规则。`gempt presets --apply` 创建的 `group/gempt-*` 可包含 Gemini、GPT 和 Flash。默认可直接使用具体 GPT 模型 ID。
 
 ---
 
-## 1. 三组与打杂组定位
+## 1. 旧版 Harness 路由组
 
 | 路由组 ID | 对标档位（推荐占比） | 主力执行模型 × 甜点强度 | 疑难升级 / 兜底 | 免费压缩 (`compact`) |
 | :--- | :--- | :--- | :--- | :--- |

@@ -1,8 +1,8 @@
 {
   "name": "gempt",
   "displayName": "GemPT — Gemini × GPT Orchestrator",
-  "version": "0.3.1",
-  "description": "Gemini-leads-GPT orchestrator plugin: Antigravity MCP (gpt_run / gpt_ask / gpt_ctl + GemPT Live) and /gempt-{sonnet,opus,fable,chore} slash skills paired with Magpie's Plugins -> GemPT control page to route GPT/Codex locally.",
+  "version": "0.4.0",
+  "description": "Pair Antigravity Gemini with GPT/Codex through MCP and control runs in GemPT Live. Includes /gempt and /gempt-chore. Other agents can select Magpie's group/gempt-{sonnet,opus,fable} directly.",
   "author": {
     "name": "yizhang-dream",
     "url": "https://github.com/yizhang-dream"
@@ -12,7 +12,7 @@
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "初始化 gempt 配置，自动扫描本机 Magpie、GPT 模型和 Codex CLI",
-    "检查 gempt 当前工作分工、默认档位与三档路由（sonnet / opus / fable + chore）状态",
+    "检查 Antigravity MCP 的工作分工、Gemini 与 GPT 配对、思考强度和 Chore 通道",
     "先分析问题再通过 gempt 派给 GPT/Codex 实施并验收"
   ]
 }

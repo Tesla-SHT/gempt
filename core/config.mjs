@@ -13,6 +13,7 @@ export const EFFORT_RANK = Object.freeze(Object.fromEntries(VALID_EFFORTS.map((n
 export const VALID_FAILOVER_MODES = ['subscription_only', 'api_fallback'];
 export const FEATURES = Object.freeze({ api_fallback: true });
 export const DEFAULT_MAGPIE_URL = 'http://127.0.0.1:3425';
+export const DEFAULT_MCP_EFFORT = 'medium';
 
 export const DEFAULT_TIERS = {
   sonnet: {
@@ -78,6 +79,16 @@ export function isCodexModelId(modelId) {
   return CODEX_MODEL_RE.test(String(modelId || '').trim());
 }
 
+export function getMcpEffort(policy) {
+  const effort = String(policy?.mcp_effort || '').trim().toLowerCase();
+  return VALID_EFFORTS.includes(effort) && effort !== 'ultra' ? effort : DEFAULT_MCP_EFFORT;
+}
+
+export function getPairing(policy, family) {
+  if (!Object.hasOwn(WORKLOAD.pairings, family)) return 'default';
+  return policy?.pairings?.[family] ?? WORKLOAD.pairings[family];
+}
+
 export function resolveConfigPath(explicit) {
   const raw = typeof explicit === 'string' && explicit.trim()
     ? explicit.trim()
@@ -125,7 +136,6 @@ export function buildTierView(tierId, tierCfg, defaultTier, fallbackPreset) {
   const effectiveExec = execModel || consultModel;
   return {
     id: tierId,
-    slash: `/gempt-${tierId}`,
     label: String(merged.label || fallback.label),
     usage_share: String(merged.usage_share || fallback.usage_share || ''),
     when_to_use: String(merged.when_to_use || fallback.when_to_use),
@@ -309,11 +319,33 @@ export function setDefaultSandbox(sandbox, { configPath } = {}) {
   }));
 }
 
-export function setEffortSettings({ tierEffort, tier, autoEffort } = {}, { configPath } = {}) {
+export function setEffortSettings({ mcpEffort, tierEffort, tier, autoEffort } = {}, { configPath } = {}) {
   return withConfigTransaction(configPath, (loaded) => {
     const existingPolicy = loaded.data.routing_policy && typeof loaded.data.routing_policy === 'object'
       ? loaded.data.routing_policy
       : {};
+    if (autoEffort !== undefined && typeof autoEffort !== 'boolean') {
+      return { ok: false, status: 400, error: 'auto_effort must be a boolean.' };
+    }
+    if (mcpEffort !== undefined || (tierEffort === undefined && tier === undefined)) {
+      if (tierEffort !== undefined || tier !== undefined) {
+        return { ok: false, status: 400, error: 'Set either mcp_effort or tier_effort.' };
+      }
+      const policy = { ...existingPolicy };
+      if (mcpEffort !== undefined) {
+        const effort = String(mcpEffort || '').trim().toLowerCase();
+        if (!VALID_EFFORTS.includes(effort) || effort === 'ultra') {
+          return { ok: false, status: 400, error: `Invalid mcp_effort '${mcpEffort}'.` };
+        }
+        policy.mcp_effort = effort;
+      }
+      policy.auto_effort = autoEffort ?? (mcpEffort === undefined && Boolean(policy.auto_effort));
+      return {
+        next: { ...loaded.data, routing_policy: policy },
+        response: { ok: true, status: 200, auto_effort: policy.auto_effort, mcp_effort: getMcpEffort(policy), config_path: loaded.path },
+      };
+    }
+
     const existingTiers = loaded.data.tiers && typeof loaded.data.tiers === 'object'
       ? loaded.data.tiers
       : {};
@@ -328,12 +360,7 @@ export function setEffortSettings({ tierEffort, tier, autoEffort } = {}, { confi
     }
 
     let nextAutoEffort = Boolean(existingPolicy.auto_effort);
-    if (autoEffort !== undefined) {
-      if (typeof autoEffort !== 'boolean') {
-        return { ok: false, status: 400, error: 'auto_effort must be a boolean.' };
-      }
-      nextAutoEffort = autoEffort;
-    }
+    if (autoEffort !== undefined) nextAutoEffort = autoEffort;
 
     const nextTiers = { ...existingTiers };
     const targetTierCfg = { ...DEFAULT_TIERS[targetTier], ...(existingTiers[targetTier] || {}) };

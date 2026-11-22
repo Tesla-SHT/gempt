@@ -6,7 +6,7 @@
 
 ```json
 {
-  "tier": "fable",
+  "gemini_family": "carbon",
   "cwd": "/work/repo",
   "file_paths": ["src/rewards/contact.py", "configs/ppo.yaml"],
   "goal": "Explain why PPO policy entropy collapses around epoch 40. Rank causes using the attached code and propose an A/B test. Keep the observation space and physics timestep fixed."

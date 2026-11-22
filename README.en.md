@@ -1,4 +1,4 @@
-# GemPT v0.3.1
+# GemPT v0.4.0
 
 [中文文档](./README.md) · [Antigravity Plugin README](./plugin/README.md) · [Third-Party Licenses](./THIRD_PARTY_LICENSES.txt)
 
@@ -21,7 +21,7 @@ Runtime code uses only Node.js built-in modules (`>= 20.11.0`). GemPT Live ships
 ```bash
 magpie plugin add gempt
 # Or pin a release tag from GitHub:
-magpie plugin add github:yizhang-dream/gempt#v0.3.1
+magpie plugin add github:yizhang-dream/gempt#v0.4.0
 ```
 
 Open **Plugins → GemPT** in Magpie and click **Enable Subscription Config** (or run `gempt init`).
@@ -30,9 +30,9 @@ Open **Plugins → GemPT** in Magpie and click **Enable Subscription Config** (o
 
 ```bash
 # Recommended pinned install:
-npx --yes gempt@0.3.1 install-agy
+npx --yes gempt@0.4.0 install-agy
 # Or from GitHub release tag:
-npx --yes github:yizhang-dream/gempt#v0.3.1 install-agy
+npx --yes github:yizhang-dream/gempt#v0.4.0 install-agy
 ```
 
 From a local checkout:
@@ -52,7 +52,7 @@ gempt init --non-interactive
 ```
 
 Then verify in Antigravity:
-1. Consultation: `gpt_ask(goal="Reply with OK", tier="sonnet")`
+1. Consultation: `gpt_ask(goal="Reply with OK")`
 2. Read-only delegation: `gpt_run(goal="Summarize repository layout", cwd="/path/to/repo", access="inspect")`, then wait using the returned `wait_command`.
 
 ## MCP Tools
@@ -60,13 +60,15 @@ Then verify in Antigravity:
 | Antigravity stdio (`gempt_gempt`) | Magpie HTTP | Purpose |
 | --- | --- | --- |
 | `gpt_run` | `gempt_run` | Async Codex execution. Use `access="inspect"` (read-only) or `access="change"` (edits/tests). For parallel edits on the same Git repo, pass `access="change"` + `workspace="share"` (checked out from committed `HEAD`; disallowed with `access="inspect"`). |
-| `gpt_ask` | `gempt_ask` | Synchronous consultation with optional `cwd`, `file_paths`, `tier` (`sonnet`/`opus`/`fable`/`chore`), and `session_id`. |
+| `gpt_ask` | `gempt_ask` | Synchronous consultation with optional `cwd`, `file_paths`, and `session_id`. Use `tier="chore"` for utility tasks such as summarization. |
 | `gpt_ctl` | `gempt_ctl` | `status`, `steer`, `interrupt`, or `reply` to `ask_gemini`. Call `gpt_ctl({})` in Antigravity to open **GemPT Live**. |
 
-## Work Split & Model Tiers
+For new MCP threads, GemPT uses the current Gemini family. Pass `gemini_family` when you know it. Receipts report `paired:<family>` for a pairing or `mcp` when an unknown family uses the default model. Explicit `tier` values remain supported for legacy scripts.
 
-- **5 Work-Split Profiles** (Magpie control page): `0%` off / `15%` heavy-task hints / `35%` source-write gate / `60%` source-write + 5-step read stop-loss / `80%` direct delegation + 2-step read stop-loss.
-- **3 Execution Tiers + `chore`**: `sonnet` (~75%), `opus` (~20%), `fable` (~5%), plus `chore` (free fast utility model for `gpt_ask` summaries/classification). Model labels such as `Sol` (`codex/gpt-6.2-sol`) and `Astra` (`codex/gpt-6.2-astra`) are configurable Magpie gateway model identifiers in `~/.config/gempt/config.json` and [templates/magpie-groups.template.json](./templates/magpie-groups.template.json).
+## Control Panel
+
+- **MCP orchestration for Antigravity.** In **Plugins → GemPT → MCP 编排**, pair Hydrogen, Neon, and Carbon with GPT/Codex models or select the default Codex subscription model. The panel also controls reasoning effort, execution permissions, Swarm, and failover, and shows actual token share. Work-split profiles are `0%` off, `15%` heavy-task hints, `35%` source-write gate, `60%` source-write plus a five-step read limit, and `80%` direct delegation plus a two-step read limit. Use `/gempt` for orchestration and `/gempt-chore` for utility consultations.
+- **Direct routing groups for other agents and clients.** Use **路由组直连** to preview, create, and copy `group/gempt-sonnet`, `group/gempt-opus`, or `group/gempt-fable`, then select that ID in the client's model picker. The CLI equivalents are `gempt presets --preview` and `gempt presets --apply`.
 
 ## Security & Permissions
 

@@ -16,6 +16,8 @@ import { findCodexCli } from './app-server-manager.mjs';
 import { runAppServer, TurnInterrupted } from './app-server-run.mjs';
 import { validateSessionId } from '../../core/state.mjs';
 import { TOOLS } from '../../core/tool-schemas.mjs';
+import { getMcpEffort, getPairing } from '../../core/config.mjs';
+import { findApiBackup, pickDefaultSubscriptionModel } from '../../core/magpie.mjs';
 import { randomBytes } from 'node:crypto';
 import { existsSync, openSync, readSync, realpathSync, statSync, closeSync } from 'node:fs';
 import http from 'node:http';
@@ -55,6 +57,7 @@ import {
   buildEscalationSuggestion,
   classifyTaskEffort,
   effortTimeoutFloor,
+  isAstraModel,
 } from './routing.mjs';
 
 const CONSULT_TIERS = ['chore', ...TIER_ORDER];
@@ -558,6 +561,7 @@ async function resolveRuntimeConfig({ configPath, tierForProbe, allowUtilityOnly
     configPath: resolvedConfigPath,
     baseUrl,
     apiKey,
+    probe,
     cfg: {
       version: 1,
       magpie: { base_url: baseUrl },
@@ -587,22 +591,35 @@ function shouldRetryFallback(err) {
   return !/redirect rejected/i.test(String(err?.message || ''));
 }
 
-function pairedModel(cfg, args, session) {
-  if (args.tier) return '';
-  const family = args.gemini_family;
-  const saved = session?.paired_model;
-  if (!session && !Object.hasOwn(WORKLOAD.pairings, family)) return '';
-  const group = cfg.tiers?.[family === 'carbon' ? 'fable' : 'sonnet']?.consult_model;
-  const model = session ? saved : cfg.routing_policy?.pairings?.[family] ?? (isHarnessGroup(group) ? group : WORKLOAD.pairings[family]);
-  if (!model || model === 'default') return '';
+async function pairedModel(runtime, args, session, probeTimeoutMs, consult) {
+  if (args.tier || (session && !session.paired_model)) return null;
+  const { cfg } = runtime;
+  const family = Object.hasOwn(WORKLOAD.pairings, args.gemini_family) ? args.gemini_family : '';
+  if (!session && !args.mcp && !family) return null;
+  const tier = session
+    ? (/^(paired(?::[a-z]+)?|mcp)$/.test(session.tier || '') ? session.tier : 'paired')
+    : (family ? `paired:${family}` : 'mcp');
+  let model = session?.paired_model || getPairing(cfg.routing_policy, family);
+  const excluded = resolveExcludedTokens(cfg);
+  const failoverMode = cfg.routing_policy?.failover_mode || 'subscription_only';
+  const useApiBackup = consult && failoverMode === 'api_fallback' && !isHarnessGroup(model);
+  let fallbackModels = [];
+  if (model === 'default' || useApiBackup) {
+    const probe = runtime.probe ?? await probeMagpie(runtime.baseUrl, runtime.apiKey, probeTimeoutMs, excluded);
+    if (model === 'default') model = pickDefaultSubscriptionModel(probe) || WORKLOAD.pairings.neon;
+    if (useApiBackup) {
+      const backup = findApiBackup(model, probe.openai_models);
+      if (backup) fallbackModels = [backup];
+    }
+  }
   if (!isCodexModelId(model) && !isHarnessGroup(model)) throw new Error('Gemini pairing requires a Codex subscription model.');
-  if (resolveExcludedTokens(cfg).some(token => model.toLowerCase().includes(token))) {
+  if (excluded.some(token => model.toLowerCase().includes(token))) {
     throw new Error('The paired Codex model is excluded. Change the pairing in GemPT.');
   }
-  return model;
+  return { model, tier, failoverMode, fallbackModels };
 }
 
-function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = false, effortOverride = '', paired = '' } = {}) {
+function resolveTierTarget(cfg, requestedTier, { allowChore, escalate, effortOverride } = {}) {
   const policy = cfg?.routing_policy || {};
   const failoverMode = String(policy.failover_mode || 'subscription_only').trim() || 'subscription_only';
   const raw = String(requestedTier || '').trim().toLowerCase();
@@ -628,7 +645,7 @@ function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = 
   }
 
   const tierCfg = { ...DEFAULT_TIERS[effectiveTier], ...(cfg?.tiers?.[effectiveTier] || {}) };
-  let model = String(paired || tierCfg.consult_model || DEFAULT_TIERS[effectiveTier].consult_model).trim();
+  let model = String(tierCfg.consult_model || DEFAULT_TIERS[effectiveTier].consult_model).trim();
   let effort = String(effortOverride || tierCfg.reasoning_effort || 'medium').trim();
   const thresh = String(tierCfg.escalate_effort_threshold || DEFAULT_TIERS[effectiveTier].escalate_effort_threshold || 'high').trim();
   const threshRank = EFFORT_RANK[thresh] ?? 4;
@@ -638,7 +655,7 @@ function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = 
 
   let escalated = false;
   const meetsThreshold = (EFFORT_RANK[effort] ?? 3) >= threshRank;
-  if (!paired && (escalate || meetsThreshold) && tierCfg.escalate_model) {
+  if ((escalate || meetsThreshold) && tierCfg.escalate_model) {
     if (!model.startsWith('group/') && !model.startsWith('auto/')) {
       model = String(tierCfg.escalate_model).trim();
       escalated = true;
@@ -657,7 +674,7 @@ function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = 
 
   const seenFallbacks = new Set([model]);
   const fallbackModels = [];
-  if (!paired && failoverMode !== 'subscription_only' && Array.isArray(tierCfg.fallback_models)) {
+  if (failoverMode !== 'subscription_only' && Array.isArray(tierCfg.fallback_models)) {
     for (const item of tierCfg.fallback_models) {
       const fb = String(item || '').trim();
       if (!fb || seenFallbacks.has(fb)) continue;
@@ -670,13 +687,47 @@ function resolveTierTarget(cfg, requestedTier, { allowChore = false, escalate = 
     tier: effectiveTier,
     failoverMode,
     model,
-    execModel: (paired || escalated) ? model : (String(tierCfg.exec_model || '').trim() || model),
+    execModel: escalated ? model : (String(tierCfg.exec_model || '').trim() || model),
     effort,
     apiMode: String(tierCfg.api_mode || 'responses'),
     maxOutputTokens: Number(tierCfg.max_output_tokens || 16384),
     fallbackModels,
     escalated,
   };
+}
+
+async function resolveGptTarget(runtime, args, priorSession, { allowChore = false, probeTimeoutMs } = {}) {
+  const { cfg } = runtime;
+  const explicitEffort = args.reasoning_effort || '';
+  if (explicitEffort && !VALID_EFFORTS_SET.has(explicitEffort)) {
+    throw new Error(`Invalid reasoning_effort '${explicitEffort}'.`);
+  }
+  const paired = await pairedModel(runtime, args, priorSession, probeTimeoutMs, allowChore);
+  const policy = cfg.routing_policy;
+  const escalate = Boolean(args.escalate);
+  const resolveTarget = (effortOverride) => {
+    if (!paired) return resolveTierTarget(cfg, args.tier || priorSession?.tier, { allowChore, escalate, effortOverride });
+    const effort = effortOverride || getMcpEffort(policy);
+    const hasAstraFloor = isAstraModel(paired.model);
+    return {
+      ...paired,
+      effort: hasAstraFloor && EFFORT_RANK[effort] < EFFORT_RANK.medium ? 'medium' : effort,
+      apiMode: 'responses',
+      maxOutputTokens: 16384,
+      escalated: false,
+    };
+  };
+  let resolved = resolveTarget(explicitEffort || String(priorSession?.reasoning_effort || '').trim());
+  let autoEffortInfo = null;
+  if (policy?.auto_effort && !explicitEffort && !priorSession && resolved.tier !== 'chore') {
+    autoEffortInfo = classifyTaskEffort({
+      tier: resolved.tier, tierDefaultEffort: resolved.effort, modelId: resolved.model, escalate,
+      goal: args.goal, context: args.context, constraints: args.constraints,
+      fileCount: Array.isArray(args.file_paths) ? args.file_paths.length : 0,
+    });
+    resolved = resolveTarget(autoEffortInfo.effort);
+  }
+  return { resolved, autoEffortInfo, paired: paired?.model || '' };
 }
 
 export function createGemptTools({ options = {}, env = process.env, ...host } = {}) {
@@ -803,7 +854,7 @@ export function createExecutionTools({
 
     consult: {
       description:
-        'Consult GPT/Codex/DeepSeek via local Magpie without Codex CLI ~18K-50K token overhead. Use tier="chore" for free fast log summarization/cleanup, sonnet (~75%, Sol@medium), opus (~20%, Sol@high; escalate=true -> Astra@xhigh), or fable (~5%, Astra@xhigh). On failure retry in a fresh thread without session_id.',
+        'Consult GPT via local Magpie. Use gemini_family for the Antigravity pairing, or tier="chore" for fast log summarization and cleanup. On failure retry in a fresh thread without session_id.',
       args: {
         type: 'object',
         properties: {
@@ -843,42 +894,11 @@ export function createExecutionTools({
           probeTimeoutMs,
           env,
         });
-        const explicitEffort = args?.reasoning_effort
-          ? (VALID_EFFORTS_SET.has(args.reasoning_effort) ? args.reasoning_effort : (() => { throw new Error(`Invalid reasoning_effort '${args.reasoning_effort}'.`); })())
-          : '';
-        const isResume = Boolean(priorSession);
-        const lockedResumeEffort = isResume && !explicitEffort ? String(priorSession?.reasoning_effort || '').trim() : '';
-        const paired = pairedModel(runtime.cfg, args, priorSession);
-        const baseResolved = resolveTierTarget(runtime.cfg, args?.tier || priorSession?.tier, {
-          allowChore: true,
-          escalate: Boolean(args?.escalate),
-          paired,
-          effortOverride: explicitEffort || lockedResumeEffort,
+        const { resolved, autoEffortInfo, paired } = await resolveGptTarget(runtime, args, priorSession, {
+          allowChore: true, probeTimeoutMs,
         });
 
         const fileList = Array.isArray(args?.file_paths) ? args.file_paths : [];
-        let autoEffortInfo = null;
-        let resolved = baseResolved;
-        if (Boolean(runtime.cfg?.routing_policy?.auto_effort) && !explicitEffort && !isResume && baseResolved.tier !== 'chore') {
-          autoEffortInfo = classifyTaskEffort({
-            tier: baseResolved.tier,
-            tierDefaultEffort: baseResolved.effort,
-            modelId: baseResolved.model,
-            escalate: Boolean(args?.escalate),
-            goal,
-            context: args?.context || '',
-            constraints: args?.constraints || '',
-            fileCount: fileList.length,
-            isResume: false,
-          });
-          resolved = resolveTierTarget(runtime.cfg, args?.tier || priorSession?.tier, {
-            allowChore: true,
-            escalate: Boolean(args?.escalate),
-            paired,
-            effortOverride: autoEffortInfo.effort,
-          });
-        }
-
         const effort = resolved.effort;
         if (resolved.failoverMode === 'subscription_only' && resolved.tier !== 'chore' && isHarnessGroup(resolved.model)) {
           await verifySubscriptionGroup(runtime.cfg, resolved.model);
@@ -1125,41 +1145,7 @@ export function createExecutionTools({
           effectiveSandbox = reqSbx;
         }
 
-        const explicitEffort = args?.reasoning_effort
-          ? (VALID_EFFORTS_SET.has(args.reasoning_effort) ? args.reasoning_effort : (() => { throw new Error(`Invalid reasoning_effort '${args.reasoning_effort}'.`); })())
-          : '';
-        const isResume = Boolean(priorSession);
-        const lockedResumeEffort = isResume && !explicitEffort ? String(priorSession?.reasoning_effort || '').trim() : '';
-        const paired = pairedModel(runtime.cfg, args, priorSession);
-        const baseResolved = resolveTierTarget(runtime.cfg, args?.tier || priorSession?.tier, {
-          allowChore: false,
-          escalate: Boolean(args?.escalate),
-          paired,
-          effortOverride: explicitEffort || lockedResumeEffort,
-        });
-
-        const fileList = Array.isArray(args?.file_paths) ? args.file_paths : [];
-        let autoEffortInfo = null;
-        let resolved = baseResolved;
-        if (Boolean(runtime.cfg?.routing_policy?.auto_effort) && !explicitEffort && !isResume) {
-          autoEffortInfo = classifyTaskEffort({
-            tier: baseResolved.tier,
-            tierDefaultEffort: baseResolved.effort,
-            modelId: baseResolved.model,
-            escalate: Boolean(args?.escalate),
-            goal,
-            context: args?.context || '',
-            constraints: args?.constraints || '',
-            fileCount: fileList.length,
-            isResume: false,
-          });
-          resolved = resolveTierTarget(runtime.cfg, args?.tier || priorSession?.tier, {
-            allowChore: false,
-            escalate: Boolean(args?.escalate),
-            paired,
-            effortOverride: autoEffortInfo.effort,
-          });
-        }
+        const { resolved, autoEffortInfo, paired } = await resolveGptTarget(runtime, args, priorSession, { probeTimeoutMs });
 
         const targetModel = resolved.execModel || resolved.model;
         if (resolved.failoverMode === 'subscription_only') {
@@ -1196,7 +1182,7 @@ export function createExecutionTools({
           constraints: args?.constraints || '',
           verification: args?.verification || '',
           expectedReport: args?.expected_report || '',
-          isResume: isResume && !sandboxUpgraded,
+          isResume: Boolean(priorSession) && !sandboxUpgraded,
         });
 
         const timeoutSec = args?.timeout_sec !== undefined

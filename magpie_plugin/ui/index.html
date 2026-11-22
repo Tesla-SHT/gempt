@@ -75,11 +75,11 @@
         <article class="surface route-card">
           <div class="route-title-row">
             <div class="route-title-group">
-              <strong id="active-tier-name" class="route-tier-name">Sonnet</strong>
+              <strong id="active-tier-name" class="route-tier-name">Antigravity MCP</strong>
               <button id="active-tier-target" type="button" class="pill-copy-btn" data-copy="group/gempt-sonnet" hidden>group/gempt-sonnet</button>
               <span id="active-tier-ready-badge" class="inline-state-badge" hidden>未创建</span>
             </div>
-            <span id="active-tier-effort" class="effort-tag">思考深度：中</span>
+            <span id="active-tier-effort" class="effort-tag"></span>
           </div>
 
           <div class="flow-grid">
@@ -87,13 +87,13 @@
               <div class="source-card">
                 <div class="source-top">
                   <span class="source-dot" aria-hidden="true"></span>
-                  <strong id="source-title">MCP 客户端</strong>
+                  <strong id="source-title">Antigravity</strong>
                 </div>
-                <span id="source-sub" class="source-sub">Claude Code · ZCode · Cursor · CLI</span>
+                <span id="source-sub" class="source-sub">原生 Gemini 按配对调用 GPT/Codex</span>
                 <div id="source-actions" class="source-actions">
                   <button id="copy-mcp-btn" type="button" class="pill-copy-btn">复制 MCP 配置</button>
                   <button id="copy-rules-btn" type="button" class="pill-copy-btn">复制协作规则</button>
-                  <button id="active-slash-btn" type="button" class="pill-copy-btn" data-copy="/gempt-sonnet " hidden>/gempt-sonnet</button>
+                  <button id="active-slash-btn" type="button" class="pill-copy-btn" data-copy="/gempt " hidden>/gempt</button>
                 </div>
               </div>
             </div>
@@ -120,16 +120,7 @@
               <path d="M0 32 C 18 32, 22 50, 44 50" stroke="currentColor" stroke-width="1.25" stroke-dasharray="3 3"/>
             </svg>
 
-            <ul id="route-chain" class="route-chain" aria-label="当前档位路由成员">
-              <li class="route-node is-primary">
-                <span class="node-left">
-                  <span class="node-dot" aria-hidden="true"></span>
-                  <span class="node-human">GPT-6.2-Sol</span>
-                  <code class="pill-code">codex/gpt-6.2-sol</code>
-                </span>
-                <span class="node-role">首选</span>
-              </li>
-            </ul>
+            <ul id="route-chain" class="route-chain" aria-label="Gemini 与 GPT 配对"></ul>
           </div>
 
           <section id="work-controls" class="work-controls" aria-labelledby="work-label" hidden>
@@ -199,7 +190,7 @@
             </fieldset>
 
             <fieldset id="effort-control-group" class="control-fieldset">
-              <legend class="control-legend">思考强度（当前档）</legend>
+              <legend class="control-legend">思考强度</legend>
               <div class="seg-control">
                 <span class="seg-option">
                   <input id="eff-medium" class="seg-radio sr-only" type="radio" name="active_effort" value="medium">
@@ -218,7 +209,7 @@
                   <label class="seg-label" for="eff-auto">智能</label>
                 </span>
               </div>
-              <span id="effort-hint" class="control-hint">当前档位思考深度；选「智能」按复杂度自动定档</span>
+              <span id="effort-hint" class="control-hint">选「智能」按任务复杂度调整思考强度</span>
             </fieldset>
 
             <fieldset id="failover-control-group" class="control-fieldset" hidden>
@@ -250,28 +241,28 @@
         </article>
       </section>
 
-      <section class="section" aria-labelledby="tiers-section-label">
+      <section id="tiers-section" class="section" aria-labelledby="tiers-section-label" hidden>
         <div class="section-head">
-          <span id="tiers-section-label" class="section-eyebrow">档位选择</span>
-          <span id="tiers-section-meta" class="section-meta">所有 MCP 客户端与 CLI 共享 · 点击切换</span>
+          <span id="tiers-section-label" class="section-eyebrow">直连路由组档位</span>
+          <span class="section-meta">供其他 Agent / 客户端选用 · 点击切换预览</span>
         </div>
 
         <fieldset class="tier-fieldset">
-          <legend class="sr-only">默认档位</legend>
+          <legend class="sr-only">预览直连路由组</legend>
           <div id="tier-list" class="tier-list">
             <label class="card tier-row" for="tier-sonnet" data-tier="sonnet">
-              <input id="tier-sonnet" class="tier-radio sr-only" type="radio" name="default_tier" value="sonnet">
+              <input id="tier-sonnet" class="tier-radio sr-only" type="radio" name="native_preview_tier" value="sonnet">
               <span class="tier-bullet" aria-hidden="true"></span>
               <span class="tier-body">
                 <span class="tier-line-top">
                   <strong class="tier-title" data-field="short_name">Sonnet</strong>
-                  <code class="pill-code" data-field="target_pill">codex/gpt-6.2-sol</code>
+                  <code class="pill-code" data-field="target_pill">group/gempt-sonnet</code>
                 </span>
                 <span class="tier-line-sub" data-field="chain_summary">GPT-6.2-Sol</span>
               </span>
               <span class="tier-tail">
                 <span class="tier-when" data-field="role_desc">日常高频 · ~75%</span>
-                <span class="tier-effort-chip" data-field="effort_tag">思考：中</span>
+                <span class="tier-effort-chip" data-field="effort_tag">未创建</span>
                 <svg class="tier-check" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                   <path d="M3.5 8.5L6.5 11.5L12.5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>
@@ -279,18 +270,18 @@
             </label>
 
             <label class="card tier-row" for="tier-opus" data-tier="opus">
-              <input id="tier-opus" class="tier-radio sr-only" type="radio" name="default_tier" value="opus">
+              <input id="tier-opus" class="tier-radio sr-only" type="radio" name="native_preview_tier" value="opus">
               <span class="tier-bullet" aria-hidden="true"></span>
               <span class="tier-body">
                 <span class="tier-line-top">
                   <strong class="tier-title" data-field="short_name">Opus</strong>
-                  <code class="pill-code" data-field="target_pill">codex/gpt-6.2-sol</code>
+                  <code class="pill-code" data-field="target_pill">group/gempt-opus</code>
                 </span>
                 <span class="tier-line-sub" data-field="chain_summary">GPT-6.2-Sol ↗ 升级 GPT-6.2-Astra</span>
               </span>
               <span class="tier-tail">
                 <span class="tier-when" data-field="role_desc">复杂工程 · ~20%</span>
-                <span class="tier-effort-chip" data-field="effort_tag">思考：高 → 极高</span>
+                <span class="tier-effort-chip" data-field="effort_tag">未创建</span>
                 <svg class="tier-check" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                   <path d="M3.5 8.5L6.5 11.5L12.5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>
@@ -298,18 +289,18 @@
             </label>
 
             <label class="card tier-row" for="tier-fable" data-tier="fable">
-              <input id="tier-fable" class="tier-radio sr-only" type="radio" name="default_tier" value="fable">
+              <input id="tier-fable" class="tier-radio sr-only" type="radio" name="native_preview_tier" value="fable">
               <span class="tier-bullet" aria-hidden="true"></span>
               <span class="tier-body">
                 <span class="tier-line-top">
                   <strong class="tier-title" data-field="short_name">Fable</strong>
-                  <code class="pill-code" data-field="target_pill">codex/gpt-6.2-astra</code>
+                  <code class="pill-code" data-field="target_pill">group/gempt-fable</code>
                 </span>
                 <span class="tier-line-sub" data-field="chain_summary">GPT-6.2-Astra</span>
               </span>
               <span class="tier-tail">
                 <span class="tier-when" data-field="role_desc">顶配攻坚 · ~5%</span>
-                <span class="tier-effort-chip" data-field="effort_tag">思考：极高</span>
+                <span class="tier-effort-chip" data-field="effort_tag">未创建</span>
                 <svg class="tier-check" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                   <path d="M3.5 8.5L6.5 11.5L12.5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>
@@ -386,9 +377,7 @@
             <div id="strip-agy-slash" class="slash-strip" aria-label="Antigravity 单轮快捷指令" hidden>
               <span class="slash-label">Antigravity 单轮</span>
               <div class="slash-buttons">
-                <button type="button" class="slash-btn" data-copy="/gempt-sonnet ">/gempt-sonnet</button>
-                <button type="button" class="slash-btn" data-copy="/gempt-opus ">/gempt-opus</button>
-                <button type="button" class="slash-btn" data-copy="/gempt-fable ">/gempt-fable</button>
+                <button type="button" class="slash-btn" data-copy="/gempt ">/gempt</button>
                 <button type="button" class="slash-btn" data-copy="/gempt-chore ">/gempt-chore</button>
               </div>
             </div>

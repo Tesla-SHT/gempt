@@ -150,6 +150,10 @@ export function dedupe(items) {
   return out;
 }
 
+export function pickDefaultSubscriptionModel(probe) {
+  return pickBest(probe?.codex_models || [], [['6.2-sol', 300], ['sol', 240], ['terra', 140], ['luna', 100]]);
+}
+
 export function pickSubscriptionPlan(probe) {
   const codexIds = Array.isArray(probe?.codex_models) ? probe.codex_models : [];
   const utilityIds = Array.isArray(probe?.utility_candidates) ? probe.utility_candidates : [];
@@ -158,7 +162,7 @@ export function pickSubscriptionPlan(probe) {
 
 export function pickTierPlan(models, utilityIds) {
   if (!models.length) return null;
-  const sonnetModel = pickBest(models, [['6.2-sol', 300], ['sol', 240], ['terra', 140], ['luna', 100]]);
+  const sonnetModel = pickDefaultSubscriptionModel({ codex_models: models });
   const fableModel = pickBest(models, [['6.2-astra', 320], ['astra', 260], ['pro', 180], ['sol', 100]]);
   const utilityModel = utilityIds[0] || DEFAULT_UTILITY.model;
 

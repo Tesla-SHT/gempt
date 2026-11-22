@@ -212,6 +212,9 @@ export function buildEscalationSuggestion({
   const cleanTier = String(tier || 'sonnet').trim().toLowerCase();
   const cleanEffort = String(effort || 'medium').trim().toLowerCase();
 
+  if (cleanTier === 'mcp' || cleanTier === 'paired' || cleanTier.startsWith('paired:')) {
+    return 'Retry in a fresh thread (omit session_id). Adjust the Gemini pairing or reasoning effort in Magpie Plugins -> GemPT if needed.';
+  }
   if (cleanTier === 'sonnet') {
     return (
       "Retry in a fresh thread (omit session_id) with tier='opus' (Sol @ high) "

@@ -1,17 +1,15 @@
 ---
 name: gempt
 description: >-
-  Orchestrate GPT/Codex models and free utility models from Gemini via local Magpie
-  3-tier routing (sonnet/opus/fable + chore) in Human-to-Gemini / Gemini-leads-GPT mode.
-  Use whenever initializing or configuring gempt (for Antigravity native Gemini or Magpie-routed
-  Gemini clients), deciding whether to delegate reasoning or coding to GPT/Codex through Magpie,
+  Orchestrate GPT/Codex from Antigravity via Gemini family pairings and a free utility channel.
+  Use when configuring gempt, deciding whether to delegate reasoning or coding to GPT/Codex,
   drafting structured Gemini-to-GPT task packets, steering multi-turn GPT/Codex sessions, or
   translating dense Astra/Sol outputs for the user.
 ---
 
 # gempt — Gemini × GPT 协作编排手册
 
-GemPT v0.3.1 使用 Node.js（`>= 20.11.0`）。Antigravity 的 `gempt_gempt` MCP 提供 `gpt_run`、`gpt_ask`、`gpt_ctl`；Magpie HTTP MCP 对应 `gempt_run`、`gempt_ask`、`gempt_ctl`，参数一致。下文使用 Antigravity 工具名。
+GemPT v0.4.0 使用 Node.js（`>= 20.11.0`）。Antigravity 的 `gempt_gempt` MCP 提供 `gpt_run`、`gpt_ask`、`gpt_ctl`，按 Hydrogen、Neon、Carbon 家族配对 GPT/Codex。Magpie HTTP MCP 对应 `gempt_run`、`gempt_ask`、`gempt_ctl`。其他 Agent 可在模型栏直接选 `group/gempt-{sonnet,opus,fable}`。
 
 > 启用本插件时，`rules/AGENTS.md` 会常驻生效；按 Magpie 面板的 5 档工作分工（0% / 15% / 35% / 60% / 80%）决定何时委派。
 
@@ -26,24 +24,20 @@ GemPT v0.3.1 使用 Node.js（`>= 20.11.0`）。Antigravity 的 `gempt_gempt` MC
 1. **最简一键开启**：确认已安装 Magpie（`>= 0.1.1340`）和 Magpie 侧 GemPT 插件并登录 ChatGPT/Codex 订阅后，在 Magpie 左侧栏打开 **`Plugins → GemPT`**，点击 **“一键启用订阅配置”** 即可完成初始化；后续也可在页面里一键切换 `仅订阅 | API 兜底` 与 `Codex 执行权限`。
 2. **命令行探测**。运行 `gempt discover`，检查 `magpie.reachable`、`subscription`、`magpie.codex_models`、`magpie.openai_models`、`magpie.utility_candidates` 与 `codex` CLI。
    - 如果 `magpie.reachable` 为 `false`，先启动本地 Magpie（默认 `127.0.0.1:3425`）。
-3. **确认三档执行路由与容灾策略**：
-   > 以下 `Sol`（`codex/gpt-6.2-sol`）、`Astra`（`codex/gpt-6.2-astra`）是默认模板中的 **Magpie 网关模型标识**，均可按你本机 Magpie 实际模型列表在 `~/.config/gempt/config.json` 或 `templates/magpie-groups.template.json` 中自定义。
-   - `sonnet`（~75% 日常高频）：默认 `Sol @ medium`
-   - `opus`（~20% 复杂工程）：默认 `Sol @ high` 主力 + 疑难 `@ xhigh` 自动升 `Astra`
-   - `fable`（~5% 顶配攻坚）：默认 `Astra @ xhigh`（**禁止把 Astra 降到 `low`**）
+3. **在「MCP 编排」确认配对和容灾策略**。
+   - Hydrogen、Neon、Carbon 默认配对 Terra、Sol、Astra。下拉可选其他 Codex 订阅模型，选择「默认模型」则使用 Magpie 探测到的默认订阅模型。
    - **免费打杂 / 压缩通道（`chore` / `utility`）**：从 `utility_candidates` 推荐免费高速模型（如 `auto/deepseek-v4.1-flash`），用于 `gpt_ask(tier="chore")` 与 Magpie `compact` 规则。
    - **容灾策略（`failover_mode`）**：
      1. `subscription_only`（推荐默认）：仅用 Codex 订阅号（不自动切按量 API，防意外扣费）；多订阅号由 Magpie 自动轮转。
-     2. `api_fallback`：订阅优先，限流或失败时自动切换按量 `openai/*` API 兜底（页面支持随时无损切换）。
-   - **思考定档策略**：可选开启 `auto_effort`（页面点选 **`智能`** 或 CLI 设 `gempt effort auto`）。
-   - **可选：同步独立路由组**：默认直接使用具体模型 ID；需要 harness 路由组时运行 `gempt init --sync-magpie --use-groups`。
+     2. `api_fallback` 启用后，咨询遇到限流或可重试的网关错误时可使用匹配的按量 `openai/*` 模型。由 Magpie 路由组托管的执行按组内规则容灾。
+   - **思考强度**可固定设置，也可在面板选 **智能** 启用 `auto_effort`。
    - **默认 Codex 沙箱（`default_sandbox`）**：推荐 `workspace-write`（只在目标工作区可写），并可通过环境变量 `GEMPT_WORKSPACE_ROOT` 限定可访问根目录。
 4. **落盘并验收**：
-   - 运行 `gempt init` 保存配置，再用 `gempt status` 验证。必要时调用 `gpt_ask(tier="sonnet", goal="Reply with OK")` 与一次只读 `gpt_run(access="inspect")` 做连通性验收。
+   - 运行 `gempt init` 保存配置，再用 `gempt status` 验证。必要时调用 `gpt_ask(goal="Reply with OK")` 与一次只读 `gpt_run(access="inspect")` 做连通性验收。
 
 ---
 
-## 2. Mode & 3+1 Tier Decision Matrix（选模式与选档位）
+## 2. 工具选择与思考强度
 
 ### 模式选择
 
@@ -55,21 +49,16 @@ GemPT v0.3.1 使用 Node.js（`>= 20.11.0`）。Antigravity 的 `gempt_gempt` MC
 
 派单时按所需能力选 `access`。只读调查使用 `access="inspect"`（禁止配 `workspace="share"`）；多路并发写入同一 Git 仓库时使用 `access="change"` + `workspace="share"`（基于已提交 `HEAD` 检出，工作区未提交改动不会随行）。
 
-### 执行档位、占比与思考强度纪律
+### Gemini 配对与思考强度
 
-| 档位 / 快捷技能 | 推荐占比 | 默认网关模型标识 × 强度 | 典型场景与约束 |
-| :--- | :--- | :--- | :--- |
-| **`chore`** (`/gempt-chore`) | 旁路打杂 | `auto/deepseek-v4.1-flash` | 日志提纯、大文本摘要、粗分类（仅限 `gpt_ask`） |
-| **`sonnet`** (`/gempt-sonnet`) | **~75%** | `Sol @ medium` | 日常实现、单测、UI 交互逻辑与常规审阅 |
-| **`opus`** (`/gempt-opus`) | **~20%** | `Sol @ high` | 跨文件重构、大仓库排查、复杂设计 |
-| **`fable`** (`/gempt-fable`) | **~5%** | `Astra @ xhigh` | 极难 Bug、数学/算法推导、核心架构；禁止降级 `Astra` 到 `low` |
+调用 `gpt_ask` 或 `gpt_run` 时沿用当前 Gemini 家族。已知时可传 `gemini_family`。回执记录 `paired:<family>`、实际模型和思考强度。日志提纯、摘要与粗分类使用 `/gempt-chore`，由 `gpt_ask(tier="chore")` 调用高速模型。
 
 - **思考强度纪律**：
   1. **新线程开局定好强度，严禁中途 `resume` 加码**：开启 `auto_effort`（页面「智能」）时，首轮按任务风险在 `low..xhigh` 间确定；`resume` 续跑锁定原强度。
   2. **失败升级必开新线程**：首轮失败、超时或未验证通过时，省略 `session_id` 重开线程。
   3. **禁用 `ultra` 与高强度子代理扇出**：默认配置与自动定档最高止步 `xhigh`，避免并发高思考导致配额雪崩。
 
-> **控制面板与快捷技能的真实边界**：在 **Magpie 左侧栏 `Plugins → GemPT`**（或终端 `gempt tier` / `gempt sandbox` / `gempt effort [medium|high|xhigh|auto]`）统一切换共享默认档位、沙箱与思考强度；`/gempt-sonnet`、`/gempt-opus`、`/gempt-fable`、`/gempt-chore` 会在 `gpt_ask` 中直接传对应 `tier`，或在需要改变 `gpt_run` 档位时提示/切换共享默认档位（`gpt_run` 本身不接受独立单回合覆盖 `tier`）。
+固定强度保存在 `routing_policy.mcp_effort`。Astra 至少用 `medium`。在 `Plugins → GemPT → 路由组直连` 可为其他 Agent 预览、创建并复制直连组 ID。
 
 ---
 

@@ -1,4 +1,5 @@
 import { APP_TOOLS, LIVE_META } from './mcp-app.mjs';
+import { WORKLOAD } from './assets.mjs';
 
 function tool(name, description, properties, required, meta) {
   return { name, description, inputSchema: { type: 'object', properties, additionalProperties: false,
@@ -7,10 +8,11 @@ function tool(name, description, properties, required, meta) {
 
 export const TOOLS = [
   tool('gpt_run',
-    "Async-first headless Codex execution inside cwd. Returns immediately with run_id, session_id, and short wait_command (`gempt-wait <run_id>`). Execute wait_command via run_command(WaitMsBeforeAsync=500) for zero-poll wakeup; pass workspace='share' for parallel repo edits and session_id to resume.",
+    "Run Codex in cwd using the current Gemini pairing. Returns run_id, session_id, and wait_command (`gempt-wait <run_id>`). Execute wait_command via run_command(WaitMsBeforeAsync=500) for zero-poll wakeup; pass workspace='share' for parallel repo edits and session_id to resume.",
     {
       goal: { type: 'string', description: 'Task objective, constraints, and verification criteria.' },
       cwd: { type: 'string', description: 'Absolute path to the target workspace directory.' },
+      gemini_family: WORKLOAD.schema.properties.gemini_family,
       access: { type: 'string', enum: ['change', 'inspect'], default: 'change',
         description: "'change' edits/tests workspace; 'inspect' runs read-only investigation." },
       workspace: { type: 'string', enum: ['inherit', 'share'], default: 'inherit',
@@ -18,12 +20,13 @@ export const TOOLS = [
       session_id: { type: 'string', description: 'Optional GPT session_id to continue.' },
     }, ['goal', 'cwd']),
   tool('gpt_ask',
-    "Fast synchronous GPT HTTP consultation via Magpie (no Codex CLI overhead; receipt <= 3200 chars). Pass file_paths for GPT to read directly; use tier='chore' for free/fast summarization.",
+    "Fast synchronous GPT consultation through the current Gemini pairing. Pass file_paths for GPT to read directly; use tier='chore' for free/fast summarization.",
     {
       goal: { type: 'string', description: 'Question, review, summary, or reasoning prompt.' },
       file_paths: { type: 'array', items: { type: 'string' }, description: 'Optional workspace file paths for GPT to read directly.' },
       cwd: { type: 'string', description: 'Optional base directory for relative file_paths.' },
-      tier: { type: 'string', enum: ['chore', 'sonnet', 'opus', 'fable'], description: 'Optional tier (chore/sonnet/opus/fable).' },
+      gemini_family: WORKLOAD.schema.properties.gemini_family,
+      tier: { type: 'string', enum: ['chore', 'sonnet', 'opus', 'fable'], description: "Use 'chore' for the utility model. Other explicit tier values support legacy callers." },
       session_id: { type: 'string', description: 'Optional consult session_id to continue.' },
     }, ['goal']),
   tool('gpt_ctl',
