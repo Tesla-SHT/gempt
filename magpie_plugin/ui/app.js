@@ -148,7 +148,7 @@
       ...(options.headers || {}),
       'x-gempt-key': apiKey,
     };
-    const res = await fetch(path, { ...options, headers });
+    const res = await fetch(path.startsWith('/api/') ? `.${path}` : path, { ...options, headers });
     if (res.status === 401 && !reloadingForAuth) {
       try {
         const last = Number(sessionStorage.getItem('gempt-auth-reload') || 0);

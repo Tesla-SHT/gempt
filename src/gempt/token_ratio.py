@@ -13,12 +13,27 @@ from typing import Any
 from .config import DEFAULT_CONFIG_PATH, WORKLOAD
 
 KIND_LADDER: tuple[str, ...] = ("specialist", "engineering", "design", "routine")
-MIN_SAMPLE_TOKENS = 200_000
+MIN_SAMPLE_TOKENS = 20_000
 UNDER_MARGIN = 6.0
 STRONG_UNDER_MARGIN = 18.0
 OVER_MARGIN = 8.0
 MAX_USAGE_TAIL_BYTES = 16 * 1024 * 1024
 DEFAULT_CACHE_TTL_SEC = 15.0
+OUTPUT_WEIGHT = 5
+
+_SWARM_COORD_TOOLS = frozenset({
+    "read_board",
+    "swarm_wait",
+    "post_message",
+    "swarm",
+    "schedule",
+    "manage_task",
+})
+_VISION_TOOLS = frozenset({"generate_image", "browser_subagent"})
+_MEDIA_EXTS = frozenset({
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".ico", ".svg",
+    ".mp4", ".mov", ".webm", ".wav", ".mp3", ".pdf",
+})
 
 
 def _is_temp_path(path: Path | None) -> bool:
@@ -98,7 +113,7 @@ def _parse_iso_ts(value: Any) -> float | None:
 
 
 def _empty_bucket() -> dict[str, int]:
-    return {"in": 0, "out": 0, "cache_read": 0, "fresh": 0, "total": 0}
+    return {"in": 0, "out": 0, "cache_read": 0, "fresh": 0, "work": 0, "total": 0}
 
 
 def _add_tokens(bucket: dict[str, int], inp: int, out: int, cache_read: int) -> None:
@@ -109,7 +124,13 @@ def _add_tokens(bucket: dict[str, int], inp: int, out: int, cache_read: int) -> 
     bucket["out"] += o
     bucket["cache_read"] += c
     bucket["fresh"] += i + o
+    bucket["work"] += i + OUTPUT_WEIGHT * o
     bucket["total"] += i + o + c
+
+
+def _merge_bucket(dst: dict[str, int], src: dict[str, int]) -> None:
+    for key in dst:
+        dst[key] += src.get(key, 0)
 
 
 def _classify_model(model: str, provider: str = "") -> str:
@@ -122,11 +143,33 @@ def _classify_model(model: str, provider: str = "") -> str:
     return "other"
 
 
-def _scan_transcript_file(path: Path, cutoff: float, gemini: dict[str, int], gpt: dict[str, int]) -> None:
+def _classify_tool_call(tc: dict[str, Any]) -> str:
+    name = str(tc.get("name") or tc.get("tool_name") or "").strip()
+    if not name:
+        return "other"
+    if name in _SWARM_COORD_TOOLS:
+        return "swarm"
+    if name in _VISION_TOOLS:
+        return "vision"
+    if name in ("read_file", "view_file"):
+        args = tc.get("args") or tc.get("arguments") or {}
+        raw_path = str(args.get("Path") or args.get("AbsolutePath") or "").strip().strip('"').lower()
+        if raw_path and Path(raw_path.replace("\\", "/")).suffix in _MEDIA_EXTS:
+            return "vision"
+    return "work"
+
+
+def _scan_transcript_file(path: Path, cutoff: float, gemini: dict[str, int], gpt: dict[str, int]) -> bool:
+    """Scan one transcript; return False if excluded as pure swarm-coordination or pure-vision."""
     try:
         raw_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
-        return
+        return True
+    file_gem = _empty_bucket()
+    file_gpt = _empty_bucket()
+    work_calls = 0
+    swarm_calls = 0
+    vision_calls = 0
     for line in raw_lines:
         if "PLANNER_RESPONSE" not in line:
             continue
@@ -139,25 +182,41 @@ def _scan_transcript_file(path: Path, cutoff: float, gemini: dict[str, int], gpt
         ts = _parse_iso_ts(obj.get("created_at"))
         if ts is not None and ts < cutoff:
             continue
+        for tc in (obj.get("tool_calls") or []):
+            if not isinstance(tc, dict):
+                continue
+            cat = _classify_tool_call(tc)
+            if cat == "swarm":
+                swarm_calls += 1
+            elif cat == "vision":
+                vision_calls += 1
+            elif cat == "work":
+                work_calls += 1
         model = str(obj.get("model") or "")
         cls = _classify_model(model)
-        bucket = gpt if cls == "gpt" else gemini
+        bucket = file_gpt if cls == "gpt" else file_gem
         _add_tokens(
             bucket,
             obj.get("input_tokens") or 0,
             obj.get("output_tokens") or 0,
             obj.get("cache_read_tokens") or 0,
         )
+    if work_calls == 0 and (swarm_calls > 0 or vision_calls > 0):
+        return False
+    _merge_bucket(gemini, file_gem)
+    _merge_bucket(gpt, file_gpt)
+    return True
 
 
-def _scan_agy_brain(brain_dir: Path | None, cutoff: float, gemini: dict[str, int], gpt: dict[str, int]) -> int:
+def _scan_agy_brain(brain_dir: Path | None, cutoff: float, gemini: dict[str, int], gpt: dict[str, int]) -> tuple[int, int]:
     if brain_dir is None or not brain_dir.is_dir():
-        return 0
+        return 0, 0
     files_scanned = 0
+    excluded_sessions = 0
     try:
         entries = list(brain_dir.iterdir())
     except OSError:
-        return 0
+        return 0, 0
     for entry in entries:
         if not entry.is_dir():
             continue
@@ -169,8 +228,9 @@ def _scan_agy_brain(brain_dir: Path | None, cutoff: float, gemini: dict[str, int
         if st.st_mtime < cutoff:
             continue
         files_scanned += 1
-        _scan_transcript_file(transcript, cutoff, gemini, gpt)
-    return files_scanned
+        if not _scan_transcript_file(transcript, cutoff, gemini, gpt):
+            excluded_sessions += 1
+    return files_scanned, excluded_sessions
 
 
 def _scan_magpie_usage(
@@ -288,27 +348,39 @@ def read_token_ratio(
     gpt = _empty_bucket()
     other = _empty_bucket()
 
-    agy_files = _scan_agy_brain(resolved_brain, cutoff, gemini, gpt)
+    agy_files, excluded_sessions = _scan_agy_brain(resolved_brain, cutoff, gemini, gpt)
     magpie_records = _scan_magpie_usage(resolved_magpie, cutoff, gemini, gpt, other)
 
-    combined_total = gemini["total"] + gpt["total"]
+    combined_work = gemini["work"] + gpt["work"]
     combined_fresh = gemini["fresh"] + gpt["fresh"]
+    combined_total = gemini["total"] + gpt["total"]
 
-    actual_gpt_share = round((gpt["total"] / combined_total) * 100.0, 1) if combined_total > 0 else None
-    actual_gemini_share = round(100.0 - actual_gpt_share, 1) if actual_gpt_share is not None else None
+    actual_gpt_work_share = round((gpt["work"] / combined_work) * 100.0, 1) if combined_work > 0 else None
     actual_gpt_fresh_share = round((gpt["fresh"] / combined_fresh) * 100.0, 1) if combined_fresh > 0 else None
+    actual_gpt_total_share = round((gpt["total"] / combined_total) * 100.0, 1) if combined_total > 0 else None
+    # Primary share uses attributable work tokens (in + 5*out), immune to 91%-cached prefix replay.
+    actual_gpt_share = actual_gpt_work_share
+    actual_gemini_share = round(100.0 - actual_gpt_share, 1) if actual_gpt_share is not None else None
 
     snapshot: dict[str, Any] = {
         "window_hours": window_hours,
+        "metric": "attributable_work_in_plus_5out",
         "gemini": gemini,
         "gpt": gpt,
         "other": other,
-        "combined_total": combined_total,
+        "combined_work": combined_work,
         "combined_fresh": combined_fresh,
+        "combined_total": combined_total,
         "actual_gpt_share": actual_gpt_share,
         "actual_gemini_share": actual_gemini_share,
+        "actual_gpt_work_share": actual_gpt_work_share,
         "actual_gpt_fresh_share": actual_gpt_fresh_share,
-        "sources": {"agy_files": agy_files, "magpie_records": magpie_records},
+        "actual_gpt_total_share": actual_gpt_total_share,
+        "sources": {
+            "agy_files": agy_files,
+            "excluded_sessions": excluded_sessions,
+            "magpie_records": magpie_records,
+        },
         "computed_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     if cache_ttl_sec > 0 and now_epoch is None:
@@ -340,10 +412,14 @@ def evaluate_budget(
     snap = snapshot or {}
     gemini = snap.get("gemini") or _empty_bucket()
     gpt = snap.get("gpt") or _empty_bucket()
-    combined_total = int(snap.get("combined_total") or (gemini.get("total", 0) + gpt.get("total", 0)))
+    combined_work = int(snap.get("combined_work") if snap.get("combined_work") is not None else (gemini.get("work", 0) + gpt.get("work", 0)))
+    combined_fresh = int(snap.get("combined_fresh") if snap.get("combined_fresh") is not None else (gemini.get("fresh", 0) + gpt.get("fresh", 0)))
+    combined_total = int(snap.get("combined_total") if snap.get("combined_total") is not None else (gemini.get("total", 0) + gpt.get("total", 0)))
+    sample_tokens = combined_work if combined_work > 0 else combined_total
     actual = snap.get("actual_gpt_share")
     actual_gem = snap.get("actual_gemini_share")
     actual_fresh = snap.get("actual_gpt_fresh_share")
+    actual_total = snap.get("actual_gpt_total_share")
     delta = round(float(actual) - target, 1) if isinstance(actual, (int, float)) else None
 
     effective_kinds = list(base_kinds)
@@ -354,7 +430,7 @@ def evaluate_budget(
         adjustment = "off"
     elif not enabled:
         adjustment = "disabled"
-    elif combined_total < MIN_SAMPLE_TOKENS or actual is None:
+    elif sample_tokens < MIN_SAMPLE_TOKENS or actual is None:
         adjustment = "warming_up"
     elif target >= 95:
         effective_kinds = list(KIND_LADDER)
@@ -383,20 +459,27 @@ def evaluate_budget(
 
     return {
         "enabled": bool(enabled),
+        "metric": snap.get("metric", "attributable_work_in_plus_5out"),
         "profile": profile,
         "target_gpt_share": target,
         "actual_gpt_share": actual,
         "actual_gemini_share": actual_gem,
         "actual_gpt_fresh_share": actual_fresh,
+        "actual_gpt_total_share": actual_total,
         "delta": delta,
         "adjustment": adjustment,
         "base_kinds": base_kinds,
         "effective_kinds": effective_kinds,
+        "gemini_work_tokens": int(gemini.get("work", 0)),
+        "gpt_work_tokens": int(gpt.get("work", 0)),
         "gemini_tokens": int(gemini.get("total", 0)),
         "gpt_tokens": int(gpt.get("total", 0)),
         "gemini_fresh_tokens": int(gemini.get("fresh", 0)),
         "gpt_fresh_tokens": int(gpt.get("fresh", 0)),
+        "combined_work": combined_work,
+        "combined_fresh": combined_fresh,
         "combined_total": combined_total,
+        "excluded_sessions": int((snap.get("sources") or {}).get("excluded_sessions") or 0),
         "window_hours": snap.get("window_hours", 24.0),
     }
 

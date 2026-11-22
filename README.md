@@ -4,16 +4,18 @@
 
 ## 1 分钟上手（任意 Magpie 客户端）
 
-先在 Magpie 登录 ChatGPT/Codex（及可选 Gemini）订阅账号，然后一条命令安装本插件：
+先在 Magpie 登录 ChatGPT/Codex 订阅账号，然后安装纯 Magpie 插件。安装和使用 `gempt_consult` 均无需 Python。Codex CLI 可选，仅在使用 `gempt_exec` 或共享 Codex app-server 时需要。
 
 ```sh
-magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/api-fallback
+magpie plugin add github:yizhang-dream/gempt
 ```
+
+默认从仓库主分支安装。需要固定版本时，可在仓库名后加 `#<tag-or-branch>`。
 
 装完后即可在 Magpie 左侧 **`Plugins → GemPT`** 打开控制面板，按需选择以下任一方式（两者可随时共用）：
 
 - **方案 A（零规则懒人直连 · 最快上手）**：
-  1. 在 `Plugins → GemPT` 右上角切换到 **`路由组直连`** → 点击 **`一键创建直连路由组`**；
+  1. 在 Magpie 登录 Gemini 和 Codex 两类账号后，在 `Plugins → GemPT` 右上角切换到 **`路由组直连`** → 点击 **`一键创建直连路由组`**；
   2. 在任意接入 Magpie 的客户端（Claude Code / ZCode / Codex CLI / OpenCode / Cursor 等）模型栏直接选用 `group/gempt-sonnet`、`group/gempt-opus` 或 `group/gempt-fable`；
   3. 聊设计时默认走首顺位 **Gemini**，明确派发写代码/修 Bug 时 Magpie 按回合意图与 `when=subagent` 自动分流到 **Terra / Sol / Astra**，压缩整理自动走 **DeepSeek Flash**。
 
@@ -30,8 +32,10 @@ magpie plugin add github:Tesla-SHT/gempt#yizhang-dream/api-fallback
 Windows、macOS 和 Linux 都可以用 [uv](https://docs.astral.sh/uv/getting-started/installation/) 安装，无需提前克隆仓库：
 
 ```sh
-uvx --from git+https://github.com/Tesla-SHT/gempt.git@yizhang-dream/api-fallback gempt install-agy
+uvx --from git+https://github.com/yizhang-dream/gempt.git gempt install-agy
 ```
+
+需要固定 Antigravity 插件版本时，可在 `.git` 后加 `@<tag-or-branch>`。
 
 用 pip 安装时，在 wheel 所在目录运行 `python -m pip install ./gempt-0.1.0-py3-none-any.whl`，再运行 `gempt install-agy`。如果已下载分支源码，在源码目录运行对应的脚本。
 
@@ -44,6 +48,19 @@ uvx --from git+https://github.com/Tesla-SHT/gempt.git@yizhang-dream/api-fallback
 
 - **Magpie HTTP MCP** 由 Magpie 托管，自动分发给接入的客户端。默认地址为 `http://127.0.0.1:3425/mcp/magpie/tools/gempt`，这一入口无需 Python。
 - **独立 Python stdio MCP** 由 Antigravity 或其他支持 stdio 的 MCP 客户端启动。Antigravity 插件已写好配置。其他独立客户端可运行 `gempt print-mcp --installed` 导出，或在源码目录运行 `.\install.ps1 -PrintMcp`（Windows）或 `bash install.sh --print-mcp`（macOS / Linux）。使用 `uvx` 安装时，可沿用上面的 `uvx --from … gempt` 命令前缀。
+
+同时安装 Magpie 与 Antigravity 插件时，可保留 Magpie 控制面板，让 Antigravity 的 Python stdio MCP 提供工具。确认需要执行权限后，可运行下列命令以启用 Magpie 的 `exec` 选项并关闭其重复的 MCP 工具注册。
+
+```sh
+magpie plugin options gempt '{"exec":true,"mcpTools":false}'
+```
+
+### 数据读写与安全说明
+
+- `~/.config/gempt/` 保存 GemPT 配置、会话、运行记录与共享 app-server 状态。GemPT 在修改设置或执行任务时更新相应文件。
+- `~/.config/magpie/` 提供插件设置、模型提供方与本地用量日志。创建原生路由组时，GemPT 通过 Magpie CLI 写入路由组配置。
+- 如有 `~/.gemini/antigravity/brain/`，GemPT 可读取本地记录以估算 Gemini 用量。探测已安装的 Antigravity 插件时，还会读取其 `mcp_config.json`。控制面板及状态工具会遮盖 MCP 配置中白名单以外的环境变量值。
+- 控制面板服务默认只监听 `127.0.0.1:3498`。除健康探针外，API 需要页面提供的 `x-gempt-key`。Magpie 插件默认 `exec: false`，需显式开启才允许通过插件调用 `gempt_exec`。
 
 ---
 
@@ -187,7 +204,7 @@ gempt exec --tier opus --escalate --cwd /path/to/repo --goal "排查并发死锁
 ## 三、配置、容灾与安全边界
 
 - 配置文件查找顺序：`--config` 参数 → 环境变量 `GEMPT_CONFIG` → 当前及上级目录 `.gempt.json` → `~/.config/gempt/config.json`。
-- 基于面向大众用户的纯订阅基线（`yizhang-dream/collab` 分支），当前个人分支额外开启按量 API 兜底能力与 Magpie 页面内的 **`仅订阅 | API 兜底`** 实时切换开关：
+- Magpie 页面提供 **`仅订阅 | API 兜底`** 切换。GemPT 支持以下路由模式：
   1. `subscription_only`（推荐默认）：只用 Codex 订阅模型，不自动切换按量 API，避免意外扣费；多订阅号在 Magpie 侧配 `#account` 或 `routing=drain/smart` 即可无感切换。
   2. `api_fallback`：订阅优先，限流或失败时按顺序降级到按量 `openai/*` API（支持页面内无损往返切换）。
   3. `effort_only`：单模型（`Sol`）仅用 `reasoning_effort`（`medium` / `high` / `xhigh`，避免 Astra 降 `low`）区分三档。

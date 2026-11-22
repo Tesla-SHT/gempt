@@ -99,6 +99,7 @@ export async function startServer({
   antigravityPluginDir,
   magpieCliPath,
   execEnabled = false,
+  mcpToolsEnabled,
   probeTimeoutMs = 2000,
   manageAppServer,
   appServerOptions,
@@ -123,8 +124,9 @@ export async function startServer({
   const corsHeaders = (req) => {
     const o = req.headers.origin;
     const h = { vary: 'Origin' };
-    if (o === 'null') h['access-control-allow-origin'] = 'null';
-    else if (o && OWN.has(o)) h['access-control-allow-origin'] = o;
+    if (o === 'null' ? req.method === 'OPTIONS' || keyOK(req) : OWN.has(o)) {
+      h['access-control-allow-origin'] = o;
+    }
     return h;
   };
   const send = (req, res, status, body, type = 'application/json; charset=utf-8', withCors = true) => {
@@ -184,7 +186,7 @@ export async function startServer({
           service: 'gempt-magpie-plugin',
           build: BUILD_ID,
           port: actualPort,
-        });
+        }, undefined, false);
       }
 
       if (pathname.startsWith('/api/')) {
@@ -206,6 +208,7 @@ export async function startServer({
             magpieConfigDir,
             antigravityPluginDir,
             execEnabled,
+            mcpToolsEnabled,
             appServer,
             probeTimeoutMs,
           });

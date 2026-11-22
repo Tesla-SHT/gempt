@@ -507,16 +507,14 @@ class McpStdioHandshakeTests(unittest.TestCase):
             tools = {tool["name"]: tool for tool in replies[2]["tools"]}
             self.assertEqual(
                 list(tools),
-                ["gempt_discover", "gempt_configure", "gempt_consult", "gempt_exec", "gempt_status", "gempt_dispatch",
-                 "gempt_steer", "gempt_interrupt", "gempt_reply_tool_call", "gempt_live_view",
+                ["gpt_run", "gpt_ask", "gpt_ctl",
                  "gempt_app_runs", "gempt_app_stream", "gempt_app_interrupt", "gempt_app_steer"],
             )
-            entry = tools["gempt_live_view"]
-            self.assertEqual(entry["inputSchema"], {"type": "object", "properties": {
-                "run_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
-                "host_conversation_id": {"type": "string", "description": "Antigravity conversation to bind to."},
-                "scope": {"type": "string", "enum": ["session", "all"], "default": "session"},
-            }, "additionalProperties": False})
+            # Strictly 3 model-visible flat tools (<= 5 properties each)
+            for mtool in ("gpt_run", "gpt_ask", "gpt_ctl"):
+                self.assertLessEqual(len(tools[mtool]["inputSchema"]["properties"]), 5)
+            entry = tools["gpt_ctl"]
+            self.assertNotIn("wait_sec", entry["inputSchema"]["properties"])
             self.assertEqual(entry["_meta"], {
                 "ui": {"resourceUri": APP_URI}, "com.google.antigravity/ui": {"entrypoints": [
                     {"type": "aux_pane", "title": "GemPT Live"}, {"type": "global", "title": "GemPT Live"},
@@ -524,10 +522,6 @@ class McpStdioHandshakeTests(unittest.TestCase):
             })
             for tool in ("gempt_app_runs", "gempt_app_stream", "gempt_app_interrupt", "gempt_app_steer"):
                 self.assertEqual(tools[tool]["_meta"], {"ui": {"visibility": ["app"]}})
-            status_schema = tools["gempt_status"]["inputSchema"]
-            wait_schema = status_schema["properties"]["wait_sec"]
-            self.assertEqual((wait_schema["type"], wait_schema["minimum"], wait_schema["maximum"]), ("number", 0, 120))
-            self.assertNotIn("wait_sec", status_schema.get("required", []))
             status_payload = json.loads(replies[3]["content"][0]["text"])
             self.assertFalse(status_payload["configured"])
             resource = {"uri": APP_URI, "mimeType": "text/html;profile=mcp-app", "name": "GemPT Live",
@@ -1019,12 +1013,13 @@ class DetachedExecTests(unittest.TestCase):
                                  title=" 派单\n短标题 ", host_conversation_id="parent-id", **args)
                     self.assertIn(reply["state"], {"queued", "running"})
                     self.assertEqual(reply["cwd"], str(self.workspace))
-                    self.assertIn("--wait", reply.get("wait_command", ""))
+                    self.assertIn(reply["run_id"], reply.get("wait_command", ""))
                     saved = json.loads((run_directory(reply["run_id"]) / "state.json").read_text(encoding="utf-8"))
                     self.assertEqual((saved["title"], saved["host_conversation_id"]), ("派单 短标题", "parent-id"))
                     if tool == "gempt_dispatch":
                         self.assertEqual(reply["action"], "exec")
-                        self.assertIn(f"run_id='{reply['run_id']}'", reply["text"])
+                        self.assertIn("wait_command", reply["text"])
+                        self.assertNotIn("query gempt_status", reply["text"])
                     self.finish_run(reply)
                 reply = call(tool, "fast", "15", **args)
                 self.assertEqual(reply["text"], "Worker finished")
@@ -1081,8 +1076,11 @@ class CliPackagingTests(unittest.TestCase):
             self.assertTrue((target / "skills" / "gempt" / "references" / "magpie-routing.md").is_file())
             hooks = json.loads((target / "hooks.json").read_text(encoding="utf-8"))["gempt-work-split"]
             hook_command = hooks["PreInvocation"][0]["command"]
-            self.assertEqual(hooks["PreToolUse"][0]["matcher"], "call_mcp_tool|invoke_subagent")
-            for handler in [*hooks["PreInvocation"], *(item for entry in hooks["PreToolUse"] for item in entry["hooks"])]:
+            self.assertIn("read_file", hooks["PreToolUse"][0]["matcher"])
+            self.assertIn("edit_file", hooks["PreToolUse"][0]["matcher"])
+            self.assertIn("call_mcp_tool", hooks["PreToolUse"][0]["matcher"])
+            self.assertTrue(hooks.get("SessionStart"))
+            for handler in [*hooks["SessionStart"], *hooks["PreInvocation"], *(item for entry in hooks["PreToolUse"] for item in entry["hooks"])]:
                 self.assertEqual(handler["command"], hook_command)
             self.assertIn(str(base_python), hook_command)
             self.assertIn(str(target / "work_split_hook.py"), hook_command)
@@ -1097,7 +1095,9 @@ class CliPackagingTests(unittest.TestCase):
                                   env=env, encoding="utf-8",
                                   capture_output=True, check=True, timeout=20)
             tools, resource = (response["result"] for response in map(json.loads, proc.stdout.splitlines()))
-            self.assertIn("gempt_live_view", [tool["name"] for tool in tools["tools"]])
+            self.assertIn("gpt_ctl", [tool["name"] for tool in tools["tools"]])
+            self.assertIn("gpt_run", [tool["name"] for tool in tools["tools"]])
+            self.assertIn("gpt_ask", [tool["name"] for tool in tools["tools"]])
             self.assertEqual(resource["contents"][0]["text"], (source / "mcp_app_live.html").read_text(encoding="utf-8"))
             self.assertFalse(any(path.name in {"node_modules", "__pycache__"} or path.suffix == ".pyc"
                                  for path in target.rglob("*")))
@@ -1189,10 +1189,10 @@ class CliPackagingTests(unittest.TestCase):
             self.assertNotIn("overwrite", native_hook(packet))
 
             context_path = Path(tmp) / "host-context.json"
-            main = {"conversationId": "main", "workspacePaths": ["D:/gempt"]}
-            child = {"conversationId": "child", "workspacePaths": ["D:/worktree"]}
+            main = {"hookEventName": "SessionStart", "conversationId": "main", "workspacePaths": ["D:/gempt"]}
+            child = {"hookEventName": "SessionStart", "conversationId": "child", "workspacePaths": ["D:/worktree"]}
             self.assertIn("injectSteps", native_hook(main))
-            invoke = {**main, "toolCall": {"name": "invoke_subagent", "args": {
+            invoke = {**main, "hookEventName": "PreToolUse", "toolCall": {"name": "invoke_subagent", "args": {
                 "TypeName": "gempt-worker", "Role": "  自动命名 ", "Prompt": "Keep the original goal.\n"}}}
             prompt = native_hook(invoke)["overwrite"]["Prompt"]
             self.assertEqual(prompt.rsplit("\n", 1)[0], invoke["toolCall"]["args"]["Prompt"])
@@ -1203,22 +1203,22 @@ class CliPackagingTests(unittest.TestCase):
             self.assertIn("injectSteps", native_hook(child))
             call = packet["toolCall"]
             call["args"]["Arguments"] = {"goal": "Use the parent", "host_conversation_id": "main", "title": "自动命名"}
-            self.assertNotIn("overwrite", native_hook({**packet, **child}))
+            self.assertNotIn("overwrite", native_hook({**packet, **child, "hookEventName": "PreToolUse"}))
             self.assertIn("injectSteps", native_hook(child))
             cached = json.loads(context_path.read_text(encoding="utf-8"))
             self.assertEqual(cached["conversation_id"], "main")
             self.assertEqual(cached["workspace_paths"], ["D:/gempt"])
             self.assertEqual(cached["subagent_conversations"], ["child"])
             self.assertGreater(cached["updated_at"], 0)
-            self.assertIn("injectSteps", native_hook({"conversationId": "another", "workspacePaths": ["D:/another"]}))
-            native_hook({**packet, **child})
+            self.assertIn("injectSteps", native_hook({"hookEventName": "SessionStart", "conversationId": "another", "workspacePaths": ["D:/another"]}))
+            native_hook({**packet, **child, "hookEventName": "PreToolUse"})
             self.assertEqual(json.loads(context_path.read_text(encoding="utf-8"))["conversation_id"], "another")
             for tool in ("gempt_dispatch", "gempt_exec", "gempt_live_view"):
                 call["args"].update(ToolName=tool, Arguments={})
-                overwrite = native_hook({**packet, **main})["overwrite"]
+                overwrite = native_hook({**packet, **main, "hookEventName": "PreToolUse"})["overwrite"]
                 self.assertEqual(overwrite["Arguments"], {"host_conversation_id": "main"})
             call["args"]["Arguments"] = {"host_conversation_id": "manual", "scope": "all"}
-            self.assertNotIn("overwrite", native_hook({**packet, **main}))
+            self.assertNotIn("overwrite", native_hook({**packet, **main, "hookEventName": "PreToolUse"}))
 
             context_path.unlink()
             context_path.mkdir()  # Simulate a host-context path that cannot be replaced.
@@ -1631,15 +1631,16 @@ class BugfixRegressionTests(unittest.TestCase):
                 self.assertEqual(cli_main(["install-agy", "--target", str(target)]), 0)
             hook = target / "work_split_hook.py"
 
-            def run_hook(work_split: str, swarm_split: str) -> str:
+            def run_hook(work_split: str, swarm_split: str, event: str = "SessionStart") -> dict:
                 cfg = default_config_template()
                 cfg["routing_policy"]["work_split"] = work_split
                 cfg["routing_policy"]["swarm_split"] = swarm_split
                 save_config(cfg, conf)
                 env = {**os.environ, "GEMPT_CONFIG": str(conf)}
+                payload = {"hookEventName": event, "modelName": "gemini-4-neon-high", "invocationNum": 1}
                 proc = subprocess.run(
                     [sys.executable, "-I", "-X", "utf8", "-B", str(hook)],
-                    input=json.dumps({"modelName": "gemini-4-neon-high"}),
+                    input=json.dumps(payload),
                     text=True,
                     encoding="utf-8",
                     capture_output=True,
@@ -1647,44 +1648,20 @@ class BugfixRegressionTests(unittest.TestCase):
                     env=env,
                     timeout=20,
                 )
-                return json.loads(proc.stdout)["injectSteps"][0]["ephemeralMessage"]
+                return json.loads(proc.stdout)
 
-            both_off = run_hook("gemini", "inherit")
-            no_delegation = "Do not call gempt_dispatch"
-            delegate = "call gempt_dispatch directly"
-            self.assertIn("GemPT is OFF for ordinary conversations and Swarm", both_off)
-            self.assertIn(no_delegation, both_off)
-            self.assertNotIn("first call gempt_dispatch", both_off)
-            self.assertNotIn(delegate, both_off)
+            # 0% off -> zero injection overhead on SessionStart & PreInvocation
+            self.assertEqual(run_hook("gemini", "inherit", "SessionStart"), {})
+            self.assertEqual(run_hook("gemini", "inherit", "PreInvocation"), {})
 
-            ord_off = run_hook("gemini", "gpt")
-            self.assertIn("GemPT is OFF for ordinary conversations", ord_off)
-            self.assertIn(f"{no_delegation} in ordinary conversations", ord_off)
-            self.assertIn("In Swarm only:", ord_off)
-            self.assertIn("first calls gempt_dispatch", ord_off)
-            self.assertNotIn(delegate, ord_off)
-            self.assertIn("Current native gemini_family=neon.", ord_off)
-
-            swarm_off = run_hook("gpt", "gemini")
-            self.assertIn("GemPT is OFF for Swarm", swarm_off)
-            self.assertIn(f"{no_delegation} in Swarm", swarm_off)
-            self.assertIn("In ordinary conversations only:", swarm_off)
-            self.assertIn(delegate, swarm_off)
-            self.assertIn("Current native gemini_family=neon.", swarm_off)
-
-            both_on = run_hook("balanced", "gpt")
-            self.assertIn(delegate, both_on)
-            self.assertIn('workspace="share"', both_on)
-            self.assertIn("zero-poll wakeup", both_on)
-            self.assertIn("Current native gemini_family=neon.", both_on)
-
-            detail = "Gemini 负责沟通、设计与常规实现，仅在疑难排错、复杂推理与专家复核时派给 GPT。"
-            for work_split, swarm_split, scope in [
-                ("gemini_first", "inherit", "GemPT ordinary"),
-                ("balanced", "gemini_first", "Swarm"),
-            ]:
-                with self.subTest(work_split=work_split, swarm_split=swarm_split):
-                    self.assertIn(f"{scope}: {detail}", run_hook(work_split, swarm_split))
+            # Non-zero -> SessionStart injects 1 concise systemMessage with 3-tool signatures (zero ephemeralMessage!)
+            ss = run_hook("balanced", "gpt", "SessionStart")
+            self.assertNotIn("ephemeralMessage", json.dumps(ss))
+            ss_msg = ss["injectSteps"][0]["systemMessage"]["systemMessage"]
+            self.assertIn("gpt_run", ss_msg)
+            self.assertIn("gpt_ask", ss_msg)
+            self.assertIn("gpt_ctl", ss_msg)
+            self.assertIn("family=neon", ss_msg)
 
             run_hook("gemini_first", "inherit")
             with mock.patch.dict(os.environ, {"GEMPT_CONFIG": str(conf)}), \
@@ -1758,7 +1735,9 @@ class BugfixRegressionTests(unittest.TestCase):
 
                 cmd = build_wait_command(run_id)
                 self.assertIn(run_id, cmd)
-                self.assertIn("--wait", cmd)
+                self.assertTrue(cmd.startswith("gempt-wait ") or "--wait" in cmd, cmd)
+                with mock.patch.dict(os.environ, {"GEMPT_DISABLE_WAIT_SHIM": "1"}):
+                    self.assertIn("--wait", build_wait_command(run_id))
                 shell_argv = ["powershell", "-NoProfile", "-Command", cmd] if os.name == "nt" else ["sh", "-c", cmd]
                 proc = subprocess.run(
                     shell_argv,
@@ -1834,6 +1813,10 @@ class AppServerHandler(socketserver.StreamRequestHandler):
                 data = bytes(value ^ mask[i % 4] for i, value in enumerate(self.rfile.read(size)))
                 if first == 0x88:
                     return
+                if first == 0x89:
+                    with self.write_lock:
+                        self.wfile.write(self.frame(data, 0x8a))
+                    continue
                 if first == 0x8a:
                     self.server.pongs.append(data)
                     continue
@@ -1922,6 +1905,16 @@ class AppServerHandler(socketserver.StreamRequestHandler):
                           "turnId": self.turn, "callId": "call_fixture", "arguments": {"reason": "visual_check", "question": "Is it legible?"}})
             elif "Hold turn" in prompt:
                 return
+            elif "Broadcast hijack" in prompt:
+                # Simulate another concurrent client creating a new thread whose thread/started broadcasts here!
+                self.notify("thread/started", thread={"id": "foreign-thread-999"})
+                self.notify("turn/started", threadId="foreign-thread-999", turn={"id": "foreign-turn-999", "status": "inProgress"})
+                self.notify("turn/completed", threadId="foreign-thread-999", turn={"id": "foreign-turn-999", "status": "completed"})
+                self.complete("completed")
+            elif "Drop once" in prompt and not getattr(self.server, "dropped_once", False):
+                self.server.dropped_once = True
+                self.connection.shutdown(2)
+                raise ConnectionResetError("simulated mid-turn drop")
             else:
                 self.complete("failed" if "Fail turn" in prompt else "completed")
         elif method in {"turn/steer", "turn/interrupt"}:
@@ -1998,7 +1991,7 @@ class AppServerTests(unittest.TestCase):
         self.assertEqual(waiting["state"], "waiting_gemini")
         self.assertEqual(waiting["progress"]["last_message"], "live")
         self.assertEqual(waiting["progress"]["token_usage"]["cached_input_tokens"], 91)
-        self.assertIn("--wait", waiting["wait_command"])
+        self.assertTrue(waiting["wait_command"].startswith("gempt-wait ") or "--wait" in waiting["wait_command"])
         pending = waiting["pending_tool_call"]
         self.assertEqual(pending["arguments"]["reason"], "visual_check")
         self.assertEqual(wait_for_run(run_id, timeout_sec=0)["state"], "waiting_gemini")
@@ -2124,7 +2117,8 @@ class AppServerTests(unittest.TestCase):
             self.assertTrue(Path(r2["worktree_path"]).is_dir())
 
             batch_cmd = build_wait_many_command([r1["run_id"], r2["run_id"]])
-            self.assertIn("--run-ids", batch_cmd)
+            self.assertIn(f"{r1['run_id']},{r2['run_id']}", batch_cmd)
+            self.assertTrue(batch_cmd.startswith("gempt-wait ") or "--run-ids" in batch_cmd, batch_cmd)
             batch = wait_for_runs([r1["run_id"], r2["run_id"]], wait_any=True, timeout_sec=10)
             self.assertIn(r2["run_id"], batch["ready"])
             self.assertIn(r1["run_id"], batch["active"])
@@ -2144,6 +2138,30 @@ class AppServerTests(unittest.TestCase):
             self.assertEqual(reused["worktree_root"], r2["worktree_path"])
             self.assertTrue(remove_share_worktree(self.repo, r1["worktree_path"]))
             self.assertTrue(remove_share_worktree(self.repo, r2["worktree_path"]))
+
+    def test_v2_broadcast_hijack_isolation_and_reconnect_recovery(self):
+        # 1. Foreign thread/started broadcast must NOT overwrite this run's codex_thread_id or drop turn/completed.
+        r_iso = self.mcp("gpt_run", goal="Broadcast hijack check", cwd=str(self.repo), access="inspect")
+        self.assertIn("wait_command", r_iso)
+        done = wait_for_run(r_iso["run_id"], timeout_sec=10)
+        self.assertEqual(done["state"], "finished", done)
+        self.assertNotEqual(done["codex_thread_id"], "foreign-thread-999")
+        self.assertEqual(done["result"]["text"], "Completed on the same turn")
+
+        # 2. Mid-turn WebSocket drop recovers via 1x thread/resume and finishes cleanly.
+        r_rec = self.mcp("gpt_run", goal="Drop once recovery check", cwd=str(self.repo), access="inspect")
+        done2 = wait_for_run(r_rec["run_id"], timeout_sec=10)
+        self.assertEqual(done2["state"], "finished", done2)
+        resumes = [req for req in self.server.requests if req.get("method") == "thread/resume"]
+        self.assertGreaterEqual(len(resumes), 1)
+        self.assertEqual(resumes[-1]["params"]["threadId"], done2["codex_thread_id"])
+
+        # 3. gpt_ctl({}) returns <=500B content while keeping full GemPT Live structuredContent; rejects wait_sec.
+        ctl_raw = _handle_tool_call("gpt_ctl", {})
+        self.assertLessEqual(len(ctl_raw["content"][0]["text"].encode("utf-8")), 500)
+        self.assertIn("runs", ctl_raw["structuredContent"])
+        with self.assertRaisesRegex(ValueError, "wait_sec"):
+            _handle_tool_call("gpt_ctl", {"action": "status", "wait_sec": 20})
 
 
 class TokenRatioTests(unittest.TestCase):
@@ -2198,9 +2216,9 @@ class TokenRatioTests(unittest.TestCase):
                 }),
                 json.dumps({
                     "t": recent_iso,
-                    "provider": "westlake-a",
+                    "provider": "free-proxy",
                     "model": "deepseek-flash",
-                    "req": "westlake-a/deepseek-flash",
+                    "req": "free-proxy/deepseek-flash",
                     "in": 999_999,
                     "out": 1,
                     "cache_read": 0,
@@ -2258,11 +2276,47 @@ class TokenRatioTests(unittest.TestCase):
             self.assertEqual(b50_ok["adjustment"], "balanced")
             self.assertEqual(b50_ok["effective_kinds"], ["specialist", "engineering"])
 
-            # Warming up below 200K tokens
-            tiny = {**snap, "combined_total": 50_000}
+            # Warming up below MIN_SAMPLE_TOKENS (20K attributable work tokens)
+            tiny = {**snap, "combined_work": 5_000, "combined_total": 5_000}
             b_warm = evaluate_budget("gemini_first", tiny)
             self.assertEqual(b_warm["adjustment"], "warming_up")
             self.assertEqual(b_warm["effective_kinds"], ["specialist"])
+
+            # Pure Swarm coordination & pure vision transcripts are excluded from attributable Gemini work
+            swarm_dir = brain / "conv-swarm" / ".system_generated" / "logs"
+            swarm_dir.mkdir(parents=True)
+            from datetime import datetime, timedelta, timezone
+            recent_iso = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
+            (swarm_dir / "transcript.jsonl").write_text(json.dumps({
+                "type": "PLANNER_RESPONSE", "created_at": recent_iso, "model": "gemini-4-neon-high",
+                "input_tokens": 5_000_000, "output_tokens": 1_000_000, "cache_read_tokens": 20_000_000,
+                "tool_calls": [{"name": "read_board", "args": {}}, {"name": "swarm_wait", "args": {}}],
+            }) + "\n", encoding="utf-8")
+            vis_dir = brain / "conv-vision" / ".system_generated" / "logs"
+            vis_dir.mkdir(parents=True)
+            (vis_dir / "transcript.jsonl").write_text(json.dumps({
+                "type": "PLANNER_RESPONSE", "created_at": recent_iso, "model": "gemini-4-neon-high",
+                "input_tokens": 3_000_000, "output_tokens": 500_000, "cache_read_tokens": 10_000_000,
+                "tool_calls": [{"name": "read_file", "args": {"Path": "D:/shot.png"}}],
+            }) + "\n", encoding="utf-8")
+            snap2 = read_token_ratio(brain_dir=brain, magpie_dir=magpie, cache_ttl_sec=0)
+            self.assertEqual(snap2["sources"]["excluded_sessions"], 2)
+            self.assertEqual(snap2["gemini"]["total"], 9_000_000)  # swarm + vision excluded!
+            self.assertEqual(snap2["actual_gpt_share"], 10.0)
+
+    def test_workload_hot_reload_and_winerror5_fallback(self) -> None:
+        from gempt import config as gempt_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wl = Path(tmp) / "workload.json"
+            wl.write_text(json.dumps({"profiles": {"balanced": {"gpt_share": 50, "kinds": ["engineering"]}}, "pairings": {}, "schema": {}}), encoding="utf-8")
+            with mock.patch.object(gempt_config, "_WORKLOAD_PATH", wl):
+                gempt_config._WORKLOAD_CACHE.update(sig=None, data=None)
+                self.assertEqual(list(gempt_config.WORKLOAD["profiles"]), ["balanced"])
+                # Mutate on disk -> must reload without reimporting module
+                wl.write_text(json.dumps({"profiles": {"balanced": {"gpt_share": 50, "kinds": ["engineering"]}, "gemini_first": {"gpt_share": 30, "kinds": ["specialist"]}}, "pairings": {}, "schema": {}}), encoding="utf-8")
+                self.assertIn("gemini_first", gempt_config.WORKLOAD["profiles"])
+            gempt_config._WORKLOAD_CACHE.update(sig=None, data=None)
 
     def test_dispatch_dynamic_budget_and_receipt_compaction(self) -> None:
         from gempt.workload import compact_receipt_text, dispatch_task
@@ -2290,7 +2344,7 @@ class TokenRatioTests(unittest.TestCase):
 
             self.assertEqual(compact_receipt_text("short"), "short")
 
-    def test_work_split_hook_live_telemetry_and_read_diet_nudge(self) -> None:
+    def test_work_split_hook_v2_five_tiers_milestones_and_fail_open(self) -> None:
         import importlib.util
 
         hook_path = Path(__file__).resolve().parent.parent / "plugin" / "work_split_hook.py"
@@ -2301,43 +2355,168 @@ class TokenRatioTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            brain, magpie = self._seed_usage(root, gem_tokens=9_000_000, gpt_tokens=1_000_000)
             cfg_path = root / "config.json"
-            cfg_path.write_text(json.dumps({
-                "routing_policy": {"work_split": "gemini_first", "swarm_split": "inherit"},
+            sess_dir = root / "sessions"
+            app_state = root / "app-server.json"
+            app_state.write_text(json.dumps({
+                "status": "running", "ws_url": "ws://127.0.0.1:59999", "pid": os.getpid(),
             }), encoding="utf-8")
+            tr_path = root / "transcript.jsonl"
             env = {
                 "GEMPT_CONFIG": str(cfg_path),
-                "GEMPT_AGY_BRAIN_DIR": str(brain),
-                "MAGPIE_CONFIG_DIR": str(magpie),
+                "GEMPT_SESSIONS_DIR": str(sess_dir),
+                "GEMPT_APP_SERVER_STATE": str(app_state),
             }
+
+            def set_split(split_name: str) -> None:
+                cfg_path.write_text(json.dumps({"routing_policy": {"work_split": split_name}}), encoding="utf-8")
+
             with mock.patch.dict(os.environ, env):
-                rem = mod.reminder("neon")["injectSteps"][0]["ephemeralMessage"]
-                self.assertIn("Live 24h token split: Gemini 90.0% vs GPT 10.0%", rem)
-                self.assertIn("ZERO-PRE-READ", rem)
+                # 1. Zero ephemeralMessage anywhere; SessionStart injects 3-tool signatures once
+                set_split("balanced")
+                ss = mod.session_start({"conversationId": "c1", "workspacePaths": [str(root)]}, "neon")
+                self.assertNotIn("ephemeralMessage", json.dumps(ss))
+                self.assertIn("gpt_run", ss["injectSteps"][0]["systemMessage"]["systemMessage"])
 
-                conv = "conv-read-diet"
-                # Exempt image & SKILL.md reads never trigger nudge
-                r_img = mod.pre_tool_use({"conversationId": conv, "toolCall": {"name": "read_file", "args": {"Path": "D:/gempt/preview.png"}}}, "neon")
-                self.assertNotIn("injectSteps", r_img)
-                r_skill = mod.pre_tool_use({"conversationId": conv, "toolCall": {"name": "read_file", "args": {"Path": "C:/Users/zyz/.zcode/skills/x/SKILL.md"}}}, "neon")
-                self.assertNotIn("injectSteps", r_skill)
+                # 2. PreInvocation mid-turn (invocationNum=2) emits NOTHING; 120k/200k/280k emits 0-token user_markdown ONCE each
+                tr_path.write_text(json.dumps({
+                    "type": "PLANNER_RESPONSE", "input_tokens": 20_000, "output_tokens": 5_000, "cache_read_tokens": 110_000,
+                }) + "\n", encoding="utf-8")
+                pi1 = mod.pre_invocation({"conversationId": "c1", "invocationNum": 2, "transcriptPath": str(tr_path)}, "neon")
+                self.assertEqual(len(pi1["injectSteps"]), 1)
+                sm = pi1["injectSteps"][0]["systemMessage"]
+                self.assertEqual(sm["systemMessage"], "")  # 0-token to model!
+                self.assertIn("/compact", sm["metadata"]["user_markdown"])
+                self.assertIn("120k", sm["metadata"]["user_markdown"])
+                # Calling again at 135k does NOT repeat
+                pi2 = mod.pre_invocation({"conversationId": "c1", "invocationNum": 3, "transcriptPath": str(tr_path)}, "neon")
+                self.assertEqual(pi2, {})
+                # Crossing 200k fires once more
+                with tr_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"type": "PLANNER_RESPONSE", "input_tokens": 20_000, "output_tokens": 5_000, "cache_read_tokens": 190_000}) + "\n")
+                pi3 = mod.pre_invocation({"conversationId": "c1", "invocationNum": 4, "transcriptPath": str(tr_path)}, "neon")
+                self.assertEqual(pi3["injectSteps"][0]["systemMessage"]["systemMessage"], "")
+                self.assertIn("200k", pi3["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
 
-                # First workspace code read -> allowed silently
-                r1 = mod.pre_tool_use({"conversationId": conv, "toolCall": {"name": "read_file", "args": {"Path": "D:/gempt/src/gempt/workload.py"}}}, "neon")
-                self.assertEqual(r1["decision"], "allow")
-                self.assertNotIn("injectSteps", r1)
+                # 3. 30% (gemini_first): ZERO PreToolUse deny, 1-line PreInvocation once per turn (0- or 1-indexed)
+                set_split("gemini_first")
+                p30_0 = mod.pre_invocation({"conversationId": "c30", "invocationNum": 0, "initialNumSteps": 10, "lastUserInput": "hi"}, "neon")
+                self.assertIn("[GemPT 30%]", p30_0["injectSteps"][0]["systemMessage"]["systemMessage"])
+                # Same turn advancing from invocationNum 0 -> 1 must NOT duplicate!
+                self.assertEqual(mod.pre_invocation({"conversationId": "c30", "invocationNum": 1, "initialNumSteps": 10, "lastUserInput": "hi"}, "neon"), {})
+                self.assertEqual(mod.pre_invocation({"conversationId": "c30", "invocationNum": 2, "initialNumSteps": 10, "lastUserInput": "hi"}, "neon"), {})
+                # Next user turn (new initialNumSteps/input) fires once even if host starts at 1
+                p30_next = mod.pre_invocation({"conversationId": "c30", "invocationNum": 1, "initialNumSteps": 14, "lastUserInput": "next"}, "neon")
+                self.assertIn("[GemPT 30%]", p30_next["injectSteps"][0]["systemMessage"]["systemMessage"])
+                self.assertEqual(mod.pre_tool_use({"conversationId": "c30", "cwd": str(root), "toolCall": {
+                    "name": "edit_file", "args": {"Path": str(root / "app.py"), "Replacement": "x=1"}}}, "neon")["decision"], "allow")
 
-                # Second consecutive code read while GPT is under target -> injects Context Diet nudge!
-                r2 = mod.pre_tool_use({"conversationId": conv, "toolCall": {"name": "read_file", "args": {"Path": "D:/gempt/src/gempt/service.py"}}}, "neon")
-                self.assertEqual(r2["decision"], "allow")
-                self.assertIn("injectSteps", r2)
-                self.assertIn("[GemPT Context Diet]", r2["injectSteps"][0]["ephemeralMessage"])
+                # 4. 50% (balanced): deny repo source write AND large config deletions (>15L Target), allow docs / small<=15L config / ALL reads
+                set_split("balanced")
+                d_src = mod.pre_tool_use({"conversationId": "c50", "cwd": str(root), "toolCall": {
+                    "name": "edit_file", "args": {"Path": str(root / "main.py"), "Replacement": "print(1)"}}}, "neon")
+                self.assertEqual(d_src["decision"], "deny")
+                self.assertIn("gpt_run", d_src["reason"])
+                self.assertEqual(mod.pre_tool_use({"conversationId": "c50", "cwd": str(root), "toolCall": {
+                    "name": "write_file", "args": {"Path": str(root / "README.md"), "Content": "# hi"}}}, "neon")["decision"], "allow")
+                self.assertEqual(mod.pre_tool_use({"conversationId": "c50", "cwd": str(root), "toolCall": {
+                    "name": "edit_file", "args": {"Path": str(root / "cfg.json"), "Target": "{\"a\":0}", "Replacement": "{\"a\":1}"}}}, "neon")["decision"], "allow")
+                # Deleting 40 lines from cfg.json with empty Replacement must be denied!
+                d_big_del = mod.pre_tool_use({"conversationId": "c50", "cwd": str(root), "toolCall": {
+                    "name": "edit_file", "args": {"Path": str(root / "cfg.json"), "Target": "\n".join(f'"k{i}": {i},' for i in range(40)), "Replacement": ""}}}, "neon")
+                self.assertEqual(d_big_del["decision"], "deny")
+                for i in range(8):
+                    self.assertEqual(mod.pre_tool_use({"conversationId": "c50", "cwd": str(root), "toolCall": {
+                        "name": "read_file", "args": {"Path": str(root / f"f{i}.py")}}}, "neon")["decision"], "allow")
 
-                # Dispatch resets the consecutive read counter
-                mod.pre_tool_use({"conversationId": conv, "toolCall": {"name": "call_mcp_tool", "args": {"ServerName": "gempt_gempt", "ToolName": "gempt_dispatch", "Arguments": {"goal": "x"}}}}, "neon")
-                r3 = mod.pre_tool_use({"conversationId": conv, "toolCall": {"name": "read_file", "args": {"Path": "D:/gempt/src/gempt/cli.py"}}}, "neon")
-                self.assertNotIn("injectSteps", r3)
+                # 5. 80% (gpt, Option A): allow first 5 non-exempt reads/searches, deny 6th; non-read python/echo commands never miscounted!
+                set_split("gpt")
+                for non_read_cmd in ('python -c "print(type(1))"', 'echo "please find this value"', 'pytest -q'):
+                    self.assertFalse(mod._is_read_command({"CommandLine": non_read_cmd}), non_read_cmd)
+                for read_cmd in ('rg foo bar.py', 'cd repo && cat a.py', 'Get-Content D:/a.py'):
+                    self.assertTrue(mod._is_read_command({"CommandLine": read_cmd}), read_cmd)
+                # Permanent whitelist: MCP schema, brain, SKILL.md, images, gempt-wait never count
+                for exempt_path in (
+                    "C:/Users/alice/.gemini/antigravity/mcp/gempt_gempt/gpt_run.json",
+                    "C:/Users/alice/.gemini/antigravity/brain/abc/notes.md",
+                    "C:/Users/alice/.zcode/skills/x/SKILL.md",
+                    "D:/gempt/shot.png",
+                ):
+                    self.assertEqual(mod.pre_tool_use({"conversationId": "c80", "lastUserInput": "check bug", "toolCall": {
+                        "name": "read_file", "args": {"Path": exempt_path}}}, "neon")["decision"], "allow")
+                self.assertEqual(mod.pre_tool_use({"conversationId": "c80", "lastUserInput": "check bug", "toolCall": {
+                    "name": "run_command", "args": {"CommandLine": "gempt-wait abcdef0123456789abcdef0123456789"}}}, "neon")["decision"], "allow")
+                for i in range(5):
+                    tc = {"name": "read_file", "args": {"Path": str(root / f"m{i}.py")}} if i < 3 else {"name": "run_command", "args": {"CommandLine": f"rg foo m{i}.py"}}
+                    self.assertEqual(mod.pre_tool_use({"conversationId": "c80", "cwd": str(root), "lastUserInput": "check bug", "toolCall": tc}, "neon")["decision"], "allow")
+                d6 = mod.pre_tool_use({"conversationId": "c80", "cwd": str(root), "lastUserInput": "check bug", "toolCall": {
+                    "name": "read_file", "args": {"Path": str(root / "m6.py")}}}, "neon")
+                self.assertEqual(d6["decision"], "deny")
+                self.assertIn("gpt_run", d6["reason"])
+                # New user input resets counter cleanly!
+                self.assertEqual(mod.pre_tool_use({"conversationId": "c80", "cwd": str(root), "lastUserInput": "next question", "toolCall": {
+                    "name": "read_file", "args": {"Path": str(root / "m7.py")}}}, "neon")["decision"], "allow")
+                # User verbal override bypasses even source edit deny!
+                self.assertEqual(mod.pre_tool_use({"conversationId": "c80", "cwd": str(root), "lastUserInput": "不用GPT，你自己改一下", "toolCall": {
+                    "name": "edit_file", "args": {"Path": str(root / "main.py"), "Replacement": "x=2"}}}, "neon")["decision"], "allow")
+
+                # 6. 95% (gpt_first): preserves >= 2 quick checks (never read=0), denies 3rd with Codex CLI hint
+                set_split("gpt_first")
+                for i in range(2):
+                    self.assertEqual(mod.pre_tool_use({"conversationId": "c95", "cwd": str(root), "lastUserInput": "fix", "toolCall": {
+                        "name": "read_file", "args": {"Path": str(root / f"k{i}.py")}}}, "neon")["decision"], "allow")
+                d95 = mod.pre_tool_use({"conversationId": "c95", "cwd": str(root), "lastUserInput": "fix", "toolCall": {
+                    "name": "read_file", "args": {"Path": str(root / "k3.py")}}}, "neon")
+                self.assertEqual(d95["decision"], "deny")
+                self.assertIn("Codex CLI", d95["reason"])
+
+                # 7. Fail-open circuit breaker: 2 consecutive recent failures -> allow!
+                for idx in range(2):
+                    rdir = sess_dir / "runs" / (f"{idx}" * 32)
+                    rdir.mkdir(parents=True, exist_ok=True)
+                    (rdir / "state.json").write_text(json.dumps({
+                        "run_id": f"{idx}" * 32, "state": "failed", "finished_at": time.time(),
+                    }), encoding="utf-8")
+                self.assertEqual(mod.pre_tool_use({"conversationId": "c50", "cwd": str(root), "toolCall": {
+                    "name": "edit_file", "args": {"Path": str(root / "main.py"), "Replacement": "x=3"}}}, "neon")["decision"], "allow")
+
+                # Dead app-server.json also fails open
+                app_state.write_text(json.dumps({"status": "stopped", "ws_url": None, "pid": None}), encoding="utf-8")
+                self.assertEqual(mod.pre_tool_use({"conversationId": "c95", "cwd": str(root), "lastUserInput": "fix", "toolCall": {
+                    "name": "edit_file", "args": {"Path": str(root / "main.py"), "Replacement": "x=4"}}}, "neon")["decision"], "allow")
+
+    def test_compact_wait_record_strips_raw_git_diffs_and_keeps_raw_status(self) -> None:
+        from gempt.cli import _compact_wait_record
+
+        huge_diff = "+" + ("x" * 65_000)
+        raw = {
+            "run_id": "a" * 32,
+            "state": "finished",
+            "goal": "G" * 1200,
+            "before": {"status": " M dirty.py\n", "diff": huge_diff},
+            "after": {"status": " M dirty.py\n M touched.py\n", "diff": huge_diff},
+            "progress": {
+                "phase": "finished",
+                "thread_id": "th-1",
+                "turn_id": "tu-1",
+                "last_message": "M" * 4000,
+                "recent_commands": [{"command": "pytest", "exit_code": 0, "output": "O" * 4000}],
+                "token_usage": {"total_tokens": 1000},
+            },
+            "result": {"text": "Done cleanly.", "formatted": "F" * 8000, "session_id": "exec-1"},
+        }
+        compact = _compact_wait_record(raw)
+        self.assertNotIn("before", compact)
+        self.assertNotIn("after", compact)
+        self.assertIn("changed_files", compact)
+        self.assertLessEqual(len(json.dumps(compact, ensure_ascii=False).encode("utf-8")), 4096)
+        # Read-only run where status did not change emits no changed_files noise
+        ro = {**raw, "after": {"status": " M dirty.py\n", "diff": huge_diff}}
+        ro_compact = _compact_wait_record(ro)
+        self.assertNotIn("changed_files", ro_compact)
+        # Raw dict itself is never mutated (non-wait status stays intact)
+        self.assertIn("before", raw)
+        self.assertIn("after", raw)
 
 
 if __name__ == "__main__":

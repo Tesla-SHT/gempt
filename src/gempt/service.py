@@ -153,7 +153,7 @@ def configure_gempt(
     default_tier: str | None = None,
     failover_mode: str = "subscription_only",
     auto_effort: bool | None = None,
-    magpie_group_strategy: str = "order",
+    magpie_group_strategy: str = "pace",
     utility_model: str | None = None,
     use_for_magpie_compact: bool | None = None,
     tiers_override: dict[str, dict[str, Any]] | None = None,

@@ -67,12 +67,20 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
   };
 
   const onEvent = ({ method, params = {}, id, ...extra }) => {
-    appendFileSync(join(directory, 'events.jsonl'), JSON.stringify({ method, params, id, ...extra }) + '\n');
+    // Shared codex app-server broadcasts thread/started to all clients. Never overwrite
+    // progress.thread_id from broadcasts — bind strictly from thread/start|resume RPC response.
     if (method === 'thread/started') {
-      identity(params.thread.id);
+      if (!progress.thread_id || params.thread?.id !== progress.thread_id) return;
+      appendFileSync(join(directory, 'events.jsonl'), JSON.stringify({ method, params, id, ...extra }) + '\n');
       return;
     }
-    const related = (params.threadId ?? params.conversationId) === progress.thread_id;
+    const eventThread = params.threadId ?? params.conversationId;
+    if (progress.thread_id && eventThread && eventThread !== progress.thread_id) {
+      if (id !== undefined) client.reject(id);
+      return;
+    }
+    appendFileSync(join(directory, 'events.jsonl'), JSON.stringify({ method, params, id, ...extra }) + '\n');
+    const related = eventThread === progress.thread_id;
     const eventTurn = params.turnId ?? params.turn?.id;
     const sameTurn = !eventTurn || !progress.turn_id || eventTurn === progress.turn_id;
     if (id !== undefined) {

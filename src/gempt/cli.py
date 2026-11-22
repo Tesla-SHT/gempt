@@ -180,7 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--config", default=None)
     p_init.add_argument("--magpie-url", default=None)
     p_init.add_argument("--failover", choices=VALID_FAILOVER_MODES, default="subscription_only")
-    p_init.add_argument("--strategy", choices=VALID_GROUP_STRATEGIES, default="order")
+    p_init.add_argument("--strategy", choices=VALID_GROUP_STRATEGIES, default="pace")
     p_init.add_argument("--sandbox", choices=VALID_SANDBOXES, default="workspace-write")
     p_init.add_argument("--utility-model", default=None)
     p_init.add_argument("--no-compact-rule", action="store_true", help="Do not add Magpie compact rule when syncing groups")
@@ -314,12 +314,46 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _compact_wait_record(record: dict[str, Any]) -> dict[str, Any]:
-    """Return a context-diet view of a waited run record for Gemini wakeups."""
+    """Return a strict context-diet view (<=5KB) of a waited run record for Gemini wakeups."""
     from .workload import compact_receipt_text
 
     if not isinstance(record, dict):
         return record
     out = dict(record)
+    before = out.pop("before", None)
+    after = out.pop("after", None)
+    if isinstance(after, dict):
+        after_status = str(after.get("status") or "").strip()
+        before_status = str((before or {}).get("status") or "").strip() if isinstance(before, dict) else ""
+        if after_status and after_status != before_status:
+            lines = [ln.strip() for ln in after_status.splitlines() if ln.strip()]
+            out["changed_files"] = lines[:20]
+            if len(lines) > 20:
+                out["changed_files_omitted"] = len(lines) - 20
+    if isinstance(out.get("goal"), str) and len(out["goal"]) > 300:
+        out["goal"] = out["goal"][:297] + "..."
+    # Drop verbose streaming progress once terminal; keep minimal progress if waiting_gemini/active.
+    progress = out.get("progress")
+    if isinstance(progress, dict):
+        if out.get("state") in {"finished", "failed", "interrupted", "outcome_unknown"}:
+            out["progress"] = {
+                k: progress[k]
+                for k in ("phase", "thread_id", "turn_id", "token_usage")
+                if k in progress
+            }
+        else:
+            slim_cmds = [
+                {"command": str(c.get("command") or "")[:160], "exit_code": c.get("exit_code")}
+                for c in (progress.get("recent_commands") or [])[-3:]
+                if isinstance(c, dict)
+            ]
+            out["progress"] = {
+                "phase": progress.get("phase"),
+                "thread_id": progress.get("thread_id"),
+                "turn_id": progress.get("turn_id"),
+                "last_message": str(progress.get("last_message") or "")[-300:],
+                "recent_commands": slim_cmds,
+            }
     sid = out.get("session_id")
     if isinstance(out.get("text"), str):
         out["text"] = compact_receipt_text(out["text"], session_id=sid)

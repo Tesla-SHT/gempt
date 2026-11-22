@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import copy
 import json
 import os
@@ -24,7 +25,35 @@ from . import (
 )
 
 
-WORKLOAD = json.loads(Path(__file__).with_name("workload.json").read_text(encoding="utf-8"))
+_WORKLOAD_PATH = Path(__file__).with_name("workload.json")
+_WORKLOAD_CACHE: dict[str, Any] = {"sig": None, "data": None}
+
+
+def load_workload(path: Path | None = None) -> dict[str, Any]:
+    """Load workload.json with mtime/size invalidation so long-lived MCP processes never go stale."""
+    target = path or _WORKLOAD_PATH
+    st = target.stat()
+    sig = (str(target), st.st_mtime_ns, st.st_size)
+    if _WORKLOAD_CACHE["sig"] != sig or _WORKLOAD_CACHE["data"] is None:
+        _WORKLOAD_CACHE["data"] = json.loads(target.read_text(encoding="utf-8"))
+        _WORKLOAD_CACHE["sig"] = sig
+    return _WORKLOAD_CACHE["data"]
+
+
+class _LiveWorkload(Mapping[str, Any]):
+    """Read-through mapping over workload.json that reloads automatically when the file changes."""
+
+    def __getitem__(self, key: str) -> Any:
+        return load_workload()[key]
+
+    def __iter__(self):
+        return iter(load_workload())
+
+    def __len__(self) -> int:
+        return len(load_workload())
+
+
+WORKLOAD: Mapping[str, Any] = _LiveWorkload()
 
 
 class ConfigError(RuntimeError):
@@ -76,7 +105,7 @@ def default_config_template() -> dict[str, Any]:
             "pairings": {},
             "failover_mode": "subscription_only",
             "auto_effort": False,
-            "magpie_group_strategy": "order",
+            "magpie_group_strategy": "pace",
             "excluded_models": [],
         },
         "tiers": {
@@ -359,18 +388,34 @@ def require_subscription(models: list[str]) -> None:
             raise ConfigError(f"subscription_only requires a concrete Codex subscription model: {model}")
 
 
+_FAMILY_GROUP_TIER = {
+    "hydrogen": "sonnet",
+    "neon": "sonnet",
+    "carbon": "fable",
+}
+
+
 def paired_model(cfg, family, tier, session):
     if tier:
         return None
     if session:
         model = session.get("paired_model")
     elif family in WORKLOAD["pairings"]:
-        model = cfg["routing_policy"]["pairings"].get(family, WORKLOAD["pairings"][family])
+        explicit_pairings = (cfg.get("routing_policy") or {}).get("pairings") or {}
+        if family in explicit_pairings:
+            model = explicit_pairings[family]
+        else:
+            mapped_tier = _FAMILY_GROUP_TIER.get(family)
+            tier_model = str(((cfg.get("tiers") or {}).get(mapped_tier or "") or {}).get("consult_model") or "")
+            if tier_model.startswith("group/gempt-harness-"):
+                return tier_model
+            model = WORKLOAD["pairings"][family]
     else:
         return None
     if not model or model == "default":
         return None
-    require_subscription([model])
+    if not str(model).startswith("group/gempt-harness-"):
+        require_subscription([model])
     from .discover import _is_excluded_model, _resolve_excluded_models
     if _is_excluded_model(model, _resolve_excluded_models(cfg["routing_policy"].get("excluded_models"))):
         raise ConfigError("The paired Codex model is excluded. Change the pairing in GemPT.")
@@ -452,7 +497,9 @@ def resolve_tier(
     fallbacks = [] if model_override else [str(m).strip() for m in (tier.get("fallback_models") or []) if str(m).strip()]
 
     if cfg["routing_policy"]["failover_mode"] == "subscription_only":
-        if chosen_model == f"group/gempt-harness-{key}" and not model_override:
+        if chosen_model.startswith("group/gempt-harness-") and (
+            not model_override or chosen_model == model_override
+        ):
             from .magpie_client import verify_subscription_group
             verify_subscription_group(cfg, chosen_model)
             require_subscription(fallbacks)

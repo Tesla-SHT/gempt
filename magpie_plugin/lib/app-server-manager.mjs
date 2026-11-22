@@ -176,7 +176,11 @@ export function createAppServerManager({
       return;
     }
     const cli = findCodexCli(raw.codex?.cli_path, env);
-    if (!cli) throw new Error('未找到 Codex CLI，无法启动共享 app-server。');
+    if (!cli) {
+      error = '未找到 Codex CLI，共享 app-server 未启动。gempt_consult 与 Magpie 原生路由组仍可使用。';
+      cleanup();
+      return;
+    }
     const picked = await freePort(port);
     if (stopped) return;
     const wsUrl = `ws://127.0.0.1:${picked}`;

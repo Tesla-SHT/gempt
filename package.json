@@ -32,11 +32,12 @@
     "pyproject.toml",
     "install.sh",
     "install.ps1",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Tesla-SHT/gempt.git"
+    "url": "git+https://github.com/yizhang-dream/gempt.git"
   },
   "engines": {
     "magpie": ">=0.1.1340"
@@ -75,7 +76,8 @@
     },
     "options": {
       "port": 3498,
-      "exec": false
+      "exec": false,
+      "mcpTools": true
     },
     "permissions": [],
     "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTYiIGZpbGw9IiMxODE4MWIiLz48cGF0aCBkPSJNMTYgNDRMMjggMjBMMzYgMzNMNDYgMjNMNDAgNDRIMTZaIiBmaWxsPSJub25lIiBzdHJva2U9IiNmZmZmZmYiIHN0cm9rZS13aWR0aD0iMy41IiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+PGNpcmNsZSBjeD0iNDYuNSIgY3k9IjE4LjUiIHI9IjMuNSIgZmlsbD0iIzM0ZDM5OSIvPjwvc3ZnPg=="

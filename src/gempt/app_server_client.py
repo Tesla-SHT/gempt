@@ -141,6 +141,10 @@ class WebSocket:
         with suppress(OSError):
             self.sock.close()
 
+    def ping(self, payload=b"gempt"):
+        if not self.closed:
+            self.send(payload, opcode=9)
+
     def send(self, payload, opcode=1):
         size = len(payload)
         mask = os.urandom(4)
@@ -290,6 +294,10 @@ class AppServerClient:
     def reject(self, ident):
         self._send(id=ident, error={"code": -32601, "message": "Unsupported server request"})
 
+    def ping(self):
+        with suppress(OSError):
+            self.ws.ping()
+
     def __enter__(self):
         return self
 
@@ -376,14 +384,25 @@ class TurnJournal:
 
     def event(self, message):
         with self.lock:
+            method = message["method"]
+            params = message.get("params") or {}
+            # Shared codex app-server broadcasts thread/started to all WebSocket clients.
+            # Never bind or overwrite thread_id from broadcasts — bind strictly from the
+            # direct thread/start or thread/resume JSON-RPC response.
+            if method == "thread/started":
+                event_thread = (params.get("thread") or {}).get("id")
+                if not self.progress["thread_id"] or event_thread != self.progress["thread_id"]:
+                    return
+            event_thread = params.get("threadId") or params.get("conversationId") or (params.get("thread") or {}).get("id")
+            if self.progress["thread_id"] and event_thread and event_thread != self.progress["thread_id"]:
+                if "id" in message:
+                    self.client.reject(message["id"])
+                return
             self.last_activity = time.monotonic()
             if self.directory:
                 with (self.directory / "events.jsonl").open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(message, ensure_ascii=False) + "\n")
-            method = message["method"]
-            params = message.get("params") or {}
             if method == "thread/started":
-                self.identity(thread_id=params["thread"]["id"])
                 return
             if "id" in message:
                 self.server_request(method, params, message["id"])
@@ -483,85 +502,129 @@ class TurnJournal:
         self.pending_changed()
 
 
+def _wait_app_server_ready(config_path, timeout_sec=3.0):
+    deadline = time.monotonic() + max(0.2, float(timeout_sec))
+    path = state_path(config_path)
+    while time.monotonic() < deadline:
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if state.get("status") == "running" and state.get("ws_url"):
+                return True
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.15)
+    return False
+
+
 def run_app_server(*, prompt, cwd, model, reasoning_effort, sandbox, approval_policy,
                    codex_thread_id, gateway_url, config_path, timeout_sec, run_id, session_id, on_identity,
-                   idle_timeout_sec=300):
+                   idle_timeout_sec=300, ping_interval_sec=30.0):
     start = time.monotonic()
     timeout_val = float(timeout_sec) if timeout_sec is not None else 600.0
     strict_short = 0 < timeout_val < 60
     rpc_timeout = max(0.05, min(60.0, timeout_val)) if strict_short else 60.0
     max_wall = timeout_val if strict_short else (None if timeout_val <= 0 else max(timeout_val * 4.0, 3600.0))
     idle_limit = None if strict_short else (float(idle_timeout_sec) if idle_timeout_sec and idle_timeout_sec > 0 else None)
+    ping_interval = float(ping_interval_sec) if ping_interval_sec and ping_interval_sec > 0 else None
 
     journal = TurnJournal(run_id, session_id, codex_thread_id, sandbox, on_identity, model=model)
     policy = {"type": SANDBOX_TYPES[sandbox]}
     common = {"cwd": str(cwd), "model": model, "modelProvider": PROVIDER,
               "sandbox": sandbox, "approvalPolicy": approval_policy,
               "developerInstructions": DEVELOPER_INSTRUCTIONS}
-    with AppServerClient(config_path=config_path, gateway_url=gateway_url, on_event=journal.event) as client:
-        journal.client = client
-        client.initialize()
-        method, params = ("thread/resume", {"threadId": codex_thread_id, "excludeTurns": True}) if codex_thread_id else (
-            "thread/start", {"dynamicTools": [ASK_GEMINI], "allowProviderModelFallback": False})
-        # Codex stores dynamic tool specs with the thread. Resume has no dynamicTools field.
-        thread = client.request(method, {**common, **params}, timeout=rpc_timeout)
-        thread_id = thread["thread"]["id"]
-        with journal.lock:
-            journal.identity(thread_id=thread_id)
-            journal.accept_turn = True
-        if codex_thread_id and thread_id != codex_thread_id:
-            raise CodexExecError("Codex returned a different thread on resume.")
-        observed = {"cwd": thread.get("cwd"), "sandbox": next(
-            (mode for mode, kind in SANDBOX_TYPES.items() if kind == (thread.get("sandbox") or {}).get("type")), None)}
-        if (not observed["cwd"] or Path(observed["cwd"]).resolve() != Path(cwd).resolve()
-                or observed["sandbox"] not in SANDBOX_TYPES
-                or list(SANDBOX_TYPES).index(observed["sandbox"]) > list(SANDBOX_TYPES).index(sandbox)
-                or thread.get("modelProvider") != PROVIDER):
-            raise CodexExecError("Codex app-server did not confirm the requested workspace, sandbox and Magpie provider.")
-        try:
-            result = client.request("turn/start", {
-                "threadId": thread_id, "input": text_input(prompt), "effort": reasoning_effort,
-                "model": model, "cwd": str(cwd), "sandboxPolicy": policy, "approvalPolicy": approval_policy,
-            }, timeout=rpc_timeout)
+    active_thread_id = codex_thread_id or ""
+    observed = {}
+    paused_sec = 0.0
+
+    for attempt in range(2):
+        turn_prompt = prompt if attempt == 0 else (
+            "The shared Codex app-server WebSocket dropped mid-turn. Inspect the current workspace state and "
+            "complete the previous task cleanly without redoing already-finished edits."
+        )
+        reconnect_exc = None
+        with AppServerClient(config_path=config_path, gateway_url=gateway_url, on_event=journal.event) as client:
+            journal.client = client
+            client.initialize()
+            resume_id = active_thread_id if attempt > 0 else codex_thread_id
+            method, params = ("thread/resume", {"threadId": resume_id, "excludeTurns": True}) if resume_id else (
+                "thread/start", {"dynamicTools": [ASK_GEMINI], "allowProviderModelFallback": False})
+            # Codex stores dynamic tool specs with the thread. Resume has no dynamicTools field.
+            thread = client.request(method, {**common, **params}, timeout=rpc_timeout)
+            thread_id = thread["thread"]["id"]
+            if resume_id and thread_id != resume_id:
+                raise CodexExecError("Codex returned a different thread on resume.")
+            active_thread_id = thread_id
             with journal.lock:
-                journal.identity(turn_id=result["turn"]["id"])
-                journal.last_activity = time.monotonic()
-            paused_sec = 0.0
-            last_tick = time.monotonic()
-            while True:
+                journal.turn = None
+                journal.progress["turn_id"] = None
+                journal.identity(thread_id=thread_id)
+                journal.accept_turn = True
+            observed = {"cwd": thread.get("cwd"), "sandbox": next(
+                (mode for mode, kind in SANDBOX_TYPES.items() if kind == (thread.get("sandbox") or {}).get("type")), None)}
+            if (not observed["cwd"] or Path(observed["cwd"]).resolve() != Path(cwd).resolve()
+                    or observed["sandbox"] not in SANDBOX_TYPES
+                    or list(SANDBOX_TYPES).index(observed["sandbox"]) > list(SANDBOX_TYPES).index(sandbox)
+                    or thread.get("modelProvider") != PROVIDER):
+                raise CodexExecError("Codex app-server did not confirm the requested workspace, sandbox and Magpie provider.")
+            try:
+                result = client.request("turn/start", {
+                    "threadId": thread_id, "input": text_input(turn_prompt), "effort": reasoning_effort,
+                    "model": model, "cwd": str(cwd), "sandboxPolicy": policy, "approvalPolicy": approval_policy,
+                }, timeout=rpc_timeout)
                 with journal.lock:
-                    now = time.monotonic()
-                    dt = max(0.0, now - last_tick)
-                    last_tick = now
-                    if journal.turn:
-                        break
-                    if client.error:
-                        raise client.error
-                    waiting_tool = bool(journal.tools)
-                    if waiting_tool:
-                        paused_sec += dt
-                        journal.last_activity = now
-                    else:
-                        active_elapsed = (now - start) - paused_sec
-                        if max_wall is not None and active_elapsed >= max_wall:
-                            label = int(timeout_val) if strict_short else int(max_wall)
-                            raise CodexExecError(f"Codex turn timed out after {label}s.")
-                        if idle_limit is not None:
-                            effective_idle = max(idle_limit, 600.0) if journal.active_commands else idle_limit
-                            if now - journal.last_activity >= effective_idle:
-                                raise CodexExecError(f"Codex turn stalled (no activity for {int(effective_idle)}s).")
-                    journal.poll_reply()
-                    journal.save()
-                    journal.changed.clear()
-                    wait_cap = 0.1
-                    if strict_short and max_wall is not None:
-                        wait_cap = min(wait_cap, max(0.01, max_wall - ((now - start) - paused_sec)))
-                journal.changed.wait(wait_cap)
-        except CodexExecError as exc:
-            if ("timed out" in str(exc) or "stalled" in str(exc)) and journal.progress["turn_id"]:
-                with suppress(CodexExecError, OSError):
-                    client.request("turn/interrupt", {"threadId": thread_id, "turnId": journal.progress["turn_id"]}, timeout=4)
-            raise
+                    journal.identity(turn_id=result["turn"]["id"])
+                    journal.last_activity = time.monotonic()
+                last_tick = time.monotonic()
+                last_ping = last_tick
+                while True:
+                    with journal.lock:
+                        now = time.monotonic()
+                        dt = max(0.0, now - last_tick)
+                        last_tick = now
+                        if journal.turn:
+                            break
+                        if client.error:
+                            if attempt == 0 and active_thread_id and not strict_short:
+                                reconnect_exc = client.error
+                                break
+                            raise client.error
+                        waiting_tool = bool(journal.tools)
+                        if waiting_tool:
+                            paused_sec += dt
+                            journal.last_activity = now
+                        else:
+                            active_elapsed = (now - start) - paused_sec
+                            if max_wall is not None and active_elapsed >= max_wall:
+                                label = int(timeout_val) if strict_short else int(max_wall)
+                                raise CodexExecError(f"Codex turn timed out after {label}s.")
+                            if idle_limit is not None:
+                                effective_idle = max(idle_limit, 600.0) if journal.active_commands else idle_limit
+                                if now - journal.last_activity >= effective_idle:
+                                    raise CodexExecError(f"Codex turn stalled (no activity for {int(effective_idle)}s).")
+                        if ping_interval is not None and (now - last_ping) >= ping_interval:
+                            client.ping()
+                            last_ping = now
+                        journal.poll_reply()
+                        journal.save()
+                        journal.changed.clear()
+                        wait_cap = 0.1
+                        if strict_short and max_wall is not None:
+                            wait_cap = min(wait_cap, max(0.01, max_wall - ((now - start) - paused_sec)))
+                    journal.changed.wait(wait_cap)
+            except CodexExecError as exc:
+                if ("timed out" in str(exc) or "stalled" in str(exc)) and journal.progress["turn_id"]:
+                    with suppress(CodexExecError, OSError):
+                        client.request("turn/interrupt", {"threadId": thread_id, "turnId": journal.progress["turn_id"]}, timeout=4)
+                raise
+        if reconnect_exc is None:
+            break
+        with journal.lock:
+            journal.accept_turn = False
+            journal.progress["phase"] = "reconnecting"
+            journal.save(force=True)
+        if not _wait_app_server_ready(config_path, timeout_sec=3.0):
+            raise reconnect_exc
+
     if journal.turn["status"] == "interrupted":
         raise TurnInterrupted("Codex turn interrupted.")
     if journal.turn["status"] != "completed":
@@ -570,6 +633,6 @@ def run_app_server(*, prompt, cwd, model, reasoning_effort, sandbox, approval_po
     reply = "\n\n".join(value.strip() for value in journal.messages.values() if value.strip())
     if not reply:
         raise CodexExecError("Codex finished without an assistant message.")
-    return {"codex_thread_id": thread_id, "turn_id": journal.progress["turn_id"], "text": reply,
+    return {"codex_thread_id": active_thread_id, "turn_id": journal.progress["turn_id"], "text": reply,
             "observed_context": observed, "commands": list(journal.commands.values()),
             "usage": journal.usage, "elapsed_sec": time.monotonic() - start}

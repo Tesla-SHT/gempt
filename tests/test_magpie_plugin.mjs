@@ -10,6 +10,7 @@ import { homedir, tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { runInNewContext } from 'node:vm';
 import { buildMcpSnippet, findMagpieCli, listDispatchActivity, normalizeTitle, readActiveRuns, readState, setDefaultSandbox, setDefaultTier } from '../magpie_plugin/lib/backend.mjs';
 import { createAppServerManager } from '../magpie_plugin/lib/app-server-manager.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
@@ -33,7 +34,11 @@ test('short titles prefer the explicit value and clean historical goals', () => 
   ]) assert.equal(normalizeTitle(title, goal, cwd), expected);
 });
 
-test('npm pack dry run includes the Live bundle and excludes local state and dependencies', async () => {
+test('npm pack dry run includes the MIT license and Live bundle and excludes local state and dependencies', async () => {
+  const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf-8'));
+  assert.ok(manifest.files.includes('LICENSE'));
+  assert.equal(manifest.magpie.options.mcpTools, true);
+  assert.match(readFileSync(join(REPO_ROOT, 'LICENSE'), 'utf-8'), /^MIT License\r?\n\r?\nCopyright \(c\) 2026 GemPT Contributors/);
   const npmCli = process.env.npm_execpath || (process.platform === 'win32'
     ? join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js') : '');
   const { stdout } = await execFileAsync(npmCli ? process.execPath : 'npm', [
@@ -41,7 +46,7 @@ test('npm pack dry run includes the Live bundle and excludes local state and dep
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files }] = JSON.parse(stdout);
   const paths = files.map((file) => file.path);
-  for (const path of ['src/gempt/mcp_app_live.html', 'src/gempt/host_context.py', 'src/gempt/titles.py',
+  for (const path of ['LICENSE', 'src/gempt/mcp_app_live.html', 'src/gempt/host_context.py', 'src/gempt/titles.py',
     'plugin/hooks.json', 'plugin/work_split_hook.py', 'magpie_plugin/lib/backend.mjs']) {
     assert.ok(paths.includes(path), path);
   }
@@ -50,6 +55,31 @@ test('npm pack dry run includes the Live bundle and excludes local state and dep
   assert.deepEqual(paths.filter((path) => !roots.test(path) || localFiles.test(path)), []);
   assert.ok(!existsSync(join(REPO_ROOT, 'node_modules')));
   assert.ok(!existsSync(join(REPO_ROOT, 'mcp_app', 'node_modules')));
+});
+
+test('UI assets and API requests resolve relative to the direct and proxied page', async () => {
+  const html = readFileSync(join(REPO_ROOT, 'magpie_plugin', 'ui', 'index.html'), 'utf-8');
+  const script = readFileSync(join(REPO_ROOT, 'magpie_plugin', 'ui', 'app.js'), 'utf-8');
+  const style = html.match(/<link rel="stylesheet" href="([^"]+)"/)?.[1];
+  const app = html.match(/<script src="([^"]*app\.js)"/)?.[1];
+  assert.equal(style, './styles.css');
+  assert.equal(app, './app.js');
+  const fetchSource = script.match(/  async function apiFetch\([\s\S]+?\r?\n  }/)?.[0];
+  assert.ok(fetchSource);
+  for (const base of ['http://127.0.0.1:3498/', 'https://magpie.invalid/service/gempt/']) {
+    assert.equal(new URL(style, base).href, `${base}styles.css`);
+    assert.equal(new URL(app, base).href, `${base}app.js`);
+    const apiFetch = runInNewContext(`${fetchSource}\napiFetch`, {
+      apiKey: 'test-key',
+      fetch(path, options) {
+        assert.equal(path, './api/requests?q=a%2Fb');
+        assert.equal(new URL(path, base).href, `${base}api/requests?q=a%2Fb`);
+        assert.equal(options.headers['x-gempt-key'], 'test-key');
+        return { status: 200 };
+      },
+    });
+    assert.equal((await apiFetch('/api/requests?q=a%2Fb')).status, 200);
+  }
 });
 
 function findPythonBin() {
@@ -385,6 +415,28 @@ test('backend discovery uses overrides, PATH and installed MCP configuration', (
   }
 });
 
+test('installed MCP snippets redact unlisted env values without modifying the config file', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'gempt-mcp-redaction-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const runtime = join(root, 'runtime', 'gempt');
+  const path = join(root, 'mcp_config.json');
+  mkdirSync(runtime, { recursive: true });
+  writeFileSync(join(runtime, 'mcp_server.py'), '');
+  const safe = { PYTHONPATH: '/runtime', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8',
+    LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', GEMPT_CONFIG: '/config/gempt.json' };
+  const installed = JSON.stringify({ mcpServers: {
+    gempt: { command: 'python', env: { ...safe, OPENAI_API_KEY: 'test-secret-one' } },
+    other: { command: 'node', env: { CUSTOM_TOKEN: 'test-secret-two' } },
+  } });
+  writeFileSync(path, installed);
+  const snippet = buildMcpSnippet({ antigravityPluginDir: root });
+  assert.deepEqual(snippet.config.mcpServers.gempt.env, { ...safe, OPENAI_API_KEY: '[REDACTED]' });
+  assert.deepEqual(snippet.config.mcpServers.other.env, { CUSTOM_TOKEN: '[REDACTED]' });
+  assert.deepEqual(JSON.parse(snippet.json), snippet.config);
+  assert.doesNotMatch(snippet.json, /test-secret-/);
+  assert.equal(readFileSync(path, 'utf-8'), installed);
+});
+
 test('backend readState exposes multi-client state, native groups, MCP snippet, usage tail, and api_fallback', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'gempt-magpie-backend-'));
   const magpie = await startMockMagpie();
@@ -491,7 +543,10 @@ test('backend readState exposes multi-client state, native groups, MCP snippet, 
     assert.deepEqual(state.clients.external_clients, ['ZCode', 'Claude Code', 'Codex CLI']);
     assert.equal(state.tools.enabled, true);
     assert.equal(state.tools.exec_enabled, false);
-    assert.match(state.rules_snippet, /gempt_consult/);
+    assert.match(state.rules_snippet, /gpt_run/);
+    assert.match(state.rules_snippet, /gpt_ask/);
+    assert.match(state.rules_snippet, /gpt_ctl/);
+    assert.ok(state.rules_snippet.trim().split(/\r?\n/).length <= 8);
 
     assert.equal(state.native_groups.ready_count, 1);
     assert.equal(state.native_groups.complete, false);
@@ -590,12 +645,15 @@ test('page server supports native-groups, lossless api_fallback <-> subscription
     magpieConfigDir: magpieDir,
     antigravityPluginDir: join(dir, 'missing-agy'),
     magpieCliPath: mockCli,
+    mcpToolsEnabled: false,
   });
   const origin = `http://127.0.0.1:${svc.port}`;
 
   try {
-    const pingRes = await fetch(`${origin}/api/ping`);
+    const opaque = { Origin: 'null' };
+    const pingRes = await fetch(`${origin}/api/ping`, { headers: opaque });
     assert.equal(pingRes.status, 200);
+    assert.equal(pingRes.headers.get('access-control-allow-origin'), null);
 
     const badHost = await rawHttpGet({ port: svc.port, path: '/api/ping', headers: { Host: 'evil.example:3498' } });
     assert.equal(badHost.status, 403);
@@ -603,8 +661,14 @@ test('page server supports native-groups, lossless api_fallback <-> subscription
     assert.equal(badOrigin.status, 403);
     const badFetchMode = await fetch(`${origin}/`, { headers: { 'sec-fetch-mode': 'cors' } });
     assert.equal(badFetchMode.status, 403);
-    const unauthState = await fetch(`${origin}/api/state`);
-    assert.equal(unauthState.status, 401);
+    for (const path of ['/api/state', '/api/requests']) {
+      const unauth = await fetch(`${origin}${path}`, { headers: opaque });
+      assert.equal(unauth.status, 401);
+      assert.equal(unauth.headers.get('access-control-allow-origin'), null);
+    }
+    const preflight = await fetch(`${origin}/api/state`, { method: 'OPTIONS', headers: opaque });
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.headers.get('access-control-allow-origin'), 'null');
 
     const pageRes = await rawHttpGet({ port: svc.port, path: '/', headers: { 'sec-fetch-mode': 'navigate' } });
     assert.equal(pageRes.status, 200);
@@ -612,6 +676,16 @@ test('page server supports native-groups, lossless api_fallback <-> subscription
     assert.match(pageRes.text, /id="create-native-btn"/);
     assert.match(pageRes.text, /id="effort-control-group"/);
     const key = pageRes.text.match(/<meta name="gempt-key" content="([^"]+)">/)[1];
+    const disabledStateRes = await fetch(`${origin}/api/state`, { headers: { ...opaque, 'x-gempt-key': key } });
+    assert.equal(disabledStateRes.status, 200);
+    assert.equal(disabledStateRes.headers.get('access-control-allow-origin'), 'null');
+    assert.equal((await disabledStateRes.json()).tools.enabled, false);
+    writeFileSync(join(magpieDir, 'plugins.json'), JSON.stringify({
+      plugins: [{ spec: 'github:yizhang-dream/gempt', options: { mcpTools: false } }],
+    }));
+    const directState = await readState({ configPath: cfgPath, sessionsDir: join(dir, 'sessions'),
+      magpieConfigDir: magpieDir, antigravityPluginDir: join(dir, 'missing-agy') });
+    assert.equal(directState.tools.enabled, false);
 
     // Native groups idempotent creation
     const nativeRes = await fetch(`${origin}/api/native-groups`, {
@@ -1602,6 +1676,36 @@ test('native tool.consult fails over to openai/* backup on HTTP 429 when failove
   }
 });
 
+test('shared app-server manager reports missing Codex CLI without scheduling retries', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-no-codex-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const managerUrl = pathToFileURL(join(REPO_ROOT, 'magpie_plugin', 'lib', 'app-server-manager.mjs')).href;
+  await execFileAsync(process.execPath, ['--input-type=module', '-e', `
+    import assert from 'node:assert/strict';
+    import { setTimeout as sleep } from 'node:timers/promises';
+    import { createAppServerManager } from ${JSON.stringify(managerUrl)};
+    let scheduled = 0;
+    const backoffMs = [10];
+    Object.defineProperty(backoffMs, '0', { get() { scheduled++; return 10; } });
+    const manager = createAppServerManager({
+      configPath: ${JSON.stringify(join(dir, 'config.json'))},
+      env: { GEMPT_APP_SERVER_STATE: ${JSON.stringify(join(dir, 'state.json'))} },
+      backoffMs,
+      spawnProcess: () => assert.fail('Codex CLI should not be spawned'),
+    });
+    try {
+      const state = await manager.ensureRunning();
+      assert.equal(state.running, false);
+      assert.match(state.error, /未找到 Codex CLI.*gempt_consult/);
+      await sleep(50);
+      assert.deepEqual(manager.getStatus(), state);
+      assert.equal(scheduled, 0);
+    } finally {
+      await manager.stop();
+    }
+  `], { timeout: 10_000, windowsHide: true, env: { ...process.env, HOME: dir, USERPROFILE: dir } });
+});
+
 test('shared app-server manager launches once, authenticates, restarts and serves live run controls', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'gempt-app-server-'));
   const configDir = join(dir, 'cfg');
@@ -1807,8 +1911,10 @@ test('token-ratio closed-loop budget widens dispatch when GPT is below target an
     const snap = readTokenRatio({ brainDir, magpieConfigDir: magpieDir, cacheTtlMs: 0 });
     assert.equal(snap.gemini.total, 9_000_000);
     assert.equal(snap.gpt.total, 1_000_000);
-    assert.equal(snap.actual_gpt_share, 10.0);
-    assert.equal(snap.actual_gemini_share, 90.0);
+    // Attributable work = in + 5*out: gemini=1.4M, gpt=150k -> 9.7% (total share remains 10.0%)
+    assert.equal(snap.actual_gpt_share, 9.7);
+    assert.equal(snap.actual_gemini_share, 90.3);
+    assert.equal(snap.actual_gpt_total_share, 10.0);
 
     const b30 = evaluateBudget('gemini_first', snap);
     assert.equal(b30.adjustment, 'widened_strong');
@@ -1831,7 +1937,7 @@ test('token-ratio closed-loop budget widens dispatch when GPT is below target an
     try {
       const state = await readState({ configPath: cfgPath, sessionsDir: sessDir, magpieConfigDir: magpieDir, probeTimeoutMs: 50 });
       assert.equal(state.token_ratio.target_gpt_share, 30);
-      assert.equal(state.token_ratio.actual_gpt_share, 10.0);
+      assert.equal(state.token_ratio.actual_gpt_share, 9.7);
       assert.equal(state.token_ratio.adjustment, 'widened_strong');
       const resolved = resolveBudget('gemini_first', { configPath: cfgPath, magpieConfigDir: magpieDir, cacheTtlMs: 0 });
       assert.deepEqual(resolved.effective_kinds, ['specialist', 'engineering', 'design']);
@@ -1839,6 +1945,17 @@ test('token-ratio closed-loop budget widens dispatch when GPT is below target an
       if (prevBrain === undefined) delete process.env.GEMPT_AGY_BRAIN_DIR;
       else process.env.GEMPT_AGY_BRAIN_DIR = prevBrain;
     }
+
+    // Verify mcpTools: false disables duplicate Magpie gempt__* tool registration (in isolated subprocess)
+    const pluginUrl = pathToFileURL(join(REPO_ROOT, 'magpie_plugin', 'index.mjs')).href;
+    const { stdout: disabledJson } = await execFileAsync(process.execPath, [
+      '--input-type=module', '-e',
+      `import { GemptPlugin } from ${JSON.stringify(pluginUrl)};
+       const out = await GemptPlugin({}, { port: 0, mcpTools: false });
+       console.log(JSON.stringify(out));
+       process.exit(0);`,
+    ], { timeout: 10_000, windowsHide: true });
+    assert.deepEqual(JSON.parse(disabledJson.trim()), {});
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -23,7 +23,7 @@ def read_host_context(config=None):
     return {}
 
 
-def update_host_context(conversation_id, workspace_paths, *, parent_id=None):
+def update_host_context(conversation_id, workspace_paths, *, parent_id=None, gemini_family=None):
     """Record the active main conversation or register a child from its dispatch."""
     if not isinstance(conversation_id, str) or not conversation_id.strip():
         return
@@ -53,6 +53,8 @@ def update_host_context(conversation_id, workspace_paths, *, parent_id=None):
                     data.update(conversation_id=conversation_id, workspace_paths=workspace)
                 else:
                     return
+                if isinstance(gemini_family, str) and gemini_family.strip():
+                    data["gemini_family"] = gemini_family.strip()
                 data.update(updated_at=time.time(), subagent_conversations=sorted(children))
                 atomic_json(path, data)
                 return

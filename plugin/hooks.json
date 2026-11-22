@@ -1,12 +1,18 @@
 {
   "gempt-work-split": {
-    "PreToolUse": [
-      { "matcher": "call_mcp_tool|invoke_subagent", "hooks": [
-        { "type": "command", "command": "python -I ./work_split_hook.py", "timeout": 5 }
-      ] }
+    "SessionStart": [
+      { "type": "command", "command": "python -I ./work_split_hook.py", "timeout": 5 }
     ],
     "PreInvocation": [
       { "type": "command", "command": "python -I ./work_split_hook.py", "timeout": 5 }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "read_file|view_file|view_file_outline|view_code_item|grep_search|find_by_name|list_dir|edit_file|write_file|run_command|call_mcp_tool|invoke_subagent",
+        "hooks": [
+          { "type": "command", "command": "python -I ./work_split_hook.py", "timeout": 5 }
+        ]
+      }
     ]
   }
 }

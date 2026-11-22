@@ -12,12 +12,17 @@ const REPO_ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const WORKLOAD = JSON.parse(readFileSync(join(REPO_ROOT, 'src', 'gempt', 'workload.json'), 'utf8'));
 
 export const KIND_LADDER = Object.freeze(['specialist', 'engineering', 'design', 'routine']);
-export const MIN_SAMPLE_TOKENS = 200_000;
+export const MIN_SAMPLE_TOKENS = 20_000;
 export const UNDER_MARGIN = 6.0;
 export const STRONG_UNDER_MARGIN = 18.0;
 export const OVER_MARGIN = 8.0;
+export const OUTPUT_WEIGHT = 5;
 const MAX_USAGE_TAIL_BYTES = 16 * 1024 * 1024;
 const DEFAULT_CACHE_TTL_MS = 15_000;
+
+const SWARM_COORD_TOOLS = new Set(['read_board', 'swarm_wait', 'post_message', 'swarm', 'schedule', 'manage_task']);
+const VISION_TOOLS = new Set(['generate_image', 'browser_subagent']);
+const MEDIA_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.ico', '.svg', '.mp4', '.mov', '.webm', '.wav', '.mp3', '.pdf']);
 
 const _memCache = new Map();
 
@@ -59,7 +64,7 @@ export function resolveMagpieDir({ magpieConfigDir, configPath, env = process.en
 }
 
 function emptyBucket() {
-  return { in: 0, out: 0, cache_read: 0, fresh: 0, total: 0 };
+  return { in: 0, out: 0, cache_read: 0, fresh: 0, work: 0, total: 0 };
 }
 
 function addTokens(bucket, inp, out, cacheRead) {
@@ -70,7 +75,27 @@ function addTokens(bucket, inp, out, cacheRead) {
   bucket.out += o;
   bucket.cache_read += c;
   bucket.fresh += i + o;
+  bucket.work += i + OUTPUT_WEIGHT * o;
   bucket.total += i + o + c;
+}
+
+function mergeBucket(dst, src) {
+  for (const key of Object.keys(dst)) {
+    dst[key] += Number(src[key] || 0);
+  }
+}
+
+function classifyToolCall(tc) {
+  const name = String(tc?.name || tc?.tool_name || '').trim();
+  if (!name) return 'other';
+  if (SWARM_COORD_TOOLS.has(name)) return 'swarm';
+  if (VISION_TOOLS.has(name)) return 'vision';
+  if (name === 'read_file' || name === 'view_file') {
+    const args = tc?.args || tc?.arguments || {};
+    const raw = String(args.Path || args.AbsolutePath || '').trim().replace(/^"|"$/g, '').toLowerCase();
+    if (raw && MEDIA_EXTS.has(extname(raw.replace(/\\/g, '/')))) return 'vision';
+  }
+  return 'work';
 }
 
 function classifyModel(model, provider = '') {
@@ -96,8 +121,13 @@ function scanTranscriptFile(filePath, cutoffMs, gemini, gpt) {
   try {
     text = readFileSync(filePath, 'utf-8');
   } catch {
-    return;
+    return true;
   }
+  const fileGem = emptyBucket();
+  const fileGpt = emptyBucket();
+  let workCalls = 0;
+  let swarmCalls = 0;
+  let visionCalls = 0;
   for (const line of text.split(/\r?\n/)) {
     if (!line.includes('PLANNER_RESPONSE')) continue;
     let obj;
@@ -109,21 +139,34 @@ function scanTranscriptFile(filePath, cutoffMs, gemini, gpt) {
     if (!obj || typeof obj !== 'object' || obj.type !== 'PLANNER_RESPONSE') continue;
     const ts = parseTimestampMs(obj.created_at);
     if (ts !== null && ts < cutoffMs) continue;
+    for (const tc of (Array.isArray(obj.tool_calls) ? obj.tool_calls : [])) {
+      const cat = classifyToolCall(tc);
+      if (cat === 'swarm') swarmCalls += 1;
+      else if (cat === 'vision') visionCalls += 1;
+      else if (cat === 'work') workCalls += 1;
+    }
     const cls = classifyModel(obj.model || '');
-    const bucket = cls === 'gpt' ? gpt : gemini;
+    const bucket = cls === 'gpt' ? fileGpt : fileGem;
     addTokens(bucket, obj.input_tokens, obj.output_tokens, obj.cache_read_tokens);
   }
+  if (workCalls === 0 && (swarmCalls > 0 || visionCalls > 0)) {
+    return false;
+  }
+  mergeBucket(gemini, fileGem);
+  mergeBucket(gpt, fileGpt);
+  return true;
 }
 
 function scanAgyBrain(brainDir, cutoffMs, gemini, gpt) {
-  if (!brainDir || !existsSync(brainDir)) return 0;
+  if (!brainDir || !existsSync(brainDir)) return { filesScanned: 0, excludedSessions: 0 };
   let entries;
   try {
     entries = readdirSync(brainDir, { withFileTypes: true });
   } catch {
-    return 0;
+    return { filesScanned: 0, excludedSessions: 0 };
   }
   let filesScanned = 0;
+  let excludedSessions = 0;
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const transcript = join(brainDir, entry.name, '.system_generated', 'logs', 'transcript.jsonl');
@@ -135,9 +178,11 @@ function scanAgyBrain(brainDir, cutoffMs, gemini, gpt) {
     }
     if (st.mtimeMs < cutoffMs) continue;
     filesScanned += 1;
-    scanTranscriptFile(transcript, cutoffMs, gemini, gpt);
+    if (!scanTranscriptFile(transcript, cutoffMs, gemini, gpt)) {
+      excludedSessions += 1;
+    }
   }
-  return filesScanned;
+  return { filesScanned, excludedSessions };
 }
 
 function scanMagpieUsage(magpieDir, cutoffMs, gemini, gpt, other) {
@@ -235,26 +280,33 @@ export function readTokenRatio({
   const gpt = emptyBucket();
   const other = emptyBucket();
 
-  const agyFiles = scanAgyBrain(resolvedBrain, cutoffMs, gemini, gpt);
+  const { filesScanned: agyFiles, excludedSessions } = scanAgyBrain(resolvedBrain, cutoffMs, gemini, gpt);
   const magpieRecords = scanMagpieUsage(resolvedMagpie, cutoffMs, gemini, gpt, other);
 
-  const combinedTotal = gemini.total + gpt.total;
+  const combinedWork = gemini.work + gpt.work;
   const combinedFresh = gemini.fresh + gpt.fresh;
-  const actualGptShare = combinedTotal > 0 ? Math.round((gpt.total / combinedTotal) * 1000) / 10 : null;
-  const actualGeminiShare = actualGptShare !== null ? Math.round((100 - actualGptShare) * 10) / 10 : null;
+  const combinedTotal = gemini.total + gpt.total;
+  const actualGptWorkShare = combinedWork > 0 ? Math.round((gpt.work / combinedWork) * 1000) / 10 : null;
   const actualGptFreshShare = combinedFresh > 0 ? Math.round((gpt.fresh / combinedFresh) * 1000) / 10 : null;
+  const actualGptTotalShare = combinedTotal > 0 ? Math.round((gpt.total / combinedTotal) * 1000) / 10 : null;
+  const actualGptShare = actualGptWorkShare;
+  const actualGeminiShare = actualGptShare !== null ? Math.round((100 - actualGptShare) * 10) / 10 : null;
 
   const snapshot = {
     window_hours: windowHours,
+    metric: 'attributable_work_in_plus_5out',
     gemini,
     gpt,
     other,
-    combined_total: combinedTotal,
+    combined_work: combinedWork,
     combined_fresh: combinedFresh,
+    combined_total: combinedTotal,
     actual_gpt_share: actualGptShare,
     actual_gemini_share: actualGeminiShare,
+    actual_gpt_work_share: actualGptWorkShare,
     actual_gpt_fresh_share: actualGptFreshShare,
-    sources: { agy_files: agyFiles, magpie_records: magpieRecords },
+    actual_gpt_total_share: actualGptTotalShare,
+    sources: { agy_files: agyFiles, excluded_sessions: excludedSessions, magpie_records: magpieRecords },
     computed_at: new Date(now).toISOString(),
   };
 
@@ -271,10 +323,14 @@ export function evaluateBudget(profile, snapshot, { enabled = true } = {}) {
   const snap = snapshot || {};
   const gemini = snap.gemini || emptyBucket();
   const gpt = snap.gpt || emptyBucket();
-  const combinedTotal = Number(snap.combined_total || (gemini.total + gpt.total));
+  const combinedWork = Number(snap.combined_work ?? (gemini.work + gpt.work));
+  const combinedFresh = Number(snap.combined_fresh ?? (gemini.fresh + gpt.fresh));
+  const combinedTotal = Number(snap.combined_total ?? (gemini.total + gpt.total));
+  const sampleTokens = combinedWork > 0 ? combinedWork : combinedTotal;
   const actual = typeof snap.actual_gpt_share === 'number' ? snap.actual_gpt_share : null;
   const actualGem = typeof snap.actual_gemini_share === 'number' ? snap.actual_gemini_share : null;
   const actualFresh = typeof snap.actual_gpt_fresh_share === 'number' ? snap.actual_gpt_fresh_share : null;
+  const actualTotal = typeof snap.actual_gpt_total_share === 'number' ? snap.actual_gpt_total_share : null;
   const delta = actual !== null ? Math.round((actual - target) * 10) / 10 : null;
 
   let effectiveKinds = [...baseKinds];
@@ -285,7 +341,7 @@ export function evaluateBudget(profile, snapshot, { enabled = true } = {}) {
     adjustment = 'off';
   } else if (!enabled) {
     adjustment = 'disabled';
-  } else if (combinedTotal < MIN_SAMPLE_TOKENS || actual === null) {
+  } else if (sampleTokens < MIN_SAMPLE_TOKENS || actual === null) {
     adjustment = 'warming_up';
   } else if (target >= 95) {
     effectiveKinds = [...KIND_LADDER];
@@ -314,20 +370,27 @@ export function evaluateBudget(profile, snapshot, { enabled = true } = {}) {
 
   return {
     enabled: Boolean(enabled),
+    metric: snap.metric || 'attributable_work_in_plus_5out',
     profile,
     target_gpt_share: target,
     actual_gpt_share: actual,
     actual_gemini_share: actualGem,
     actual_gpt_fresh_share: actualFresh,
+    actual_gpt_total_share: actualTotal,
     delta,
     adjustment,
     base_kinds: baseKinds,
     effective_kinds: effectiveKinds,
+    gemini_work_tokens: Number(gemini.work || 0),
+    gpt_work_tokens: Number(gpt.work || 0),
     gemini_tokens: Number(gemini.total || 0),
     gpt_tokens: Number(gpt.total || 0),
     gemini_fresh_tokens: Number(gemini.fresh || 0),
     gpt_fresh_tokens: Number(gpt.fresh || 0),
+    combined_work: combinedWork,
+    combined_fresh: combinedFresh,
     combined_total: combinedTotal,
+    excluded_sessions: Number(snap.sources?.excluded_sessions || 0),
     window_hours: snap.window_hours || 24,
   };
 }

@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -131,7 +133,8 @@ def _validate_staged(staged: Path) -> None:
                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     env = os.environ.copy()
     env.pop("GEMPT_APP_HTML", None)
-    requests = "".join(json.dumps(request) + "\n" for request in (initialize, read_app))
+    read_tools = {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}
+    requests = "".join(json.dumps(request) + "\n" for request in (initialize, read_app, read_tools))
     server = subprocess.run([mcp["command"], *mcp["args"]], input=requests, env=env, **options)
     if server.returncode or not server.stdout:
         raise ValueError(f"Staged Antigravity MCP server failed to start: {server.stderr.strip()}")
@@ -141,15 +144,125 @@ def _validate_staged(staged: Path) -> None:
     contents = responses.get(2, {}).get("result", {}).get("contents", [])
     if not contents or contents[0].get("mimeType") != APP_RESOURCE["mimeType"] or not contents[0].get("text"):
         raise ValueError("Staged Antigravity MCP server could not read the bundled GemPT Live app.")
+    tool_names = [t.get("name") for t in responses.get(3, {}).get("result", {}).get("tools", [])]
+    for required_tool in ("gpt_run", "gpt_ask", "gpt_ctl"):
+        if required_tool not in tool_names:
+            raise ValueError(f"Staged Antigravity MCP server missing required tool: {required_tool}")
 
     hook = subprocess.run(
         [mcp["command"], "-I", "-X", "utf8", "-B", str(staged / "work_split_hook.py")],
-        input="{}", env={**os.environ, "GEMPT_CONFIG": str(staged / "no-local-config.json")}, **options,
+        input=json.dumps({"hookEventName": "SessionStart", "modelName": "gemini-4-neon-high"}),
+        env={**os.environ, "GEMPT_CONFIG": str(staged / "no-local-config.json")}, **options,
     )
     if hook.returncode or not hook.stdout:
         raise ValueError(f"Staged Antigravity hook failed to start: {hook.stderr.strip()}")
-    if not json.loads(hook.stdout).get("injectSteps"):
-        raise ValueError("Staged Antigravity hook did not return a work-split reminder.")
+    parsed_hook = json.loads(hook.stdout)
+    steps = parsed_hook.get("injectSteps") or []
+    if not steps or "systemMessage" not in steps[0]:
+        raise ValueError("Staged Antigravity SessionStart hook did not return a systemMessage.")
+
+
+def install_wait_shim(target: Path, python_exe: str, bin_dir: Path | None = None) -> list[str]:
+    """Install short `gempt-wait` (and `gempt-wait.cmd` on Windows) shims into ~/bin."""
+    dest_dir = bin_dir or (Path.home() / "bin")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    runtime_root = str((target / "runtime").resolve())
+    helper_py = dest_dir / "gempt-wait.py"
+    helper_code = (
+        "#!/usr/bin/env python3\n"
+        '"""Short zero-poll waiter shim for GemPT v2 (`gempt-wait <run_id>` or `gempt-wait [--all] id1,id2`)."""\n'
+        "import sys\n"
+        f"sys.path.insert(0, {runtime_root!r})\n"
+        "from gempt.cli import main\n"
+        "raw = [a for a in sys.argv[1:] if a != '--wait']\n"
+        "wait_all = '--all' in raw or '--wait-all' in raw\n"
+        "ids = [a for a in raw if not a.startswith('-')]\n"
+        "if not ids:\n"
+        "    sys.stderr.write('usage: gempt-wait [--all] <run_id[,run_id2,...]>\\n')\n"
+        "    raise SystemExit(2)\n"
+        "joined = ','.join(part.strip() for item in ids for part in item.split(',') if part.strip())\n"
+        "if ',' in joined:\n"
+        "    cli_args = ['status', '--run-ids', joined, '--wait', *(['--wait-all'] if wait_all else [])]\n"
+        "else:\n"
+        "    cli_args = ['status', '--run-id', joined, '--wait']\n"
+        "raise SystemExit(main(cli_args))\n"
+    )
+    helper_py.write_text(helper_code, encoding="utf-8")
+    written = [str(helper_py)]
+
+    posix_shim = dest_dir / "gempt-wait"
+    posix_shim.write_text(
+        f'#!/usr/bin/env sh\nexec "{python_exe}" -I -X utf8 -B "{helper_py}" "$@"\n',
+        encoding="utf-8",
+    )
+    try:
+        os.chmod(posix_shim, 0o755)
+    except OSError:
+        pass
+    written.append(str(posix_shim))
+
+    if os.name == "nt":
+        cmd_shim = dest_dir / "gempt-wait.cmd"
+        cmd_shim.write_text(
+            f'@echo off\r\n"{python_exe}" -I -X utf8 -B "{helper_py}" %*\r\n',
+            encoding="utf-8",
+        )
+        written.append(str(cmd_shim))
+    return written
+
+
+def refresh_mcp_server(server_name: str = "gempt_gempt") -> dict[str, Any]:
+    """Best-effort Antigravity MCP server reload via local LanguageServerService."""
+    csrf = os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "").strip()
+    addr = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "").strip() or "localhost:5387"
+    if not csrf:
+        return {"refreshed": False, "reason": "ANTIGRAVITY_CSRF_TOKEN not present in environment"}
+    url = f"http://{addr}/exa.language_server_pb.LanguageServerService/RefreshMcpServers"
+    data = json.dumps({"serverName": server_name}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json", "x-codeium-csrf-token": csrf},
+        method="POST",
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=3) as resp:
+            return {"refreshed": 200 <= resp.status < 300, "status": resp.status, "url": url}
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        return {"refreshed": False, "reason": str(exc), "url": url}
+
+
+def _sync_in_place(staged: Path, target: Path) -> None:
+    """Fallback when Windows denies renaming an active plugin directory (WinError 5/32)."""
+    target.mkdir(parents=True, exist_ok=True)
+    expected_files: set[Path] = set()
+    for src in staged.rglob("*"):
+        rel = src.relative_to(staged)
+        dst = target / rel
+        if src.is_dir():
+            dst.mkdir(parents=True, exist_ok=True)
+        elif src.is_file():
+            expected_files.add(rel)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_name(f".{dst.name}.{os.getpid()}.tmp")
+            tmp.write_bytes(src.read_bytes())
+            tmp.replace(dst)
+    # Remove stale files/dirs (like legacy sidecars/) without failing on locked caches.
+    for existing in sorted(target.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        rel = existing.relative_to(target)
+        if "__pycache__" in rel.parts:
+            continue
+        if existing.is_file() and rel not in expected_files:
+            try:
+                existing.unlink()
+            except OSError:
+                pass
+        elif existing.is_dir() and not (staged / rel).is_dir():
+            try:
+                existing.rmdir()
+            except OSError:
+                pass
 
 
 def install_agy(target: Path, *, source: Path | None = None, force: bool = False) -> dict[str, Any]:
@@ -174,8 +287,15 @@ def install_agy(target: Path, *, source: Path | None = None, force: bool = False
 
             try:
                 if target.exists():
-                    target.replace(backup)
-                staged.replace(target)
+                    try:
+                        target.replace(backup)
+                        staged.replace(target)
+                    except PermissionError as exc:
+                        if os.name != "nt" or getattr(exc, "winerror", None) not in {5, 32} or backup.exists():
+                            raise
+                        _sync_in_place(staged, target)
+                else:
+                    staged.replace(target)
             except BaseException:
                 if backup.exists() and not target.exists():
                     try:
@@ -184,6 +304,12 @@ def install_agy(target: Path, *, source: Path | None = None, force: bool = False
                         keep_backup = True
                         raise OSError(f"Could not restore {target}. Previous installation saved at {backup}.") from exc
                 raise
+            if target.resolve() == DEFAULT_AGY_TARGET.resolve():
+                try:
+                    install_wait_shim(target, mcp_config["mcpServers"]["gempt"]["command"])
+                except OSError:
+                    pass
+                mcp_config = {**mcp_config, "_refresh": refresh_mcp_server("gempt_gempt")}
             return mcp_config
         finally:
             if not keep_backup:

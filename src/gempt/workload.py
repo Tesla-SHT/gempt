@@ -98,7 +98,7 @@ def dispatch_task(args, config_path, *, wait_sec: float | None = None):
             return {**result, "action": action, **reply,
                     "wait_command": build_wait_command(run_id),
                     "text": (f"Run {run_id} is waiting for a reply to ask_gemini." if state == "waiting_gemini"
-                             else f"Run {run_id} is {state}. Run wait_command in background (zero-poll) or query gempt_status with run_id='{run_id}'.")}
+                             else f"Run {run_id} is {state}. Execute wait_command via run_command(WaitMsBeforeAsync=500) for zero-poll wakeup.")}
     fields = ("model", "served_model", "session_id", "run_id", "worktree_path", "source_cwd", "verification", "usage", "warnings", "text")
     receipt = {key: reply[key] for key in fields if key in reply}
     if "text" in receipt:

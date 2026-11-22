@@ -430,7 +430,7 @@ def _sync_magpie_groups(
         raise MagpieRequestError("Magpie CLI path not configured or discovered; cannot sync routing groups.")
 
     policy = config.get("routing_policy") or {}
-    strategy = str(policy.get("magpie_group_strategy") or "order")
+    strategy = str(policy.get("magpie_group_strategy") or "pace")
     tiers = config.get("tiers") or {}
     utility = config.get("utility") or {}
     utility_model = str(utility.get("model") or "").strip()

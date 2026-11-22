@@ -1417,6 +1417,8 @@ function resolvePythonBin() {
   return findExecutable(dirs.flatMap((dir) => names.map((name) => join(dir, name)))) || names[0];
 }
 
+const SAFE_MCP_ENV_KEYS = new Set(['PYTHONPATH', 'PYTHONUTF8', 'PYTHONIOENCODING', 'LANG', 'LC_ALL', 'GEMPT_CONFIG']);
+
 export function buildMcpSnippet({ antigravityPluginDir, repoRoot = REPO_ROOT } = {}) {
   const agyDir = antigravityPluginDir
     ? resolve(expandUser(antigravityPluginDir))
@@ -1427,7 +1429,13 @@ export function buildMcpSnippet({ antigravityPluginDir, repoRoot = REPO_ROOT } =
     : resolve(join(repoRoot, 'src'));
   const installedConfig = targetRoot === installedRuntime ? readJsonSafe(join(agyDir, 'mcp_config.json')) : null;
   if (installedConfig?.mcpServers?.gempt?.command) {
-    return { target_root: targetRoot, config: installedConfig, json: JSON.stringify(installedConfig, null, 2) };
+    const json = JSON.stringify(installedConfig, (key, value) => {
+      if (key !== 'env' || !value || typeof value !== 'object') return value;
+      return Object.fromEntries(Object.entries(value).map(([name, entry]) => [
+        name, SAFE_MCP_ENV_KEYS.has(name) ? entry : '[REDACTED]',
+      ]));
+    }, 2);
+    return { target_root: targetRoot, config: JSON.parse(json), json };
   }
 
   const pythonBin = resolvePythonBin();
@@ -1515,12 +1523,19 @@ export function readExternalGroupUsage(magpieConfigDir, limit = 6) {
   return out;
 }
 
-function readPluginExecOption(magpieConfigDir) {
-  if (String(process.env.GEMPT_MAGPIE_TOOLS_EXEC || '') === '1') return true;
+function readPluginOptions(magpieConfigDir) {
   const plugins = readJsonSafe(join(magpieConfigDir, 'plugins.json'));
   const list = Array.isArray(plugins?.plugins) ? plugins.plugins : [];
   const entry = list.find((item) => String(item?.spec || '').toLowerCase().includes('gempt'));
-  return entry?.options?.exec === true;
+  return entry?.options;
+}
+
+function readPluginExecOption(magpieConfigDir) {
+  return String(process.env.GEMPT_MAGPIE_TOOLS_EXEC || '') === '1' || readPluginOptions(magpieConfigDir)?.exec === true;
+}
+
+function readPluginMcpToolsOption(magpieConfigDir) {
+  return String(process.env.GEMPT_MAGPIE_DISABLE_TOOLS || '') !== '1' && readPluginOptions(magpieConfigDir)?.mcpTools !== false;
 }
 
 function hasApiSnapshot(cfg) {
@@ -1529,7 +1544,7 @@ function hasApiSnapshot(cfg) {
   return TIER_ORDER.some((t) => snap[t] && typeof snap[t] === 'object' && typeof snap[t].consult_model === 'string' && snap[t].consult_model.trim());
 }
 
-export async function readState({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, execEnabled, appServer, probeTimeoutMs = 2000 } = {}) {
+export async function readState({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, execEnabled, mcpToolsEnabled, appServer, probeTimeoutMs = 2000 } = {}) {
   const resolvedConfigPath = resolveConfigPath(configPath);
   const resolvedSessionsDir = resolveSessionsDir(sessionsDir);
   const resolvedMagpieDir = resolveMagpieConfigDir(magpieConfigDir);
@@ -1643,7 +1658,7 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     mcp_snippet: mcpSnippet,
     rules_snippet: buildRulesSnippet(),
     tools: {
-      enabled: true,
+      enabled: typeof mcpToolsEnabled === 'boolean' ? mcpToolsEnabled : readPluginMcpToolsOption(resolvedMagpieDir),
       exec_enabled: typeof execEnabled === 'boolean' ? execEnabled : readPluginExecOption(resolvedMagpieDir),
       endpoint: `${baseUrl}/mcp/magpie/tools/gempt`,
     },
@@ -1941,7 +1956,7 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
       default_tier: defaultTier,
       failover_mode: 'subscription_only',
       auto_effort: Boolean(existingPolicy.auto_effort),
-      magpie_group_strategy: String(existingPolicy.magpie_group_strategy || 'order'),
+      magpie_group_strategy: String(existingPolicy.magpie_group_strategy || 'pace'),
       excluded_models: excludedList,
     },
     tiers: plan.tiers,

@@ -24,6 +24,7 @@ function resolveHostMagpieDir(dir) {
 export const GemptPlugin = async (ctx = {}, options = {}) => {
   const magpieConfigDir = resolveHostMagpieDir(ctx?.directory);
   const execEnabled = isExecEnabled(options, process.env);
+  const mcpToolsEnabled = !(options?.mcpTools === false || String(process.env.GEMPT_MAGPIE_DISABLE_TOOLS || '') === '1');
 
   if (!servicePromise) {
     const value = Number(options?.port);
@@ -32,10 +33,16 @@ export const GemptPlugin = async (ctx = {}, options = {}) => {
       port,
       magpieConfigDir,
       execEnabled,
+      mcpToolsEnabled,
       manageAppServer: options.manageAppServer ?? port !== 0,
-    }).catch(() => {
+    }).catch((err) => {
+      console.warn(`[gempt-magpie-plugin] Service startup failed: ${err?.message || err}`);
       servicePromise = null;
     });
+  }
+
+  if (!mcpToolsEnabled) {
+    return {};
   }
 
   return {

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -175,8 +176,20 @@ def _format_cli_command(cli_args: list[str]) -> str:
     return "& " + " ".join(_ps_quote(a) for a in argv)
 
 
+def _wait_shim_available() -> bool:
+    if os.environ.get("GEMPT_DISABLE_WAIT_SHIM", "").strip() in {"1", "true", "yes"}:
+        return False
+    if shutil.which("gempt-wait"):
+        return True
+    home_bin = Path.home() / "bin"
+    candidates = [home_bin / "gempt-wait.cmd", home_bin / "gempt-wait"] if os.name == "nt" else [home_bin / "gempt-wait"]
+    return any(p.is_file() for p in candidates)
+
+
 def build_wait_command(run_id: str) -> str:
     run_directory(run_id)
+    if _wait_shim_available():
+        return f"gempt-wait {run_id}"
     return _format_cli_command(["status", "--run-id", run_id, "--wait"])
 
 
@@ -186,6 +199,9 @@ def build_wait_many_command(run_ids: list[str], *, wait_any: bool = True) -> str
         raise ValueError("At least one run_id is required.")
     for rid in ids:
         run_directory(rid)
+    if _wait_shim_available():
+        flag = "" if wait_any else "--all "
+        return f"gempt-wait {flag}{','.join(ids)}"
     args = ["status", "--run-ids", ",".join(ids), "--wait"]
     if not wait_any:
         args.append("--wait-all")
@@ -416,23 +432,45 @@ def dispatch_exec(*, background=False, run_id="", wait_sec: float | None = None,
         bootstrap = ("import runpy,sys;sys.path.insert(0,sys.argv.pop(1));"
                      "runpy.run_module('gempt.runs',run_name='__main__')")
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        new_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
         use_launcher = os.name == "nt"
-        if use_launcher:
-            # A host can close its Windows job when the MCP connection ends.
-            # Request independent lifetime, retaining the caller's security token.
-            flags |= subprocess.CREATE_BREAKAWAY_FROM_JOB
         argv = [sys.executable, "-I", "-c", bootstrap, runtime, run_id]
         if use_launcher:
             # Antigravity also reaps descendants of a live MCP process. The
             # launcher relinquishes parentage before we acknowledge submission.
-            launcher = ("import subprocess,sys;"
-                        "subprocess.Popen(sys.argv[1:],stdin=subprocess.DEVNULL,"
-                        "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
-                        "creationflags=subprocess.CREATE_NO_WINDOW)")
+            launcher = (
+                "import subprocess,sys;"
+                "fl=getattr(subprocess,'CREATE_NO_WINDOW',0)|getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0);"
+                "subprocess.Popen(sys.argv[1:],stdin=subprocess.DEVNULL,"
+                "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
+                "creationflags=fl)"
+            )
             argv = [sys.executable, "-I", "-c", launcher, *argv]
-        proc = subprocess.Popen(argv,
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                env=env, creationflags=flags, start_new_session=os.name != "nt")
+        if use_launcher and breakaway:
+            # Prefer breakaway from host Windows Job Object, but gracefully fall back
+            # when the host Job Object denies JOB_OBJECT_LIMIT_BREAKAWAY_OK (WinError 5).
+            try:
+                proc = subprocess.Popen(
+                    argv,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    env=env, creationflags=flags | breakaway, start_new_session=False,
+                )
+            except PermissionError as exc:
+                if getattr(exc, "winerror", None) != 5 and exc.errno != 13:
+                    raise
+                proc = subprocess.Popen(
+                    argv,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    env=env, creationflags=flags | new_group, start_new_session=False,
+                )
+        else:
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env, creationflags=flags | new_group if use_launcher else flags,
+                start_new_session=not use_launcher,
+            )
         if use_launcher:
             if proc.wait() != 0:
                 raise RuntimeError("Could not launch independent background worker.")
