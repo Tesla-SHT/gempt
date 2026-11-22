@@ -748,7 +748,9 @@ export function createExecutionTools({
           return { ...result, action: 'board', text: 'Keep this role on the board. Give each task one owner and summarize the results.' };
         }
         if (kind === 'visual' && access === 'change') throw new Error('Separate visual observation from implementation.');
-        const budget = resolveBudget(profile, { policy, configPath: path, magpieConfigDir: resolvedMagpieDir, env });
+        const budget = resolveBudget(profile, {
+          policy, configPath: path, sessionsDir: resolvedSessionsDir, magpieConfigDir: resolvedMagpieDir, env,
+        });
         const effectiveKinds = budget.effective_kinds;
         result.budget = {
           target_gpt_share: budget.target_gpt_share,

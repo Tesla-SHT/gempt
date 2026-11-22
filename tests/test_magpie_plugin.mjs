@@ -47,7 +47,7 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files, version }] = JSON.parse(stdout);
-  assert.equal(version, '0.2.0');
+  assert.equal(version, '0.2.1');
   const paths = files.map((file) => file.path);
   for (const path of ['LICENSE', 'plugin/hooks.json', 'magpie_plugin/lib/backend.mjs',
     'bin/gempt.mjs', 'plugin/work_split_hook.mjs', 'core/agy-install.mjs', 'core/mcp-server.mjs',
@@ -83,6 +83,29 @@ test('UI assets and API requests resolve relative to the direct and proxied page
       },
     });
     assert.equal((await apiFetch('/api/requests?q=a%2Fb')).status, 200);
+  }
+});
+
+test('UI token-ratio card renders the calibrated targets and hides when GemPT is off', () => {
+  const script = readFileSync(join(REPO_ROOT, 'magpie_plugin', 'ui', 'app.js'), 'utf-8');
+  const renderSource = script.match(/  function renderTokenRatio\([\s\S]+?\r?\n  }/)?.[0];
+  assert.ok(renderSource);
+  const card = {};
+  const tick = { style: {} };
+  const meta = {};
+  const elements = { 'token-ratio-card': card, 'token-ratio-target-tick': tick, 'token-ratio-meta': meta };
+  const renderTokenRatio = runInNewContext(`${renderSource}\nrenderTokenRatio`, {
+    $: (id) => elements[id],
+    RATIO_ADJ_META: {},
+  });
+  for (const target of [0, 15, 35, 60, 80]) {
+    renderTokenRatio({ target_gpt_share: target }, { gpt_share: target });
+    assert.equal(card.hidden, target === 0);
+    if (target === 0) continue;
+    assert.equal(tick.hidden, false);
+    assert.equal(tick.style.left, `${target}%`);
+    assert.equal(tick.title, `目标 GPT ${target}%`);
+    assert.ok(meta.textContent.includes(`目标 GPT ${target}%`));
   }
 });
 
@@ -364,6 +387,61 @@ test('package.json Magpie manifest fields and single plugin factory export exist
     windowsHide: true,
   });
   assert.deepEqual(JSON.parse(stdout.trim()), ['ask', 'ctl', 'run']);
+});
+
+test('token-ratio scopes Antigravity usage to conversations with recent GemPT activity', async (t) => {
+  const { readTokenRatio } = await import('../magpie_plugin/lib/token-ratio.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-ratio-scope-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const brainDir = join(dir, 'brain');
+  const sessionsDir = join(dir, 'custom-sessions');
+  const magpieConfigDir = join(dir, 'magpie');
+  const recent = new Date().toISOString();
+  const old = new Date(Date.now() - 48 * 3600_000).toISOString();
+  const saveTranscript = (id, inputTokens, toolCalls = []) => {
+    const logDir = join(brainDir, id, '.system_generated', 'logs');
+    mkdirSync(logDir, { recursive: true });
+    writeFileSync(join(logDir, 'transcript.jsonl'), JSON.stringify({
+      type: 'PLANNER_RESPONSE', created_at: recent, model: 'gemini-4-neon-high',
+      input_tokens: inputTokens, output_tokens: 1_000, tool_calls: toolCalls,
+    }) + '\n');
+  };
+  saveTranscript('unrelated', 985_000);
+  mkdirSync(magpieConfigDir);
+  writeFileSync(join(magpieConfigDir, 'usage.jsonl'), JSON.stringify({
+    t: recent, provider: 'codex', in: 10_000, out: 2_000,
+  }) + '\n');
+  const read = () => readTokenRatio({ brainDir, sessionsDir, magpieConfigDir, cacheTtlMs: 0 });
+  const assertScoped = () => {
+    const snapshot = read();
+    assert.equal(snapshot.scope, 'gempt_active_sessions');
+    assert.equal(snapshot.sources.agy_files, 2);
+    assert.equal(snapshot.sources.skipped_non_gempt_sessions, 1);
+    assert.equal(snapshot.gemini.work, 10_000);
+    assert.equal(snapshot.gpt.work, 20_000);
+    assert.equal(snapshot.actual_gpt_share, 66.7);
+  };
+  for (const call of [
+    { name: 'gpt_run' },
+    { name: 'call_mcp_tool', args: { ServerName: 'gempt_gempt', ToolName: 'gpt_run' } },
+    { name: 'invoke_subagent', args: { TypeName: 'gempt-worker' } },
+  ]) {
+    saveTranscript('active', 5_000, [call]);
+    assertScoped();
+  }
+  saveTranscript('active', 5_000);
+  const runDir = join(sessionsDir, 'runs', 'a'.repeat(32));
+  mkdirSync(runDir, { recursive: true });
+  const saveRun = (createdAt) => writeFileSync(join(runDir, 'state.json'), JSON.stringify({
+    host_conversation_id: 'active', created_at: createdAt,
+  }));
+  saveRun(old);
+  const fallback = read();
+  assert.equal(fallback.scope, 'all_sessions');
+  assert.equal(fallback.sources.skipped_non_gempt_sessions, 0);
+  assert.equal(fallback.actual_gpt_share, 2);
+  saveRun(recent);
+  assertScoped();
 });
 
 test('backend discovery uses overrides, PATH and installed MCP configuration', () => {
@@ -791,7 +869,7 @@ test('page server supports native groups and lossless failover round-trip with a
     const stateJson = await stateRes.json();
     assert.equal(stateJson.work_split, 'gemini_first');
     assert.equal(stateJson.swarm_split, 'gemini_first');
-    assert.deepEqual(Object.values(stateJson.work_profiles).map(({ gpt_share }) => gpt_share), [0, 30, 50, 80, 95]);
+    assert.deepEqual(Object.values(stateJson.work_profiles).map(({ gpt_share }) => gpt_share), [0, 15, 35, 60, 80]);
     assert.equal(stateJson.auto_effort, false);
     assert.equal(stateJson.tiers.find((t) => t.id === 'opus').reasoning_effort, 'xhigh');
   } finally {
@@ -1922,7 +2000,9 @@ test('token-ratio closed-loop budget widens dispatch when GPT is below target an
       cache_read: 890_000,
     }) + '\n', 'utf8');
 
-    const snap = readTokenRatio({ brainDir, magpieConfigDir: magpieDir, cacheTtlMs: 0 });
+    const snap = readTokenRatio({ brainDir, magpieConfigDir: magpieDir, sessionsDir: join(dir, 'sessions'), cacheTtlMs: 0 });
+    assert.equal(snap.scope, 'all_sessions');
+    assert.equal(snap.sources.skipped_non_gempt_sessions, 0);
     assert.equal(snap.gemini.total, 9_000_000);
     assert.equal(snap.gpt.total, 1_000_000);
     // Attributable work = in + 5*out: gemini=1.4M, gpt=150k -> 9.7% (total share remains 10.0%)
@@ -1930,13 +2010,21 @@ test('token-ratio closed-loop budget widens dispatch when GPT is below target an
     assert.equal(snap.actual_gemini_share, 90.3);
     assert.equal(snap.actual_gpt_total_share, 10.0);
 
-    const b30 = evaluateBudget('gemini_first', snap);
-    assert.equal(b30.adjustment, 'widened_strong');
-    assert.deepEqual(b30.effective_kinds, ['specialist', 'engineering', 'design']);
+    const geminiFirst = evaluateBudget('gemini_first', snap);
+    assert.equal(geminiFirst.adjustment, 'balanced');
+    assert.deepEqual(geminiFirst.effective_kinds, ['specialist']);
 
-    const b50Over = evaluateBudget('balanced', { ...snap, actual_gpt_share: 64.0, actual_gemini_share: 36.0 });
-    assert.equal(b50Over.adjustment, 'tightened');
-    assert.deepEqual(b50Over.effective_kinds, ['specialist']);
+    const balancedUnder = evaluateBudget('balanced', snap);
+    assert.equal(balancedUnder.adjustment, 'widened_strong');
+    assert.deepEqual(balancedUnder.effective_kinds, ['specialist', 'engineering', 'design']);
+
+    const balancedOver = evaluateBudget('balanced', { ...snap, actual_gpt_share: 64.0, actual_gemini_share: 36.0 });
+    assert.equal(balancedOver.adjustment, 'tightened');
+    assert.deepEqual(balancedOver.effective_kinds, ['specialist']);
+
+    const gptFirst = evaluateBudget('gpt_first', snap);
+    assert.equal(gptFirst.adjustment, 'under_target');
+    assert.deepEqual(gptFirst.effective_kinds, ['specialist', 'engineering', 'design', 'routine']);
 
     const cfgPath = join(dir, 'config.json');
     const sessDir = join(dir, 'sessions');
@@ -1944,16 +2032,16 @@ test('token-ratio closed-loop budget widens dispatch when GPT is below target an
     writeFileSync(cfgPath, JSON.stringify({
       version: 2,
       magpie: { base_url: 'http://127.0.0.1:3425' },
-      routing_policy: { work_split: 'gemini_first', default_tier: 'sonnet' },
+      routing_policy: { work_split: 'balanced', default_tier: 'sonnet' },
     }), 'utf8');
     const prevBrain = process.env.GEMPT_AGY_BRAIN_DIR;
     process.env.GEMPT_AGY_BRAIN_DIR = brainDir;
     try {
       const state = await readState({ configPath: cfgPath, sessionsDir: sessDir, magpieConfigDir: magpieDir, probeTimeoutMs: 50 });
-      assert.equal(state.token_ratio.target_gpt_share, 30);
+      assert.equal(state.token_ratio.target_gpt_share, 35);
       assert.equal(state.token_ratio.actual_gpt_share, 9.7);
       assert.equal(state.token_ratio.adjustment, 'widened_strong');
-      const resolved = resolveBudget('gemini_first', { configPath: cfgPath, magpieConfigDir: magpieDir, cacheTtlMs: 0 });
+      const resolved = resolveBudget('balanced', { configPath: cfgPath, sessionsDir: sessDir, magpieConfigDir: magpieDir, cacheTtlMs: 0 });
       assert.deepEqual(resolved.effective_kinds, ['specialist', 'engineering', 'design']);
     } finally {
       if (prevBrain === undefined) delete process.env.GEMPT_AGY_BRAIN_DIR;

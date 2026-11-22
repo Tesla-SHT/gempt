@@ -2,10 +2,11 @@
  * Live Gemini vs. GPT token-ratio telemetry and closed-loop work-split budget controller.
  * Shared by the MCP server, Antigravity hooks, and Magpie control panel.
  */
-import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
+import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { extname, join, resolve } from 'node:path';
 import { WORKLOAD } from '../../core/assets.mjs';
+import { readJsonSafe, resolveSessionsDir } from '../../core/config.mjs';
 
 export const KIND_LADDER = Object.freeze(['specialist', 'engineering', 'design', 'routine']);
 export const MIN_SAMPLE_TOKENS = 20_000;
@@ -18,6 +19,9 @@ const DEFAULT_CACHE_TTL_MS = 15_000;
 
 const SWARM_COORD_TOOLS = new Set(['read_board', 'swarm_wait', 'post_message', 'swarm', 'schedule', 'manage_task']);
 const VISION_TOOLS = new Set(['generate_image', 'browser_subagent']);
+const GEMPT_TOOLS = new Set([
+  'gempt_gempt', 'gpt_run', 'gpt_ask', 'gpt_ctl', 'gempt_run', 'gempt_ask', 'gempt_ctl', 'gempt-worker',
+]);
 const MEDIA_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.ico', '.svg', '.mp4', '.mov', '.webm', '.wav', '.mp3', '.pdf']);
 
 const _memCache = new Map();
@@ -81,13 +85,11 @@ function mergeBucket(dst, src) {
   }
 }
 
-function classifyToolCall(tc) {
-  const name = String(tc?.name || tc?.tool_name || '').trim();
+function classifyToolCall(name, args) {
   if (!name) return 'other';
   if (SWARM_COORD_TOOLS.has(name)) return 'swarm';
   if (VISION_TOOLS.has(name)) return 'vision';
   if (name === 'read_file' || name === 'view_file') {
-    const args = tc?.args || tc?.arguments || {};
     const raw = String(args.Path || args.AbsolutePath || '').trim().replace(/^"|"$/g, '').toLowerCase();
     if (raw && MEDIA_EXTS.has(extname(raw.replace(/\\/g, '/')))) return 'vision';
   }
@@ -112,18 +114,25 @@ function parseTimestampMs(raw) {
   return Number.isFinite(ms) ? ms : null;
 }
 
-function scanTranscriptFile(filePath, cutoffMs, gemini, gpt) {
+function isGemptToolCall(name, args) {
+  return GEMPT_TOOLS.has(name.split('__').at(-1))
+    || (name === 'call_mcp_tool' && (args.ServerName === 'gempt_gempt' || GEMPT_TOOLS.has(args.ToolName)))
+    || (name === 'invoke_subagent' && args.TypeName === 'gempt-worker');
+}
+
+function scanTranscriptFile(filePath, cutoffMs) {
   let text;
   try {
     text = readFileSync(filePath, 'utf-8');
   } catch {
-    return true;
+    return null;
   }
   const fileGem = emptyBucket();
   const fileGpt = emptyBucket();
   let workCalls = 0;
   let swarmCalls = 0;
   let visionCalls = 0;
+  let gemptActive = false;
   for (const line of text.split(/\r?\n/)) {
     if (!line.includes('PLANNER_RESPONSE')) continue;
     let obj;
@@ -136,7 +145,10 @@ function scanTranscriptFile(filePath, cutoffMs, gemini, gpt) {
     const ts = parseTimestampMs(obj.created_at);
     if (ts !== null && ts < cutoffMs) continue;
     for (const tc of (Array.isArray(obj.tool_calls) ? obj.tool_calls : [])) {
-      const cat = classifyToolCall(tc);
+      const name = String(tc?.name || tc?.tool_name || '').trim();
+      const args = tc?.args || tc?.arguments || {};
+      gemptActive ||= isGemptToolCall(name, args);
+      const cat = classifyToolCall(name, args);
       if (cat === 'swarm') swarmCalls += 1;
       else if (cat === 'vision') visionCalls += 1;
       else if (cat === 'work') workCalls += 1;
@@ -145,26 +157,48 @@ function scanTranscriptFile(filePath, cutoffMs, gemini, gpt) {
     const bucket = cls === 'gpt' ? fileGpt : fileGem;
     addTokens(bucket, obj.input_tokens, obj.output_tokens, obj.cache_read_tokens);
   }
-  if (workCalls === 0 && (swarmCalls > 0 || visionCalls > 0)) {
-    return false;
-  }
-  mergeBucket(gemini, fileGem);
-  mergeBucket(gpt, fileGpt);
-  return true;
+  const excluded = workCalls === 0 && (swarmCalls > 0 || visionCalls > 0);
+  return { gemini: fileGem, gpt: fileGpt, gemptActive, excluded };
 }
 
-function scanAgyBrain(brainDir, cutoffMs, gemini, gpt) {
-  if (!brainDir || !existsSync(brainDir)) return { filesScanned: 0, excludedSessions: 0 };
-  let entries;
+function listDirectories(dir) {
+  if (!dir) return [];
   try {
-    entries = readdirSync(brainDir, { withFileTypes: true });
+    return readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory());
   } catch {
-    return { filesScanned: 0, excludedSessions: 0 };
+    return [];
   }
+}
+
+function recentRunConversations(sessionsDir, cutoffMs) {
+  const runsDir = join(sessionsDir, 'runs');
+  const conversations = new Set();
+  for (const entry of listDirectories(runsDir)) {
+    const path = join(runsDir, entry.name, 'state.json');
+    try {
+      if (statSync(path).mtimeMs < cutoffMs) continue;
+    } catch {
+      continue;
+    }
+    const run = readJsonSafe(path);
+    if (typeof run?.host_conversation_id !== 'string' || !run.host_conversation_id) continue;
+    const timestamps = [run.created_at, run.started_at, run.finished_at, run.updated_at, run.progress?.updated_at]
+      .map(parseTimestampMs).filter((time) => time !== null);
+    if (!timestamps.length || Math.max(...timestamps) >= cutoffMs) conversations.add(run.host_conversation_id);
+  }
+  return conversations;
+}
+
+function scanAgyBrain(brainDir, sessionsDir, cutoffMs, gemini, gpt) {
+  const entries = listDirectories(brainDir);
+  const activeHosts = entries.length ? recentRunConversations(sessionsDir, cutoffMs) : new Set();
+  const unmarkedGemini = emptyBucket();
+  const unmarkedGpt = emptyBucket();
+  let hasGemptActivity = false;
   let filesScanned = 0;
   let excludedSessions = 0;
+  let unmarkedSessions = 0;
   for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
     const transcript = join(brainDir, entry.name, '.system_generated', 'logs', 'transcript.jsonl');
     let st;
     try {
@@ -174,11 +208,30 @@ function scanAgyBrain(brainDir, cutoffMs, gemini, gpt) {
     }
     if (st.mtimeMs < cutoffMs) continue;
     filesScanned += 1;
-    if (!scanTranscriptFile(transcript, cutoffMs, gemini, gpt)) {
+    const usage = scanTranscriptFile(transcript, cutoffMs);
+    if (!usage) continue;
+    const active = usage.gemptActive || activeHosts.has(entry.name);
+    hasGemptActivity ||= active;
+    if (usage.excluded) {
       excludedSessions += 1;
+    } else if (active) {
+      mergeBucket(gemini, usage.gemini);
+      mergeBucket(gpt, usage.gpt);
+    } else {
+      unmarkedSessions += 1;
+      mergeBucket(unmarkedGemini, usage.gemini);
+      mergeBucket(unmarkedGpt, usage.gpt);
     }
   }
-  return { filesScanned, excludedSessions };
+  if (!hasGemptActivity) {
+    mergeBucket(gemini, unmarkedGemini);
+    mergeBucket(gpt, unmarkedGpt);
+  }
+  return {
+    filesScanned, excludedSessions,
+    skippedNonGemptSessions: hasGemptActivity ? unmarkedSessions : 0,
+    scope: hasGemptActivity ? 'gempt_active_sessions' : 'all_sessions',
+  };
 }
 
 function scanMagpieUsage(magpieDir, cutoffMs, gemini, gpt, other) {
@@ -253,6 +306,7 @@ export function dynamicBudgetEnabled(policy = {}, env = process.env) {
 export function readTokenRatio({
   windowHours = 24,
   configPath,
+  sessionsDir,
   brainDir,
   magpieConfigDir,
   cacheTtlMs = DEFAULT_CACHE_TTL_MS,
@@ -262,7 +316,8 @@ export function readTokenRatio({
   const now = Number.isFinite(nowMs) ? Number(nowMs) : Date.now();
   const resolvedBrain = resolveAgyBrainDir({ brainDir, configPath, magpieConfigDir, env });
   const resolvedMagpie = resolveMagpieDir({ magpieConfigDir, configPath, env });
-  const cacheKey = `${windowHours}|${resolvedBrain}|${resolvedMagpie}`;
+  const resolvedSessions = resolveSessionsDir(sessionsDir || env.GEMPT_SESSIONS_DIR);
+  const cacheKey = `${windowHours}|${resolvedBrain}|${resolvedMagpie}|${resolvedSessions}`;
 
   if (cacheTtlMs > 0 && !Number.isFinite(nowMs)) {
     const hit = _memCache.get(cacheKey);
@@ -276,7 +331,8 @@ export function readTokenRatio({
   const gpt = emptyBucket();
   const other = emptyBucket();
 
-  const { filesScanned: agyFiles, excludedSessions } = scanAgyBrain(resolvedBrain, cutoffMs, gemini, gpt);
+  const { filesScanned: agyFiles, excludedSessions, skippedNonGemptSessions, scope } =
+    scanAgyBrain(resolvedBrain, resolvedSessions, cutoffMs, gemini, gpt);
   const magpieRecords = scanMagpieUsage(resolvedMagpie, cutoffMs, gemini, gpt, other);
 
   const combinedWork = gemini.work + gpt.work;
@@ -291,6 +347,7 @@ export function readTokenRatio({
   const snapshot = {
     window_hours: windowHours,
     metric: 'attributable_work_in_plus_5out',
+    scope,
     gemini,
     gpt,
     other,
@@ -302,7 +359,10 @@ export function readTokenRatio({
     actual_gpt_work_share: actualGptWorkShare,
     actual_gpt_fresh_share: actualGptFreshShare,
     actual_gpt_total_share: actualGptTotalShare,
-    sources: { agy_files: agyFiles, excluded_sessions: excludedSessions, magpie_records: magpieRecords },
+    sources: {
+      agy_files: agyFiles, excluded_sessions: excludedSessions,
+      skipped_non_gempt_sessions: skippedNonGemptSessions, magpie_records: magpieRecords,
+    },
     computed_at: new Date(now).toISOString(),
   };
 
@@ -339,11 +399,11 @@ export function evaluateBudget(profile, snapshot, { enabled = true } = {}) {
     adjustment = 'disabled';
   } else if (sampleTokens < MIN_SAMPLE_TOKENS || actual === null) {
     adjustment = 'warming_up';
-  } else if (target >= 95) {
+  } else if (baseKinds.length >= KIND_LADDER.length || target >= 80) {
     effectiveKinds = [...KIND_LADDER];
     adjustment = actual < (target - UNDER_MARGIN) ? 'under_target' : 'balanced';
   } else if (delta <= -STRONG_UNDER_MARGIN) {
-    const maxCap = target <= 50 ? 3 : KIND_LADDER.length;
+    const maxCap = target <= 35 ? 3 : KIND_LADDER.length;
     const count = Math.min(maxCap, baseKinds.length + 2);
     effectiveKinds = KIND_LADDER.slice(0, count);
     adjustment = 'widened_strong';
@@ -391,8 +451,8 @@ export function evaluateBudget(profile, snapshot, { enabled = true } = {}) {
   };
 }
 
-export function resolveBudget(profile, { policy, configPath, brainDir, magpieConfigDir, windowHours = 24, cacheTtlMs = DEFAULT_CACHE_TTL_MS, env = process.env } = {}) {
+export function resolveBudget(profile, { policy, configPath, sessionsDir, brainDir, magpieConfigDir, windowHours = 24, cacheTtlMs = DEFAULT_CACHE_TTL_MS, env = process.env } = {}) {
   const enabled = dynamicBudgetEnabled(policy, env);
-  const snapshot = readTokenRatio({ windowHours, configPath, brainDir, magpieConfigDir, cacheTtlMs, env });
+  const snapshot = readTokenRatio({ windowHours, configPath, sessionsDir, brainDir, magpieConfigDir, cacheTtlMs, env });
   return evaluateBudget(profile, snapshot, { enabled });
 }

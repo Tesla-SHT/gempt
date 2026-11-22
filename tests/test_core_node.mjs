@@ -48,7 +48,7 @@ test('Node hook emits entry banners and one user-only alert per context mileston
     JSON.stringify({ status: 'running', pid: process.pid, ws_url: 'ws://127.0.0.1:1' }));
   const env = { ...f.env, GEMPT_APP_SERVER_STATE: join(dirname(f.configPath), 'app-server.json') };
   const invoke = (payload) => jsonProcess(process.execPath, [hookPath], { env, input: JSON.stringify(payload) });
-  for (const [profile, share] of [['gemini', 0], ['gemini_first', 30], ['balanced', 50], ['gpt', 80], ['gpt_first', 95]]) {
+  for (const [profile, share] of [['gemini', 0], ['gemini_first', 15], ['balanced', 35], ['gpt', 60], ['gpt_first', 80]]) {
     writeFileSync(f.configPath, JSON.stringify({ routing_policy: { work_split: profile } }));
     const payload = { conversationId: profile, workspacePaths: [f.cwd], modelName: 'gemini-4-neon-high' };
     const start = invoke({ ...payload, hookEventName: 'SessionStart' });
@@ -56,7 +56,7 @@ test('Node hook emits entry banners and one user-only alert per context mileston
     else assert.deepEqual(start, {});
     const turn = { ...payload, hookEventName: 'PreInvocation', initialNumSteps: 31, lastUserInput: 'Review this' };
     const entry = invoke({ ...turn, invocationNum: 0 });
-    if ([30, 80, 95].includes(share)) assert.match(entry.injectSteps[0].systemMessage.systemMessage, new RegExp(`${share}%`));
+    if ([15, 60, 80].includes(share)) assert.ok(entry.injectSteps[0].systemMessage.systemMessage.startsWith(`[GemPT ${share}%] `));
     else assert.deepEqual(entry, {});
     assert.deepEqual(invoke({ ...turn, invocationNum: 1 }), {});
   }
@@ -85,7 +85,7 @@ test('Node hook applies write and explore gates with exemptions, resets and fail
   set('balanced');
   assert.equal(edit().decision, 'allow');
   writeFileSync(health, JSON.stringify({ status: 'running', pid: process.pid, ws_url: 'ws://127.0.0.1:1' }));
-  assert.match(edit().reason, /50% Write Gate/);
+  assert.match(edit().reason, /35% Write Gate/);
   assert.equal(edit(join(f.cwd, 'app.json'), 'line\n'.repeat(15)).decision, 'allow');
   assert.match(edit(join(f.cwd, 'app.json'), 'line\n'.repeat(16)).reason, /Write Gate/);
   assert.equal(edit(join(f.cwd, 'README.md')).decision, 'allow');
@@ -95,11 +95,14 @@ test('Node hook applies write and explore gates with exemptions, resets and fail
     set(profile);
     assert.equal(edit().decision, 'allow');
   }
-  for (const [profile, limit] of [['gpt', 5], ['gpt_first', 2]]) {
+  for (const [profile, share, limit] of [['gpt', 60, 5], ['gpt_first', 80, 2]]) {
     set(profile);
     const read = () => allow('read_file', { Path: join(f.cwd, 'app.mjs') }, { lastUserInput: profile });
     for (let count = 0; count < limit; count++) assert.equal(read().decision, 'allow');
-    assert.match(read().reason, new RegExp(`limit ${limit}`));
+    const reason = read().reason;
+    assert.ok(reason.startsWith(`[GemPT ${share}% Explore Stop-Loss] `));
+    assert.match(reason, new RegExp(`limit ${limit}`));
+    assert.equal(reason.includes('Codex CLI'), profile === 'gpt_first');
     assert.equal(allow('run_command', { CommandLine: 'gempt status --run-id 123 --wait' }).decision, 'allow');
     for (const delegation of [
       ['call_mcp_tool', { ServerName: 'gempt_gempt', ToolName: 'gpt_run' }],
@@ -158,6 +161,10 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const { command, args } = config.mcpServers.gempt;
   assert.equal(command, process.execPath);
   assert.deepEqual(args, [join(target, 'runtime', 'core', 'mcp-server.mjs')]);
+  const initialized = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
+    jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' },
+  }) });
+  assert.equal(initialized.result.serverInfo.version, '0.2.1');
   const response = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'resources/read', params: { uri: APP_URI },
   }) });
@@ -649,7 +656,7 @@ test('standalone NDJSON MCP advertises three model tools and four app tools and 
   const started = await request('initialize', { protocolVersion: '2026-test' });
   assert.equal(started.result.protocolVersion, '2026-test');
   assert.equal(started.result.serverInfo.name, 'gempt');
-  assert.equal(started.result.serverInfo.version, '0.2.0');
+  assert.equal(started.result.serverInfo.version, '0.2.1');
   send({ method: 'notifications/initialized' });
   assert.deepEqual((await request('ping')).result, {});
   const { tools } = (await request('tools/list')).result;

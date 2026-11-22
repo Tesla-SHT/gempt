@@ -235,6 +235,7 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
   const tokenRatio = resolveBudget(workSplit, {
     policy,
     configPath: resolvedConfigPath,
+    sessionsDir: resolvedSessionsDir,
     magpieConfigDir: resolvedMagpieDir,
   });
 

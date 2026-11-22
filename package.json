@@ -1,6 +1,6 @@
 {
   "name": "gempt",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Magpie tools + control page plugin for Gemini-leads-GPT 3+1 routing tiers (Sonnet / Opus / Fable + Chore) across every Magpie client.",
   "type": "module",
   "bin": {

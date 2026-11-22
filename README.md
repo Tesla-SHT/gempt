@@ -1,4 +1,4 @@
-# GemPT v0.2.0
+# GemPT v0.2.1
 
 GemPT 让 Gemini 通过本机 Magpie 咨询 GPT、委派 Codex 仓库任务，并在 GemPT Live 查看和介入运行。Magpie 插件、Antigravity stdio MCP、hooks、安装器和 CLI 共用一套 Node.js ESM 核心。运行时只使用 Node.js 内置模块。GemPT Live 随包提供预构建资源。
 
@@ -38,7 +38,7 @@ npx --yes github:yizhang-dream/gempt install-agy
 
 `gpt_run` 返回 `run_id`、`session_id` 和 `wait_command`。在 Antigravity 用 `run_command(WaitMsBeforeAsync=500)` 后台执行等待命令。终端可运行 `gempt-wait <run_id>`、`gempt-wait id1,id2` 或 `gempt-wait --all id1,id2`。续聊时传 `session_id`。从只读升级到可写时，GemPT 会创建可写线程并带上上一轮摘要。
 
-在 Magpie **Plugins → GemPT** 可切换 0% / 30% / 50% / 80% / 95% 工作分工、Gemini 与 GPT 配对、默认沙箱和执行档位。`sonnet` 用于日常任务，`opus` 用于复杂工程，`fable` 用于高难推理。Antigravity 的 `/gempt-sonnet`、`/gempt-opus`、`/gempt-fable` 和 `/gempt-chore` 提供对应指引。
+在 Magpie **Plugins → GemPT** 可切换 0% / 15% / 35% / 60% / 80% 工作分工、Gemini 与 GPT 配对、默认沙箱和执行档位。80% 档计入 Gemini 前端编排约 15–20% 的占比下限。`sonnet` 用于日常任务，`opus` 用于复杂工程，`fable` 用于高难推理。Antigravity 的 `/gempt-sonnet`、`/gempt-opus`、`/gempt-fable` 和 `/gempt-chore` 提供对应指引。
 
 ## 命令行
 

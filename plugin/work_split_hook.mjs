@@ -23,9 +23,9 @@ const waitCommand = /\bgempt-wait\b|\bgempt\s+status\b[^\n]*--wait\b/i;
 const readCommand = /(?:^|[;&|\r\n]\s*)(?:(?:sudo|command|time)\s+)?(?:Get-Content|Select-String|Get-ChildItem|gc|sls|gci|cat|head|tail|rg|ripgrep|grep|findstr|find|ls|dir|tree|sed|awk|wc|git\s+(?:diff|show|log|grep|status)|type)(?:\.exe)?(?=\s|$)/i;
 const milestones = [120, 200, 280];
 const banners = {
-  gemini_first: '[GemPT 30%] Handle routine edits/reads in Gemini; route heavy debugging, long test loops, expert review, or Swarm verification to gpt_run / gpt_ask.',
-  gpt: "[GemPT 80%] Route repo investigation & code changes directly to gpt_run(cwd, access='inspect'|'change') or gpt_ask(file_paths); keep quick Gemini checks <=5 steps.",
-  gpt_first: '[GemPT 95%] Delegate this turn to a persistent gpt_run(cwd, session_id=...) thread immediately; reserve Gemini for <=2 quick checks/visuals (for pure 95% coding workspaces, use Codex CLI / codex-lab directly).',
+  gemini_first: 'Handle routine edits/reads in Gemini; route heavy debugging, long test loops, expert review, or Swarm verification to gpt_run / gpt_ask.',
+  gpt: "Route repo investigation & code changes directly to gpt_run(cwd, access='inspect'|'change') or gpt_ask(file_paths); keep quick Gemini checks <=5 steps.",
+  gpt_first: 'Delegate this turn to a persistent gpt_run(cwd, session_id=...) thread immediately; reserve Gemini for <=2 quick checks/visuals (for coding-only workspaces, use Codex CLI / codex-lab directly).',
 };
 const now = () => Date.now() / 1000;
 const text = (value) => typeof value === 'string' ? value.trim() : '';
@@ -156,6 +156,7 @@ async function handle(payload) {
     : /(?:^|[^a-z0-9])(hydrogen|neon|carbon)(?:$|[^a-z0-9])/i.exec(String(modelName))?.[1]?.toLowerCase();
   await updateHostContext(conversationId, workspacePaths, { geminiFamily: family, configPath });
   const ordinary = profile();
+  const pct = WORKLOAD.profiles[ordinary]?.gpt_share ?? WORKLOAD.profiles.balanced.gpt_share;
   const userInput = String(payload.lastUserInput || '');
   const key = userInput.trim() ? createHash('sha1').update(userInput.trim()).digest('hex').slice(0, 16) : '';
   if (Object.hasOwn(payload, 'toolCall') || hookEventName === 'PreToolUse') {
@@ -184,7 +185,6 @@ async function handle(payload) {
     if (['gemini', 'gemini_first'].includes(ordinary) || override.test(userInput) || !healthy()) return allow;
     const target = ['Path', 'TargetFile', 'AbsolutePath', 'SearchPath', 'DirectoryPath'].map((key) => text(input[key])).find(Boolean) || '';
     const cwd = text(payload.cwd) || text(workspacePaths?.[0]) || (extname(target) ? dirname(target) : target) || '.';
-    const pct = { gpt: 80, gpt_first: 95 }[ordinary] || 50;
     if (['edit_file', 'write_file'].includes(name)) {
       if (!sourceWrite(target, input)) return allow;
       return { decision: 'deny', reason: `[GemPT ${pct}% Write Gate] Source edit (${basename(target)}) routed to Codex. `
@@ -199,15 +199,14 @@ async function handle(payload) {
     const count = await updateState(conversationId, (state) => setCount(state, key,
       1 + (key && state.turn_key && key !== state.turn_key ? 0 : Number(state.explore_count) || 0)));
     if (count <= limit) return allow;
-    const extra = pct === 95 ? ' For pure 95% coding workspaces, prefer Codex CLI / codex-lab directly.' : '';
-    return { decision: 'deny', reason: `[GemPT ${ordinary === 'gpt' ? 80 : 95}% Explore Stop-Loss] ${count} non-exempt workspace reads/searches this turn (limit ${limit}). `
+    const extra = ordinary === 'gpt_first' ? ' For coding-only workspaces, prefer Codex CLI / codex-lab directly.' : '';
+    return { decision: 'deny', reason: `[GemPT ${pct}% Explore Stop-Loss] ${count} non-exempt workspace reads/searches this turn (limit ${limit}). `
       + `Dispatch deep inspection to Codex: call_mcp_tool(ServerName="gempt_gempt", ToolName="gpt_run", Arguments={"goal": "<what to inspect>", "cwd": "${cwd}", "access": "inspect"}) `
       + `then run returned \`gempt-wait <id>\` via run_command(WaitMsBeforeAsync=500).${extra} (Say "自己查" to bypass.)` };
   }
   if (hookEventName === 'SessionStart') {
-    const target = (WORKLOAD.profiles[ordinary] || WORKLOAD.profiles.balanced).gpt_share;
-    if (target <= 0) return {};
-    return { injectSteps: [step(`GemPT v2 active: ${ordinary} (${target}% GPT${family ? `, family=${family}` : ''}).\n`
+    if (pct <= 0) return {};
+    return { injectSteps: [step(`GemPT v2 active: ${ordinary} (${pct}% GPT${family ? `, family=${family}` : ''}).\n`
       + 'Tools (ServerName="gempt_gempt"): gpt_run(goal,cwd,access="change"|"inspect",workspace="inherit"|"share",session_id?) | '
       + 'gpt_ask(goal,file_paths?,cwd?,tier?,session_id?) | gpt_ctl(action="status"|"steer"|"interrupt"|"reply",run_id?,message?,call_id?).\n'
       + "Run gpt_run's returned `gempt-wait <id>` via run_command(WaitMsBeforeAsync=500); never poll status.")] };
@@ -231,7 +230,9 @@ async function handle(payload) {
       setCount(state, key, 0);
       state.last_entry_key = entry;
       state.last_entry_at = now();
-      if (Object.hasOwn(banners, ordinary) && !override.test(userInput) && healthy()) result.push(step(banners[ordinary]));
+      if (Object.hasOwn(banners, ordinary) && !override.test(userInput) && healthy()) {
+        result.push(step(`[GemPT ${pct}%] ${banners[ordinary]}`));
+      }
     }
     return result;
   });

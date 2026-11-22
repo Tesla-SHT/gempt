@@ -8,13 +8,13 @@
     },
     "gemini_first": {
       "label": "Gemini 为主",
-      "gpt_share": 30,
+      "gpt_share": 15,
       "kinds": ["specialist"],
       "detail": "Gemini 负责沟通、设计与常规实现，仅在疑难排错、复杂推理与专家复核时派给 GPT。"
     },
     "balanced": {
       "label": "按领域分工",
-      "gpt_share": 50,
+      "gpt_share": 35,
       "kinds": [
         "specialist",
         "engineering"
@@ -23,7 +23,7 @@
     },
     "gpt": {
       "label": "GPT 为主",
-      "gpt_share": 80,
+      "gpt_share": 60,
       "kinds": [
         "specialist",
         "engineering",
@@ -33,7 +33,7 @@
     },
     "gpt_first": {
       "label": "基本全由 GPT 做",
-      "gpt_share": 95,
+      "gpt_share": 80,
       "kinds": [
         "specialist",
         "engineering",
