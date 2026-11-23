@@ -490,6 +490,10 @@ test('token-ratio scopes Antigravity usage to conversations with recent GemPT ac
     { name: 'gpt_run' },
     { name: 'call_mcp_tool', args: { ServerName: 'gempt_gempt', ToolName: 'gpt_run' } },
     { name: 'invoke_subagent', args: { TypeName: 'gempt-worker' } },
+    ...['gempt run --goal -', 'gempt ask --goal -', 'gempt-wait 123', 'gempt steer 123 update',
+      'gempt reply-tool 123 ask_1 reply', 'cat brief.txt | gempt run --goal -',
+      "'/path with space/bin/gempt-wait' 123", '"C:\\path with space\\gempt.cmd" run --goal x']
+      .map((CommandLine) => ({ name: 'run_command', args: { CommandLine } })),
   ]) {
     saveTranscript('active', 5_000, [call]);
     assertScoped();
@@ -507,6 +511,55 @@ test('token-ratio scopes Antigravity usage to conversations with recent GemPT ac
   assert.equal(fallback.actual_gpt_share, 2);
   saveRun(recent);
   assertScoped();
+});
+
+test('token-ratio includes native Swarm workers by the opening board message from an active coordinator', async (t) => {
+  const { readTokenRatio } = await import('../magpie_plugin/lib/token-ratio.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-ratio-swarm-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const brainDir = join(dir, 'brain');
+  const sessionsDir = join(dir, 'sessions');
+  const nowMs = Date.now();
+  const recent = new Date(nowMs - 30_000).toISOString();
+  const old = new Date(nowMs - 48 * 3600_000).toISOString();
+  const notice = (sender) => ({
+    type: 'SYSTEM_MESSAGE', created_at: old,
+    content: '<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-23T00:00:00Z sender=' + sender
+      + ' priority=MESSAGE_PRIORITY_HIGH content=[swarm] new board message #2\n</SYSTEM_MESSAGE>',
+  });
+  const planner = (toolCalls, created_at = recent) => ({
+    type: 'PLANNER_RESPONSE', created_at, model: 'gemini-4-neon-high', input_tokens: 100, output_tokens: 10,
+    tool_calls: toolCalls,
+  });
+  const saveTranscript = (id, ...records) => {
+    const logs = join(brainDir, id, '.system_generated', 'logs');
+    mkdirSync(logs, { recursive: true });
+    writeFileSync(join(logs, 'transcript.jsonl'), records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  };
+  const native = planner([{ name: 'read_board' }, { name: 'post_message' }]);
+  const shell = (CommandLine) => planner([{ name: 'run_command', args: { CommandLine } }]);
+  saveTranscript('a-linked-worker', notice('z-coordinator'), native);
+  saveTranscript('b-fake-opening', shell('echo "gempt run --goal x"'), notice('z-coordinator'));
+  saveTranscript('c-inactive-parent', notice('inactive'), shell('git status'));
+  saveTranscript('z-coordinator', shell('gempt run --goal x'));
+  const read = () => readTokenRatio({ brainDir, sessionsDir, magpieConfigDir: '', nowMs });
+  const both = read();
+  assert.equal(both.scope, 'gempt_active_sessions');
+  assert.equal(both.gemini.work, 300);
+  assert.equal(both.sources.excluded_sessions, 0);
+  assert.equal(both.sources.skipped_non_gempt_sessions, 2);
+
+  saveTranscript('z-coordinator', { ...shell('gempt run --goal x'), created_at: old });
+  const other = read();
+  assert.equal(other.scope, 'all_sessions');
+  assert.equal(other.sources.excluded_sessions, 1);
+  const runDir = join(sessionsDir, 'runs', 'a'.repeat(32));
+  mkdirSync(runDir, { recursive: true });
+  writeFileSync(join(runDir, 'state.json'), JSON.stringify({ host_conversation_id: 'z-coordinator', created_at: recent }));
+  const byRun = read();
+  assert.equal(byRun.scope, 'gempt_active_sessions');
+  assert.equal(byRun.gemini.work, 150);
+  assert.equal(byRun.sources.skipped_non_gempt_sessions, 2);
 });
 
 test('backend discovery uses overrides, PATH and installed MCP configuration', () => {

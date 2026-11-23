@@ -72,6 +72,16 @@ GemPT v0.4.1 使用 Node.js（`>= 20.11.0`）。Antigravity 的 `gempt_gempt` MC
 
 ---
 
+### Swarm 混合编队（多 GPT + Gemini / Claude）
+
+Coordinator 按需原生启动 Gemini/Claude 工位，亲自协调、审 diff 和合并。GPT 工位使用 `model="gemini-4-hydrogen-low"` 转发任务。需要隔离写入时由 Swarm 创建原生 `workspace="share"`，其余按需用 `"inherit"`。内层 GemPT 始终用 `--workspace inherit`，禁止在原生 worktree 内再创建 GemPT worktree。Sol 建议选 `sonnet` 或 `opus`，Astra 建议选 `fable`。
+
+Coordinator 给 Hydrogen 工位的 brief 可直接填空：
+
+> 你是 GPT 工位 <name>，Coordinator ID 是 <coordinator_id>。本工位没有插件 MCP 或 Hook。用 `gempt run --cwd "$PWD" --workspace inherit --tier <tier> --host <coordinator_id> --title <name> --goal -`，从 stdin 传入任务 <目标、范围、约束、验收命令>。只读任务加 `--access inspect`。保存回执的 run_id 和 session_id，原样通过 `run_command(WaitMsBeforeAsync=500)` 跑 wait_command。把改动、验证和卡点发到看板。
+>
+> 当前回合收到看板新指示时用 `gempt steer <run_id> "<message>"`；后续回合可加 `--session <session_id>`。如果等待返回 `waiting_gemini`，把 `pending_tool_call` 的问题发到看板，收到答复后用 `gempt reply-tool <run_id> <call_id> "<text>"` 回复，再执行原 wait_command。
+
 ## 4. AI-to-AI Steering & Review Loop（内部纠偏闭环）
 
 1. `gpt_run` 返回 `wait_command` 时，原样通过 `run_command(WaitMsBeforeAsync=500)` 后台等待唤醒。用 `gpt_ctl` 随时查看或介入，收到 `ask_gemini` 时用 `action="reply"` 原回合续跑。

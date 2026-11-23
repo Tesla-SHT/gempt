@@ -48,6 +48,7 @@ export function stagePluginBundle(staged, { target, source, nodeBin, portable = 
   }
   copyTree(join(projectSource, 'core'), join(runtime, 'core'));
   copyTree(join(projectSource, 'magpie_plugin', 'lib'), join(runtime, 'magpie_plugin', 'lib'));
+  if (existsSync(join(projectSource, 'bin'))) copyTree(join(projectSource, 'bin'), join(runtime, 'bin'));
   let pkgVersion;
   try { pkgVersion = JSON.parse(readFileSync(join(plugin, 'plugin.json'), 'utf8')).version; } catch {}
   atomicJson(join(runtime, 'package.json'), { type: 'module', ...(pkgVersion ? { version: pkgVersion } : {}) });
@@ -107,7 +108,7 @@ export async function validatePluginBundle(staged, nodeBin, env = process.env, {
   }
   for (const file of ['README.md', 'LICENSE', 'THIRD_PARTY_LICENSES.txt', 'assets/logo.svg',
     'hooks.json', 'mcp_config.json', 'rules/AGENTS.md', 'agents/gempt-worker.md',
-    'skills/gempt/SKILL.md', 'runtime/core/assets/workload.json', 'runtime/core/assets/mcp_app_live.html']) {
+    'skills/gempt/SKILL.md', 'runtime/bin/gempt.mjs', 'runtime/core/assets/workload.json', 'runtime/core/assets/mcp_app_live.html']) {
     if (!statSync(join(staged, file), { throwIfNoEntry: false })?.isFile() || !statSync(join(staged, file)).size) {
       throw new Error(`Missing or empty Antigravity plugin asset: ${file}`);
     }
@@ -324,23 +325,37 @@ function resetWindowsAcls(paths) {
   }
 }
 
+function writeShimFile(path, contents, mode) {
+  const tmp = join(dirname(path), `.gempt-${randomUUID()}.tmp`);
+  try {
+    writeFileSync(tmp, contents);
+    if (mode) chmodSync(tmp, mode);
+    renameSync(tmp, path);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+function installShim(shim, nodeBin, entry) {
+  const command = [nodeBin, entry].map(quotePosix).join(' ');
+  writeShimFile(shim, `#!/usr/bin/env sh\nexec ${command} "$@"\n`, 0o755);
+  const written = [shim];
+  if (WINDOWS) {
+    const cmd = `${shim}.cmd`;
+    writeShimFile(cmd, `@echo off\r\n${[nodeBin, entry].map((value) => quoteWindows(value.replaceAll('%', '%%'))).join(' ')} %*\r\n`);
+    written.push(cmd);
+  }
+  return written;
+}
+
 function installWaitShim(target, nodeBin, binDir) {
   mkdirSync(binDir, { recursive: true });
   const helper = join(binDir, 'gempt-wait.mjs');
-  const shim = join(binDir, 'gempt-wait');
-  const command = [nodeBin, helper].map(quotePosix).join(' ');
   const entry = pathToFileURL(join(target, 'runtime', 'core', 'wait.mjs')).href;
-  writeFileSync(helper, `import { runWait } from ${JSON.stringify(entry)};\nprocess.exitCode = await runWait(process.argv.slice(2));\n`);
-  writeFileSync(shim, `#!/usr/bin/env sh\nexec ${command} "$@"\n`);
-  chmodSync(shim, 0o755);
-  const written = [helper, shim];
-  if (WINDOWS) {
-    const cmd = `${shim}.cmd`;
-    writeFileSync(cmd, `@echo off\r\n${[nodeBin, helper].map((value) => quoteWindows(value.replaceAll('%', '%%'))).join(' ')} %*\r\n`);
-    written.push(cmd);
-  }
+  writeShimFile(helper, `import { runWait } from ${JSON.stringify(entry)};\nprocess.exitCode = await runWait(process.argv.slice(2));\n`);
+  const written = installShim(join(binDir, 'gempt-wait'), nodeBin, helper);
   try { rmSync(join(binDir, 'gempt-wait.py'), { force: true }); } catch {}
-  return written;
+  return [helper, ...written];
 }
 
 async function refresh(env) {
@@ -407,33 +422,47 @@ export async function installAgy({ target = DEFAULT_AGY_TARGET, source, force = 
       resetWindowsAcls([target]);
       const resolvedBinDir = resolvePath(binDir);
       let shims = [];
-      let shimError;
-      try { shims = installWaitShim(target, nodeBin, resolvedBinDir); } catch (error) { shimError = error.message; }
-      resetWindowsAcls(shims);
+      let cliShims = [];
+      let waitShimError;
+      let cliShimError;
+      try { shims = installWaitShim(target, nodeBin, resolvedBinDir); } catch (error) { waitShimError = error.message; }
+      try {
+        mkdirSync(resolvedBinDir, { recursive: true });
+        cliShims = installShim(join(resolvedBinDir, 'gempt'), nodeBin, join(target, 'runtime', 'bin', 'gempt.mjs'));
+      } catch (error) { cliShimError = error.message; }
+      resetWindowsAcls([...shims, ...cliShims]);
       const pathEntries = String(env.PATH || env.Path || '').split(delimiter).filter(Boolean).map((dir) => {
         try { return resolvePath(dir); } catch { return dir; }
       });
       const fold = (p) => (WINDOWS ? p.toLowerCase() : p);
       const binOnPath = pathEntries.some((dir) => fold(dir) === fold(resolvedBinDir));
       const warnings = [];
-      if (shimError) {
-        warnings.push(`Could not install gempt-wait shim in ${resolvedBinDir}: ${shimError}. gpt_run will return an explicit fallback wait_command.`);
+      if (waitShimError) {
+        warnings.push(`Could not install gempt-wait shim in ${resolvedBinDir}: ${waitShimError}. gpt_run will return an explicit fallback wait_command.`);
       } else if (!binOnPath) {
         warnings.push(`${resolvedBinDir} is not on PATH; add it to PATH to run \`gempt-wait\` directly, or execute the exact \`wait_command\` returned by gpt_run.`);
       }
+      if (cliShimError) {
+        warnings.push(`Could not install gempt shim in ${resolvedBinDir}: ${cliShimError}.`);
+      } else if (!binOnPath) {
+        warnings.push(`Add ${resolvedBinDir} to PATH to run \`gempt\` from Swarm workers.`);
+      }
+      const shimError = waitShimError || cliShimError;
       return {
         installed: !shimError,
         plugin_installed: true,
-        shim_installed: !shimError,
+        shim_installed: !waitShimError,
         plugin_dir: target,
         mcp_config: config,
         shims,
+        cli_shims: cliShims,
         wait_shim: {
-          installed: !shimError,
+          installed: !waitShimError,
           on_path: binOnPath,
           bin_dir: resolvedBinDir,
-          ...(shimError ? { error: shimError } : {}),
+          ...(waitShimError ? { error: waitShimError } : {}),
         },
+        ...(cliShimError ? { cli_shim_error: cliShimError } : {}),
         ...(shimError ? { shim_error: shimError } : {}),
         ...(warnings.length ? { warnings } : {}),
         refresh: await refresh(env),

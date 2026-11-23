@@ -23,6 +23,7 @@ const VISION_TOOLS = new Set(['generate_image', 'browser_subagent']);
 const GEMPT_TOOLS = new Set([
   'gempt_gempt', 'gpt_run', 'gpt_ask', 'gpt_ctl', 'gempt_run', 'gempt_ask', 'gempt_ctl', 'gempt-worker',
 ]);
+const GEMPT_COMMAND = /(?:^|[;&|]\s*)(?:&\s+)?(?:"[^"\r\n]*[/\\]|'[^'\r\n]*[/\\]|[^\s"';&|]*[/\\]|["'])?(?:gempt-wait(?:\.cmd)?["']?|gempt(?:\.cmd)?["']?\s+(?:run|ask|steer|reply-tool))(?=\s|[;&|]|$)/i;
 const MEDIA_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.ico', '.svg', '.mp4', '.mov', '.webm', '.wav', '.mp3', '.pdf']);
 
 const _memCache = new Map();
@@ -122,7 +123,8 @@ function parseTimestampMs(raw) {
 function isGemptToolCall(name, args) {
   return GEMPT_TOOLS.has(name.split('__').at(-1))
     || (name === 'call_mcp_tool' && (args.ServerName === 'gempt_gempt' || GEMPT_TOOLS.has(args.ToolName)))
-    || (name === 'invoke_subagent' && args.TypeName === 'gempt-worker');
+    || (name === 'invoke_subagent' && args.TypeName === 'gempt-worker')
+    || (name === 'run_command' && GEMPT_COMMAND.test(String(args.CommandLine || '').trim()));
 }
 
 function scanTranscriptFile(filePath, cutoffMs, nowMs) {
@@ -138,15 +140,26 @@ function scanTranscriptFile(filePath, cutoffMs, nowMs) {
   let swarmCalls = 0;
   let visionCalls = 0;
   let gemptActive = false;
+  let swarmParent;
   for (const line of text.split(/\r?\n/)) {
-    if (!line.includes('PLANNER_RESPONSE')) continue;
+    if (!line.includes('PLANNER_RESPONSE') && !(swarmParent === undefined && line.includes('SYSTEM_MESSAGE'))) continue;
     let obj;
     try {
       obj = JSON.parse(line);
     } catch {
       continue;
     }
-    if (!obj || typeof obj !== 'object' || obj.type !== 'PLANNER_RESPONSE') continue;
+    if (!obj || typeof obj !== 'object') continue;
+    if (swarmParent === undefined) {
+      if (obj.type === 'SYSTEM_MESSAGE') {
+        const notice = typeof obj.content === 'string'
+          ? obj.content.split(/\r?\n/).find((part) => part.includes('[swarm] new board message')) : '';
+        swarmParent = notice?.match(/\bsender=([a-z0-9._-]+)(?=\s|$)/i)?.[1] || null;
+      } else if (obj.type === 'PLANNER_RESPONSE') {
+        swarmParent = null;
+      }
+    }
+    if (obj.type !== 'PLANNER_RESPONSE') continue;
     const ts = parseTimestampMs(obj.created_at);
     if (ts === null || ts < cutoffMs || ts > nowMs) continue;
     for (const tc of (Array.isArray(obj.tool_calls) ? obj.tool_calls : [])) {
@@ -163,7 +176,7 @@ function scanTranscriptFile(filePath, cutoffMs, nowMs) {
     addTokens(bucket, obj.input_tokens, obj.output_tokens, obj.cache_read_tokens);
   }
   const excluded = workCalls === 0 && (swarmCalls > 0 || visionCalls > 0);
-  return { gemini: fileGem, gpt: fileGpt, gemptActive, excluded };
+  return { gemini: fileGem, gpt: fileGpt, gemptActive, excluded, swarmParent };
 }
 
 function listDirectories(dir) {
@@ -207,6 +220,20 @@ function scanAgyBrain(brainDir, sessionsDir, cutoffMs, nowMs, gemini, gpt) {
   let filesScanned = 0;
   let excludedSessions = 0;
   let unmarkedSessions = 0;
+  const swarmWorkers = [];
+  const collect = (usage, active, linkedWorker = false) => {
+    hasGemptActivity ||= active;
+    if (usage.excluded && !linkedWorker) {
+      excludedSessions += 1;
+    } else if (active) {
+      mergeBucket(gemini, usage.gemini);
+      mergeBucket(gpt, usage.gpt);
+    } else {
+      unmarkedSessions += 1;
+      mergeBucket(unmarkedGemini, usage.gemini);
+      mergeBucket(unmarkedGpt, usage.gpt);
+    }
+  };
   for (const entry of entries) {
     const transcript = join(brainDir, entry.name, '.system_generated', 'logs', 'transcript.jsonl');
     let st;
@@ -219,18 +246,16 @@ function scanAgyBrain(brainDir, sessionsDir, cutoffMs, nowMs, gemini, gpt) {
     filesScanned += 1;
     const usage = scanTranscriptFile(transcript, cutoffMs, nowMs);
     if (!usage) continue;
-    const active = usage.gemptActive || activeHosts.has(entry.name);
-    hasGemptActivity ||= active;
-    if (usage.excluded) {
-      excludedSessions += 1;
-    } else if (active) {
-      mergeBucket(gemini, usage.gemini);
-      mergeBucket(gpt, usage.gpt);
+    if (usage.gemptActive) activeHosts.add(entry.name);
+    if (usage.swarmParent && usage.swarmParent !== entry.name) {
+      swarmWorkers.push({ id: entry.name, usage });
     } else {
-      unmarkedSessions += 1;
-      mergeBucket(unmarkedGemini, usage.gemini);
-      mergeBucket(unmarkedGpt, usage.gpt);
+      collect(usage, activeHosts.has(entry.name));
     }
+  }
+  for (const { id, usage } of swarmWorkers) {
+    const linkedWorker = activeHosts.has(usage.swarmParent);
+    collect(usage, linkedWorker || activeHosts.has(id), linkedWorker);
   }
   if (!hasGemptActivity) {
     mergeBucket(gemini, unmarkedGemini);

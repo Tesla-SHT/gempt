@@ -199,6 +199,13 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   assert.ok(!existsSync(legacyLock));
   assert.ok(!existsSync(legacyWait));
   assert.ok(existsSync(join(binDir, 'gempt-wait.mjs')));
+  const cliShim = join(binDir, process.platform === 'win32' ? 'gempt.cmd' : 'gempt');
+  assert.ok(installed.cli_shims.includes(cliShim));
+  const help = process.platform === 'win32'
+    ? spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/c', 'gempt.cmd --help'], { cwd: binDir, env, encoding: 'utf8' })
+    : spawnSync(cliShim, ['--help'], { cwd: f.root, env, encoding: 'utf8' });
+  assert.equal(help.status, 0, help.stderr || help.error?.message);
+  assert.match(help.stdout, /\|run\|ask\|/);
   assert.ok(installed.refresh.refreshed);
   assert.deepEqual(refreshCalls, [{ url: '/exa.language_server_pb.LanguageServerService/RefreshMcpServers',
     method: 'POST', token: 'fixture', data: { serverName: 'gempt_gempt' } }]);
@@ -222,6 +229,10 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   }) });
   assert.match(response.result.contents[0].text, /GemPT/);
   const hooks = JSON.parse(readFileSync(join(target, 'hooks.json'), 'utf8'));
+  const matcher = hooks['gempt-work-split'].PreToolUse[0].matcher.split('|');
+  for (const name of ['swarm', 'post_message', 'read_board', 'swarm_wait', 'define_subagent', 'send_message']) {
+    assert.ok(matcher.includes(name), name);
+  }
   const hook = hooks['gempt-work-split'].SessionStart[0].command;
   assert.ok(hook.includes('work_split_hook.mjs'));
   assert.doesNotMatch(hook, /python/i);
@@ -286,11 +297,12 @@ test('Antigravity installer resets Windows plugin and shim ACLs after placement,
     const installed = await installWindowsAgy({ target, binDir, env });
     assert.equal(installed.installed, true);
     assert.equal(installed.shims.length, 3);
+    assert.deepEqual(installed.cli_shims, ['gempt', 'gempt.cmd'].map((name) => join(binDir, name)));
     assert.deepEqual(calls.map(({ args }) => args), [
       [installed.plugin_dir, '/reset', '/T', '/C', '/Q'],
-      ...installed.shims.map((path) => [path, '/reset', '/C', '/Q']),
+      ...[...installed.shims, ...installed.cli_shims].map((path) => [path, '/reset', '/C', '/Q']),
     ]);
-    assert.deepEqual(calls.map(({ shimsWritten }) => shimsWritten), [false, true, true, true]);
+    assert.deepEqual(calls.map(({ shimsWritten }) => shimsWritten), [false, true, true, true, true, true]);
     assert.ok(calls.every(({ command, exists, pluginPlaced, options }) =>
       command === 'icacls.exe' && exists && pluginPlaced && options.windowsHide === true));
 
@@ -367,6 +379,7 @@ test('portable Antigravity bundle validates and a shim failure reports a partial
   assert.equal(result.shim_installed, false);
   assert.equal(result.installed, false);
   assert.ok(result.shim_error);
+  assert.ok(result.cli_shim_error);
   assert.ok(result.warnings.some((warning) => warning.includes(result.shim_error)));
   assert.equal(JSON.parse(readFileSync(join(target, 'plugin.json'), 'utf8')).name, 'gempt');
   assert.equal(readFileSync(binDir, 'utf8'), 'keep this file');
@@ -504,6 +517,72 @@ async function until(probe) {
   }
   assert.fail('Timed out waiting for fixture state.');
 }
+
+test('gempt run and ask accept shell input and share execution and consult sessions with MCP', async (t) => {
+  const f = fixture(t);
+  const repoSubdir = initRepo(f.cwd);
+  const workerCwd = join(f.root, 'native swarm worktree');
+  git(f.cwd, 'worktree', 'add', '--detach', workerCwd, 'HEAD');
+  const packets = await appFixture(t, f);
+  const baseEnv = { ...f.env, GEMPT_WORKSPACE_ROOT: f.root, GEMPT_GPT_RUN_SYNC_SEC: '0' };
+  const cli = (args, input = '', env = baseEnv) => {
+    const pending = execFileAsync(process.execPath, [cliPath, ...args], { cwd: workerCwd, env, timeout: 15_000 });
+    pending.child.stdin.end(input);
+    return pending.then(({ stdout }) => JSON.parse(stdout));
+  };
+  const run = await cli(['run', '--goal', '-', '--access', 'inspect', '--workspace', 'inherit', '--tier', 'sonnet',
+    '--family', 'hydrogen', '--host', 'coordinator', '--title', 'inspect worker', '--timeout', '90'], '  Inspect the native worktree. \n');
+  assert.equal(run.state, 'queued');
+  assert.equal(run.cwd, workerCwd);
+  assert.equal(run.worktree_path, null);
+  assert.equal(run.tier, 'sonnet');
+  assert.match(run.wait_command, new RegExp(run.run_id + '$'));
+  assert.equal(run.goal, undefined);
+  const done = await waitForRun(run.run_id, { ...f, timeoutSec: 5 });
+  assert.equal(done.state, 'finished', done.error);
+  assert.equal(done.session_id, run.session_id);
+  assert.equal(done.host_conversation_id, 'coordinator');
+  assert.equal(done.title, 'inspect worker');
+  assert.equal(done.sandbox, 'read-only');
+  assert.equal(done.goal, 'Inspect the native worktree.');
+  assert.equal(git(f.cwd, 'worktree', 'list', '--porcelain').match(/^worktree /gm).length, 2);
+
+  const goalFile = join(f.root, 'brief.txt');
+  writeFileSync(goalFile, 'Follow up on the inspection.');
+  const follow = await cli(['run', '--goal-file', goalFile, '--cwd', workerCwd, '--access', 'inspect',
+    '--session', run.session_id], '', { ...baseEnv, GEMPT_GPT_RUN_SYNC_SEC: '5' });
+  assert.equal(follow.state, 'finished');
+  assert.equal(follow.session_id, run.session_id);
+  assert.equal(follow.cwd, workerCwd);
+  assert.match(follow.text, /Prior finding/);
+  assert.match(packets.filter(({ method }) => method === 'turn/start').at(-1).params.input[0].text, /Follow up on the inspection/);
+
+  writeFileSync(join(repoSubdir, 'second.txt'), 'second attachment');
+  const askArgs = ['ask', '--cwd', repoSubdir, '--tier', 'sonnet', '--host', 'coordinator', '--file', 'readme.txt', '--file', 'second.txt'];
+  const answer = await cli(askArgs, 'Summarize these files.');
+  assert.match(answer.text, /Consult answer/);
+  const consulted = JSON.parse(readFileSync(join(f.sessionsDir, answer.session_id + '.json'), 'utf8'));
+  assert.equal(consulted.host_conversation_id, 'coordinator');
+  const prompt = consulted.turns.find(({ role }) => role === 'user').content;
+  assert.match(prompt, /tracked/);
+  assert.match(prompt, /second attachment/);
+  const continuation = await cli(['ask', '--goal-file', goalFile, '--cwd', repoSubdir, '--session', answer.session_id]);
+  assert.equal(continuation.session_id, answer.session_id);
+  await assert.rejects(cli([...askArgs, '--file', '../outside.txt'], 'Check attachments.'), /outside workspace/);
+
+  for (const [args, input, error] of [
+    [['run'], ' \n', /goal is required/],
+    [['ask', '--goal', '-'], '', /goal is required/],
+    [['ask', '--goal', 'x', '--goal-file', goalFile], '', /Choose --goal or --goal-file/],
+    [['run', '--access', 'admin'], '', /Invalid --access/],
+    [['run', '--workspace', 'other'], '', /Invalid --workspace/],
+    [['run', '--access', 'inspect', '--workspace', 'share', '--goal', 'x'], '', /not allowed with read-only/],
+    [['run', '--tier', 'chore'], '', /Invalid --tier/],
+    [['ask', '--tier', 'unknown'], '', /Invalid --tier/],
+    [['ask', '--family', 'unknown'], '', /Invalid --family/],
+    [['run', '--timeout', 'Infinity'], '', /Invalid timeout_sec/],
+  ]) await assert.rejects(cli(args, input), error);
+});
 
 test('host context reclaims a dead PID lock, restores the main conversation and tracks subagents', async (t) => {
   const { cwd, configPath } = fixture(t);
@@ -1380,7 +1459,49 @@ test('Live restricts out-of-workspace files, exposes remote_turn_unconfirmed, an
     env: { ...env, GEMPT_SWARM_MODE: '1' },
     input: JSON.stringify({ hookEventName: 'SessionStart', conversationId: 'swarm-inherit', workspacePaths: [f.cwd] }),
   });
-  assert.match(inheritedStart.injectSteps[0].systemMessage.systemMessage, /35% GPT/);
+  assert.match(inheritedStart.injectSteps[0].systemMessage.systemMessage, /gemini_first \(15% GPT, swarm\)/);
+});
+
+test('Coordinator detects Swarm tools without a host flag and inherits the coordination policy', (t) => {
+  const f = fixture(t);
+  mkdirSync(dirname(f.configPath), { recursive: true });
+  const appState = join(dirname(f.configPath), 'app-server.json');
+  writeFileSync(appState, JSON.stringify({ status: 'running', pid: process.pid, ws_url: 'ws://127.0.0.1:1' }));
+  const env = { ...f.env, GEMPT_APP_SERVER_STATE: appState, GEMPT_SWARM_MODE: '', GEMPT_IS_SWARM: '', GEMPT_SWARM_ROLE: '' };
+  const payload = { conversationId: 'coordinator', workspacePaths: [f.cwd], lastUserInput: 'Review the work.' };
+  const invoke = (event) => jsonProcess(process.execPath, [hookPath], { env, input: JSON.stringify({ ...payload, ...event }) });
+  const tool = (name, args, fields) => invoke({ hookEventName: 'PreToolUse', toolCall: { name, args }, ...fields });
+  const policy = (work_split, swarm_split = 'inherit') =>
+    writeFileSync(f.configPath, JSON.stringify({ routing_policy: { work_split, swarm_split } }));
+  const path = join(f.cwd, 'index.mjs');
+  const statePath = join(dirname(f.configPath), 'hook-state', 'coordinator.json');
+  policy('gpt_first');
+  assert.equal(tool('swarm', { action: 'models' }).decision, 'allow');
+  assert.ok(!existsSync(statePath));
+  assert.match(tool('edit_file', { Path: path }).reason, /Write Gate/);
+  assert.equal(tool('swarm', { action: 'add' }).decision, 'allow');
+  assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).is_swarm, true);
+  assert.equal(tool('edit_file', { Path: path }).decision, 'allow');
+  for (let i = 0; i < 3; i++) assert.equal(tool('read_file', { Path: path }).decision, 'allow');
+  const entry = (initialNumSteps) => invoke({ hookEventName: 'PreInvocation', invocationNum: 0, initialNumSteps });
+  const message = entry(1).injectSteps[0].systemMessage.systemMessage;
+  assert.match(message, /Swarm Coordinator.*gemini-4-hydrogen-low/);
+  assert.match(message, /gempt run --cwd "\$PWD" --workspace inherit.*gempt-wait.*Gemini\/Claude/);
+  assert.deepEqual(entry(1), {});
+  policy('gemini');
+  assert.deepEqual(entry(2), {});
+  policy('gemini', 'gpt_first');
+  assert.match(entry(3).injectSteps[0].systemMessage.systemMessage, /\[GemPT 80%\]/);
+  assert.match(tool('edit_file', { Path: path }).reason, /Write Gate/);
+  for (const [name, args] of [
+    ...['status', 'title', 'model', 'kill'].map((action) => ['swarm', { action }]),
+    ...['post_message', 'read_board', 'swarm_wait', 'define_subagent', 'send_message'].map((name) => [name, {}]),
+  ]) {
+    const conversationId = name === 'swarm' ? args.action : name;
+    tool(name, args, { conversationId });
+    const file = join(dirname(statePath), conversationId + '.json');
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).is_swarm, true);
+  }
 });
 
 test('packaging guards unsafe output paths and rolls back in-place sync on verify failure', async (t) => {

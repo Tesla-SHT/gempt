@@ -4,8 +4,9 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
 import { DEFAULT_AGY_TARGET, installAgy } from '../core/agy-install.mjs';
-import { serveStdio } from '../core/mcp-server.mjs';
-import { interruptRun, replyToolCall, steerRun } from '../core/runs.mjs';
+import { handleTool, serveStdio } from '../core/mcp-server.mjs';
+import { ACTIVE_STATES, buildWaitCommand, compactReceiptText, dispatchRun, interruptRun, replyToolCall,
+  steerRun, validateExecTimeoutSec } from '../core/runs.mjs';
 import { resolvePath } from '../core/state.mjs';
 import { runWait } from '../core/wait.mjs';
 import { pruneShareWorktrees } from '../core/worktrees.mjs';
@@ -18,8 +19,12 @@ import {
 
 const string = { type: 'string' };
 const flag = { type: 'boolean' };
+const goalOptions = { goal: string, 'goal-file': string, cwd: string, tier: string,
+  family: string, session: string, host: string };
 const commands = {
   'install-agy': { target: string, source: string, force: flag },
+  run: { ...goalOptions, access: string, workspace: string, title: string, timeout: string },
+  ask: { ...goalOptions, file: { ...string, multiple: true } },
   mcp: {}, discover: {}, status: { 'run-id': string, 'run-ids': string, wait: flag, 'wait-all': flag },
   init: { 'non-interactive': flag, failover: string, strategy: string, sandbox: string,
     'utility-model': string, 'sync-magpie': flag, 'use-groups': flag, 'dry-run': flag },
@@ -32,6 +37,24 @@ const print = (value) => console.log(JSON.stringify(value, null, 2));
 function choose(value, allowed, label) {
   if (value !== undefined && !allowed.includes(value)) throw new Error(`Invalid ${label} '${value}'. Choose ${allowed.join(', ')}.`);
   return value;
+}
+
+async function goalArgs(values, tiers) {
+  const tier = choose(values.tier, tiers, '--tier');
+  const family = choose(values.family, ['hydrogen', 'neon', 'carbon'], '--family');
+  const goalFile = values['goal-file'];
+  if (values.goal !== undefined && goalFile !== undefined) throw new Error('Choose --goal or --goal-file.');
+  let goal = values.goal ?? '';
+  if (goalFile !== undefined) {
+    goal = readFileSync(resolvePath(goalFile), 'utf8');
+  } else if (values.goal === '-' || (values.goal === undefined && !process.stdin.isTTY)) {
+    goal = '';
+    for await (const chunk of process.stdin.setEncoding('utf8')) goal += chunk;
+  }
+  goal = goal.trim();
+  if (!goal) throw new Error('goal is required and must be a non-empty string.');
+  return { goal, cwd: resolvePath(values.cwd ?? process.cwd()), tier, gemini_family: family,
+    session_id: values.session?.trim(), host_conversation_id: values.host };
 }
 
 async function settings(options) {
@@ -68,6 +91,36 @@ async function main([command, ...args]) {
   switch (command) {
     case 'mcp':
       return serveStdio(process.stdin, process.stdout, { ...process.env, GEMPT_CONFIG: configPath });
+    case 'run': {
+      const access = choose(values.access, ['change', 'inspect'], '--access') ?? 'change';
+      const workspace = choose(values.workspace, ['inherit', 'share'], '--workspace') ?? 'inherit';
+      const timeoutSec = validateExecTimeoutSec(values.timeout === undefined ? undefined : Number(values.timeout));
+      const args = await goalArgs(values, TIER_ORDER);
+      const syncBudget = Number(process.env.GEMPT_GPT_RUN_SYNC_SEC);
+      const waitSec = Number.isFinite(syncBudget) && syncBudget > 0 ? Math.min(syncBudget, 10) : 0;
+      const run = await dispatchRun({ ...args, access, workspace, title: values.title, timeout_sec: timeoutSec,
+        background: waitSec === 0, sandbox: access === 'inspect' ? 'read-only' : undefined, mcp: true,
+        expected_report: 'Report concisely: changed files, verification commands/results, and any remaining blockers. Omit verbose raw logs.',
+      }, { configPath, waitSec });
+      const { run_id, session_id, state, worktree_path = null, cwd, tier = null } = run;
+      const receipt = { run_id, session_id, state, worktree_path, cwd, tier };
+      if (ACTIVE_STATES.has(state) || state === 'interrupted') {
+        const wait_command = buildWaitCommand(run_id);
+        print({ ...receipt, wait_command, text: state === 'waiting_gemini'
+          ? `Run ${run_id} is waiting for ask_gemini reply (use gempt reply-tool).`
+          : `Run ${run_id} started. Execute \`${wait_command}\` via run_command(WaitMsBeforeAsync=500) for zero-poll wakeup.` });
+        return Number(state === 'interrupted');
+      }
+      const { model, reasoning_effort, verification, usage, text } = run;
+      print({ ...receipt, model, reasoning_effort, verification, usage, text: compactReceiptText(text, session_id) });
+      return Number(['failed', 'unverified'].includes(verification?.status));
+    }
+    case 'ask': {
+      const args = await goalArgs(values, ['chore', ...TIER_ORDER]);
+      const response = await handleTool('gpt_ask', { ...args, file_paths: values.file }, process.env, { configPath });
+      console.log(response.content[0].text);
+      return Number(Boolean(response.isError));
+    }
     case 'install-agy':
       result = await installAgy({ target, source: values.source, force: values.force });
       break;

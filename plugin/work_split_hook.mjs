@@ -71,7 +71,7 @@ function payloadSwarmSignal(payload) {
   const parent = text(payload.parentConversationId) || text(payload.parent_conversation_id);
   if (parent && parent !== conversation) return true;
   const toolName = text(payload.toolCall?.name);
-  if (swarmTools.has(toolName)) return true;
+  if (swarmTools.has(toolName)) return toolName !== 'swarm' || payload.toolCall?.args?.action !== 'models';
   if (toolName === 'invoke_subagent' && text(payload.toolCall?.args?.TypeName) !== 'gempt-worker') return true;
   if (toolName === 'call_mcp_tool' && payload.toolCall?.args?.ServerName === 'gempt_gempt') {
     const parentId = text(payload.toolCall?.args?.Arguments?.host_conversation_id);
@@ -225,8 +225,9 @@ async function handle(payload) {
     }
   }
   const isSwarm = envSwarmSignal() || detectedSwarm || storedSwarm;
-  const usingSwarmSplit = isSwarm && routing.swarm_split !== 'inherit';
-  const ordinary = usingSwarmSplit ? routing.swarm_split : routing.work_split;
+  const coordinatingSwarm = isSwarm && routing.swarm_split === 'inherit' && routing.work_split !== 'gemini';
+  const ordinary = isSwarm && routing.swarm_split !== 'inherit' ? routing.swarm_split
+    : coordinatingSwarm ? 'gemini_first' : routing.work_split;
   const pct = WORKLOAD.profiles[ordinary]?.gpt_share ?? WORKLOAD.profiles.balanced.gpt_share;
   const userInput = String(payload.lastUserInput || '');
   const key = userInput.trim() ? createHash('sha1').update(userInput.trim()).digest('hex').slice(0, 16) : '';
@@ -277,7 +278,7 @@ async function handle(payload) {
   }
   if (hookEventName === 'SessionStart') {
     if (pct <= 0) return {};
-    return { injectSteps: [step(`GemPT v2 active: ${ordinary} (${pct}% GPT${family ? `, family=${family}` : ''}${usingSwarmSplit ? ', swarm' : ''}).\n`
+    return { injectSteps: [step(`GemPT v2 active: ${ordinary} (${pct}% GPT${family ? `, family=${family}` : ''}${isSwarm ? ', swarm' : ''}).\n`
       + 'Tools (ServerName="gempt_gempt"): gpt_run(goal,cwd,access="change"|"inspect",workspace="inherit"|"share",session_id?) | '
       + 'gpt_ask(goal,file_paths?,cwd?,tier?,session_id?) | gpt_ctl(action="status"|"steer"|"interrupt"|"reply",run_id?,message?,call_id?).\n'
       + "Run gpt_run's returned `gempt-wait <id>` via run_command(WaitMsBeforeAsync=500); never poll status.")] };
@@ -301,7 +302,9 @@ async function handle(payload) {
       setCount(state, key, 0);
       state.last_entry_key = entry;
       state.last_entry_at = now();
-      if (Object.hasOwn(banners, ordinary) && !override.test(userInput) && healthy()) {
+      if (coordinatingSwarm && !override.test(userInput)) {
+        result.push(step(`[GemPT ${pct}%] Swarm Coordinator: coordinate, review, and merge freely. Start GPT workers with model="gemini-4-hydrogen-low"; their brief runs \`gempt run --cwd "$PWD" --workspace inherit\` and the returned \`gempt-wait\` command. Launch Gemini/Claude workers natively.`));
+      } else if (Object.hasOwn(banners, ordinary) && !override.test(userInput) && healthy()) {
         result.push(step(`[GemPT ${pct}%] ${banners[ordinary]}`));
       }
     }
