@@ -12,12 +12,40 @@ import { atomicJson, resolvePath, validateSessionId, withLock, withinPath } from
 import { ensureShareWorktree } from './worktrees.mjs';
 
 export const ACTIVE_STATES = new Set(['queued', 'running', 'waiting_gemini']);
+export const EXEC_TIMEOUT_MIN_SEC = 30;
+export const EXEC_TIMEOUT_MAX_SEC = 7200;
+export const UNCONFIRMED_HOLD_MS = 30 * 60 * 1000;
+const STARTUP_GRACE_MS = 60_000;
+const TERMINAL_INTERRUPT_ERR = /not found|no active|already (?:completed|finished|interrupted|stopped|ended)|unknown turn|invalid turn/i;
 const pending = (state) => state === 'queued' || state === 'running';
 const workerPath = fileURLToPath(new URL('../magpie_plugin/lib/exec-worker.mjs', import.meta.url));
 const waitPath = fileURLToPath(new URL('./wait.mjs', import.meta.url));
 const now = () => Date.now() / 1000;
 const readRetry = new Int32Array(new SharedArrayBuffer(4));
 const runError = (message, status, cause) => Object.assign(new Error(message, { cause }), { status });
+
+export function validateExecTimeoutSec(value) {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < EXEC_TIMEOUT_MIN_SEC || value > EXEC_TIMEOUT_MAX_SEC) {
+    throw runError(`Invalid timeout_sec: expected a finite number between ${EXEC_TIMEOUT_MIN_SEC} and ${EXEC_TIMEOUT_MAX_SEC}.`, 400);
+  }
+  return value;
+}
+
+export function isRecentUnconfirmedRun(record, nowMs = Date.now(), modifiedAtMs = null) {
+  if (!record?.remote_turn_unconfirmed || ACTIVE_STATES.has(record.state)) return false;
+  const deadlineMs = Number.isFinite(record.deadline) ? record.deadline * 1000 : NaN;
+  if (Number.isFinite(deadlineMs) && nowMs <= deadlineMs) return true;
+  const ts = [record.unconfirmed_at, record.finished_at, record.progress?.updated_at, record.started_at, record.created_at]
+    .map((v) => (typeof v === 'string' ? Date.parse(v) : (typeof v === 'number' ? v * (v < 1e12 ? 1000 : 1) : NaN)))
+    .find(Number.isFinite) ?? modifiedAtMs;
+  if (!Number.isFinite(ts)) return true;
+  return nowMs - ts <= UNCONFIRMED_HOLD_MS;
+}
+
+export function isRunOccupying(record, nowMs = Date.now(), modifiedAtMs = null) {
+  return Boolean(record) && (ACTIVE_STATES.has(record.state) || isRecentUnconfirmedRun(record, nowMs, modifiedAtMs));
+}
 
 export function runDirectory(runId, sessionsDir) {
   if (typeof runId !== 'string' || !/^[a-f0-9]{32}$/.test(runId)) {
@@ -52,14 +80,31 @@ export function readRun(runId, sessionsDir) {
     }
   }
   if (record?.run_id !== runId || typeof record.state !== 'string') throw new Error('Run state does not match the requested ID.');
-  if (ACTIVE_STATES.has(record.state)) {
-    let expired = now() > (record.deadline ?? Infinity);
-    if (!expired && record.source === 'magpie_exec' && Number.isInteger(record.pid) && record.pid > 0) {
-      try { process.kill(record.pid, 0); } catch (error) { expired = error.code === 'ESRCH'; }
-    }
-    if (expired) Object.assign(record, { state: 'outcome_unknown', pending_tool_call: null });
-  }
+  reconcileRunState(record, () => statSync(path, { throwIfNoEntry: false })?.mtimeMs);
   record.title = normalizeTitle(record.title, record.goal, record.source_cwd || record.cwd);
+  return record;
+}
+
+export function reconcileRunState(record, modifiedAt) {
+  if (!ACTIVE_STATES.has(record.state)) return record;
+  const hasPid = Number.isInteger(record.pid) && record.pid > 0;
+  const created = record.state === 'queued' && !hasPid ? Date.parse(record.created_at) : null;
+  if (created !== null && Date.now() - (Number.isFinite(created) ? created : modifiedAt?.() ?? Infinity) >= STARTUP_GRACE_MS) {
+    return Object.assign(record, { state: 'failed', error: 'Codex worker startup timed out after 60s.',
+      pending_tool_call: null });
+  }
+  let expired = record.state !== 'waiting_gemini' && now() > (record.deadline ?? Infinity);
+  if (!expired && record.source === 'magpie_exec' && hasPid) {
+    try { process.kill(record.pid, 0); } catch (error) { expired = error.code === 'ESRCH'; }
+  }
+  if (expired) {
+    Object.assign(record, { state: 'outcome_unknown', pending_tool_call: null });
+    if (record.turn_id) {
+      record.remote_turn_unconfirmed = true;
+      record.unconfirmed_at ||= new Date().toISOString();
+      record.error ||= 'Remote Codex turn may still be running (worker stopped reporting).';
+    }
+  }
   return record;
 }
 
@@ -128,27 +173,77 @@ export function compactReceiptText(text, sessionId) {
 }
 
 async function controlRun(runId, method, message, {
-  configPath, sessionsDir, env = process.env, getState, connect = connectAppServer,
+  configPath, sessionsDir, env = process.env, getState, connect = connectAppServer, confirmMs = 500,
 } = {}) {
   const record = readRun(runId, sessionsDir);
   const { codex_thread_id: threadId, turn_id: turnId } = record;
-  if (!['running', 'waiting_gemini'].includes(record.state) || !threadId || !turnId) {
+  const isInterrupt = method === 'turn/interrupt';
+  const isActive = ['running', 'waiting_gemini'].includes(record.state);
+  const isUnconfirmed = Boolean(record.remote_turn_unconfirmed);
+  if (isInterrupt && isUnconfirmed && (!threadId || !turnId)) {
+    const file = join(runDirectory(runId, sessionsDir), 'state.json');
+    const updated = { ...record, interrupt_confirmed_at: new Date().toISOString() };
+    delete updated.remote_turn_unconfirmed;
+    delete updated.unconfirmed_at;
+    saveRun(file, updated);
+    return { ok: true, run_id: runId, session_id: record.session_id, thread_id: threadId ?? null,
+      turn_id: turnId ?? null, cleared_unconfirmed: true };
+  }
+  if ((!isActive && !(isInterrupt && isUnconfirmed)) || !threadId || !turnId) {
     throw runError(`Run ${runId} has no active Codex turn.`, 409);
   }
   let client;
+  let observedTerminal;
+  let resolveTerminal;
+  const onEvent = isInterrupt && isUnconfirmed ? ({ method: evMethod, params: event }) => {
+    if (evMethod === 'turn/completed' && event?.threadId === threadId && event.turn?.id === turnId) {
+      observedTerminal = event.turn;
+      resolveTerminal?.(observedTerminal);
+    }
+  } : undefined;
   try {
     const state = getState ? getState() : readAppServerState(configPath || record.config_path, env);
     if (state?.status !== 'running') throw new Error(UNAVAILABLE);
-    client = await connect(state);
+    client = await connect(state, onEvent);
   } catch (error) {
     throw runError(error.message, 503, error);
   }
+  let note;
   try {
     const params = method === 'turn/steer'
       ? { threadId, expectedTurnId: turnId, input: textInput(message) } : { threadId, turnId };
-    await client.request(method, params);
+    try {
+      await client.request(method, params);
+    } catch (error) {
+      if (isInterrupt && isUnconfirmed && !client.disconnected && TERMINAL_INTERRUPT_ERR.test(String(error?.message || ''))) {
+        note = String(error.message);
+      } else {
+        throw error;
+      }
+    }
+    if (isInterrupt && isUnconfirmed && !observedTerminal && !note && confirmMs > 0 && !client.disconnected) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(() => { resolveTerminal = undefined; resolve(); }, confirmMs);
+        resolveTerminal = () => { clearTimeout(timer); resolveTerminal = undefined; resolve(); };
+        client.onFailure?.(() => { clearTimeout(timer); resolveTerminal = undefined; resolve(); });
+      });
+    }
   } finally {
     client.close();
+  }
+  if (isInterrupt && isUnconfirmed) {
+    const file = join(runDirectory(runId, sessionsDir), 'state.json');
+    const latest = readRun(runId, sessionsDir);
+    const updated = { ...latest, interrupt_confirmed_at: new Date().toISOString() };
+    delete updated.remote_turn_unconfirmed;
+    delete updated.unconfirmed_at;
+    if (updated.state === 'outcome_unknown' && observedTerminal?.status === 'interrupted') {
+      updated.state = 'interrupted';
+      if (updated.progress) Object.assign(updated.progress, { phase: 'interrupted', updated_at: updated.interrupt_confirmed_at });
+    }
+    saveRun(file, updated);
+    return { ok: true, run_id: runId, session_id: record.session_id, thread_id: threadId, turn_id: turnId,
+      cleared_unconfirmed: true, ...(note ? { note } : {}) };
   }
   return { ok: true, run_id: runId, session_id: record.session_id, thread_id: threadId, turn_id: turnId };
 }
@@ -206,19 +301,26 @@ export function runWithinRoot(record, root) {
   return !root || (typeof cwd === 'string' && withinPath(resolvePath(cwd), root));
 }
 
-export function listActiveRoster({ limit = 20, root, hostConversationId, sessionsDir } = {}) {
+export function listActiveRoster({ limit = 20, root, hostConversationId, sessionId, sessionsDir, includeUnconfirmed = true } = {}) {
   const roster = [];
   const workspace = root && resolvePath(root);
-  for (const { id } of stateEntries(sessionsDir)) {
+  const foldSession = (id) => process.platform === 'win32' ? id?.toLowerCase() : id;
+  const sessionKey = foldSession(sessionId);
+  const nowMs = Date.now();
+  for (const { id, mtime } of stateEntries(sessionsDir)) {
     if (roster.length >= limit) break;
     let record;
     try { record = readRun(id, sessionsDir); } catch { continue; }
-    if (!ACTIVE_STATES.has(record.state) || !runWithinRoot(record, workspace)
-        || (hostConversationId && record.host_conversation_id !== hostConversationId)) continue;
-    const { run_id, session_id, title, state, model, cwd, worktree_path, source_cwd, host_conversation_id, progress, pending_tool_call } = record;
+    const active = includeUnconfirmed ? isRunOccupying(record, nowMs, mtime) : ACTIVE_STATES.has(record.state);
+    if (!active || !runWithinRoot(record, workspace)
+        || (hostConversationId && record.host_conversation_id !== hostConversationId)
+        || (sessionKey && (typeof record.session_id !== 'string' || foldSession(record.session_id) !== sessionKey))) continue;
+    const { run_id, session_id, title, state, model, cwd, worktree_path, source_cwd, host_conversation_id, progress, pending_tool_call,
+      remote_turn_unconfirmed } = record;
     roster.push({ run_id, session_id, title, state, model: model ?? null, cwd, worktree_path: worktree_path ?? null,
       source_cwd: source_cwd ?? null, host_conversation_id: host_conversation_id ?? null, phase: progress?.phase ?? null,
-      last_message: (progress?.last_message || '').slice(-240), pending_tool_call: pending_tool_call ?? null });
+      last_message: (progress?.last_message || '').slice(-240), pending_tool_call: pending_tool_call ?? null,
+      remote_turn_unconfirmed: Boolean(remote_turn_unconfirmed) });
   }
   return roster;
 }
@@ -234,6 +336,7 @@ export async function dispatchRun(args, {
   if (workspace === 'share' && isReadOnly) {
     throw runError("workspace='share' is not allowed with read-only access ('inspect'); use workspace='inherit' for read-only inspection.", 400);
   }
+  const timeoutSec = validateExecTimeoutSec(args.timeout_sec);
   const config = resolveConfigPath(configPath || env.GEMPT_CONFIG);
   const sessions = resolveSessionsDir(sessionsDir || env.GEMPT_SESSIONS_DIR);
   const { normalizeWorkspaceCwd } = await import('../magpie_plugin/lib/tools.mjs');
@@ -242,9 +345,8 @@ export async function dispatchRun(args, {
   const directory = runDirectory(id, sessions);
   const file = join(directory, 'state.json');
   const sessionId = args.session_id ? validateSessionId(args.session_id) : `exec-${randomUUID()}`;
-  const prior = args.session_id && readJsonSafe(join(sessions, `${sessionId}.json`));
-  const hostContext = readHostContext(config);
-  const hostId = args.host_conversation_id || prior?.host_conversation_id || hostContext.conversation_id || null;
+  let hostContext;
+  let hostId;
   const deadline = waitSec == null ? Infinity : performance.now() + waitSec * 1000;
   mkdirSync(join(sessions, 'runs'), { recursive: true });
   try {
@@ -272,11 +374,15 @@ export async function dispatchRun(args, {
   try {
     await withLock(join(sessions, `${sessionId}.dispatch.lock`), async () => {
       if (args.session_id) {
-        const busy = listActiveRoster({ limit: 50, sessionsDir: sessions }).find((entry) => entry.session_id === sessionId);
+        const [busy] = listActiveRoster({ limit: 1, sessionId, sessionsDir: sessions, includeUnconfirmed: true });
         if (busy) {
-          throw runError(`Session '${sessionId}' already has an active run (${busy.run_id}); wait for it to finish, steer it, or omit session_id to start a new thread.`, 409);
+          const detail = busy.remote_turn_unconfirmed
+            ? `Session '${sessionId}' has an unconfirmed remote turn (${busy.run_id}); run gpt_ctl(action='interrupt', run_id='${busy.run_id}') to confirm/clear it, or omit session_id to start a new thread.`
+            : `Session '${sessionId}' already has an active run (${busy.run_id}); wait for it to finish, steer it, or omit session_id to start a new thread.`;
+          throw runError(detail, 409);
         }
       }
+      const prior = args.session_id && readJsonSafe(join(sessions, `${sessionId}.json`));
       if (prior?.worktree_path && statSync(prior.worktree_path, { throwIfNoEntry: false })?.isDirectory()) {
         sourceCwd = resolvePath(prior.source_cwd || requestedCwd);
         cwd = resolvePath(prior.cwd || prior.worktree_path);
@@ -287,12 +393,16 @@ export async function dispatchRun(args, {
       } else if (workspace === 'share') {
         ({ cwd, source_cwd: sourceCwd, worktree_root: worktreePath } = ensureShareWorktree(cwd, sessionId, env));
       }
+      hostContext = readHostContext(config, sourceCwd);
+      hostId = args.host_conversation_id || prior?.host_conversation_id || hostContext.conversation_id || null;
+      const configuredTimeout = Number(readJsonSafe(config)?.codex?.timeout_sec) || 0;
+      const deadlineBudget = timeoutSec ?? Math.max(3600, configuredTimeout);
       record = {
         source: 'magpie_exec', run_id: id, cwd, state: 'queued', created_at: new Date().toISOString(),
         worktree_path: worktreePath, source_cwd: worktreePath ? sourceCwd : null, goal: args.goal,
         title: normalizeTitle(args.title, args.goal, sourceCwd), tier: args.tier, agent,
         host_conversation_id: hostId, session_id: sessionId, config_path: config, progress: null,
-        verification: args.verification, deadline: now() + 900 + (Number(args.timeout_sec) || 3600),
+        verification: args.verification, deadline: now() + 900 + deadlineBudget,
       };
       saveRun(file, record);
     }, { attempts: 80, delayMs: 25 });
@@ -303,6 +413,7 @@ export async function dispatchRun(args, {
   const host = { configPath: config, sessionsDir: sessions, magpieConfigDir, options: { exec: true },
     probeTimeoutMs, allowSandboxUpgrade: !legacyNative, worktreePath, sourceCwd };
   const request = { ...args, cwd, session_id: args.session_id ? sessionId : undefined,
+    ...(timeoutSec !== undefined ? { timeout_sec: timeoutSec } : {}),
     host_conversation_id: hostId, gemini_family: args.gemini_family || hostContext.gemini_family };
   try {
     const child = spawn(resolveNodeExecutable({ env }), [workerPath], {

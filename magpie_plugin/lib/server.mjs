@@ -4,12 +4,14 @@
  * Follows Magpie's sandboxed page service model:
  * - Binds strictly to 127.0.0.1 and validates Host & Origin headers.
  * - Generates an ephemeral per-process token injected into ui/index.html only on
- *   navigation requests (sec-fetch-mode === 'navigate' or absent).
+ *   navigation requests (sec-fetch-mode === 'navigate' / 'nested-navigate' or absent)
+ *   without a foreign/opaque Origin header.
  * - Requires `x-gempt-key` on every /api/* route except /api/ping.
- * - Reuses and seamlessly takes over the port across Magpie plugin reloads.
+ * - Reuses and seamlessly takes over the port across Magpie plugin reloads,
+ *   cleaning up stale identity files whose owning PID has exited.
  */
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { dirname, extname, join, resolve, sep } from 'node:path';
@@ -24,12 +26,8 @@ import {
   readJsonSafe,
   readState,
   resolveConfigPath,
-  setDefaultSandbox,
   setDefaultTier,
-  setWorkSplit,
-  setPairing,
-  setEffortSettings,
-  setFailoverMode,
+  updateSettings,
 } from './backend.mjs';
 
 import { createAppServerManager } from './app-server-manager.mjs';
@@ -41,7 +39,9 @@ const MAX_POST_BYTES = 8192;
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const UI_ROOT = resolve(HERE, '..', 'ui');
 const UI_PREFIX = UI_ROOT.endsWith(sep) ? UI_ROOT : UI_ROOT + sep;
+const INDEX_FILE = resolve(UI_ROOT, 'index.html');
 const THIS_FILE = fileURLToPath(import.meta.url);
+const CASE_INSENSITIVE_FS = process.platform === 'win32' || process.platform === 'darwin';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -59,16 +59,15 @@ const PKG = (() => {
   }
 })();
 
-const BUILD_ID = `${PKG.version || '0.4.0'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
+const BUILD_ID = `${PKG.version || '0.4.1'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
 const pidAlive = (pid) => {
   if (!Number.isSafeInteger(pid) || pid < 1) return false;
   try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }
 };
 const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
-const sleepUnref = (ms) => new Promise((resolveSleep) => {
-  const timer = setTimeout(resolveSleep, ms);
-  timer.unref?.();
-});
+const isIndexFile = (file) => (CASE_INSENSITIVE_FS
+  ? file.toLowerCase() === INDEX_FILE.toLowerCase()
+  : file === INDEX_FILE);
 
 function readJsonBody(req) {
   return new Promise((resolveBody, rejectBody) => {
@@ -118,6 +117,44 @@ export async function startServer({
   const resolvedConfigDir = dirname(resolveConfigPath(configPath));
   const identityFile = (p) => join(resolvedConfigDir, `page-server-${p}.json`);
   let publishedIdentityPath = null;
+  let exitHookRegistered = false;
+
+  const cleanStaleIdentity = (file) => {
+    if (!file || file === publishedIdentityPath || !existsSync(file)) return false;
+    try {
+      const rec = readJsonSafe(file);
+      const stale = !rec
+        || (rec.service === 'gempt-magpie-plugin'
+          && (!pidAlive(rec.pid) || typeof rec.instance_id !== 'string' || !rec.instance_id));
+      if (stale) {
+        unlinkSync(file);
+        return true;
+      }
+    } catch { /* Ignore cleanup races or read-only directories. */ }
+    return false;
+  };
+
+  const sweepStaleIdentities = () => {
+    try {
+      if (!existsSync(resolvedConfigDir)) return;
+      for (const name of readdirSync(resolvedConfigDir)) {
+        if (!/^page-server-\d+\.json$/.test(name)) continue;
+        cleanStaleIdentity(join(resolvedConfigDir, name));
+      }
+    } catch { /* Best effort. */ }
+  };
+
+  const clearIdentity = () => {
+    if (!publishedIdentityPath) return;
+    try {
+      const current = readJsonSafe(publishedIdentityPath);
+      if (current?.instance_id === INSTANCE_ID && existsSync(publishedIdentityPath)) {
+        unlinkSync(publishedIdentityPath);
+      }
+    } catch { /* Ignore cleanup errors. */ }
+    publishedIdentityPath = null;
+  };
+
   const publishIdentity = (p) => {
     try {
       mkdirSync(resolvedConfigDir, { recursive: true, mode: 0o700 });
@@ -130,18 +167,13 @@ export async function startServer({
         build: BUILD_ID,
       }) + '\n', { mode: 0o600 });
       publishedIdentityPath = file;
+      if (!exitHookRegistered) {
+        exitHookRegistered = true;
+        process.once('exit', clearIdentity);
+      }
     } catch { /* Best effort when config dir is read-only. */ }
   };
-  const clearIdentity = () => {
-    if (!publishedIdentityPath) return;
-    try {
-      const current = readJsonSafe(publishedIdentityPath);
-      if (current?.instance_id === INSTANCE_ID && existsSync(publishedIdentityPath)) {
-        unlinkSync(publishedIdentityPath);
-      }
-    } catch { /* Ignore cleanup errors. */ }
-    publishedIdentityPath = null;
-  };
+
   let actualPort = 0;
   let appServer;
   let OWN = new Set();
@@ -153,15 +185,20 @@ export async function startServer({
     HOSTS = new Set([`127.0.0.1:${p}`, `localhost:${p}`]);
   };
 
+  const normalizedOrigin = (req) => {
+    const o = req.headers.origin;
+    return typeof o === 'string' ? o.trim().toLowerCase() : undefined;
+  };
   const hostAllowed = (req) => HOSTS.has(String(req.headers.host || '').toLowerCase());
   const originAllowed = (req) => {
-    const o = req.headers.origin;
+    const o = normalizedOrigin(req);
     return o === undefined || o === 'null' || OWN.has(o);
   };
   const corsHeaders = (req) => {
     const o = req.headers.origin;
+    const norm = normalizedOrigin(req);
     const h = { vary: 'Origin' };
-    if (o === 'null' ? req.method === 'OPTIONS' || keyOK(req) : OWN.has(o)) {
+    if (norm === 'null' ? req.method === 'OPTIONS' || keyOK(req) : (norm !== undefined && OWN.has(norm))) {
       h['access-control-allow-origin'] = o;
     }
     return h;
@@ -232,11 +269,11 @@ export async function startServer({
           return send(req, res, 401, { error: 'unauthorized: send the x-gempt-key header' });
         }
         if (req.method === 'POST' && pathname === '/api/install-agy') {
-          if (req.headers.origin === 'null') return send(req, res, 403, { error: 'invalid origin' });
+          if (normalizedOrigin(req) === 'null') return send(req, res, 403, { error: 'invalid origin' });
           return send(req, res, 200, await installAgy({ target: antigravityPluginDir, binDir: agyBinDir }));
         }
         if (req.method === 'POST' && pathname === '/api/app-server/restart') {
-          if (req.headers.origin === 'null') return send(req, res, 403, { error: 'invalid origin' });
+          if (normalizedOrigin(req) === 'null') return send(req, res, 403, { error: 'invalid origin' });
           if (!appServer) return send(req, res, 503, { error: 'shared Codex app-server management is disabled' });
           const body = await readJsonBody(req);
           const result = await appServer.restart({ force: body?.force === true });
@@ -244,7 +281,7 @@ export async function startServer({
         }
         const interrupt = /^\/api\/runs\/(.*?)\/interrupt$/.exec((req.url || '/').split('?', 1)[0]);
         if (req.method === 'POST' && interrupt) {
-          if (req.headers.origin === 'null') return send(req, res, 403, { error: 'invalid origin' });
+          if (normalizedOrigin(req) === 'null') return send(req, res, 403, { error: 'invalid origin' });
           const id = interrupt[1];
           if (id.length !== 32 || !/^[a-f0-9]+$/.test(id)) return send(req, res, 400, { error: 'invalid run_id' });
           if (!appServer) return send(req, res, 503, { error: 'shared Codex app-server management is disabled' });
@@ -290,55 +327,8 @@ export async function startServer({
           return send(req, res, result.status, result);
         }
         if (req.method === 'POST' && pathname === '/api/settings') {
-          const body = await readJsonBody(req);
-          if (!body || typeof body !== 'object') {
-            return send(req, res, 400, { ok: false, error: '未提供有效设置项。' });
-          }
-          const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
-          if (has('pairing')) {
-            if (Object.keys(body).length !== 1) return send(req, res, 400, { ok: false, error: '每次请选择一个配对设置。' });
-            const result = setPairing(body.pairing?.family, body.pairing?.model, { configPath });
-            return send(req, res, result.status, result);
-          }
-          if (has('work_split') || has('swarm_split')) {
-            if (Object.keys(body).length !== 1) {
-              return send(req, res, 400, { ok: false, error: '每次请选择一个分工设置。' });
-            }
-            const key = has('work_split') ? 'work_split' : 'swarm_split';
-            const result = setWorkSplit(key, body[key], { configPath });
-            return send(req, res, result.status, result);
-          }
-          const hasSbx = has('default_sandbox');
-          const hasMode = has('failover_mode');
-          const hasEffort = has('auto_effort') || has('tier_effort') || has('mcp_effort');
-          if (!hasSbx && !hasMode && !hasEffort) {
-            return send(req, res, 400, { ok: false, error: '未提供有效设置项。' });
-          }
-          let out = { ok: true, status: 200 };
-          if (hasSbx) {
-            const sbxRes = setDefaultSandbox(body.default_sandbox, { configPath });
-            if (!sbxRes.ok) return send(req, res, sbxRes.status, sbxRes);
-            out = { ...out, ...sbxRes };
-          }
-          if (hasMode) {
-            const fmRes = await setFailoverMode(body.failover_mode, { configPath, probeTimeoutMs });
-            if (!fmRes.ok) return send(req, res, fmRes.status, fmRes);
-            out = { ...out, ...fmRes };
-          }
-          if (hasEffort) {
-            const effRes = setEffortSettings(
-              {
-                autoEffort: has('auto_effort') ? body.auto_effort : undefined,
-                mcpEffort: has('mcp_effort') ? body.mcp_effort : undefined,
-                tierEffort: has('tier_effort') ? body.tier_effort : undefined,
-                tier: has('tier') ? body.tier : undefined,
-              },
-              { configPath },
-            );
-            if (!effRes.ok) return send(req, res, effRes.status, effRes);
-            out = { ...out, ...effRes };
-          }
-          return send(req, res, out.status || 200, out);
+          const result = await updateSettings(await readJsonBody(req), { configPath, probeTimeoutMs });
+          return send(req, res, result.status, result);
         }
         return send(req, res, 404, { error: 'not found' });
       }
@@ -357,9 +347,13 @@ export async function startServer({
         return send(req, res, 404, 'not found', 'text/plain; charset=utf-8', false);
       }
       const type = MIME[extname(file).toLowerCase()] || 'application/octet-stream';
-      if (rel === 'index.html') {
-        const mode = String(req.headers['sec-fetch-mode'] || '');
-        if (mode && mode !== 'navigate') {
+      if (isIndexFile(file)) {
+        const mode = String(req.headers['sec-fetch-mode'] || '').trim().toLowerCase();
+        if (mode && mode !== 'navigate' && mode !== 'nested-navigate') {
+          return send(req, res, 403, { error: 'cross-origin page read not allowed' }, undefined, false);
+        }
+        const origin = normalizedOrigin(req);
+        if (origin !== undefined && !OWN.has(origin)) {
           return send(req, res, 403, { error: 'cross-origin page read not allowed' }, undefined, false);
         }
         const html = data.toString('utf-8').replace('<head>', `<head>\n  <meta name="gempt-key" content="${KEY}">`);
@@ -382,20 +376,29 @@ export async function startServer({
     if (Number.isInteger(n) && n >= 0 && n <= 65535) target = n;
   }
 
+  sweepStaleIdentities();
+
   const probeExisting = async (p) => {
+    const idFile = identityFile(p);
+    cleanStaleIdentity(idFile);
     try {
       const r = await fetch(`http://127.0.0.1:${p}/api/ping`, { signal: AbortSignal.timeout(800) });
       if (!r.ok) return null;
       const body = await r.json();
       if (!body || body.service !== 'gempt-magpie-plugin') return null;
-      const expected = readJsonSafe(identityFile(p));
+      const expected = readJsonSafe(idFile);
       if (!expected || expected.service !== 'gempt-magpie-plugin' || expected.port !== p
           || typeof expected.instance_id !== 'string' || !expected.instance_id
-          || body.instance_id !== expected.instance_id || !pidAlive(expected.pid)) {
+          || !pidAlive(expected.pid)) {
+        cleanStaleIdentity(idFile);
+        return null;
+      }
+      if (body.instance_id !== expected.instance_id) {
         return null;
       }
       return body;
     } catch {
+      cleanStaleIdentity(idFile);
       return null;
     }
   };
@@ -422,19 +425,53 @@ export async function startServer({
   });
 
   let closed = false;
+  let takeoverTimer = null;
+  let takeoverDone = null;
+  const sleepTakeover = (ms) => new Promise((resolveSleep) => {
+    takeoverDone = resolveSleep;
+    takeoverTimer = setTimeout(() => {
+      takeoverTimer = null;
+      takeoverDone = null;
+      resolveSleep();
+    }, ms);
+    takeoverTimer.unref?.();
+  });
+
   const result = (listening, reused) => {
     if (manageAppServer ?? target !== 0) {
       appServer = createAppServerManager({ configPath, sessionsDir, ...appServerOptions });
       void appServer.ensureRunning();
     }
     return {
-      port: actualPort, listening, reused, server, appServer,
+      port: actualPort,
+      get listening() { return server.listening; },
+      reused,
+      server,
+      appServer,
       async close() {
         closed = true;
+        if (takeoverTimer) {
+          clearTimeout(takeoverTimer);
+          takeoverTimer = null;
+        }
+        if (takeoverDone) {
+          const done = takeoverDone;
+          takeoverDone = null;
+          done();
+        }
+        if (exitHookRegistered) {
+          exitHookRegistered = false;
+          process.off('exit', clearIdentity);
+        }
         clearIdentity();
         await Promise.all([
           appServer?.stop(),
-          new Promise((done) => (server.listening ? server.close(done) : done())),
+          new Promise((done) => {
+            if (!server.listening) return done();
+            server.close(done);
+            server.closeIdleConnections?.();
+            server.closeAllConnections?.();
+          }),
         ]);
       },
     };
@@ -448,8 +485,9 @@ export async function startServer({
   const takeover = (p) => {
     (async () => {
       while (!closed) {
-        await sleepUnref(1000);
+        await sleepTakeover(500);
         if (closed) return;
+        cleanStaleIdentity(identityFile(p));
         try {
           if (await bindOnce(p)) {
             console.log(`[gempt-magpie-plugin] took over port ${p} (build ${BUILD_ID})`);
@@ -466,6 +504,7 @@ export async function startServer({
   const deadline = Date.now() + 18000;
   let foreignSince = 0;
   for (;;) {
+    cleanStaleIdentity(identityFile(target));
     if (await bindOnce(target)) break;
     const st = await probeExisting(target);
     if (st) {

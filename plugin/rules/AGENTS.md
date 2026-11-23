@@ -1,4 +1,4 @@
-# GemPT v0.4.0
+# GemPT v0.4.1
 - 使用 `gempt_gempt` MCP 的 `gpt_run(goal,cwd,access="change"|"inspect",workspace="inherit"|"share",session_id?)`、`gpt_ask(goal,file_paths?,cwd?,session_id?)`、`gpt_ctl(action="status"|"steer"|"interrupt"|"reply",run_id?,message?,call_id?)`。
 - 委派时沿用当前 Gemini 家族的配对。已知家族时可传 `gemini_family="hydrogen"|"neon"|"carbon"`，杂活咨询传 `tier="chore"`。
 - `gpt_run` 异步直返 `wait_command`（如 `gempt-wait <run_id>` 或含绝对路径的后备命令），优先原样用 `run_command(WaitMsBeforeAsync=500)` 后台等待唤醒；严禁循环轮询 status。

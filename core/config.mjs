@@ -85,7 +85,7 @@ export function getMcpEffort(policy) {
 }
 
 export function getPairing(policy, family) {
-  if (!Object.hasOwn(WORKLOAD.pairings, family)) return 'default';
+  if (typeof family !== 'string' || !Object.hasOwn(WORKLOAD.pairings, family)) return 'default';
   return policy?.pairings?.[family] ?? WORKLOAD.pairings[family];
 }
 
@@ -220,12 +220,13 @@ export function writeConfigAtomic(resolvedConfigPath, nextObj) {
   }
 }
 
-export function withConfigTransaction(configPath, mutator) {
+export function withConfigTransaction(configPath, mutator, { create = false } = {}) {
   const resolved = resolveConfigPath(configPath);
   const lockPath = `${resolved}.lock`;
   try {
     return withLockSync(lockPath, () => {
-      const loaded = readExistingConfigObject(resolved);
+      let loaded = readExistingConfigObject(resolved);
+      if (create && loaded.status === 404) loaded = { ok: true, path: resolved, data: {} };
       if (!loaded.ok) return loaded;
       const result = mutator(loaded);
       if (!result || result.ok === false || !result.next) return result;
@@ -270,39 +271,45 @@ export function setDefaultTier(tier, { configPath } = {}) {
 }
 
 export function setPairing(family, model, { configPath } = {}) {
-  if (!Object.hasOwn(WORKLOAD.pairings, family) ||
+  return withConfigTransaction(configPath, (loaded) => editPairing(loaded, family, model));
+}
+
+export function editPairing(loaded, family, model) {
+  if (typeof family !== 'string' || !Object.hasOwn(WORKLOAD.pairings, family) ||
       (model !== 'default' && (typeof model !== 'string' || !isCodexModelId(model) || model.trim() !== model))) {
     return { ok: false, status: 400, error: '请选择有效的 Gemini 档位和 Codex 订阅模型。' };
   }
-  return withConfigTransaction(configPath, (config) => {
-    const policy = config.data.routing_policy ||= {};
-    policy.pairings = { ...policy.pairings, [family]: model };
-    return { next: config.data };
-  });
+  const policy = loaded.data.routing_policy;
+  return { next: { ...loaded.data, routing_policy: { ...policy, pairings: { ...policy?.pairings, [family]: model } } } };
 }
 
 export function setWorkSplit(key, profile, { configPath } = {}) {
+  return withConfigTransaction(configPath, (loaded) => editWorkSplit(loaded, key, profile));
+}
+
+export function editWorkSplit(loaded, key, profile) {
   if (!['work_split', 'swarm_split'].includes(key) ||
-      !(Object.hasOwn(WORKLOAD.profiles, profile) || (key === 'swarm_split' && profile === 'inherit'))) {
+      typeof profile !== 'string' || !(Object.hasOwn(WORKLOAD.profiles, profile) || (key === 'swarm_split' && profile === 'inherit'))) {
     return { ok: false, status: 400, error: '请选择有效的工作分工档位。' };
   }
-  return withConfigTransaction(configPath, (config) => {
-    config.data.routing_policy = { ...config.data.routing_policy, [key]: profile };
-    return { next: config.data };
-  });
+  return { next: { ...loaded.data, routing_policy: { ...loaded.data.routing_policy, [key]: profile } } };
 }
 
 export function setDefaultSandbox(sandbox, { configPath } = {}) {
-  const normalized = String(sandbox || '').trim();
+  return withConfigTransaction(configPath, (loaded) => editDefaultSandbox(loaded, sandbox));
+}
+
+export function editDefaultSandbox(loaded, sandbox) {
+  const normalized = typeof sandbox === 'string' ? sandbox.trim() : '';
   if (!VALID_SANDBOXES.includes(normalized)) {
     return {
       ok: false,
       status: 400,
-      error: `Invalid default sandbox '${String(sandbox ?? '')}'. Expected one of: ${VALID_SANDBOXES.join(', ')}.`,
+      error: `Invalid default sandbox. Expected one of: ${VALID_SANDBOXES.join(', ')}.`,
     };
   }
 
-  return withConfigTransaction(configPath, (loaded) => ({
+  return {
     next: {
       ...loaded.data,
       codex: {
@@ -316,108 +323,108 @@ export function setDefaultSandbox(sandbox, { configPath } = {}) {
       default_sandbox: normalized,
       config_path: loaded.path,
     },
-  }));
+  };
 }
 
-export function setEffortSettings({ mcpEffort, tierEffort, tier, autoEffort } = {}, { configPath } = {}) {
-  return withConfigTransaction(configPath, (loaded) => {
-    const existingPolicy = loaded.data.routing_policy && typeof loaded.data.routing_policy === 'object'
-      ? loaded.data.routing_policy
-      : {};
-    if (autoEffort !== undefined && typeof autoEffort !== 'boolean') {
-      return { ok: false, status: 400, error: 'auto_effort must be a boolean.' };
-    }
-    if (mcpEffort !== undefined || (tierEffort === undefined && tier === undefined)) {
-      if (tierEffort !== undefined || tier !== undefined) {
-        return { ok: false, status: 400, error: 'Set either mcp_effort or tier_effort.' };
-      }
-      const policy = { ...existingPolicy };
-      if (mcpEffort !== undefined) {
-        const effort = String(mcpEffort || '').trim().toLowerCase();
-        if (!VALID_EFFORTS.includes(effort) || effort === 'ultra') {
-          return { ok: false, status: 400, error: `Invalid mcp_effort '${mcpEffort}'.` };
-        }
-        policy.mcp_effort = effort;
-      }
-      policy.auto_effort = autoEffort ?? (mcpEffort === undefined && Boolean(policy.auto_effort));
-      return {
-        next: { ...loaded.data, routing_policy: policy },
-        response: { ok: true, status: 200, auto_effort: policy.auto_effort, mcp_effort: getMcpEffort(policy), config_path: loaded.path },
-      };
-    }
+export function setEffortSettings(settings = {}, { configPath } = {}) {
+  return withConfigTransaction(configPath, (loaded) => editEffortSettings(loaded, settings));
+}
 
-    const existingTiers = loaded.data.tiers && typeof loaded.data.tiers === 'object'
-      ? loaded.data.tiers
-      : {};
+export function editEffortSettings(loaded, { mcpEffort, tierEffort, tier, autoEffort }) {
+  const existingPolicy = loaded.data.routing_policy && typeof loaded.data.routing_policy === 'object'
+    ? loaded.data.routing_policy
+    : {};
+  const invalid = validateEffortSettings({ mcpEffort, tierEffort, tier, autoEffort });
+  if (invalid) return invalid;
+  if (mcpEffort !== undefined || (tierEffort === undefined && tier === undefined)) {
+    const policy = { ...existingPolicy };
+    if (mcpEffort !== undefined) {
+      const effort = mcpEffort.trim().toLowerCase();
+      policy.mcp_effort = effort;
+    }
+    policy.auto_effort = autoEffort ?? (mcpEffort === undefined && Boolean(policy.auto_effort));
+    return {
+      next: { ...loaded.data, routing_policy: policy },
+      response: { ok: true, status: 200, auto_effort: policy.auto_effort, mcp_effort: getMcpEffort(policy), config_path: loaded.path },
+    };
+  }
 
-    const targetTier = normalizeDefaultTier(tier || existingPolicy.default_tier || 'sonnet');
-    if (!targetTier) {
+  const existingTiers = loaded.data.tiers && typeof loaded.data.tiers === 'object'
+    ? loaded.data.tiers
+    : {};
+
+  const targetTier = tier === undefined ? normalizeDefaultTier(existingPolicy.default_tier || 'sonnet')
+    : typeof tier === 'string' && normalizeDefaultTier(tier);
+  if (!targetTier) {
+    return {
+      ok: false,
+      status: 400,
+      error: `Invalid target tier '${String(tier ?? '')}'. Expected one of: ${TIER_ORDER.join(', ')}.`,
+    };
+  }
+
+  let nextAutoEffort = Boolean(existingPolicy.auto_effort);
+  if (autoEffort !== undefined) nextAutoEffort = autoEffort;
+
+  const nextTiers = { ...existingTiers };
+  const targetTierCfg = { ...DEFAULT_TIERS[targetTier], ...(existingTiers[targetTier] || {}) };
+
+  const cleanEffort = tierEffort?.trim().toLowerCase();
+  if (cleanEffort) {
+    const usesAstra = targetTier === 'fable'
+      || isAstraModel(targetTierCfg.consult_model)
+      || isAstraModel(targetTierCfg.exec_model)
+      || (Array.isArray(targetTierCfg.magpie_group_members) && targetTierCfg.magpie_group_members.some((m) => isAstraModel(m)));
+    if (usesAstra && EFFORT_RANK[cleanEffort] < EFFORT_RANK.medium) {
       return {
         ok: false,
         status: 400,
-        error: `Invalid target tier '${String(tier ?? '')}'. Expected one of: ${TIER_ORDER.join(', ')}.`,
+        error: 'Astra 模型禁止降到 low 档思考，请保持 high / xhigh 或切换到 Sol 档。',
       };
     }
-
-    let nextAutoEffort = Boolean(existingPolicy.auto_effort);
-    if (autoEffort !== undefined) nextAutoEffort = autoEffort;
-
-    const nextTiers = { ...existingTiers };
-    const targetTierCfg = { ...DEFAULT_TIERS[targetTier], ...(existingTiers[targetTier] || {}) };
-
-    if (tierEffort !== undefined && tierEffort !== null && String(tierEffort).trim() !== '') {
-      const cleanEffort = String(tierEffort).trim().toLowerCase();
-      if (!VALID_EFFORTS.includes(cleanEffort)) {
-        return {
-          ok: false,
-          status: 400,
-          error: `Invalid reasoning_effort '${String(tierEffort)}'. Expected one of: ${VALID_EFFORTS.join(', ')}.`,
-        };
-      }
-      if (cleanEffort === 'ultra') {
-        return {
-          ok: false,
-          status: 400,
-          error: "默认档位禁止设为 ultra（避免高倍并发配额消耗），仅在极端个案单次手动传参。",
-        };
-      }
-      const usesAstra = targetTier === 'fable'
-        || isAstraModel(targetTierCfg.consult_model)
-        || isAstraModel(targetTierCfg.exec_model)
-        || (Array.isArray(targetTierCfg.magpie_group_members) && targetTierCfg.magpie_group_members.some((m) => isAstraModel(m)));
-      if (usesAstra && EFFORT_RANK[cleanEffort] < EFFORT_RANK.medium) {
-        return {
-          ok: false,
-          status: 400,
-          error: 'Astra 模型禁止降到 low 档思考，请保持 high / xhigh 或切换到 Sol 档。',
-        };
-      }
-      targetTierCfg.reasoning_effort = cleanEffort;
-      nextTiers[targetTier] = targetTierCfg;
-      if (autoEffort === undefined) {
-        nextAutoEffort = false;
-      }
+    targetTierCfg.reasoning_effort = cleanEffort;
+    nextTiers[targetTier] = targetTierCfg;
+    if (autoEffort === undefined) {
+      nextAutoEffort = false;
     }
+  }
 
-    const next = {
-      ...loaded.data,
-      routing_policy: {
-        ...existingPolicy,
-        auto_effort: nextAutoEffort,
-      },
-      tiers: nextTiers,
-    };
+  const next = {
+    ...loaded.data,
+    routing_policy: {
+      ...existingPolicy,
+      auto_effort: nextAutoEffort,
+    },
+    tiers: nextTiers,
+  };
 
-    return {
-      next,
-      response: {
-        ok: true,
-        status: 200,
-        auto_effort: nextAutoEffort,
-        tier: targetTier,
-        reasoning_effort: String(nextTiers[targetTier]?.reasoning_effort || targetTierCfg.reasoning_effort || 'medium'),
-        config_path: loaded.path,
-      },
-    };
-  });
+  return {
+    next,
+    response: {
+      ok: true,
+      status: 200,
+      auto_effort: nextAutoEffort,
+      tier: targetTier,
+      reasoning_effort: String(nextTiers[targetTier]?.reasoning_effort || targetTierCfg.reasoning_effort || 'medium'),
+      config_path: loaded.path,
+    },
+  };
+}
+
+export function validateEffortSettings({ mcpEffort, tierEffort, tier, autoEffort }) {
+  let error;
+  if (autoEffort !== undefined && typeof autoEffort !== 'boolean') {
+    error = 'auto_effort must be a boolean.';
+  } else if (mcpEffort !== undefined) {
+    const effort = typeof mcpEffort === 'string' ? mcpEffort.trim().toLowerCase() : '';
+    if (tierEffort !== undefined || tier !== undefined) error = 'Set either mcp_effort or tier_effort.';
+    else if (!VALID_EFFORTS.includes(effort) || effort === 'ultra') error = 'Invalid mcp_effort.';
+  } else if (tier !== undefined && (typeof tier !== 'string' || !normalizeDefaultTier(tier))) {
+    error = 'Invalid target tier.';
+  } else if (tierEffort != null) {
+    const effort = typeof tierEffort === 'string' ? tierEffort.trim().toLowerCase() : null;
+    if (effort === 'ultra') error = '默认档位禁止设为 ultra，仅在极端个案单次手动传参。';
+    else if (effort !== '' && !VALID_EFFORTS.includes(effort)) error = 'Invalid reasoning_effort.';
+  }
+  if (error) return { ok: false, status: 400, error };
 }

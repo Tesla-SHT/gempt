@@ -7,7 +7,7 @@ import { basename, delimiter, dirname, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { defaultGatewayFromEnv, expandUser, readActiveRuns, readJsonSafe, resolveConfigPath, resolveMagpieApiKey } from './backend.mjs';
 import { appServerStatePath, connectAppServer } from './app-server-client.mjs';
-import { launchAppServer, matchesAppServerProcess, pidAlive, terminateAppServer } from './app-server-process.mjs';
+import { launchAppServer, matchesAppServerProcess, pidAlive, terminateAppServer, waitForProcessExit } from './app-server-process.mjs';
 import { interruptRun as interruptCoreRun } from '../../core/runs.mjs';
 
 const STRIPPED_ENV = ['CODEX_WINDOWS_REGISTERED_CORE', 'CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY', 'CODEX_APP_TOOLS_PIPE_PATH',
@@ -93,22 +93,27 @@ function atomicState(path, record) {
   }
 }
 
-function alive(pid) {
-  return pidAlive(pid);
-}
-
-function terminate(child) {
-  try { terminateAppServer(child); } catch { /* Best effort. */ }
-}
-
 function configFingerprint(url, key) {
   return createHash('sha256').update(`${url || ''}\0${key || ''}`).digest('hex').slice(0, 16);
+}
+
+function instanceSignature(rec) {
+  if (!rec || typeof rec !== 'object') return null;
+  if (typeof rec.instance_id === 'string' && rec.instance_id) return rec.instance_id;
+  if (!rec.pid && !rec.auth_token && !rec.started_at) return null;
+  return `${rec.pid ?? ''}:${rec.auth_token ?? ''}:${rec.started_at ?? ''}`;
 }
 
 export function createAppServerManager({
   configPath, sessionsDir, env = process.env, port = Number(env.GEMPT_APP_SERVER_PORT || 0),
   spawnProcess = spawn, connect = connectAppServer, startupMs = 8000,
   backoffMs = [250, 500, 1000, 2000, 4000, 8000],
+  healthIntervalMs = 30_000,
+  restartTimeoutMs = Math.max(startupMs, 5000),
+  verifyProcess = matchesAppServerProcess,
+  terminateProcess = terminateAppServer,
+  waitForExit = waitForProcessExit,
+  isPidAlive = pidAlive,
 } = {}) {
   const config = resolveConfigPath(configPath);
   const stateFile = appServerStatePath(config, env);
@@ -120,11 +125,51 @@ export function createAppServerManager({
   let connection;
   let starting;
   let restart;
+  let healthTimer;
   let stopped = false;
   let failures = 0;
   let startedAt = 0;
   let error = null;
   let gatewayUrl = null;
+  let lastProbeAt = 0;
+  let probeHealthy = null;
+  let probeTargetSig = null;
+  let degradedReason = null;
+
+  const alive = (pid) => isPidAlive(pid);
+  const terminate = (target) => {
+    try { terminateProcess(target); } catch { /* Best effort. */ }
+  };
+
+  function clearHealthTimer() {
+    if (healthTimer) {
+      clearTimeout(healthTimer);
+      healthTimer = undefined;
+    }
+  }
+
+  function scheduleHealthCheck() {
+    if (stopped || healthTimer || !ownsLock || !connection || !(healthIntervalMs > 0)) return;
+    healthTimer = setTimeout(() => {
+      healthTimer = undefined;
+      if (!stopped) void ensureRunning({ probe: true });
+    }, healthIntervalMs);
+    healthTimer.unref?.();
+  }
+
+  function publishHealth(healthy, reason = null) {
+    probeHealthy = healthy;
+    probeTargetSig = instanceSignature(connection);
+    degradedReason = healthy ? null : (reason || 'Codex app-server unresponsive.');
+    error = healthy ? null : degradedReason;
+    if (ownsLock && connection) {
+      const nextErr = healthy ? null : degradedReason;
+      if (connection.healthy !== healthy || (connection.error ?? null) !== nextErr) {
+        connection = { ...connection, healthy, error: nextErr };
+        try { atomicState(stateFile, connection); } catch { /* Best effort. */ }
+      }
+    }
+  }
 
   function claim() {
     mkdirSync(dirname(stateFile), { recursive: true, mode: 0o700 });
@@ -181,10 +226,24 @@ export function createAppServerManager({
 
   function getStatus() {
     const shared = connection || (!ownsLock && readJsonSafe(stateFile));
-    const running = shared?.status === 'running' && alive(shared.pid);
-    return { running: Boolean(running), ws_url: running ? shared.ws_url : null,
-      pid: running ? shared.pid : null, gateway_url: (running ? shared.gateway_url : gatewayUrl) || null,
-      error: running ? null : error };
+    const processAlive = Boolean(shared?.status === 'running' && alive(shared.pid));
+    const sig = instanceSignature(shared);
+    const localUnhealthy = probeHealthy === false && (!probeTargetSig || probeTargetSig === sig);
+    const degraded = processAlive && (localUnhealthy || shared?.healthy === false);
+    const healthy = processAlive && !degraded;
+    const running = healthy;
+    const statusError = degraded
+      ? ((localUnhealthy ? degradedReason : null) || shared?.error || error || 'Codex app-server unresponsive.')
+      : (running ? null : error);
+    return {
+      running,
+      healthy,
+      degraded,
+      ws_url: processAlive ? shared.ws_url : null,
+      pid: processAlive ? shared.pid : null,
+      gateway_url: (processAlive ? shared.gateway_url : gatewayUrl) || null,
+      error: statusError,
+    };
   }
 
   function retry() {
@@ -201,11 +260,13 @@ export function createAppServerManager({
     if (!ownsLock) return;
     const current = connection || readJsonSafe(stateFile);
     atomicState(stateFile, { ws_url: null, auth_token: null, auth_header: 'Authorization', pid: null,
-      port: current?.port ?? null, gateway_url: gatewayUrl, started_at: current?.started_at ?? null, status });
+      port: current?.port ?? null, gateway_url: gatewayUrl, started_at: current?.started_at ?? null,
+      instance_id: null, healthy: false, error, status });
     connection = undefined;
+    probeHealthy = null;
+    probeTargetSig = null;
+    degradedReason = null;
   }
-
-  let lastProbeAt = 0;
 
   function currentGatewayConfig() {
     const raw = readJsonSafe(config) || {};
@@ -221,6 +282,7 @@ export function createAppServerManager({
       lastProbeAt = Date.now();
       return true;
     } catch {
+      lastProbeAt = Date.now();
       return false;
     }
   }
@@ -235,20 +297,32 @@ export function createAppServerManager({
     gatewayUrl = url;
     const stale = readJsonSafe(stateFile);
     if (stale?.status === 'running' && alive(stale.pid)) {
-      const hasActive = (() => { try { return readActiveRuns(sessionsDir).length > 0; } catch { return false; } })();
       const configMatches = !stale.config_hash || stale.config_hash === cfgHash;
-      if ((configMatches || hasActive) && await probeConnection(stale, 1500)) {
-        connection = stale;
-        error = null;
-        retry();
+      const staleHealthy = await probeConnection(stale, 1500);
+      if (configMatches && staleHealthy) {
+        connection = { ...stale, healthy: true, error: null };
+        publishHealth(true, null);
+        scheduleHealthCheck();
         return;
       }
-      // Stale/wedged listener or outdated gateway config with no active runs: recycle cleanly.
-      if (!hasActive) {
-        const verified = !stale.process_marker || await matchesAppServerProcess(stale.pid, stale.process_marker);
-        if (verified) terminate({ pid: stale.pid });
-        clearPublished('stopped');
+      if (readActiveRuns(sessionsDir).length) {
+        connection = stale;
+        if (!staleHealthy) {
+          publishHealth(false, 'Codex app-server unresponsive; waiting for active runs to finish before restarting.');
+        } else {
+          publishHealth(true, null);
+        }
+        scheduleHealthCheck();
+        return;
       }
+      const verified = !stale.process_marker || await verifyProcess(stale.pid, stale.process_marker);
+      if (verified) {
+        terminate({ pid: stale.pid });
+        if (stale.pid !== process.pid && alive(stale.pid)) {
+          await waitForExit(stale.pid, { timeoutMs: 2000, forceKillAfterMs: 1200 });
+        }
+      }
+      clearPublished('stopped');
     }
     const cli = findCodexCli(raw.codex?.cli_path, env);
     if (!cli) {
@@ -289,6 +363,7 @@ export function createAppServerManager({
       const exit = (message) => {
         if (child !== spawned) return;
         child = undefined;
+        clearHealthTimer();
         try { if (existsSync(tokenFile)) unlinkSync(tokenFile); } catch { /* Retried on stop. */ }
         if (stopped) return;
         if (Date.now() - startedAt > 30000) failures = 0;
@@ -299,9 +374,21 @@ export function createAppServerManager({
       spawned.once?.('error', (err) => exit(err.message));
       spawned.once?.('exit', (code, signal) => exit(`Codex app-server exited (${signal || code}): ${stderr.trim().replaceAll(token, '[redacted]')}`));
 
-      const next = { ws_url: wsUrl, auth_token: token, auth_header: 'Authorization', pid: spawned.pid,
-        port: picked, gateway_url: gatewayUrl, config_hash: cfgHash, process_marker: basename(tokenFile),
-        started_at: new Date(startedAt).toISOString(), status: 'running' };
+      const next = {
+        ws_url: wsUrl,
+        auth_token: token,
+        auth_header: 'Authorization',
+        pid: spawned.pid,
+        port: picked,
+        gateway_url: gatewayUrl,
+        config_hash: cfgHash,
+        process_marker: basename(tokenFile),
+        instance_id: randomUUID(),
+        started_at: new Date(startedAt).toISOString(),
+        healthy: true,
+        error: null,
+        status: 'running',
+      };
       while (!stopped && child === spawned && Date.now() - startedAt < startupMs) {
         if (!spawned.once && !alive(spawned.pid)) {
           startupError = 'Codex app-server exited during startup.';
@@ -311,9 +398,12 @@ export function createAppServerManager({
           if (!stopped && child === spawned) {
             atomicState(stateFile, next);
             connection = next;
+            probeHealthy = true;
+            probeTargetSig = instanceSignature(next);
+            degradedReason = null;
             error = null;
             try { if (existsSync(tokenFile)) unlinkSync(tokenFile); } catch {}
-            if (!spawned.once) retry();
+            scheduleHealthCheck();
           }
           return;
         }
@@ -336,29 +426,37 @@ export function createAppServerManager({
 
   async function ensureRunning({ probe = false } = {}) {
     if (stopped) return getStatus();
-    if (connection && alive(connection.pid)) {
+    if (ownsLock && connection && alive(connection.pid)) {
       const { hash: wantHash } = currentGatewayConfig();
       const configChanged = Boolean(connection.config_hash && connection.config_hash !== wantHash);
-      const shouldProbe = probe || (!child?.once && Date.now() - lastProbeAt > 30_000);
-      let healthy = true;
-      if (shouldProbe) healthy = await probeConnection(connection, 800);
-      if (!healthy) {
-        error = 'Codex app-server unresponsive; restarting automatically.';
-        cleanup({ preserveActive: false });
-        clearTimeout(restart);
-        restart = undefined;
-      } else if (configChanged) {
-        let hasActive = false;
-        try { hasActive = readActiveRuns(sessionsDir).length > 0; } catch {}
-        if (!hasActive) {
-          cleanup({ preserveActive: false });
-          clearTimeout(restart);
-          restart = undefined;
-        } else {
+      const shouldProbe = probe || (healthIntervalMs > 0 && Date.now() - lastProbeAt > healthIntervalMs);
+      let healthy = probeHealthy !== false;
+      if (shouldProbe) {
+        const target = connection;
+        healthy = await probeConnection(target, 800);
+        if (connection !== target || stopped) return getStatus();
+      }
+      if (!healthy || configChanged) {
+        if (readActiveRuns(sessionsDir).length) {
+          if (!healthy) {
+            publishHealth(false, 'Codex app-server unresponsive; waiting for active runs to finish before restarting.');
+          } else {
+            publishHealth(true, null);
+          }
+          scheduleHealthCheck();
           return getStatus();
         }
+        if (!healthy) error = 'Codex app-server unresponsive; restarting automatically.';
+        const prevPid = connection?.pid;
+        cleanup({ preserveActive: false });
+        if (prevPid && prevPid !== process.pid && alive(prevPid)) {
+          await waitForExit(prevPid, { timeoutMs: 2000, forceKillAfterMs: 1200 });
+        }
+        clearTimeout(restart);
+        restart = undefined;
       } else {
-        if (!child || !child.once) retry();
+        if (shouldProbe) publishHealth(true, null);
+        scheduleHealthCheck();
         return getStatus();
       }
     }
@@ -377,14 +475,29 @@ export function createAppServerManager({
       }).finally(() => { starting = undefined; });
     }
     await starting;
+    if (!ownsLock && probe) {
+      const shared = readJsonSafe(stateFile);
+      if (shared?.status === 'running' && alive(shared.pid)) {
+        const ok = await probeConnection(shared, 800);
+        probeHealthy = ok;
+        probeTargetSig = instanceSignature(shared);
+        degradedReason = ok ? null : 'Codex app-server health probe failed.';
+        error = ok ? null : degradedReason;
+      }
+    }
     return getStatus();
   }
 
   async function restartService({ force = false } = {}) {
     if (stopped) return { ok: false, status: 503, error: 'Codex app-server manager is stopped.' };
-    let active = [];
-    try { active = readActiveRuns(sessionsDir); } catch { /* Best effort. */ }
-    if (active.length > 0 && !force) {
+    if (starting) await starting;
+    const prev = connection || readJsonSafe(stateFile);
+    const prevSig = instanceSignature(prev);
+    const prevPid = prev?.status === 'running' ? prev.pid : null;
+    const external = !ownsLock && prev?.status === 'running' && alive(prev.pid);
+    const verified = external && (!prev.process_marker || await verifyProcess(prev.pid, prev.process_marker));
+    const active = force === true ? [] : readActiveRuns(sessionsDir);
+    if (active.length) {
       return {
         ok: false,
         status: 409,
@@ -392,22 +505,93 @@ export function createAppServerManager({
         error: `当前有 ${active.length} 个正在运行的 Codex 任务，请等待完成或确认强制重启。`,
       };
     }
+    clearHealthTimer();
     clearTimeout(restart);
     restart = undefined;
     failures = 0;
-    if (starting) await starting;
-    const prev = connection || readJsonSafe(stateFile);
+
     if (ownsLock) {
       cleanup({ preserveActive: false });
-    } else if (prev?.status === 'running' && alive(prev.pid)) {
-      const verified = !prev.process_marker || await matchesAppServerProcess(prev.pid, prev.process_marker);
-      if (verified) terminate({ pid: prev.pid });
+      if (prevPid && prevPid !== process.pid && alive(prevPid)) {
+        await waitForExit(prevPid, { timeoutMs: 2500, forceKillAfterMs: 1500 });
+      }
+      const status = await ensureRunning({ probe: true });
+      if (!status.running) {
+        return { ok: false, status: 500, error: status.error || 'Codex app-server 重启失败。', app_server: status };
+      }
+      return { ok: true, status: 200, app_server: status };
     }
-    const status = await ensureRunning({ probe: true });
-    if (!status.running) {
-      return { ok: false, status: 500, error: status.error || 'Codex app-server 重启失败。', app_server: status };
+
+    if (external) {
+      if (!verified) {
+        return {
+          ok: false,
+          status: 409,
+          error: '无法验证运行中的 Codex app-server 进程归属，拒绝终止未知进程。',
+          app_server: getStatus(),
+        };
+      }
+      terminate({ pid: prevPid });
     }
-    return { ok: true, status: 200, app_server: status };
+
+    const deadline = Date.now() + restartTimeoutMs;
+    let oldExited = !prevPid || !alive(prevPid);
+    let forcedKillSent = false;
+    const forceKillAt = Date.now() + Math.min(1500, Math.floor(restartTimeoutMs / 2));
+
+    while (!stopped && Date.now() < deadline) {
+      if (!oldExited && prevPid) {
+        if (!alive(prevPid)) {
+          oldExited = true;
+        } else if (external && !forcedKillSent && prevPid !== process.pid
+            && Date.now() >= forceKillAt && process.platform !== 'win32') {
+          forcedKillSent = true;
+          try { process.kill(prevPid, 'SIGKILL'); } catch { /* ignore */ }
+        }
+      }
+
+      const current = readJsonSafe(stateFile);
+      const currentSig = instanceSignature(current);
+      const isNewInstance = Boolean(
+        current?.status === 'running'
+        && alive(current.pid)
+        && (!prevSig || currentSig !== prevSig || (prevPid && current.pid !== prevPid)),
+      );
+      if (isNewInstance && await probeConnection(current, 800)) {
+        probeHealthy = true;
+        probeTargetSig = currentSig;
+        degradedReason = null;
+        error = null;
+        const status = getStatus();
+        if (status.running) return { ok: true, status: 200, app_server: status };
+      }
+
+      if (oldExited && !isNewInstance) {
+        const status = await ensureRunning({ probe: true });
+        if (ownsLock && status.running) {
+          return { ok: true, status: 200, app_server: status };
+        }
+      }
+
+      await sleep(60);
+    }
+
+    const finalStatus = await ensureRunning({ probe: true });
+    const finalCurrent = connection || readJsonSafe(stateFile);
+    const finalSig = instanceSignature(finalCurrent);
+    const replaced = Boolean(
+      finalStatus.running
+      && (!prevSig || finalSig !== prevSig || (prevPid && finalCurrent?.pid !== prevPid)),
+    );
+    if (!replaced) {
+      return {
+        ok: false,
+        status: 500,
+        error: finalStatus.error || 'Codex app-server 重启超时，未检测到旧进程退出或新实例生效。',
+        app_server: finalStatus,
+      };
+    }
+    return { ok: true, status: 200, app_server: finalStatus };
   }
 
   function interruptRun(runId, sessionsDir) {
@@ -415,6 +599,7 @@ export function createAppServerManager({
   }
 
   function cleanup({ preserveActive = false } = {}) {
+    clearHealthTimer();
     if (!ownsLock) return;
     if (preserveActive && connection?.status === 'running' && alive(connection.pid)) {
       let hasActive = false;
@@ -443,6 +628,7 @@ export function createAppServerManager({
   process.once('exit', atExit);
   return { getStatus, ensureRunning, restart: restartService, interruptRun, async stop() {
     stopped = true;
+    clearHealthTimer();
     clearTimeout(restart);
     await starting;
     process.off('exit', atExit);

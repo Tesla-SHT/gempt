@@ -1,5 +1,8 @@
 import { App, applyDocumentTheme, applyHostStyleVariables } from "@modelcontextprotocol/ext-apps";
 import { z } from "zod";
+import { icon } from "./icons.js";
+import { renderMarkdown } from "./markdown.js";
+import { linkTarget, listArguments, streamRenderKey, timelineMessages } from "./live-state.js";
 
 const app = new App({ name: "GemPT Live", version: "1.0.0" }, {});
 const active = new Set(["queued", "running", "waiting_gemini"]);
@@ -34,7 +37,14 @@ let snapshot = null;
 let transcript = { text: "", complete: false };
 let fullGoal = null;
 let goalLoading = null;
-let boundConversation = null;
+let scope = "session";
+let scopeChosen = false;
+let lockedConversation = null;
+let nextOffset = null;
+let requestedCount = 50;
+let lastListConversation = null;
+let activeConversation = null;
+let connectFailed = false;
 let listLoaded = false;
 let listVersion = 0;
 let listTimer, streamTimer;
@@ -44,6 +54,9 @@ let readingStream = false;
 let streamWanted = false;
 let control = null;
 let confirming = false;
+let bridgeBusy = false;
+let toastTimer;
+let toastPath = "";
 const hostStyleKeys = new Set();
 const openSteps = new Set();
 
@@ -58,15 +71,21 @@ function applyHost(context) {
   applyHostStyleVariables(variables);
 }
 
-function notify(message = "", error = false) {
-  for (const id of ["notice", "notice-list"]) {
-    const el = $(id);
-    if (!el) continue;
-    el.hidden = !message;
-    el.dataset.error = String(error);
-    el.textContent = message;
-  }
+function notice(id, message = "") {
+  put(id, message);
+  $(id).hidden = !message;
 }
+
+function toast(message, path = "") {
+  clearTimeout(toastTimer);
+  toastPath = path;
+  put("toast-message", message);
+  $("toast").hidden = !message;
+  $("toast-copy").hidden = !path;
+  $("toast-path").hidden = true;
+  if (message && !path) toastTimer = setTimeout(() => toast(""), 3200);
+}
+
 
 async function call(name, args) {
   const result = await app.callServerTool({ name, arguments: args }, { timeout: 15_000 });
@@ -83,10 +102,9 @@ const canFetch = () => ready && supportsTools && !document.hidden;
 function formatElapsed(seconds) {
   if (seconds == null) return "";
   const elapsed = Math.max(0, Math.floor(seconds));
-  return elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`;
+  return elapsed < 60 ? `${elapsed} 秒` : `${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒`;
 }
 
-/* Group runs strictly belonging to this conversation by session_id (1 card per GPT session). */
 function groupSessions(runList) {
   const bySession = new Map();
   for (const run of runList) {
@@ -113,293 +131,233 @@ function groupSessions(runList) {
   return groups;
 }
 
-/* Safe DOM-only Markdown renderer (zero innerHTML, 100% CSP-safe). */
-function appendInline(parent, text) {
-  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*)/g;
-  let last = 0;
-  for (const match of text.matchAll(pattern)) {
-    if (match.index > last) parent.append(document.createTextNode(text.slice(last, match.index)));
-    const token = match[0];
-    if (token.startsWith("`")) parent.append(node("code", token.slice(1, -1)));
-    else parent.append(node("strong", token.slice(2, -2)));
-    last = match.index + token.length;
-  }
-  if (last < text.length) parent.append(document.createTextNode(text.slice(last)));
-}
-
-function renderMarkdown(raw) {
-  const root = node("div", "", "md");
-  const lines = String(raw || "").replace(/\r\n/g, "\n").split("\n");
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    if (!line.trim()) { i++; continue; }
-    if (line.trim().startsWith("```")) {
-      const codeLines = [];
-      i++;
-      while (i < lines.length && !lines[i].trim().startsWith("```")) {
-        codeLines.push(lines[i]);
-        i++;
-      }
-      if (i < lines.length) i++;
-      const pre = node("pre");
-      pre.append(node("code", codeLines.join("\n")));
-      root.append(pre);
-      continue;
-    }
-    const heading = /^(#{1,4})\s+(.+)$/.exec(line);
-    if (heading) {
-      const h = node("h" + Math.min(4, heading[1].length));
-      appendInline(h, heading[2]);
-      root.append(h);
-      i++;
-      continue;
-    }
-    if (/^\s*[-*]\s+/.test(line)) {
-      const ul = node("ul");
-      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
-        const li = node("li");
-        appendInline(li, lines[i].replace(/^\s*[-*]\s+/, ""));
-        ul.append(li);
-        i++;
-      }
-      root.append(ul);
-      continue;
-    }
-    if (/^\s*\d+\.\s+/.test(line)) {
-      const ol = node("ol");
-      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
-        const li = node("li");
-        appendInline(li, lines[i].replace(/^\s*\d+\.\s+/, ""));
-        ol.append(li);
-        i++;
-      }
-      root.append(ol);
-      continue;
-    }
-    if (line.startsWith(">")) {
-      const bq = node("blockquote");
-      const parts = [];
-      while (i < lines.length && lines[i].startsWith(">")) {
-        parts.push(lines[i].replace(/^>\s?/, ""));
-        i++;
-      }
-      appendInline(bq, parts.join("\n"));
-      root.append(bq);
-      continue;
-    }
-    const para = [];
-    while (
-      i < lines.length && lines[i].trim()
-      && !lines[i].trim().startsWith("```")
-      && !/^(#{1,4})\s+/.test(lines[i])
-      && !/^\s*[-*]\s+/.test(lines[i])
-      && !/^\s*\d+\.\s+/.test(lines[i])
-      && !lines[i].startsWith(">")
-    ) {
-      para.push(lines[i]);
-      i++;
-    }
-    const p = node("p");
-    appendInline(p, para.join("\n"));
-    root.append(p);
-  }
-  return root;
-}
-
 const fileResult = z.object({ isError: z.boolean().optional() }).passthrough();
-function makeFileChip(path, uri) {
-  const label = basename(path);
-  if (!uri) {
-    const span = node("span", label, "file-chip");
-    span.title = path;
-    return span;
-  }
-  const btn = node("button", label, "file-chip");
-  btn.type = "button";
-  btn.title = path;
-  btn.addEventListener("click", async () => {
-    try {
-      await app.request({
+
+async function openLink(target, path = target.value) {
+  try {
+    if (target.kind === "file") {
+      const result = await app.request({
         method: "com.google.antigravity/toggle-aux-pane",
-        params: { tabType: "fileView", uri },
+        params: { tabType: "fileView", uri: target.value },
       }, fileResult, { timeout: 3000 });
-    } catch { /* Graceful fallback on hosts without fileView. */ }
-  });
-  return btn;
+      if (result.isError) throw new Error("File preview rejected");
+    } else {
+      if (!app.getHostCapabilities()?.openLinks) throw new Error("Opening links is unavailable");
+      const result = await app.openLink({ url: target.value }, { timeout: 3000 });
+      if (result.isError) throw new Error("Link rejected");
+    }
+  } catch {
+    if (target.kind === "file") toast("当前视图无法打开文件预览。", path);
+    else toast("当前视图无法打开链接。");
+  }
 }
 
-function openSessionDetail(runId) {
-  if (!runId) return;
-  viewMode = "detail";
-  if (runId !== selected) {
-    selected = runId;
-    selection++;
-    snapshot = null;
-    transcript = { text: "", complete: false };
-    fullGoal = null;
-    goalLoading = null;
-    confirming = false;
-    openSteps.clear();
-    $("steer").value = "";
-    $("control-status").hidden = true;
-    put("control-status", "");
-    $("meta-drawer").hidden = true;
-    $("info-toggle").setAttribute("aria-expanded", "false");
-    notify();
+function makeFileChip(path, uri, restrictedReason = "") {
+  const target = !restrictedReason
+    ? (uri ? linkTarget(uri, currentRun()?.cwd, { approved: true }) : linkTarget(path, currentRun()?.cwd))
+    : null;
+  if (target?.kind === "file") {
+    const button = node("button", "", "file-chip");
+    button.type = "button";
+    button.title = path;
+    button.append(icon("file"), node("span", basename(path)));
+    button.addEventListener("click", () => void openLink(target, path));
+    return button;
   }
+  const chip = node("span", "", "file-chip is-restricted");
+  const outside = restrictedReason === "outside_workspace";
+  chip.title = outside ? `${path}（位于工作区外，已禁止预览）` : `${path}（仅只读显示）`;
+  chip.append(icon("file"), node("span", basename(path)), node("span", outside ? "工作区外" : "只读", "file-chip-tag"));
+  return chip;
+}
+
+function resetSelection(runId = null) {
+  selected = runId;
+  viewMode = runId ? "detail" : "list";
+  selection++;
+  snapshot = null;
+  transcript = { text: "", complete: false };
+  fullGoal = null;
+  goalLoading = null;
+  confirming = false;
+  openSteps.clear();
+  $("steer").value = "";
+  $("feed-wrap").scrollTop = 0;
+  $("meta-drawer").hidden = true;
+  $("goal-details").open = false;
+  $("info-toggle").setAttribute("aria-expanded", "false");
+  notice("stream-error");
+  setControlStatus();
+}
+
+function openSessionDetail(runId, { focus = true } = {}) {
+  const run = runs.find((item) => item.run_id === runId);
+  if (!run) return;
+  if (scope === "session" && run.host_conversation_id && lockedConversation !== run.host_conversation_id) {
+    lockedConversation = run.host_conversation_id;
+    listVersion++;
+    void refreshRuns();
+  }
+  if (selected !== runId) resetSelection(runId);
   render();
+  if (focus) $("detail-title").focus();
   void refreshStream();
 }
 
 function backToList() {
-  viewMode = "list";
-  confirming = false;
-  $("meta-drawer").hidden = true;
-  $("info-toggle").setAttribute("aria-expanded", "false");
-  notify();
+  const previous = selected;
+  lockedConversation = null;
+  listVersion++;
+  resetSelection();
   render();
   scheduleStream();
+  const card = [...$("session-cards").querySelectorAll("button")].find((button) => button.dataset.runId === previous);
+  (card || $("scope-session")).focus();
+  void refreshRuns();
+}
+
+function statusIcon(state) {
+  return icon(state === "finished" ? "check" : ["failed", "interrupted"].includes(state) ? "close" : "dot");
 }
 
 function buildStatusGlyph(state) {
-  const wrap = node("span", "", "sc-glyph");
+  const wrap = node("span", "", "status-glyph");
   wrap.dataset.state = state || "";
-  if (state === "finished") {
-    wrap.textContent = "✓";
-  } else if (state === "failed" || state === "interrupted") {
-    wrap.textContent = "×";
-  } else {
-    const dot = node("span", "", "status-dot");
-    dot.dataset.state = state || "";
-    wrap.append(dot);
-  }
+  wrap.append(statusIcon(state));
   return wrap;
 }
 
+function runTitle(run) {
+  const title = (run.title || run.goal || run.session_id || run.run_id).replace(/\s+/g, " ").trim();
+  const workspace = run.workspace_name;
+  const prefix = workspace && (workspace + " · ");
+  return prefix && title.toLowerCase().startsWith(prefix.toLowerCase()) ? title.slice(prefix.length) || title : title;
+}
+
 function sessionPreview(run) {
-  if (run.state === "waiting_gemini" && run.pending_tool_call?.arguments?.question) {
-    return { text: `等待回复：${run.pending_tool_call.arguments.question}`, cls: "sc-preview is-ask" };
-  }
-  if (run.error && (run.state === "failed" || run.state === "interrupted")) {
-    return { text: run.error.replace(/\s+/g, " ").trim(), cls: "sc-preview is-err" };
-  }
-  if (active.has(run.state) && run.last_command) {
-    return { text: `$ ${run.last_command.replace(/\s+/g, " ").trim()}`, cls: "sc-preview is-cmd" };
-  }
-  if (run.last_message) {
-    return { text: run.last_message.replace(/\s+/g, " ").trim(), cls: "sc-preview" };
-  }
-  if (run.goal) {
-    return { text: run.goal.replace(/\s+/g, " ").trim(), cls: "sc-preview" };
-  }
-  return { text: statusLabel(run), cls: "sc-preview" };
+  return (run.pending_tool_call?.arguments?.question || run.error || run.last_command || run.last_message || "")
+    .replace(/\s+/g, " ").trim();
 }
 
 function renderList() {
   const sessions = groupSessions(runs);
-  const countEl = $("session-count");
-  countEl.hidden = !sessions.length;
-  countEl.textContent = number.format(sessions.length);
+  const loading = !listLoaded && !connectFailed && (!ready || supportsTools) && !sessions.length;
+  $("list-loading").hidden = !loading;
+  $("list-wrap").setAttribute("aria-busy", String(loading));
+  $("empty").hidden = loading || sessions.length > 0;
   $("refresh-list").disabled = !supportsTools;
-
-  const hasSessions = sessions.length > 0;
-  $("list-wrap").hidden = !hasSessions;
-  $("empty").hidden = hasSessions;
-  if (!hasSessions) {
-    put("empty-message", !ready ? "正在连接 GemPT…" : !listLoaded && supportsTools ? "正在读取当前对话的 GPT 会话…" : "当前对话暂无 GPT 会话");
-    return;
+  $("load-more").hidden = nextOffset == null;
+  $("load-more").disabled = readingList;
+  $("scope-session").setAttribute("aria-pressed", String(scope === "session"));
+  $("scope-all").setAttribute("aria-pressed", String(scope === "all"));
+  if (!sessions.length && !loading) {
+    if (connectFailed || !supportsTools) {
+      put("empty-title", "任务列表暂不可用");
+      put("empty-message", connectFailed ? "请重新打开此页面。" : "当前宿主未开放实时工具调用。");
+    } else {
+      put("empty-title", scope === "all" ? "暂无任务" : "当前会话暂无任务");
+      put("empty-message", scope === "all" ? "发起任务后，执行进度会显示在这里。" : "可发起任务，或切换到「全部」查看记录。");
+    }
   }
 
   const list = $("session-cards");
-  const key = JSON.stringify(sessions.map((s) => [
-    s.key, s.runs.length, s.latest.run_id, s.latest.state, s.latest.title,
-    s.latest.elapsed_sec, s.latest.last_command, s.latest.last_message,
-    s.latest.pending_tool_call?.arguments?.question,
-  ]));
+  const key = JSON.stringify([scope, selected, sessions.map(({ key, latest, runs }) => [key, latest, runs.length])]);
   if (list.dataset.key === key) return;
   list.dataset.key = key;
+  const focused = list.contains(document.activeElement) ? document.activeElement.dataset.runId : null;
 
-  list.replaceChildren(...sessions.map((sess) => {
-    const run = sess.latest;
+  list.replaceChildren(...sessions.map((session) => {
+    const run = session.latest;
     const li = node("li");
     const card = node("button", "", "session-card");
     card.type = "button";
-    card.dataset.state = run.state || "";
-
-    const top = node("div", "", "sc-top");
-    const title = (run.title || run.goal || run.session_id || run.run_id).replace(/\s+/g, " ").trim();
-    const titleEl = node("span", title, "sc-title");
-    titleEl.title = title;
-
-    const metaParts = [];
-    if (sess.runs.length > 1) metaParts.push(`${sess.runs.length} 轮`);
-    if (run.state === "waiting_gemini") metaParts.push("等待回复");
-    else if (active.has(run.state)) metaParts.push(formatElapsed(run.elapsed_sec) || "运行中");
-    else metaParts.push(formatElapsed(run.elapsed_sec) || statusLabel(run));
-    const metaEl = node("span", metaParts.join(" · "), "sc-meta");
-    metaEl.dataset.state = run.state || "";
-
-    top.append(buildStatusGlyph(run.state), titleEl, metaEl, node("span", "›", "sc-chevron"));
-
-    const prev = sessionPreview(run);
-    const prevEl = node("p", prev.text, prev.cls);
-    prevEl.title = prev.text;
-
-    card.append(top, prevEl);
+    card.dataset.runId = run.run_id;
+    if (session.runs.some((item) => item.run_id === selected)) card.setAttribute("aria-current", "true");
+    const title = runTitle(run);
+    const label = node("span", title, "sc-title");
+    label.title = title;
+    const meta = node("span", "", "sc-meta");
+    meta.append(node("span", statusLabel(run)));
+    if (run.remote_turn_unconfirmed) meta.append(node("span", "远端终态未确认", "unconfirmed-badge"));
+    const elapsed = formatElapsed(run.elapsed_sec);
+    if (elapsed) meta.append(node("span", elapsed));
+    if (session.runs.length > 1) meta.append(node("span", `${session.runs.length} 轮`));
+    if (scope === "all" && run.workspace_name) meta.append(node("span", run.workspace_name, "sc-workspace"));
+    const preview = sessionPreview(run);
+    card.append(buildStatusGlyph(run.state), label, icon("chevron", "sc-chevron"), meta);
+    if (preview) {
+      const line = node("span", preview, "sc-preview");
+      line.title = preview;
+      card.append(line);
+    }
     card.addEventListener("click", () => openSessionDetail(run.run_id));
     li.append(card);
     return li;
   }));
+  if (focused) [...list.querySelectorAll("button")].find((button) => button.dataset.runId === focused)?.focus({ preventScroll: true });
 }
 
-function buildStepDetails(key, iconChar, tone, titleText, metaText, bodyText, { muted = false, prose = false, failed = false } = {}) {
-  const det = node("details", "", "step-row");
-  det.dataset.stepKey = key;
-  if (openSteps.has(key)) det.open = true;
-  det.addEventListener("toggle", () => {
-    if (det.open) openSteps.add(key);
+function buildStepDetails(key, symbol, title, meta, body, { prose = false, failed = false } = {}) {
+  const details = node("details", "", "step-row");
+  const generation = selection;
+  details.open = openSteps.has(key);
+  details.addEventListener("toggle", () => {
+    if (generation !== selection) return;
+    if (details.open) openSteps.add(key);
     else openSteps.delete(key);
   });
-  const sum = node("summary");
-  const ic = node("span", iconChar, "step-icon");
-  if (tone) ic.dataset.tone = tone;
-  const title = node("span", titleText, muted ? "step-title is-muted" : "step-title");
-  sum.append(ic, title);
-  if (metaText) {
-    const meta = node("span", metaText, "step-meta");
-    if (failed) meta.dataset.failed = "true";
-    sum.append(meta);
+  const summary = node("summary");
+  summary.append(icon(symbol), node("span", title, "step-title"));
+  if (meta) {
+    const label = node("span", meta, "step-meta");
+    if (failed) label.dataset.failed = "true";
+    summary.append(label);
   }
-  det.append(sum);
-  if (bodyText) {
-    det.append(node("pre", bodyText, prose ? "step-body is-prose" : "step-body"));
-  }
-  return det;
+  summary.append(icon("chevron", "step-chevron"));
+  details.append(summary);
+  if (typeof body === "string" && body) details.append(node("pre", body, prose ? "step-body is-prose" : "step-body"));
+  else if (body && typeof body !== "string") details.append(body);
+  return details;
 }
+
 
 function renderTurnStrip(run) {
   const strip = $("turn-strip");
-  if (!run) { strip.hidden = true; return; }
-  const sessKey = run.session_id || run.run_id;
-  const group = groupSessions(runs).find((g) => g.key === sessKey);
-  const turns = group && group.runs.length >= 2 ? group.runs : [];
-  strip.hidden = !turns.length;
-  if (!turns.length) return;
-  const key = JSON.stringify([selected, turns.map((t) => [t.run_id, t.state])]);
+  const group = groupSessions(runs).find((item) => item.key === (run.session_id || run.run_id));
+  const turns = group?.runs || [];
+  const bar = $("turn-bar");
+  bar.hidden = turns.length < 2;
+  const panel = $("turn-panel");
+  if (bar.hidden) {
+    panel.removeAttribute("role");
+    panel.removeAttribute("aria-labelledby");
+    panel.removeAttribute("tabindex");
+    return;
+  }
+  panel.setAttribute("role", "tabpanel");
+  panel.setAttribute("aria-labelledby", `turn-${selected}`);
+  panel.tabIndex = 0;
+  const key = JSON.stringify([selected, turns.map((turn) => [turn.run_id, turn.state])]);
   if (strip.dataset.key === key) return;
   strip.dataset.key = key;
-  strip.replaceChildren(...turns.map((turn, idx) => {
-    const btn = node("button", "", "turn-pill");
-    btn.type = "button";
-    btn.setAttribute("role", "tab");
-    btn.setAttribute("aria-selected", String(turn.run_id === selected));
-    const dot = node("span", "", "status-dot");
-    dot.dataset.state = turn.state || "";
-    btn.append(dot, node("span", `第 ${idx + 1} 轮`));
-    btn.addEventListener("click", () => openSessionDetail(turn.run_id));
-    return btn;
+  const focused = strip.contains(document.activeElement) ? document.activeElement.id : null;
+  strip.replaceChildren(...turns.map((turn, index) => {
+    const button = node("button", "", "turn-pill");
+    const chosen = turn.run_id === selected;
+    button.id = `turn-${turn.run_id}`;
+    button.type = "button";
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-controls", "turn-panel");
+    button.setAttribute("aria-selected", String(chosen));
+    button.tabIndex = chosen ? 0 : -1;
+    button.append(buildStatusGlyph(turn.state), node("span", `第 ${index + 1} 轮`));
+    button.addEventListener("click", () => {
+      openSessionDetail(turn.run_id, { focus: false });
+      $(button.id)?.focus({ preventScroll: true });
+    });
+    return button;
   }));
+  if (focused) $(focused)?.focus({ preventScroll: true });
 }
 
 function renderStream() {
@@ -409,134 +367,188 @@ function renderStream() {
   const follow = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 48;
   const events = snapshot?.timeline || [];
   const fileUris = snapshot?.file_uris || {};
-  const hasAgentMsg = events.some((e) => e.type === "agent_message" && e.text);
-  const fullText = transcript.text || "";
-
-  const renderKey = JSON.stringify([
-    selected, run?.state, events.length,
-    events.map((e) => [e.type, e.id, e.exit_code, e.text?.length || 0, e.output?.length || 0, e.paths?.length || 0]),
-    hasAgentMsg ? "" : fullText.length, transcript.complete,
-  ]);
-  if (list.dataset.key === renderKey) return;
-  list.dataset.key = renderKey;
-
-  const nodes = [];
-  let lastMsgIdx = -1;
-  events.forEach((ev, idx) => {
-    if (ev.type === "agent_message" && ev.text) lastMsgIdx = idx;
-  });
-
+  const restrictedFiles = snapshot?.restricted_files || {};
   const pendingAsk = run?.state === "waiting_gemini" ? run.pending_tool_call : null;
-  events.forEach((ev, idx) => {
-    const li = node("li");
-    const stepKey = ev.id || `${ev.type}-${idx}`;
-    if (ev.type === "reasoning") {
-      const preview = String(ev.text || "").replace(/\s+/g, " ").trim().slice(0, 72) || "思考中…";
-      li.append(buildStepDetails(stepKey, "·", "", `思考：${preview}`, "", ev.text || "", { muted: true, prose: true }));
-    } else if (ev.type === "command") {
-      const running = ev.exit_code == null;
-      const ok = ev.exit_code === 0;
-      const icon = running ? "◌" : ok ? "✓" : "✗";
-      const tone = running ? "run" : ok ? "ok" : "err";
-      const meta = running ? "运行中" : `exit ${ev.exit_code}`;
-      const body = [ev.command, ev.output].filter(Boolean).join("\n\n");
-      li.append(buildStepDetails(stepKey, icon, tone, ev.command || "执行命令", meta, body, { failed: !running && !ok }));
-    } else if (ev.type === "files") {
-      const paths = ev.paths || [];
-      const row = node("div", "", "step-row step-files");
-      row.append(node("span", "✎", "step-icon"), node("span", `变更 ${paths.length || ev.count || 0} 个文件`, "step-title is-muted"));
-      for (const p of paths) row.append(makeFileChip(p, fileUris[p]));
-      li.append(row);
-    } else if (ev.type === "ask_gemini") {
-      const isPendingDup = pendingAsk && (
-        (pendingAsk.call_id && ev.id === pendingAsk.call_id)
-        || (pendingAsk.arguments?.question && ev.arguments?.question === pendingAsk.arguments.question)
-      );
-      if (isPendingDup) return;
-      const q = ev.arguments?.question || "等待主 Gemini 回复";
-      li.append(buildStepDetails(stepKey, "?", "run", `请求 Gemini：${q}`, ev.arguments?.reason || "", ev.arguments?.context || "", { prose: true }));
-    } else if (ev.type === "agent_message" && ev.text) {
-      const box = node("div", "", "msg-block");
-      if (idx === lastMsgIdx) {
-        const head = node("div", "", "msg-head");
-        head.append(node("span", "GPT", "msg-role"));
-        const copyBtn = node("button", transcript.complete ? "复制" : "补齐中…", "copy-btn");
-        copyBtn.type = "button";
-        copyBtn.disabled = !transcript.complete;
-        copyBtn.addEventListener("click", () => copy(fullText || ev.text));
-        head.append(copyBtn);
-        box.append(head);
-      }
-      box.append(renderMarkdown(idx === lastMsgIdx && fullText.length > ev.text.length ? fullText : ev.text));
-      li.append(box);
-    } else {
-      return;
-    }
-    nodes.push(li);
-  });
+  const key = streamRenderKey(selected, run?.state, events, fileUris, transcript, pendingAsk,
+    Boolean(snapshot), restrictedFiles, Boolean(run?.remote_turn_unconfirmed));
+  if (list.dataset.key === key) return;
+  list.dataset.key = key;
+  const fullText = transcript.text;
+  const messages = timelineMessages(events, fullText);
+  const lastMessage = [...messages.keys()].at(-1);
+  const options = { cwd: run?.cwd, fileUris, openLink, copy };
 
-  if (!hasAgentMsg && fullText) {
-    const li = node("li");
+  function message(text, showCopy) {
     const box = node("div", "", "msg-block");
-    const head = node("div", "", "msg-head");
-    head.append(node("span", "GPT", "msg-role"));
-    const copyBtn = node("button", transcript.complete ? "复制" : "补齐中…", "copy-btn");
-    copyBtn.type = "button";
-    copyBtn.disabled = !transcript.complete;
-    copyBtn.addEventListener("click", () => copy(fullText));
-    head.append(copyBtn);
-    box.append(head, renderMarkdown(fullText));
-    li.append(box);
-    nodes.push(li);
+    if (showCopy) {
+      const head = node("div", "", "msg-head");
+      const button = node("button", "", "copy-btn");
+      button.type = "button";
+      button.append(icon("copy"), "复制全文");
+      button.disabled = !transcript.complete;
+      button.addEventListener("click", () => void copy(fullText || text));
+      head.append(node("span", "GPT 输出"), button);
+      box.append(head);
+    }
+    box.append(renderMarkdown(text, options));
+    return box;
   }
 
-  if (isActive() && !pendingAsk) {
+  const nodes = events.flatMap((event, index) => {
     const li = node("li");
-    li.append(node("div", "GPT 执行中…", "streaming-indicator"));
+    const stepKey = `${event.type}-${event.id || index}`;
+    if (event.type === "reasoning") {
+      const preview = (event.text || "").replace(/\s+/g, " ").trim();
+      li.append(buildStepDetails(stepKey, "think", preview ? `思考：${preview}` : "思考", "", event.text, { prose: true }));
+    } else if (event.type === "command") {
+      const running = event.exit_code == null;
+      li.append(buildStepDetails(stepKey, "terminal", event.command || "执行命令",
+        running ? "执行中" : `退出码 ${event.exit_code}`,
+        [event.command, event.output].filter(Boolean).join("\n\n"), { failed: !running && event.exit_code !== 0 }));
+    } else if (event.type === "files") {
+      const paths = event.paths || [];
+      const body = node("div", "", "step-files step-body");
+      body.append(...paths.map((path) => makeFileChip(path, fileUris[path], restrictedFiles[path])));
+      li.append(buildStepDetails(stepKey, "files", `变更 ${event.count || paths.length} 个文件`, "", body));
+    } else if (event.type === "ask_gemini") {
+      if (pendingAsk && (pendingAsk.call_id === event.id ||
+          pendingAsk.arguments?.question === event.arguments?.question)) return [];
+      li.append(buildStepDetails(stepKey, "chat", event.arguments?.question || "请求主对话回复", "",
+        event.arguments?.context, { prose: true }));
+    } else if (messages.has(event)) {
+      li.append(message(messages.get(event), event === lastMessage));
+    } else return [];
+    return [li];
+  });
+
+  if (messages.has(undefined)) {
+    const li = node("li");
+    li.append(message(messages.get(undefined), true));
+    nodes.push(li);
+  }
+  if (!snapshot && !nodes.length) {
+    const li = node("li", "", "skeleton-stream");
+    li.setAttribute("role", "status");
+    li.setAttribute("aria-label", "正在加载执行流");
+    nodes.push(li);
+  } else if (isActive() && !pendingAsk) {
+    const li = node("li", "", "streaming-indicator");
+    li.append(buildStatusGlyph(run.state), statusLabel(run));
     nodes.push(li);
   } else if (!nodes.length && !pendingAsk) {
-    const li = node("li");
-    li.append(node("div", snapshot ? "暂无输出内容" : "正在加载执行流…", "streaming-indicator"));
+    const li = node("li", "", "empty");
+    const symbol = node("span", "", "empty-icon");
+    symbol.append(icon("chat"));
+    li.append(symbol, node("p", "暂无输出", "empty-title"), node("p", "产生输出后会显示在这里。"));
     nodes.push(li);
   }
 
   list.replaceChildren(...nodes);
-  if (follow) wrap.scrollTop = wrap.scrollHeight;
+  if (follow && list.dataset.runId === selected) wrap.scrollTop = wrap.scrollHeight;
+  list.dataset.runId = selected;
 }
+
 
 function renderControls(run = currentRun()) {
   const usable = supportsTools && run?.can_control && !control;
   $("controls").hidden = !active.has(run?.state);
+  const instruction = run?.state === "waiting_gemini" ? "补充执行指令（请到主对话回复提问）" : "补充执行指令";
+  $("steer").placeholder = instruction + "…";
+  $("steer").setAttribute("aria-label", instruction);
   $("steer").disabled = !usable;
   $("send-steer").disabled = !usable || !$("steer").value.trim();
   $("interrupt").disabled = !usable;
   $("cancel-interrupt").hidden = !confirming;
   put("interrupt", confirming ? "确认中止" : "中止");
+  const canConfirmInterrupt = Boolean(supportsTools && run?.remote_turn_unconfirmed && (run?.can_interrupt ?? run?.can_control));
+  $("unconfirmed-interrupt").hidden = !canConfirmInterrupt;
+  $("unconfirmed-interrupt").disabled = !canConfirmInterrupt || Boolean(control);
 }
 
-function renderDetail() {
-  const run = currentRun();
-  if (!run) {
-    viewMode = "list";
-    render();
-    return;
+function renderAsk(run) {
+  const ask = run.state === "waiting_gemini" && run.pending_tool_call?.arguments;
+  $("ask").hidden = !ask;
+  if (!ask) return;
+  put("ask-question", ask.question || "正在等待回应");
+  $("ask-context").hidden = !ask.context;
+  put("ask-context", ask.context || "");
+  const media = ask.media_paths || [];
+  const uris = snapshot?.file_uris || {};
+  const restricted = snapshot?.restricted_files || {};
+  const mediaList = $("ask-media");
+  mediaList.hidden = !media.length;
+  const key = JSON.stringify([run.run_id, media.map((path) => [path, uris[path], restricted[path]])]);
+  if (mediaList.dataset.key !== key) {
+    mediaList.dataset.key = key;
+    mediaList.replaceChildren(...media.map((path) => {
+      const li = node("li");
+      li.append(makeFileChip(path, uris[path], restricted[path]));
+      return li;
+    }));
   }
-  const title = (run.title || run.goal || run.session_id || run.run_id).replace(/\s+/g, " ").trim();
+  const capabilities = app.getHostCapabilities();
+  const matching = !run.host_conversation_id || !activeConversation || run.host_conversation_id === activeConversation;
+  $("attach-context").hidden = !(matching && capabilities?.updateModelContext?.text);
+  $("remind-host").hidden = !(matching && capabilities?.message?.text);
+  $("attach-context").disabled = $("remind-host").disabled = bridgeBusy;
+  $("ask-hint").hidden = !($("attach-context").hidden && $("remind-host").hidden);
+}
+
+async function bridgeAsk(action) {
+  const run = currentRun();
+  const pending = run?.pending_tool_call;
+  if (run?.state !== "waiting_gemini" || !pending?.call_id || bridgeBusy) return;
+  const { question, context, media_paths: media } = pending.arguments || {};
+  const attach = action === "attach";
+  const content = [{ type: "text", text: [
+    attach ? "GemPT 任务正在等待主对话回复。" : "请查看并处理这条 GemPT 任务的提问。",
+    question, context, ...(media || []),
+    `任务 ID ${run.run_id}`,
+    `提问 ID ${pending.call_id}`,
+    "请在主对话回复后，通过 gpt_ctl 的 reply 操作将回答交回任务。",
+  ].filter(Boolean).join("\n\n") }];
+  bridgeBusy = true;
+  renderAsk(run);
+  try {
+    const result = attach ? await app.updateModelContext({ content }, { timeout: 5000 })
+      : await app.sendMessage({ role: "user", content }, { timeout: 5000 });
+    if (result.isError) throw new Error("Host rejected the request");
+    toast(attach ? "已附带上下文，随下一条主对话消息发送。" : "已在主对话中发送提醒。");
+  } catch {
+    toast("当前视图无法发送，请回到任务所属的主对话处理。");
+  } finally {
+    bridgeBusy = false;
+    if (currentRun()) renderAsk(currentRun());
+  }
+}
+
+function renderDetail(run) {
+  const title = runTitle(run);
   put("detail-title", title);
   $("detail-title").title = title;
-  $("dot").dataset.state = run.state || "";
-  $("dot").title = statusLabel(run);
-  $("info-toggle").disabled = false;
+  const dot = $("dot");
+  if (dot.dataset.state !== run.state || !dot.firstChild) {
+    dot.dataset.state = run.state || "";
+    dot.replaceChildren(statusIcon(run.state));
+  }
+  put("detail-status", statusLabel(run));
+  const unconfirmed = Boolean(run.remote_turn_unconfirmed);
+  $("unconfirmed-badge").hidden = !unconfirmed;
+  $("unconfirmed-banner").hidden = !unconfirmed;
+  if (unconfirmed) {
+    const canConfirmInterrupt = Boolean(supportsTools && (run.can_interrupt ?? run.can_control));
+    put("unconfirmed-text", canConfirmInterrupt
+      ? "远端 Codex 回合可能仍在运行。请勿对同一会话盲目并发派发；可点击「尝试中断确认」向远端补发中断。"
+      : "远端 Codex 回合可能仍在运行。请勿对同一会话盲目并发派发，待确认远端结束后再继续。");
+  }
   $("refresh").disabled = !supportsTools;
 
   renderTurnStrip(run);
   renderControls(run);
-
   const usage = snapshot?.usage ?? run.usage ?? {};
   const tokens = usage.total_tokens ?? (usage.input_tokens != null ? usage.input_tokens + (usage.output_tokens ?? 0) : null);
   const rate = snapshot?.cache_hit_rate ?? (usage.input_tokens && usage.cached_input_tokens != null
     ? Math.min(1, usage.cached_input_tokens / usage.input_tokens) : null);
-  put("badge", statusLabel(run));
   put("model", run.model || "—");
   put("elapsed", formatElapsed(run.elapsed_sec) || "—");
   put("tokens", tokens == null ? "—" : number.format(tokens));
@@ -546,32 +558,19 @@ function renderDetail() {
   put("run-id", run.run_id);
   put("session-id", run.session_id || "—");
   $("session-id").disabled = !run.session_id;
-  if (run.error) notify(run.error, true);
-
-  const ask = run.state === "waiting_gemini" && run.pending_tool_call?.arguments;
-  $("ask").hidden = !ask;
-  if (ask) {
-    put("ask-reason", ask.reason || "ask_gemini");
-    put("ask-question", ask.question || "正在等待回应");
-    $("ask-context").hidden = !ask.context;
-    put("ask-context", ask.context || "");
-    const media = ask.media_paths || [];
-    $("ask-media").hidden = !media.length;
-    $("ask-media").replaceChildren(...media.map((p) => {
-      const li = node("li");
-      li.append(makeFileChip(p, snapshot?.file_uris?.[p]));
-      return li;
-    }));
-  }
+  notice("run-error", run.error || "");
+  renderAsk(run);
   renderStream();
 }
 
 function render() {
-  const showDetail = viewMode === "detail" && Boolean(currentRun());
-  $("view-list").hidden = showDetail;
-  $("view-detail").hidden = !showDetail;
-  if (showDetail) renderDetail();
-  else renderList();
+  const run = viewMode === "detail" ? currentRun() : null;
+  document.querySelector(".shell").dataset.view = run ? "detail" : "list";
+  $("detail-empty").hidden = Boolean(run);
+  $("detail-bar").hidden = $("turn-panel").hidden = !run;
+  renderList();
+  if (run) renderDetail(run);
+  else $("turn-bar").hidden = true;
 }
 
 function acceptSnapshot(data) {
@@ -603,34 +602,27 @@ async function loadGoal() {
       render();
     }
   } catch (error) {
-    if (generation === selection) notify(error.message, true);
+    if (generation === selection) notice("stream-error", error.message);
   } finally {
     if (goalLoading === generation) goalLoading = null;
   }
 }
 
-async function loadMoreTranscript(generation, runId, offset, revision) {
-  let text = transcript.text;
-  try {
-    while (offset != null && generation === selection && canFetch()) {
-      const page = await call("gempt_app_stream", {
-        run_id: runId, text_offset: offset, ...(revision ? { text_revision: revision } : {}),
-      });
-      if (generation !== selection) return;
-      if (page.stale_text_revision) {
-        transcript = { text: "", complete: false };
-        void refreshStream();
-        return;
-      }
-      text += page.full_text;
-      offset = page.next_text_offset;
-    }
-    if (generation === selection && offset == null) {
-      transcript = { text, complete: true };
-      render();
-    }
-  } catch (error) {
-    if (generation === selection) notify(error.message, true);
+async function loadMoreTranscript(data) {
+  let offset = data.next_text_offset;
+  if (offset == null || transcript.complete || !canFetch()) return;
+  let text = data.full_text;
+  while (offset != null && snapshot === data && canFetch()) {
+    const page = await call("gempt_app_stream", {
+      run_id: data.run.run_id, text_offset: offset, text_revision: data.text_revision,
+    });
+    if (snapshot !== data || page.stale_text_revision) return;
+    text += page.full_text;
+    offset = page.next_text_offset;
+  }
+  if (snapshot === data && offset == null) {
+    transcript = { text, complete: true };
+    render();
   }
 }
 
@@ -646,32 +638,32 @@ function scheduleStream() {
   }
 }
 
-function filterConversationRuns(rawRuns, convId) {
-  if (!convId) return [];
-  return (rawRuns || []).filter((r) => r.host_conversation_id === convId);
+function changeScope(next) {
+  scopeChosen = true;
+  if (next === scope && !lockedConversation) return;
+  scope = next;
+  lockedConversation = null;
+  requestedCount = 50;
+  nextOffset = null;
+  lastListConversation = null;
+  listLoaded = false;
+  runs = [];
+  listVersion++;
+  resetSelection();
+  notice("list-error");
+  render();
+  void refreshRuns();
 }
 
-function applyRunList(data, { explicitRunId = null } = {}) {
-  const nextConversation = data.bound_conversation_id || boundConversation;
-  const conversationChanged = Boolean(nextConversation && boundConversation && nextConversation !== boundConversation);
-  boundConversation = nextConversation || null;
+function applyRunList(data) {
+  activeConversation = Object.hasOwn(data, "active_conversation_id")
+    ? data.active_conversation_id : data.bound_conversation_id ?? null;
+  lastListConversation = data.bound_conversation_id ?? null;
   listLoaded = true;
-  runs = filterConversationRuns(data.runs, boundConversation);
-
-  if (conversationChanged) {
-    selected = null;
-    snapshot = null;
-    viewMode = "list";
-  }
-
-  if (explicitRunId && runs.some((r) => r.run_id === explicitRunId)) {
-    selected = explicitRunId;
-    viewMode = "detail";
-  } else if (viewMode === "detail" && selected && !runs.some((r) => r.run_id === selected)) {
-    selected = null;
-    snapshot = null;
-    viewMode = "list";
-  }
+  runs = data.runs;
+  nextOffset = data.next_offset ?? null;
+  // An explicitly opened task may fall outside the current page.
+  if (selected && !snapshot && !runs.some((run) => run.run_id === selected)) resetSelection();
   render();
 }
 
@@ -682,17 +674,34 @@ async function refreshRuns() {
   listWanted = false;
   clearTimeout(listTimer);
   const version = listVersion;
+  $("load-more").disabled = true;
   try {
-    const args = { scope: "session", limit: 50, ...(boundConversation ? { host_conversation_id: boundConversation } : {}) };
-    const data = await call("gempt_app_runs", args);
+    const first = await call("gempt_app_runs", listArguments(scope, lockedConversation));
     if (version !== listVersion) return;
-    applyRunList(data);
-    if (viewMode === "detail" && selected && !snapshot) void refreshStream();
-    notify();
+    if (scope === "session" && !lockedConversation && lastListConversation !== first.bound_conversation_id) requestedCount = 50;
+    const collected = new Map(first.runs.map((run) => [run.run_id, run]));
+    let cursor = first.next_offset;
+    while (cursor != null && collected.size < requestedCount) {
+      const page = await call("gempt_app_runs", listArguments(scope, lockedConversation, cursor));
+      if (version !== listVersion) return;
+      if (scope === "session" && page.bound_conversation_id !== first.bound_conversation_id) {
+        listWanted = true;
+        return;
+      }
+      for (const run of page.runs) collected.set(run.run_id, run);
+      cursor = page.next_offset > cursor ? page.next_offset : null;
+    }
+    applyRunList({ ...first, next_offset: cursor, runs: [...collected.values()] });
+    notice("list-error");
   } catch (error) {
-    notify(error.message, true);
+    if (version === listVersion) {
+      listLoaded = true;
+      notice("list-error", error.message);
+      render();
+    }
   } finally {
     readingList = false;
+    $("load-more").disabled = false;
     if (listWanted) void refreshRuns();
     else scheduleList();
   }
@@ -710,10 +719,10 @@ async function refreshStream() {
     const data = await call("gempt_app_stream", { run_id: runId });
     if (generation !== selection) return;
     acceptSnapshot(data);
-    if (data.next_text_offset != null) void loadMoreTranscript(generation, runId, data.next_text_offset, data.text_revision);
-    if (!data.run.error) notify();
+    await loadMoreTranscript(data);
+    if (snapshot === data) notice("stream-error");
   } catch (error) {
-    if (generation === selection) notify(error.message, true);
+    if (generation === selection) notice("stream-error", error.message);
   } finally {
     readingStream = false;
     if (streamWanted) void refreshStream();
@@ -722,9 +731,14 @@ async function refreshStream() {
 }
 
 function setControlStatus(message = "", error = false) {
-  $("control-status").hidden = !message;
-  $("control-status").dataset.error = String(error);
-  put("control-status", message);
+  for (const id of ["control-status", "unconfirmed-status"]) {
+    const el = $(id);
+    if (!el) continue;
+    const show = Boolean(message) && (id === "unconfirmed-status" ? !$("unconfirmed-banner").hidden : !$("controls").hidden);
+    el.hidden = !show;
+    el.dataset.error = String(error);
+    put(id, show ? message : "");
+  }
 }
 
 async function sendControl(name, args, doneMessage) {
@@ -749,40 +763,69 @@ async function sendControl(name, args, doneMessage) {
   }
 }
 
-async function copy(value) {
+async function copy(value, path = false) {
   if (!value) return;
   try {
     await navigator.clipboard.writeText(value);
-    notify("已复制");
-    setTimeout(() => { if ($("notice").textContent === "已复制") notify(); }, 1200);
+    toast(path ? "已复制路径。" : "已复制。");
   } catch {
-    notify("当前环境不支持剪贴板复制", true);
+    if (path) {
+      toast("请手动复制路径。", value);
+      const field = $("toast-path");
+      field.value = value;
+      field.hidden = false;
+      field.select();
+    } else toast("当前视图无法访问剪贴板。");
   }
 }
 
-app.onhostcontextchanged = applyHost;
+app.onhostcontextchanged = (context) => {
+  applyHost(context);
+  if (ready && !lockedConversation) void refreshRuns();
+};
+
 app.ontoolresult = (result) => {
   const data = result?.structuredContent;
-  if (!data) return;
+  if (!Array.isArray(data?.runs)) return;
+  const explicit = data.requested_run && data.run_id && data.stream?.run?.run_id === data.run_id;
+  if (!explicit && (scopeChosen || selected)) return;
   listVersion++;
-  // Only drill directly into Detail when explicitly opened with a specific run_id;
-  // otherwise land on the conversation's Subagent Sessions list.
-  const explicitId = data.requested_run && data.run_id && data.stream?.run?.run_id === data.run_id ? data.run_id : null;
-  if (Array.isArray(data.runs)) applyRunList(data, { explicitRunId: explicitId });
-  if (explicitId && data.stream?.run?.host_conversation_id === boundConversation) {
-    selected = explicitId;
-    viewMode = "detail";
-    selection++;
-    fullGoal = null;
-    goalLoading = null;
-    acceptSnapshot(data.stream);
-    if (data.stream.next_text_offset != null) {
-      void loadMoreTranscript(selection, explicitId, data.stream.next_text_offset, data.stream.text_revision);
-    }
+  scope = data.scope === "all" ? "all" : "session";
+  lockedConversation = explicit && scope === "session" ? data.stream.run.host_conversation_id || null : null;
+  if (explicit && selected !== data.run_id) resetSelection(data.run_id);
+  if (explicit) acceptSnapshot(data.stream);
+  applyRunList(data);
+  requestedCount = Math.max(50, runs.length);
+  if (explicit) {
+    void loadMoreTranscript(data.stream).catch((error) => {
+      if (snapshot === data.stream) notice("stream-error", error.message);
+    });
     scheduleStream();
   }
   scheduleList();
 };
+
+for (const element of document.querySelectorAll("[data-icon]")) element.append(icon(element.dataset.icon));
+$("scope-session").addEventListener("click", () => changeScope("session"));
+$("scope-all").addEventListener("click", () => changeScope("all"));
+$("load-more").addEventListener("click", () => {
+  requestedCount = runs.length + 50;
+  void refreshRuns();
+});
+$("attach-context").addEventListener("click", () => void bridgeAsk("attach"));
+$("remind-host").addEventListener("click", () => void bridgeAsk("remind"));
+$("toast-copy").addEventListener("click", () => void copy(toastPath, true));
+$("toast-dismiss").addEventListener("click", () => toast(""));
+$("turn-strip").addEventListener("keydown", (event) => {
+  const tabs = [...$("turn-strip").querySelectorAll('[role="tab"]')];
+  const index = tabs.indexOf(document.activeElement);
+  const offsets = { ArrowLeft: -1, ArrowRight: 1 };
+  if (index < 0 || (!Object.hasOwn(offsets, event.key) && !["Home", "End"].includes(event.key))) return;
+  event.preventDefault();
+  const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1
+    : (index + offsets[event.key] + tabs.length) % tabs.length;
+  tabs[next]?.click();
+});
 
 $("back-btn").addEventListener("click", backToList);
 $("refresh-list").addEventListener("click", () => void refreshRuns());
@@ -808,6 +851,9 @@ $("interrupt").addEventListener("click", () => {
   if (!confirming) { confirming = true; renderControls(); return; }
   void sendControl("gempt_app_interrupt", { run_id: selected }, "已请求中止当前回合");
 });
+$("unconfirmed-interrupt").addEventListener("click", () => {
+  void sendControl("gempt_app_interrupt", { run_id: selected }, "已尝试向远端发送中断确认");
+});
 $("cancel-interrupt").addEventListener("click", () => { confirming = false; renderControls(); });
 systemTheme.addEventListener("change", () => applyHost(app.getHostContext()));
 document.addEventListener("visibilitychange", () => {
@@ -822,5 +868,8 @@ app.connect().then(() => {
   applyHost(app.getHostContext());
   render();
   if (supportsTools) void refreshRuns();
-  else notify("当前宿主未开放实时工具调用。");
-}).catch((error) => notify(error.message, true));
+}).catch((error) => {
+  connectFailed = true;
+  notice("list-error", error.message);
+  render();
+});

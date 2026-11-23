@@ -1,3 +1,5 @@
+import { isRunOccupying, reconcileRunState } from '../../core/runs.mjs';
+import { isValidSessionId } from '../../core/state.mjs';
 import {
   closeSync, existsSync, fstatSync, lstatSync, openSync, readSync, readdirSync, statSync,
 } from 'node:fs';
@@ -7,6 +9,47 @@ import { readActivityTimeline } from './activity-timeline.mjs';
 import { buildRequestAnalytics, buildSessionAnalytics } from './activity-analytics.mjs';
 import { readJsonSafe, resolveConfigPath, resolveMagpieConfigDir, resolveSessionsDir } from '../../core/config.mjs';
 import { defaultGatewayFromEnv, resolveMagpieApiKey } from '../../core/magpie.mjs';
+
+const ACTIVITY_CACHE_TTL_MS = 5000;
+const MAX_CACHE_ENTRIES = 8;
+const rawActivityCache = new Map();
+const enrichedActivityCache = new Map();
+const activityCacheStats = { rawHits: 0, rawMisses: 0, enrichedHits: 0, enrichedMisses: 0 };
+
+export function invalidateActivityCache(sessionsDir) {
+  if (!sessionsDir) {
+    rawActivityCache.clear();
+    enrichedActivityCache.clear();
+    return;
+  }
+  const resolved = resolveSessionsDir(sessionsDir);
+  rawActivityCache.delete(resolved);
+  for (const key of enrichedActivityCache.keys()) {
+    try {
+      if (JSON.parse(key)[0] === resolved) enrichedActivityCache.delete(key);
+    } catch { /* ignore */ }
+  }
+}
+
+export function getActivityCacheStats() {
+  return { ...activityCacheStats };
+}
+
+function setBoundedCache(map, key, value) {
+  if (!map.has(key) && map.size >= MAX_CACHE_ENTRIES) {
+    map.delete(map.keys().next().value);
+  }
+  map.set(key, value);
+}
+
+function statSignature(path) {
+  try {
+    const st = lstatSync(path, { bigint: true });
+    return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+  } catch {
+    return 'missing';
+  }
+}
 
 function sortedMtimeEntries(dirPath, filterFn) {
   if (!existsSync(dirPath)) return [];
@@ -85,55 +128,20 @@ export function sessionGoal(record) {
   return '';
 }
 
-export function readRecentActivity(sessionsDir, limit = 6) {
-  const recentSessions = [];
-  for (const entry of sortedMtimeEntries(sessionsDir, (n) => n.endsWith('.json')).slice(0, limit)) {
-    const rec = readJsonSafe(entry.full);
-    if (!rec) continue;
-    recentSessions.push({
-      session_id: String(rec.session_id || entry.name.replace(/\.json$/, '')),
-      mode: String(rec.mode || 'consult'),
-      tier: String(rec.tier || ''),
-      model: String(rec.model || ''),
-      agent: String(rec.agent || ''),
-      turns: Array.isArray(rec.turns) ? rec.turns.length : 0,
-      cwd_name: workspaceName(rec.cwd),
-      title: normalizeTitle(rec.title, sessionGoal(rec), rec.cwd),
-      updated_at: String(rec.updated_at || ''),
-    });
-  }
-
-  const runsDir = join(sessionsDir, 'runs');
-  const recentRuns = [];
-  if (existsSync(runsDir)) {
-    const runDirs = sortedMtimeEntries(runsDir, () => true);
-    for (const dirEntry of runDirs) {
-      const stateFile = join(dirEntry.full, 'state.json');
-      const rec = readJsonSafe(stateFile);
-      if (!rec) continue;
-      let runState = String(rec.state || 'unknown');
-      if ((runState === 'queued' || runState === 'running') && Number.isFinite(rec.deadline) && (Date.now() / 1000) > rec.deadline) {
-        runState = 'outcome_unknown';
-      }
-      recentRuns.push({
-        run_id: String(rec.run_id || dirEntry.name),
-        state: runState,
-        cwd_name: workspaceName(rec.cwd),
-        title: normalizeTitle(rec.title, rec.goal, rec.cwd),
-        tier: String(rec.result?.tier || ''),
-        model: String(rec.result?.model || ''),
-        verification: String(rec.result?.verification?.status || ''),
-      });
-      if (recentRuns.length >= limit) break;
-    }
-  }
-
-  return { recentSessions, recentRuns };
-}
-
-const ACTIVITY_SESSION_ID = /^(?:consult|exec)-[A-Za-z0-9_.-]{1,120}$/;
 const ACTIVITY_RUN_ID = /^[a-f0-9]{32}$/;
-const safeSessionId = (id) => typeof id === 'string' && ACTIVITY_SESSION_ID.test(id) && !id.includes('..');
+const safeSessionId = (id) => isValidSessionId(id);
+
+function inferSessionMode(id, data) {
+  if (!data || typeof data !== 'object') return null;
+  if (data.session_id && data.session_id !== id) return null;
+  if (id.startsWith('exec-')) {
+    return data.mode && data.mode !== 'exec' ? null : 'exec';
+  }
+  if (id.startsWith('consult-')) {
+    return data.mode && data.mode !== 'consult' ? null : 'consult';
+  }
+  return data.mode === 'exec' || data.mode === 'consult' ? data.mode : null;
+}
 
 export function isActivityId(kind, id) {
   if (kind === 'sessions') return safeSessionId(id);
@@ -144,18 +152,85 @@ export function isActivityId(kind, id) {
 
 const ACTIVE_RUN_STATES = new Set(['queued', 'running', 'waiting_gemini']);
 
+function reconcileActivityRun(data, modifiedMs) {
+  const record = { ...data };
+  return reconcileRunState(record, () => modifiedMs);
+}
+
+export function readRecentActivity(sessionsDir, limit = 6) {
+  const recentSessions = [];
+  for (const entry of sortedMtimeEntries(sessionsDir, (n) => n.endsWith('.json'))) {
+    const id = entry.name.slice(0, -5);
+    if (!safeSessionId(id)) continue;
+    const rec = readJsonSafe(entry.full);
+    const mode = inferSessionMode(id, rec);
+    if (!mode) continue;
+    recentSessions.push({
+      session_id: String(rec.session_id || id),
+      mode,
+      tier: String(rec.tier || ''),
+      model: String(rec.model || ''),
+      agent: String(rec.agent || ''),
+      turns: Array.isArray(rec.turns) ? rec.turns.length : 0,
+      cwd_name: workspaceName(rec.cwd),
+      title: normalizeTitle(rec.title, sessionGoal(rec), rec.cwd),
+      updated_at: String(rec.updated_at || ''),
+    });
+    if (recentSessions.length >= limit) break;
+  }
+
+  const runsDir = join(sessionsDir, 'runs');
+  const recentRuns = [];
+  if (existsSync(runsDir)) {
+    const runDirs = sortedMtimeEntries(runsDir, (name) => ACTIVITY_RUN_ID.test(name));
+    for (const dirEntry of runDirs) {
+      const stateFile = join(dirEntry.full, 'state.json');
+      const file = readActivityFile(stateFile);
+      if (!file) continue;
+      const { data, modifiedMs } = file;
+      if (data.run_id && data.run_id !== dirEntry.name) continue;
+      const reconciled = reconcileActivityRun(data, modifiedMs);
+      recentRuns.push({
+        run_id: String(reconciled.run_id || dirEntry.name),
+        state: String(reconciled.state || 'unknown'),
+        cwd_name: workspaceName(reconciled.cwd),
+        title: normalizeTitle(reconciled.title, reconciled.goal, reconciled.cwd),
+        tier: String(reconciled.result?.tier || ''),
+        model: String(reconciled.result?.model || ''),
+        verification: String(reconciled.result?.verification?.status || ''),
+        ...(reconciled.remote_turn_unconfirmed ? { remote_turn_unconfirmed: true } : {}),
+      });
+      if (recentRuns.length >= limit) break;
+    }
+  }
+
+  return { recentSessions, recentRuns };
+}
+
 export function readActiveRuns(sessionsDir) {
   const dir = join(resolveSessionsDir(sessionsDir), 'runs');
+  const nowMs = Date.now();
   const result = [];
   for (const item of activityEntries(dir)) {
     if (!item.isDirectory() || !ACTIVITY_RUN_ID.test(item.name)) continue;
-    const { data } = readActivityFile(join(dir, item.name, 'state.json')) || {};
-    if (!data || (data.run_id && data.run_id !== item.name) || !ACTIVE_RUN_STATES.has(data.state)
-        || (data.deadline && Date.now() / 1000 > data.deadline)) continue;
-    result.push({ run_id: item.name, state: data.state, session_id: data.session_id ?? null, cwd: data.cwd,
-      title: normalizeTitle(data.title, data.goal, data.cwd),
-      codex_thread_id: data.codex_thread_id ?? null, turn_id: data.turn_id ?? null,
-      progress: data.progress ?? null, pending_tool_call: data.pending_tool_call ?? null });
+    const file = readActivityFile(join(dir, item.name, 'state.json'));
+    if (!file) continue;
+    const { data, modifiedMs } = file;
+    if (!data || (data.run_id && data.run_id !== item.name)) continue;
+    const reconciled = reconcileActivityRun(data, modifiedMs);
+    if (!isRunOccupying(reconciled, nowMs, modifiedMs)) continue;
+    result.push({
+      run_id: item.name,
+      state: reconciled.state,
+      session_id: reconciled.session_id ?? null,
+      cwd: reconciled.cwd,
+      title: normalizeTitle(reconciled.title, reconciled.goal, reconciled.cwd),
+      codex_thread_id: reconciled.codex_thread_id ?? null,
+      turn_id: reconciled.turn_id ?? null,
+      progress: reconciled.progress ?? null,
+      pending_tool_call: reconciled.pending_tool_call ?? null,
+      ...(reconciled.remote_turn_unconfirmed ? { remote_turn_unconfirmed: true } : {}),
+    });
   }
   return result;
 }
@@ -173,12 +248,58 @@ function readActivityFile(file) {
     const stat = lstatSync(file);
     if (stat.isFile()) {
       const data = readJsonSafe(file);
-      if (data) return { data, modified: stat.mtime.toISOString() };
+      if (data) return { data, modified: stat.mtime.toISOString(), modifiedMs: stat.mtimeMs };
     }
   } catch {
     // A worker may have replaced or removed the entry since enumeration.
   }
   return null;
+}
+
+function sessionsFingerprint(dir) {
+  const dirSig = statSignature(dir);
+  if (dirSig === 'missing') return 'missing';
+  const entries = activityEntries(dir);
+  const parts = [`d:${dirSig}`];
+  const sessionParts = [];
+  let hasRunsDir = false;
+  for (const entry of entries) {
+    if (entry.name === 'runs' && entry.isDirectory()) {
+      hasRunsDir = true;
+      continue;
+    }
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    const id = entry.name.slice(0, -5);
+    if (!safeSessionId(id)) continue;
+    sessionParts.push(`s:${entry.name}:${statSignature(join(dir, entry.name))}`);
+  }
+  sessionParts.sort();
+  parts.push(...sessionParts);
+  if (hasRunsDir) {
+    const runsDir = join(dir, 'runs');
+    parts.push(`rd:${statSignature(runsDir)}`);
+    const runParts = [];
+    for (const entry of activityEntries(runsDir)) {
+      if (!entry.isDirectory() || !ACTIVITY_RUN_ID.test(entry.name)) continue;
+      runParts.push(`r:${entry.name}:${statSignature(join(runsDir, entry.name, 'state.json'))}`);
+    }
+    runParts.sort();
+    parts.push(...runParts);
+  }
+  return parts.join('|');
+}
+
+function liveRunStateChanged(liveRunChecks) {
+  if (!liveRunChecks?.length) return false;
+  const nowMs = Date.now();
+  for (const snap of liveRunChecks) {
+    const reconciled = reconcileActivityRun(snap.record, snap.modifiedMs);
+    const occupying = isRunOccupying(reconciled, nowMs, snap.modifiedMs);
+    if (reconciled.state !== snap.state || occupying !== snap.occupying) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function activityTime(...values) {
@@ -251,6 +372,7 @@ function activityRequest(source, context) {
     ...(source.state ? { state: source.state } : {}),
     ...(source.progress ? { progress: source.progress } : {}),
     ...(source.pending_tool_call ? { pending_tool_call: source.pending_tool_call } : {}),
+    ...(source.remote_turn_unconfirmed ? { remote_turn_unconfirmed: true } : {}),
     retried: Boolean(source.retried || source.attempted_models?.length > 1),
     error: String(source.error || ''),
     elapsed_sec: activityNumber(source.elapsed_sec),
@@ -271,8 +393,8 @@ function readActivitySession(dir, id) {
   const file = readActivityFile(join(dir, `${id}.json`));
   if (!file) return null;
   const { data, modified } = file;
-  const mode = id.startsWith('exec-') ? 'exec' : 'consult';
-  if ((data.mode && data.mode !== mode) || (data.session_id && data.session_id !== id)) return null;
+  const mode = inferSessionMode(id, data);
+  if (!mode) return null;
 
   // Legacy consult and native exec files store alternating messages. Python
   // exec files store one object per turn, with a reply preview in older files.
@@ -308,26 +430,54 @@ function readActivitySession(dir, id) {
     title: explicitTitle(data.title), cwd: String(data.cwd || ''), model: String(data.model || ''), tier: String(data.tier || '') };
 }
 
-function readActivityRun(dir, id) {
+function readActivityRun(dir, id, liveRunChecks) {
   const file = readActivityFile(join(dir, id, 'state.json'));
   if (!file) return null;
-  const { data, modified } = file;
+  const { data, modified, modifiedMs } = file;
   if ((data.run_id && data.run_id !== id) || !data.state) return null;
-  const result = data.result;
-  const sessionId = result?.session_id || data.session_id;
-  const pending = ACTIVE_RUN_STATES.has(data.state);
-  const status = pending && Number.isFinite(data.deadline) && Date.now() / 1000 > data.deadline
-    ? 'outcome_unknown' : data.state === 'finished' ? 'succeeded' : data.state;
+  const reconciled = reconcileActivityRun(data, modifiedMs);
+  const nowMs = Date.now();
+  const occupying = isRunOccupying(reconciled, nowMs, modifiedMs);
+  if (ACTIVE_RUN_STATES.has(data.state) || occupying || reconciled.remote_turn_unconfirmed) {
+    liveRunChecks?.push({
+      record: {
+        state: data.state,
+        pid: data.pid,
+        source: data.source,
+        deadline: data.deadline,
+        created_at: data.created_at,
+        started_at: data.started_at,
+        finished_at: data.finished_at,
+        unconfirmed_at: data.unconfirmed_at,
+        turn_id: data.turn_id,
+        remote_turn_unconfirmed: data.remote_turn_unconfirmed,
+        progress: data.progress ? { updated_at: data.progress.updated_at } : null,
+      },
+      modifiedMs,
+      state: reconciled.state,
+      occupying,
+    });
+  }
+  const result = reconciled.result;
+  const sessionId = result?.session_id || reconciled.session_id;
+  const status = reconciled.state === 'finished' ? 'succeeded' : reconciled.state;
   const reply = result?.reply ?? String(result?.text || '').replace(/^\[mode=exec \| [^\r\n]+\]\r?\n\r?\n/, '');
   const request = activityRequest({
-    ...data, ...result, status, state: status === 'succeeded' ? 'finished' : status, reply, error: data.error,
-    timestamp: activityTime(data.finished_at, result?.timestamp, data.updated_at, data.started_at, data.created_at, modified),
+    ...reconciled,
+    ...result,
+    status,
+    state: status === 'succeeded' ? 'finished' : status,
+    reply,
+    error: reconciled.error,
+    pending_tool_call: reconciled.pending_tool_call,
+    remote_turn_unconfirmed: reconciled.remote_turn_unconfirmed,
+    timestamp: activityTime(reconciled.finished_at, result?.timestamp, reconciled.updated_at, reconciled.started_at, reconciled.created_at, modified),
   }, {
     id: `run-${id}`, run_id: id, mode: 'exec',
-    session_id: safeSessionId(sessionId) && sessionId.startsWith('exec-') ? sessionId : '',
+    session_id: safeSessionId(sessionId) && !sessionId.startsWith('consult-') ? sessionId : '',
     turn: null,
   });
-  return { request, turn: result?.turn ?? result?.turns ?? data.turn };
+  return { request, turn: result?.turn ?? result?.turns ?? reconciled.turn };
 }
 
 function joinActivityRun(session, request, turn) {
@@ -347,7 +497,7 @@ function joinActivityRun(session, request, turn) {
   if (target) {
     target.run_id = request.run_id;
     if (request.progress || !ACTIVE_RUN_STATES.has(request.status)) target.status = request.status;
-    for (const key of ['state', 'progress', 'pending_tool_call']) {
+    for (const key of ['state', 'progress', 'pending_tool_call', 'remote_turn_unconfirmed']) {
       if (request[key]) target[key] = request[key];
     }
     target.retried ||= request.retried;
@@ -444,8 +594,7 @@ function mergeGatewayUsage(request, rows) {
       + (row.input_includes_cache ? 0 : (row.cache_read_tokens ?? 0) + (row.cache_write_tokens ?? 0)));
 }
 
-export function readDispatchActivity(sessionsDir) {
-  const dir = resolveSessionsDir(sessionsDir);
+function buildDispatchActivity(dir) {
   const entries = activityEntries(dir);
   const sessions = new Map();
   for (const entry of entries) {
@@ -464,10 +613,11 @@ export function readDispatchActivity(sessionsDir) {
   }
   const runsDir = join(dir, 'runs');
   const runRecords = [];
+  const liveRunChecks = [];
   if (entries.some((entry) => entry.name === 'runs' && entry.isDirectory())) {
     for (const entry of activityEntries(runsDir)) {
       if (!entry.isDirectory() || !ACTIVITY_RUN_ID.test(entry.name)) continue;
-      const run = readActivityRun(runsDir, entry.name);
+      const run = readActivityRun(runsDir, entry.name, liveRunChecks);
       if (!run) continue;
       const { request } = run;
       request.session_id = sessionsByRun.get(request.run_id) || request.session_id;
@@ -507,6 +657,7 @@ export function readDispatchActivity(sessionsDir) {
       session.state = latest.state || (latest.status === 'succeeded' ? 'finished' : latest.status);
       if (latest.progress) session.progress = latest.progress;
       if (latest.pending_tool_call) session.pending_tool_call = latest.pending_tool_call;
+      if (latest.remote_turn_unconfirmed) session.remote_turn_unconfirmed = true;
     }
     session.usage = totalUsage(session.requests);
     session.elapsed_sec = session.requests.reduce((total, r) => r.elapsed_sec == null ? total : (total ?? 0) + r.elapsed_sec, null);
@@ -518,16 +669,48 @@ export function readDispatchActivity(sessionsDir) {
     return time(b).localeCompare(time(a)) || (b.turn ?? 0) - (a.turn ?? 0) || a.id.localeCompare(b.id);
   });
   const history = [...sessions.values()].sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || '') || a.id.localeCompare(b.id));
-  return { ledger, history, totals: { requests: ledger.length, sessions: history.length, runs: runRecords.length } };
+  return {
+    data: { ledger, history, totals: { requests: ledger.length, sessions: history.length, runs: runRecords.length } },
+    liveRunChecks,
+  };
+}
+
+export function readDispatchActivity(sessionsDir) {
+  const dir = resolveSessionsDir(sessionsDir);
+  const now = Date.now();
+  const fp = sessionsFingerprint(dir);
+  const hit = rawActivityCache.get(dir);
+  if (hit && hit.fp === fp && now >= hit.at && (now - hit.at) <= ACTIVITY_CACHE_TTL_MS && !liveRunStateChanged(hit.liveRunChecks)) {
+    activityCacheStats.rawHits += 1;
+    return hit.data;
+  }
+  activityCacheStats.rawMisses += 1;
+  const built = buildDispatchActivity(dir);
+  setBoundedCache(rawActivityCache, dir, { fp, at: now, data: built.data, liveRunChecks: built.liveRunChecks });
+  return built.data;
 }
 
 async function enrichDispatchActivity(sessionsDir, magpieConfigDir, configPath) {
-  const data = readDispatchActivity(sessionsDir);
-  const cfg = readJsonSafe(resolveConfigPath(configPath));
+  const dir = resolveSessionsDir(sessionsDir);
+  const resolvedMagpieDir = resolveMagpieConfigDir(magpieConfigDir);
+  const resolvedCfgPath = resolveConfigPath(configPath);
+  const usageFile = join(resolvedMagpieDir, 'usage.jsonl');
+  const now = Date.now();
+  const fp = `${sessionsFingerprint(dir)}\0${statSignature(usageFile)}\0${statSignature(resolvedCfgPath)}`;
+  const cacheKey = JSON.stringify([dir, resolvedMagpieDir, resolvedCfgPath]);
+  const hit = enrichedActivityCache.get(cacheKey);
+  if (hit && hit.fp === fp && now >= hit.at && (now - hit.at) <= ACTIVITY_CACHE_TTL_MS && !liveRunStateChanged(hit.liveRunChecks)) {
+    activityCacheStats.enrichedHits += 1;
+    return hit.data;
+  }
+  activityCacheStats.enrichedMisses += 1;
+  const built = buildDispatchActivity(dir);
+  const { data, liveRunChecks } = built;
+  const cfg = readJsonSafe(resolvedCfgPath);
   const baseUrl = cfg?.magpie?.base_url || defaultGatewayFromEnv();
   const candidates = data.ledger.map((row) => ({ ...row, dispatchSessionId: row.session_id || row.dispatchSessionId,
     active: ACTIVE_RUN_STATES.has(row.status) }));
-  const linked = await correlateGatewayUsage(join(resolveMagpieConfigDir(magpieConfigDir), 'usage.jsonl'), candidates,
+  const linked = await correlateGatewayUsage(usageFile, candidates,
     { baseUrl, apiKey: cfg ? resolveMagpieApiKey(cfg, baseUrl) : '' });
   data.ledger.forEach((row, index) => mergeGatewayUsage(row, linked.get(candidates[index]) || []));
   for (const session of data.history) {
@@ -535,6 +718,7 @@ async function enrichDispatchActivity(sessionsDir, magpieConfigDir, configPath) 
     session.cost_usd = activityCost(session.requests);
     session.gateway_request_count = session.requests.reduce((total, row) => total + row.gateway_request_count, 0);
   }
+  setBoundedCache(enrichedActivityCache, cacheKey, { fp, at: Date.now(), data, liveRunChecks });
   return data;
 }
 

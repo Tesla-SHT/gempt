@@ -40,39 +40,41 @@ async function writeThirdPartyLicenses(nodeModulesDir, meta) {
     if (pkg.homepage) lines.push(`Homepage: ${pkg.homepage}`);
     lines.push("");
     if (licFile) {
-      lines.push((await readFile(join(dir, licFile), "utf8")).replace(/\r\n/g, "\n").trim());
+      lines.push((await readFile(join(dir, licFile), "utf8")).replace(/\r\n/g, "\n").replace(/[ \t]+$/gm, "").trim());
     }
     if (noticeFile) {
       lines.push("");
       lines.push("NOTICE:");
-      lines.push((await readFile(join(dir, noticeFile), "utf8")).replace(/\r\n/g, "\n").trim());
+      lines.push((await readFile(join(dir, noticeFile), "utf8")).replace(/\r\n/g, "\n").replace(/[ \t]+$/gm, "").trim());
     }
     lines.push("");
   }
-  await writeFile(licensesOutput, lines.join("\n"), "utf8");
+  const nextText = lines.join("\n");
+  let existingText = null;
+  try { existingText = await readFile(licensesOutput, "utf8"); } catch {}
+  if (existingText !== nextText) {
+    await writeFile(licensesOutput, nextText, "utf8");
+  }
   return pkgNames;
 }
 
 const temporary = await mkdtemp(join(tmpdir(), "gempt-mcp-app-"));
+let esbuild;
 try {
   execFileSync(process.execPath, [
     npm, "install", "--prefix", temporary, "--no-save", "--no-package-lock", "--no-audit", "--no-fund",
     "@modelcontextprotocol/ext-apps@2.0.4", "esbuild@0.28.2", "zod@4.4.3",
+    "marked@18.2.0", "entities@7.0.1",
   ], { stdio: "inherit", windowsHide: true });
   const require = createRequire(join(temporary, "package.json"));
-  const metaFile = join(temporary, "meta.json");
-  const script = execFileSync(process.execPath, [
-    require.resolve("esbuild/bin/esbuild"), "app.js", "--bundle", "--format=iife", "--minify", "--target=es2022",
-    `--metafile=${metaFile}`,
-  ], {
-    cwd: fileURLToPath(source),
-    env: { ...process.env, NODE_PATH: join(temporary, "node_modules") },
-    encoding: "utf8",
-    maxBuffer: 16 * 1024 * 1024,
-    windowsHide: true,
+  const nodeModules = join(temporary, "node_modules");
+  esbuild = require("esbuild");
+  const { metafile, outputFiles } = await esbuild.build({
+    absWorkingDir: fileURLToPath(source), nodePaths: [nodeModules], entryPoints: ["app.js"],
+    bundle: true, format: "iife", minify: true, target: "es2022", metafile: true, write: false,
   });
-  const meta = JSON.parse(await readFile(metaFile, "utf8"));
-  const pkgs = await writeThirdPartyLicenses(join(temporary, "node_modules"), meta);
+  const script = outputFiles[0].text;
+  const pkgs = await writeThirdPartyLicenses(nodeModules, metafile);
   const [template, styles] = await Promise.all([
     readFile(new URL("index.html", source), "utf8"),
     readFile(new URL("styles.css", source), "utf8"),
@@ -83,5 +85,6 @@ try {
   await writeFile(output, html.replace(/\r\n/g, "\n"), "utf8");
   console.log(`GemPT Live · ${Buffer.byteLength(html)} bytes · ${pkgs.length} third-party notices`);
 } finally {
+  esbuild?.stop();
   await rm(temporary, { recursive: true, force: true, maxRetries: 3 });
 }

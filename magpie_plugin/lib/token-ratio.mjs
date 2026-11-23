@@ -12,8 +12,11 @@ const ROLLING_HOURS = { '1h': 1, '6h': 6, '24h': 24, '7d': 168 };
 const HOUR_MS = 3_600_000;
 const MIN_SAMPLE_TOKENS = 20_000;
 export const OUTPUT_WEIGHT = 5;
-const MAX_USAGE_TAIL_BYTES = 16 * 1024 * 1024;
+export const MAX_USAGE_TAIL_BYTES = 16 * 1024 * 1024;
+const USAGE_READ_CHUNK_BYTES = 256 * 1024;
+const MAX_USAGE_LINE_BYTES = 1024 * 1024;
 const DEFAULT_CACHE_TTL_MS = 15_000;
+const MAX_MEM_CACHE_ENTRIES = 32;
 
 const SWARM_COORD_TOOLS = new Set(['read_board', 'swarm_wait', 'post_message', 'swarm', 'schedule', 'manage_task']);
 const VISION_TOOLS = new Set(['generate_image', 'browser_subagent']);
@@ -107,6 +110,10 @@ function classifyModel(model, provider = '') {
 }
 
 function parseTimestampMs(raw) {
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    const ms = raw < 1e12 ? raw * 1000 : raw;
+    return Math.abs(ms) <= 8.64e15 ? ms : null;
+  }
   if (typeof raw !== 'string' || !raw.trim()) return null;
   const ms = Date.parse(raw.trim());
   return Number.isFinite(ms) ? ms : null;
@@ -141,7 +148,7 @@ function scanTranscriptFile(filePath, cutoffMs, nowMs) {
     }
     if (!obj || typeof obj !== 'object' || obj.type !== 'PLANNER_RESPONSE') continue;
     const ts = parseTimestampMs(obj.created_at);
-    if (ts !== null && (ts < cutoffMs || ts > nowMs)) continue;
+    if (ts === null || ts < cutoffMs || ts > nowMs) continue;
     for (const tc of (Array.isArray(obj.tool_calls) ? obj.tool_calls : [])) {
       const name = String(tc?.name || tc?.tool_name || '').trim();
       const args = tc?.args || tc?.arguments || {};
@@ -236,52 +243,33 @@ function scanAgyBrain(brainDir, sessionsDir, cutoffMs, nowMs, gemini, gpt) {
   };
 }
 
-function scanMagpieUsage(magpieDir, cutoffMs, nowMs, gemini, gpt, other) {
-  if (!magpieDir) return 0;
+function scanMagpieUsage(magpieDir, cutoffMs, nowMs, gemini, gpt, other, maxTailBytes = MAX_USAGE_TAIL_BYTES) {
+  if (!magpieDir) return { matched: 0, truncated: false };
   const usageFile = join(magpieDir, 'usage.jsonl');
   let size = 0;
   try {
     size = statSync(usageFile).size;
   } catch {
-    return 0;
+    return { matched: 0, truncated: false };
   }
-  if (size <= 0) return 0;
-  const start = Math.max(0, size - MAX_USAGE_TAIL_BYTES);
-  let text = '';
-  let fd;
-  try {
-    fd = openSync(usageFile, 'r');
-    const len = size - start;
-    const buf = Buffer.alloc(len);
-    let readBytes = 0;
-    while (readBytes < len) {
-      const n = readSync(fd, buf, readBytes, len - readBytes, start + readBytes);
-      if (n <= 0) break;
-      readBytes += n;
-    }
-    text = buf.subarray(0, readBytes).toString('utf-8');
-  } catch {
-    return 0;
-  } finally {
-    if (fd !== undefined) {
-      try { closeSync(fd); } catch { /* ignore */ }
-    }
-  }
-  let lines = text.split(/\r?\n/);
-  if (start > 0 && lines.length > 0) lines = lines.slice(1);
-
+  if (size <= 0) return { matched: 0, truncated: false };
+  const tailLimit = Number.isFinite(maxTailBytes) && maxTailBytes > 0 ? Math.trunc(maxTailBytes) : MAX_USAGE_TAIL_BYTES;
+  const start = Math.max(0, size - tailLimit);
+  const truncated = start > 0;
   let matched = 0;
-  for (const line of lines) {
-    if (!line.trim()) continue;
+
+  const processLine = (buf) => {
+    const raw = buf.toString('utf-8').trim();
+    if (!raw) return;
     let obj;
     try {
-      obj = JSON.parse(line);
+      obj = JSON.parse(raw);
     } catch {
-      continue;
+      return;
     }
-    if (!obj || typeof obj !== 'object') continue;
-    const ts = parseTimestampMs(obj.t || obj.created_at || obj.timestamp);
-    if (ts !== null && (ts < cutoffMs || ts > nowMs)) continue;
+    if (!obj || typeof obj !== 'object') return;
+    const ts = parseTimestampMs(obj.t ?? obj.created_at ?? obj.timestamp);
+    if (ts === null || ts < cutoffMs || ts > nowMs) return;
     const model = String(obj.served || obj.model || obj.req || '');
     const provider = String(obj.provider || '');
     const cls = classifyModel(model, provider);
@@ -293,8 +281,48 @@ function scanMagpieUsage(magpieDir, cutoffMs, nowMs, gemini, gpt, other) {
       obj.cache_read !== undefined ? obj.cache_read : obj.cache_read_tokens,
     );
     matched += 1;
+  };
+
+  let fd;
+  try {
+    fd = openSync(usageFile, 'r');
+    const chunk = Buffer.alloc(Math.min(USAGE_READ_CHUNK_BYTES, size - start));
+    let carry = Buffer.alloc(0);
+    let oversized = false;
+    let skipFirst = truncated;
+    for (let pos = start; pos < size;) {
+      const n = readSync(fd, chunk, 0, Math.min(chunk.length, size - pos), pos);
+      if (n <= 0) break;
+      const slice = chunk.subarray(0, n);
+      let lineStart = 0;
+      for (let nl; (nl = slice.indexOf(10, lineStart)) >= 0; lineStart = nl + 1) {
+        if (skipFirst) {
+          skipFirst = false;
+        } else if (!oversized && carry.length + nl - lineStart <= MAX_USAGE_LINE_BYTES) {
+          const part = slice.subarray(lineStart, nl);
+          processLine(carry.length ? Buffer.concat([carry, part]) : part);
+        }
+        carry = Buffer.alloc(0);
+        oversized = false;
+      }
+      const rest = slice.subarray(lineStart);
+      if (!skipFirst) {
+        oversized ||= carry.length + rest.length > MAX_USAGE_LINE_BYTES;
+        if (!oversized && rest.length) carry = Buffer.concat([carry, rest]);
+      }
+      pos += n;
+    }
+    if (!skipFirst && !oversized && carry.length) {
+      processLine(carry);
+    }
+  } catch {
+    return { matched: 0, truncated };
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
   }
-  return matched;
+  return { matched, truncated };
 }
 
 export function readTokenRatio({
@@ -304,6 +332,7 @@ export function readTokenRatio({
   sessionsDir,
   brainDir,
   magpieConfigDir,
+  maxUsageTailBytes = MAX_USAGE_TAIL_BYTES,
   cacheTtlMs = DEFAULT_CACHE_TTL_MS,
   nowMs,
   env = process.env,
@@ -320,7 +349,7 @@ export function readTokenRatio({
   const resolvedBrain = resolveAgyBrainDir({ brainDir, configPath, magpieConfigDir, env });
   const resolvedMagpie = resolveMagpieDir({ magpieConfigDir, configPath, env });
   const resolvedSessions = resolveSessionsDir(sessionsDir || env.GEMPT_SESSIONS_DIR);
-  const cacheKey = JSON.stringify([selectedRange, midnight ?? hours, resolvedBrain, resolvedMagpie, resolvedSessions]);
+  const cacheKey = JSON.stringify([selectedRange, midnight ?? hours, resolvedBrain, resolvedMagpie, resolvedSessions, maxUsageTailBytes]);
 
   if (cacheTtlMs > 0 && !Number.isFinite(nowMs)) {
     const hit = _memCache.get(cacheKey);
@@ -335,7 +364,8 @@ export function readTokenRatio({
 
   const { filesScanned: agyFiles, excludedSessions, skippedNonGemptSessions, scope } =
     scanAgyBrain(resolvedBrain, resolvedSessions, cutoffMs, now, gemini, gpt);
-  const magpieRecords = scanMagpieUsage(resolvedMagpie, cutoffMs, now, gemini, gpt, other);
+  const { matched: magpieRecords, truncated: usageTruncated } =
+    scanMagpieUsage(resolvedMagpie, cutoffMs, now, gemini, gpt, other, maxUsageTailBytes);
 
   const combinedWork = gemini.work + gpt.work;
   const combinedFresh = gemini.fresh + gpt.fresh;
@@ -351,6 +381,7 @@ export function readTokenRatio({
     window_hours: (now - cutoffMs) / HOUR_MS,
     metric: 'attributable_work_in_plus_5out',
     scope,
+    truncated: usageTruncated,
     gemini,
     gpt,
     other,
@@ -365,11 +396,15 @@ export function readTokenRatio({
     sources: {
       agy_files: agyFiles, excluded_sessions: excludedSessions,
       skipped_non_gempt_sessions: skippedNonGemptSessions, magpie_records: magpieRecords,
+      usage_truncated: usageTruncated,
     },
     computed_at: new Date(now).toISOString(),
   };
 
   if (cacheTtlMs > 0 && !Number.isFinite(nowMs)) {
+    if (!_memCache.has(cacheKey) && _memCache.size >= MAX_MEM_CACHE_ENTRIES) {
+      _memCache.delete(_memCache.keys().next().value);
+    }
     _memCache.set(cacheKey, { ts: now, snapshot });
   }
   return snapshot;
@@ -386,6 +421,7 @@ export function resolveBudget(profile, options = {}) {
     profile,
     range: snapshot.range,
     scope: snapshot.scope,
+    truncated: snapshot.truncated,
     target_gpt_share: target,
     actual_gpt_share: snapshot.actual_gpt_share,
     actual_gemini_share: snapshot.actual_gemini_share,

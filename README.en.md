@@ -1,4 +1,4 @@
-# GemPT v0.4.0
+# GemPT v0.4.1
 
 [中文文档](./README.md) · [Antigravity Plugin README](./plugin/README.md) · [Third-Party Licenses](./THIRD_PARTY_LICENSES.txt)
 
@@ -18,27 +18,30 @@ Runtime code uses only Node.js built-in modules (`>= 20.11.0`). GemPT Live ships
 
 ### 1. Install the Magpie Plugin
 
+Search for **GemPT** directly in the Magpie Plugin Marketplace (published at `v0.4.1` via `github:yizhang-dream/gempt`), or install from the CLI:
+
 ```bash
-magpie plugin add gempt
-# Or pin a release tag from GitHub:
-magpie plugin add github:yizhang-dream/gempt#v0.4.0
+# Recommended: install from the published GitHub release tag (available now)
+magpie plugin add github:yizhang-dream/gempt#v0.4.1
 ```
+
+> **Note:** `gempt` is not yet published on the npm registry; do not run bare `magpie plugin add gempt` yet (it returns 404).
 
 Open **Plugins → GemPT** in Magpie and click **Enable Subscription Config** (or run `gempt init`).
 
 ### 2. Install the Antigravity Plugin
 
 ```bash
-# Recommended pinned install:
-npx --yes gempt@0.4.0 install-agy
-# Or from GitHub release tag:
-npx --yes github:yizhang-dream/gempt#v0.4.0 install-agy
+# Recommended: one-command install from the GitHub release tag (available now)
+npx --yes github:yizhang-dream/gempt#v0.4.1 install-agy
 ```
+
+> **Note:** Since `gempt` is not yet published on the npm registry, use the GitHub tag above or install from a local checkout (bare `npx --yes gempt@0.4.1 install-agy` is not yet active).
 
 From a local checkout:
 - **Linux / macOS**: `bash install.sh`
 - **Windows PowerShell**: `powershell -ExecutionPolicy Bypass -File .\install.ps1`
-- **Build a portable Marketplace bundle**: `npm run build:agy-plugin` (outputs self-contained `dist/agy-plugin/` using `${PLUGIN_ROOT}` and relative hook paths)
+- **Build a portable Marketplace bundle**: `npm run build:agy-plugin` (outputs self-contained `dist/agy-plugin/`, supports `--out <dir>`, using `${PLUGIN_ROOT}` and relative hook paths)
 
 If `~/bin` is not on your `PATH`, add it to invoke bare `gempt-wait`, or execute the exact `wait_command` returned by `gpt_run` (which includes a fully-quoted fallback).
 
@@ -79,7 +82,7 @@ For new MCP threads, GemPT uses the current Gemini family. Pass `gemini_family` 
 
 ## Upgrade & Uninstall
 
-- **Upgrade**: re-run `magpie plugin add gempt@<version>` and `npx --yes gempt@<version> install-agy`.
+- **Upgrade**: update **GemPT** in the Magpie Plugin Marketplace (or re-run `magpie plugin add github:yizhang-dream/gempt#<tag>`) and run `npx --yes github:yizhang-dream/gempt#<tag> install-agy`.
 - **Uninstall**: remove `gempt` from Magpie Plugins, uninstall `gempt` from Antigravity Customizations (or delete `~/.gemini/config/plugins/gempt`), remove `~/bin/gempt-wait*`, and optionally delete `~/.config/gempt/`.
 
 ## Development & Verification

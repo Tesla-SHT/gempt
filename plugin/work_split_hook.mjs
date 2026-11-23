@@ -3,7 +3,7 @@ import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, 
 import { basename, dirname, extname, join } from 'node:path';
 
 const runtime = existsSync(new URL('./runtime/core/host-context.mjs', import.meta.url)) ? './runtime/' : '../';
-const [{ WORKLOAD }, { updateHostContext }, { atomicJson, resolvePath, withLock }, backend] = await Promise.all([
+const [{ WORKLOAD }, { readHostContext, updateHostContext }, { atomicJson, resolvePath, withLock }, backend] = await Promise.all([
   import(`${runtime}core/assets.mjs`), import(`${runtime}core/host-context.mjs`),
   import(`${runtime}core/state.mjs`), import(`${runtime}magpie_plugin/lib/backend.mjs`),
 ]);
@@ -31,17 +31,70 @@ const now = () => Date.now() / 1000;
 const text = (value) => typeof value === 'string' ? value.trim() : '';
 const step = (systemMessage) => ({ systemMessage: { systemMessage } });
 
-function profile() {
+const swarmTools = new Set(['swarm', 'post_message', 'read_board', 'swarm_wait', 'define_subagent', 'send_message']);
+
+function readRoutingPolicy() {
   try {
-    return JSON.parse(readFileSync(configPath, 'utf8').replace(/^\uFEFF/, ''))?.routing_policy?.work_split ?? 'balanced';
+    const policy = JSON.parse(readFileSync(configPath, 'utf8').replace(/^\uFEFF/, ''))?.routing_policy;
+    const work = typeof policy?.work_split === 'string' && Object.hasOwn(WORKLOAD.profiles, policy.work_split)
+      ? policy.work_split : 'balanced';
+    const rawSwarm = typeof policy?.swarm_split === 'string' ? policy.swarm_split : 'inherit';
+    const swarm = rawSwarm === 'inherit' || Object.hasOwn(WORKLOAD.profiles, rawSwarm)
+      ? rawSwarm : 'inherit';
+    return { work_split: work, swarm_split: swarm };
   } catch {
-    return 'balanced';
+    return { work_split: 'balanced', swarm_split: 'inherit' };
   }
+}
+
+function truthyEnv(value) {
+  const raw = text(value).toLowerCase();
+  return Boolean(raw) && !['0', 'false', 'no', 'off', 'solo', 'none'].includes(raw);
+}
+
+function envSwarmSignal(env = process.env) {
+  return truthyEnv(env.GEMPT_SWARM_MODE) || truthyEnv(env.GEMPT_IS_SWARM) || truthyEnv(env.GEMPT_SWARM_ROLE);
+}
+
+function payloadSwarmSignal(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  if (payload.isSwarm === true || payload.is_swarm === true
+      || payload.isSubagent === true || payload.is_subagent === true) return true;
+  for (const key of ['swarmId', 'swarm_id', 'swarmName', 'swarm_name', 'subagentType', 'subagent_type']) {
+    if (text(payload[key])) return true;
+  }
+  for (const key of ['swarmRole', 'swarm_role', 'agentRole', 'agent_role', 'role']) {
+    const role = text(payload[key]).toLowerCase();
+    if (role && role !== 'solo') return true;
+  }
+  const conversation = text(payload.conversationId);
+  const parent = text(payload.parentConversationId) || text(payload.parent_conversation_id);
+  if (parent && parent !== conversation) return true;
+  const toolName = text(payload.toolCall?.name);
+  if (swarmTools.has(toolName)) return true;
+  if (toolName === 'invoke_subagent' && text(payload.toolCall?.args?.TypeName) !== 'gempt-worker') return true;
+  if (toolName === 'call_mcp_tool' && payload.toolCall?.args?.ServerName === 'gempt_gempt') {
+    const parentId = text(payload.toolCall?.args?.Arguments?.host_conversation_id);
+    if (parentId && conversation && parentId !== conversation) return true;
+    const mcpRole = text(payload.toolCall?.args?.Arguments?.role).toLowerCase();
+    if (mcpRole && mcpRole !== 'solo') return true;
+  }
+  return false;
+}
+
+function hostSubagentSignal(conversation) {
+  if (!text(conversation)) return false;
+  const ctx = readHostContext(configPath);
+  return Array.isArray(ctx?.subagent_conversations) && ctx.subagent_conversations.includes(conversation);
+}
+
+function stateFilePath(conversation) {
+  return join(dirname(configPath), 'hook-state', `${conversation.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80)}.json`);
 }
 
 async function updateState(conversation, operation) {
   if (!text(conversation)) return operation({});
-  const file = join(dirname(configPath), 'hook-state', `${conversation.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80)}.json`);
+  const file = stateFilePath(conversation);
   try {
     return await withLock(`${file}.node.lock`, () => {
       const stored = readJsonSafe(file);
@@ -155,7 +208,25 @@ async function handle(payload) {
   const family = modelName === 'gemini-pro-orchestrator' ? 'carbon'
     : /(?:^|[^a-z0-9])(hydrogen|neon|carbon)(?:$|[^a-z0-9])/i.exec(String(modelName))?.[1]?.toLowerCase();
   await updateHostContext(conversationId, workspacePaths, { geminiFamily: family, configPath });
-  const ordinary = profile();
+  const routing = readRoutingPolicy();
+  const detectedSwarm = payloadSwarmSignal(payload) || hostSubagentSignal(conversationId);
+  let storedSwarm = false;
+  if (text(conversationId)) {
+    const existing = readJsonSafe(stateFilePath(conversationId));
+    storedSwarm = Boolean(existing?.is_swarm);
+    if (detectedSwarm && !storedSwarm) {
+      await updateState(conversationId, (state) => {
+        if (!state.is_swarm) {
+          state.is_swarm = true;
+          state.updated_at = now();
+        }
+      });
+      storedSwarm = true;
+    }
+  }
+  const isSwarm = envSwarmSignal() || detectedSwarm || storedSwarm;
+  const usingSwarmSplit = isSwarm && routing.swarm_split !== 'inherit';
+  const ordinary = usingSwarmSplit ? routing.swarm_split : routing.work_split;
   const pct = WORKLOAD.profiles[ordinary]?.gpt_share ?? WORKLOAD.profiles.balanced.gpt_share;
   const userInput = String(payload.lastUserInput || '');
   const key = userInput.trim() ? createHash('sha1').update(userInput.trim()).digest('hex').slice(0, 16) : '';
@@ -206,7 +277,7 @@ async function handle(payload) {
   }
   if (hookEventName === 'SessionStart') {
     if (pct <= 0) return {};
-    return { injectSteps: [step(`GemPT v2 active: ${ordinary} (${pct}% GPT${family ? `, family=${family}` : ''}).\n`
+    return { injectSteps: [step(`GemPT v2 active: ${ordinary} (${pct}% GPT${family ? `, family=${family}` : ''}${usingSwarmSplit ? ', swarm' : ''}).\n`
       + 'Tools (ServerName="gempt_gempt"): gpt_run(goal,cwd,access="change"|"inspect",workspace="inherit"|"share",session_id?) | '
       + 'gpt_ask(goal,file_paths?,cwd?,tier?,session_id?) | gpt_ctl(action="status"|"steer"|"interrupt"|"reply",run_id?,message?,call_id?).\n'
       + "Run gpt_run's returned `gempt-wait <id>` via run_command(WaitMsBeforeAsync=500); never poll status.")] };

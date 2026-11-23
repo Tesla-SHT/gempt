@@ -48,7 +48,7 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files, version }] = JSON.parse(stdout);
-  assert.equal(version, '0.4.0');
+  assert.equal(version, '0.4.1');
   const paths = files.map((file) => file.path);
   assert.deepEqual(paths.filter((path) => /^plugin\/skills\/[^/]+\/SKILL\.md$/.test(path)).sort(),
     ['plugin/skills/gempt-chore/SKILL.md', 'plugin/skills/gempt/SKILL.md']);
@@ -1034,6 +1034,61 @@ test('fresh subscription_only auto-discovers openai/* backup when switching to a
   }
 });
 
+test('settings batch validates atomically and failover preserves changes made during the gateway probe', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-settings-'));
+  const configPath = join(dir, 'config.json');
+  let probeStarted, releaseProbe;
+  const probing = new Promise((resolve) => { probeStarted = resolve; });
+  const allowProbe = new Promise((resolve) => { releaseProbe = resolve; });
+  let requests = 0;
+  const magpie = http.createServer(async (_req, res) => {
+    requests++;
+    probeStarted();
+    await allowProbe;
+    res.end(JSON.stringify({ data: [{ id: 'codex/gpt-6.2-sol' }, { id: 'openai/gpt-6.1-sol' }] }));
+  });
+  await new Promise((resolve) => magpie.listen(0, '127.0.0.1', resolve));
+  const original = JSON.stringify({ magpie: { base_url: `http://127.0.0.1:${magpie.address().port}` },
+    codex: { default_sandbox: 'workspace-write' }, routing_policy: { failover_mode: 'subscription_only' } });
+  writeFileSync(configPath, original);
+  const svc = await startServer({ port: 0, configPath, sessionsDir: join(dir, 'sessions'), probeTimeoutMs: 5000 });
+  t.after(async () => {
+    releaseProbe();
+    await svc.close();
+    await new Promise((resolve) => magpie.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const key = (await rawHttpGet({ port: svc.port, path: '/' })).text.match(/<meta name="gempt-key" content="([^"]+)">/)[1];
+  const post = (body) => fetch(`http://127.0.0.1:${svc.port}/api/settings`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'x-gempt-key': key }, body: JSON.stringify(body),
+  });
+  for (const invalid of [{ failover_mode: 'wrong' }, { mcp_effort: 'ultra' }, { auto_effort: 'true' },
+    { pairing: { family: 'bogus', model: 'default' } }, { work_split: 'invalid' },
+    { tier: 'fable', tier_effort: 'low' }, { unknown: 1 }]) {
+    assert.equal((await post({ default_sandbox: 'read-only', ...invalid })).status, 400);
+    assert.equal(readFileSync(configPath, 'utf8'), original);
+  }
+  assert.equal((await post({ default_sandbox: ['read-only'], work_split: 'balanced' })).status, 400);
+  assert.equal((await post({ failover_mode: 'api_fallback', mcp_effort: 'ultra' })).status, 400);
+  assert.equal(requests, 0);
+
+  const toggle = post({ failover_mode: 'api_fallback', default_sandbox: 'read-only', mcp_effort: 'high' });
+  try {
+    await Promise.race([probing, toggle.then((response) => assert.fail(`Failover returned ${response.status} before probing`))]);
+    assert.equal(readFileSync(configPath, 'utf8'), original);
+    assert.equal((await post({ pairing: { family: 'hydrogen', model: 'codex/fixture' }, work_split: 'balanced' })).status, 200);
+  } finally {
+    releaseProbe();
+  }
+  assert.equal((await toggle).status, 200);
+  const saved = JSON.parse(readFileSync(configPath, 'utf8'));
+  assert.equal(saved.codex.default_sandbox, 'read-only');
+  assert.equal(saved.routing_policy.mcp_effort, 'high');
+  assert.equal(saved.routing_policy.failover_mode, 'api_fallback');
+  assert.equal(saved.routing_policy.pairings.hydrogen, 'codex/fixture');
+  assert.equal(saved.routing_policy.work_split, 'balanced');
+});
+
 test('history API paginates GemPT dispatches, correlates exec receipts and returns full transcripts', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'gempt-activity-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -1109,7 +1164,7 @@ test('history API paginates GemPT dispatches, correlates exec receipts and retur
     result: { session_id: 'exec-orphan', turns: 3, text: 'receipt only', tier: 'fable' } });
   saveRun(failed, { state: 'failed', cwd: alpha, finished_at: stamp(13), goal: 'standalone failure', error: 'failed to start' });
   saveRun(expired, { state: 'running', deadline: 1, created_at: stamp(14) });
-  saveRun(queued, { state: 'queued', created_at: stamp(15) });
+  saveRun(queued, { state: 'queued', pid: process.pid, created_at: stamp(15) });
   saveRun(running, { state: 'running', started_at: stamp(16) });
   for (let i = 1; i <= 7; i += 1) {
     saveSession(`consult-filler-${i}`, {
@@ -2192,7 +2247,7 @@ test('mcpTools false disables duplicate Magpie GemPT tool registration', async (
 
 test('Magpie marketplace check shape and inspect+share guard hold', async () => {
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '0.4.0');
+  assert.equal(pkg.version, '0.4.1');
   assert.ok(pkg.keywords.includes('magpie-plugin'));
   assert.ok(pkg.files.includes('THIRD_PARTY_LICENSES.txt'));
   assert.ok(pkg.magpie?.summary?.en && pkg.magpie?.summary?.zh);
@@ -2214,9 +2269,11 @@ test('Windows Codex shim resolution supports non-npm shims and server probe reje
   const dir = mkdtempSync(join(tmpdir(), 'gempt-shim-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const customCmd = join(dir, 'codex.cmd');
+  const comspec = join(dir, 'cmd.exe');
   writeFileSync(customCmd, '@echo off\r\necho fake\r\n');
-  const resolved = resolveCodexInvocation(customCmd, { ComSpec: process.env.ComSpec || 'C:\\Windows\\System32\\cmd.exe', SystemRoot: process.env.SystemRoot || 'C:\\Windows' }, 'win32');
-  assert.equal(resolved.at(-1), customCmd);
+  writeFileSync(comspec, '');
+  const resolved = resolveCodexInvocation(customCmd, { ComSpec: comspec }, 'win32');
+  assert.deepEqual(resolved, [comspec, '/d', '/s', '/c', customCmd]);
 
   const spoof = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -2328,6 +2385,13 @@ test('transport disconnects yield recovery hint and app-server self-heals on wed
     run_id: runId, source: 'magpie_exec', state: 'running', pid: process.pid,
     deadline: Date.now() / 1000 + 600, cwd: dir, goal: 'busy',
   }));
+  const spawnsBeforeActiveProbe = spawnCount;
+  const refreshed = await mgr.ensureRunning({ probe: true });
+  assert.equal(refreshed.running, false);
+  assert.equal(refreshed.healthy, false);
+  assert.equal(refreshed.degraded, true);
+  assert.match(refreshed.error || '', /unresponsive/i);
+  assert.equal(spawnCount, spawnsBeforeActiveProbe);
   const blocked = await mgr.restart({ force: false });
   assert.equal(blocked.ok, false);
   assert.equal(blocked.status, 409);
@@ -2335,4 +2399,366 @@ test('transport disconnects yield recovery hint and app-server self-heals on wed
   const forced = await mgr.restart({ force: true });
   assert.equal(forced.ok, true);
   assert.equal(forced.status, 200);
+  assert.equal(forced.app_server.running, true);
+  assert.equal(forced.app_server.healthy, true);
+  assert.equal(forced.app_server.degraded, false);
+});
+
+test('GemptPlugin hot-reload disposes prior HTTP server, cleans stale identity files and enforces GET / boundaries', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-hotreload-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const configPath = join(dir, 'config.json');
+  const sessionsDir = join(dir, 'sessions');
+  writeFileSync(configPath, JSON.stringify({ version: 1 }));
+
+  // Pick a free ephemeral port and plant a stale identity file with a dead PID.
+  const probeSrv = http.createServer();
+  await new Promise((ok) => probeSrv.listen(0, '127.0.0.1', ok));
+  const targetPort = probeSrv.address().port;
+  await new Promise((ok) => probeSrv.close(ok));
+  const deadPid = 999_999;
+  const staleIdFile = join(dir, `page-server-${targetPort}.json`);
+  const staleOtherFile = join(dir, 'page-server-65432.json');
+  writeFileSync(staleIdFile, JSON.stringify({
+    service: 'gempt-magpie-plugin', instance_id: 'dead-inst', pid: deadPid, port: targetPort, build: 'old',
+  }));
+  writeFileSync(staleOtherFile, JSON.stringify({
+    service: 'gempt-magpie-plugin', instance_id: 'dead-other', pid: deadPid, port: 65432, build: 'old',
+  }));
+
+  const { GemptPlugin } = await import('../magpie_plugin/index.mjs');
+  const controller = new AbortController();
+  const first = await GemptPlugin({ signal: controller.signal }, {
+    port: targetPort, configPath, sessionsDir, mcpTools: false, manageAppServer: false,
+  });
+  assert.equal(typeof first.dispose, 'function');
+  const ping1 = await eventually(async () => {
+    try {
+      const res = await fetch(`http://127.0.0.1:${targetPort}/api/ping`);
+      return res.ok ? await res.json() : null;
+    } catch { return null; }
+  });
+  assert.equal(ping1.service, 'gempt-magpie-plugin');
+  assert.equal(existsSync(staleOtherFile), false);
+  const idRec1 = JSON.parse(readFileSync(staleIdFile, 'utf8'));
+  assert.equal(idRec1.instance_id, ping1.instance_id);
+  assert.equal(idRec1.pid, process.pid);
+
+  // Verify GET / security boundaries (allow navigate/nested-navigate/host proxy; block cors/opaque Origin/path tricks).
+  assert.equal((await rawHttpGet({ port: targetPort, path: '/', headers: { 'sec-fetch-mode': 'navigate' } })).status, 200);
+  assert.equal((await rawHttpGet({ port: targetPort, path: '/', headers: { 'sec-fetch-mode': 'nested-navigate' } })).status, 200);
+  assert.equal((await rawHttpGet({ port: targetPort, path: '/' })).status, 200);
+  assert.equal((await rawHttpGet({ port: targetPort, path: '/', headers: { Origin: `http://127.0.0.1:${targetPort}` } })).status, 200);
+  assert.equal((await rawHttpGet({ port: targetPort, path: '/', headers: { Origin: 'null' } })).status, 403);
+  assert.equal((await rawHttpGet({ port: targetPort, path: '/', headers: { 'sec-fetch-mode': 'cors' } })).status, 403);
+  assert.equal((await rawHttpGet({ port: targetPort, path: '/./index.html', headers: { 'sec-fetch-mode': 'cors' } })).status, 403);
+
+  // Hot-reload in the same process should gracefully close old server and bind a fresh instance on the same port.
+  const second = await GemptPlugin({}, {
+    port: targetPort, configPath, sessionsDir, mcpTools: false, manageAppServer: false,
+  });
+  const ping2 = await eventually(async () => {
+    try {
+      const res = await fetch(`http://127.0.0.1:${targetPort}/api/ping`);
+      if (!res.ok) return null;
+      const body = await res.json();
+      return body.instance_id !== ping1.instance_id ? body : null;
+    } catch { return null; }
+  });
+  assert.notEqual(ping2.instance_id, ping1.instance_id);
+
+  // Disposing releases the port and removes the identity file.
+  await second.dispose();
+  assert.equal(existsSync(staleIdFile), false);
+  await assert.rejects(() => fetch(`http://127.0.0.1:${targetPort}/api/ping`));
+
+  // AbortSignal hook also disposes cleanly.
+  const abortCtrl = new AbortController();
+  const third = await GemptPlugin({ signal: abortCtrl.signal }, {
+    port: targetPort, configPath, sessionsDir, mcpTools: false, manageAppServer: false,
+  });
+  await eventually(async () => {
+    try { return (await fetch(`http://127.0.0.1:${targetPort}/api/ping`)).ok; } catch { return false; }
+  });
+  abortCtrl.abort();
+  await eventually(() => !existsSync(staleIdFile));
+  await third.dispose();
+});
+
+test('app-server manager runs periodic health probes for Linux children and closes non-lock-holder restart race', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-app-health-'));
+  const managers = [];
+  t.after(async () => {
+    for (const m of managers) await m.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const configPath = join(dir, 'config.json');
+  const sessionsDir = join(dir, 'sessions');
+  const statePath = join(dir, 'app-server.json');
+  mkdirSync(join(sessionsDir, 'runs'), { recursive: true });
+  const fakeCli = join(dir, process.platform === 'win32' ? 'codex.exe' : 'codex');
+  writeFileSync(fakeCli, 'fake');
+  if (process.platform !== 'win32') chmodSync(fakeCli, 0o755);
+  writeFileSync(configPath, JSON.stringify({
+    magpie: { base_url: 'http://127.0.0.1:3425' },
+    codex: { cli_path: fakeCli },
+  }));
+
+  // 1. Periodic health probe heals a wedged Linux-style child (with .once) automatically when idle.
+  let spawns = 0;
+  let wedgedPid = null;
+  const fakePids = new Set();
+  const spawnLinuxChild = () => {
+    spawns++;
+    const child = new EventEmitter();
+    child.pid = 700000 + spawns;
+    fakePids.add(child.pid);
+    child.stderr = new EventEmitter();
+    child.kill = () => {
+      fakePids.delete(child.pid);
+      child.exitCode = 0;
+      child.emit('exit', 0, null);
+    };
+    return child;
+  };
+  const ownerMgr = createAppServerManager({
+    configPath,
+    sessionsDir,
+    env: { ...process.env, GEMPT_APP_SERVER_STATE: statePath },
+    port: 0,
+    spawnProcess: spawnLinuxChild,
+    connect: async (target) => {
+      if (target.pid === wedgedPid) throw new Error('wedged');
+      return { close() {}, request: async () => ({}) };
+    },
+    isPidAlive: (pid) => pid === process.pid || fakePids.has(pid),
+    terminateProcess: (target) => {
+      if (target?.kill) target.kill();
+      else if (target?.pid) fakePids.delete(target.pid);
+    },
+    waitForExit: async (pid) => !fakePids.has(pid),
+    startupMs: 2000,
+    backoffMs: [20],
+    healthIntervalMs: 60,
+  });
+  managers.push(ownerMgr);
+
+  const initial = await ownerMgr.ensureRunning();
+  assert.equal(initial.running, true);
+  assert.equal(initial.healthy, true);
+  assert.equal(initial.degraded, false);
+  const firstPid = initial.pid;
+
+  // Wedge the running child; periodic health timer should detect and replace it automatically.
+  wedgedPid = firstPid;
+  const healed = await eventually(() => {
+    const st = ownerMgr.getStatus();
+    return st.running && st.pid !== firstPid ? st : null;
+  }, 3000);
+  assert.equal(healed.healthy, true);
+  assert.equal(healed.degraded, false);
+  assert.notEqual(healed.pid, firstPid);
+
+  // 2. Non-lock-holder restart must NOT report false success when old PID does not exit/replace.
+  const stubbornFollower = createAppServerManager({
+    configPath,
+    sessionsDir,
+    env: { ...process.env, GEMPT_APP_SERVER_STATE: statePath },
+    port: 0,
+    spawnProcess: spawnLinuxChild,
+    connect: async () => ({ close() {}, request: async () => ({}) }),
+    isPidAlive: (pid) => pid === process.pid || fakePids.has(pid),
+    verifyProcess: async () => true,
+    terminateProcess: () => { /* Simulate stubborn process ignoring SIGTERM */ },
+    startupMs: 300,
+    restartTimeoutMs: 250,
+    backoffMs: [20],
+    healthIntervalMs: 0,
+  });
+  managers.push(stubbornFollower);
+  const failedRestart = await stubbornFollower.restart();
+  assert.equal(failedRestart.ok, false);
+  assert.equal(failedRestart.status, 500);
+  assert.match(failedRestart.error, /重启超时/);
+
+  // 3. Non-lock-holder restart waits for delayed exit + replacement and returns the NEW PID.
+  const oldPid = ownerMgr.getStatus().pid;
+  const delayedFollower = createAppServerManager({
+    configPath,
+    sessionsDir,
+    env: { ...process.env, GEMPT_APP_SERVER_STATE: statePath },
+    port: 0,
+    spawnProcess: spawnLinuxChild,
+    connect: async (target) => {
+      if (!fakePids.has(target.pid)) throw new Error('gone');
+      return { close() {}, request: async () => ({}) };
+    },
+    isPidAlive: (pid) => pid === process.pid || fakePids.has(pid),
+    verifyProcess: async () => true,
+    terminateProcess: (target) => {
+      setTimeout(() => {
+        fakePids.delete(target.pid);
+        // Trigger ownerMgr to notice dead child and spawn replacement.
+        void ownerMgr.ensureRunning({ probe: true });
+      }, 120);
+    },
+    startupMs: 2000,
+    restartTimeoutMs: 3000,
+    backoffMs: [20],
+    healthIntervalMs: 0,
+  });
+  managers.push(delayedFollower);
+  const restarted = await delayedFollower.restart();
+  assert.equal(restarted.ok, true, restarted.error);
+  assert.equal(restarted.status, 200);
+  assert.equal(restarted.app_server.running, true);
+  assert.equal(restarted.app_server.healthy, true);
+  assert.notEqual(restarted.app_server.pid, oldPid);
+});
+
+test('activity endpoints unify run reconciliation, cache ledger with write invalidation, and align session_id with core/state', async (t) => {
+  const { getActivityCacheStats, invalidateActivityCache } = await import('../magpie_plugin/lib/activity.mjs');
+  const f = await activityFixture(t);
+  const dir = dirname(f.usageFile);
+  const sessionsDir = join(dirname(dir), 'sessions');
+  const nowIso = new Date().toISOString();
+  const oldIso = new Date(Date.now() - 120_000).toISOString();
+  const timedOutQueued = '4'.repeat(32);
+  const deadWorkerRun = '5'.repeat(32);
+  const customSessionId = 'feature-auth.v1';
+
+  // Custom valid session_id (matches core/state.mjs) with explicit mode.
+  f.session(customSessionId, {
+    mode: 'exec',
+    cwd: dir,
+    model: 'codex/gpt-6.2-sol',
+    updated_at: nowIso,
+    turns: [{ goal: 'Custom session task', timestamp: nowIso, reply: 'done' }],
+  });
+  // Queued run > 60s without PID -> must reconcile to 'failed' everywhere.
+  f.run(timedOutQueued, {
+    source: 'magpie_exec', state: 'queued', created_at: oldIso, cwd: dir, goal: 'stuck queue',
+  }, []);
+  // Running run with dead PID and active turn_id -> must reconcile to 'outcome_unknown' + remote_turn_unconfirmed everywhere.
+  f.run(deadWorkerRun, {
+    source: 'magpie_exec', state: 'running', pid: 999_999, turn_id: 'turn-dead',
+    session_id: customSessionId, created_at: nowIso, deadline: Date.now() / 1000 + 600, cwd: dir, goal: 'dead worker',
+  }, []);
+
+  const { get, json } = await f.start();
+  invalidateActivityCache(sessionsDir);
+
+  const state = await json('/api/state');
+  const requests = await json('/api/requests?limit=100');
+  const sessions = await json('/api/sessions?limit=100');
+
+  // Unified state across /api/state, /api/requests, and /api/sessions.
+  assert.equal(state.active_runs.some((r) => r.run_id === timedOutQueued), false);
+  const activeDead = state.active_runs.find((r) => r.run_id === deadWorkerRun);
+  assert.ok(activeDead, 'recent remote_turn_unconfirmed run remains occupying active_runs');
+  assert.equal(activeDead.state, 'outcome_unknown');
+  assert.equal(activeDead.remote_turn_unconfirmed, true);
+
+  const recentQueued = state.recent_runs.find((r) => r.run_id === timedOutQueued);
+  assert.equal(recentQueued.state, 'failed');
+  const recentDead = state.recent_runs.find((r) => r.run_id === deadWorkerRun);
+  assert.equal(recentDead.state, 'outcome_unknown');
+
+  const reqQueued = requests.items.find((r) => r.run_id === timedOutQueued);
+  assert.equal(reqQueued.status, 'failed');
+  const reqDead = requests.items.find((r) => r.run_id === deadWorkerRun);
+  assert.equal(reqDead.status, 'outcome_unknown');
+  assert.equal(reqDead.remote_turn_unconfirmed, true);
+
+  // Custom valid session_id is visible in /api/sessions and /api/sessions/:id.
+  const customSess = sessions.items.find((s) => s.id === customSessionId);
+  assert.ok(customSess);
+  assert.equal(customSess.state, 'outcome_unknown');
+  const customDetail = await json(`/api/sessions/${encodeURIComponent(customSessionId)}`);
+  assert.equal(customDetail.session_id, customSessionId);
+  assert.equal(customDetail.turns.length, 2);
+
+  // Invalid core/state.mjs session IDs are rejected with 400.
+  for (const bad of ['con', 'nul', 'exec-trail.', '.hidden']) {
+    assert.equal((await get(`/api/sessions/${encodeURIComponent(bad)}`)).status, 400, bad);
+  }
+
+  // Activity cache hits on unchanged consecutive reads and invalidates immediately on write.
+  const before = getActivityCacheStats();
+  await json('/api/requests');
+  await json('/api/sessions');
+  const afterHits = getActivityCacheStats();
+  assert.equal(afterHits.enrichedHits, before.enrichedHits + 2);
+  assert.equal(afterHits.enrichedMisses, before.enrichedMisses);
+
+  f.session('consult-cache-new', {
+    mode: 'consult', cwd: dir, updated_at: new Date().toISOString(),
+    turns: [{ goal: 'invalidate cache', timestamp: new Date().toISOString(), reply: 'fresh' }],
+  });
+  const afterWrite = await json('/api/sessions');
+  const afterMiss = getActivityCacheStats();
+  assert.equal(afterMiss.enrichedMisses, afterHits.enrichedMisses + 1);
+  assert.ok(afterWrite.items.some((s) => s.id === 'consult-cache-new'));
+});
+
+test('token-ratio skips unparseable timestamps and flags truncated usage.jsonl metadata', async (t) => {
+  const { readTokenRatio, resolveBudget } = await import('../magpie_plugin/lib/token-ratio.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-ratio-edge-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const brainDir = join(dir, 'brain');
+  const logDir = join(brainDir, 'conv-edge', '.system_generated', 'logs');
+  const magpieConfigDir = join(dir, 'magpie');
+  const sessionsDir = join(dir, 'sessions');
+  mkdirSync(logDir, { recursive: true });
+  mkdirSync(magpieConfigDir, { recursive: true });
+
+  const nowMs = Date.UTC(2026, 10, 20, 12, 0, 0);
+  const validTs = new Date(nowMs - 30 * 60_000).toISOString();
+
+  // Transcript has one valid record + two invalid/missing timestamp records that must be skipped.
+  writeFileSync(join(logDir, 'transcript.jsonl'), [
+    JSON.stringify({ type: 'PLANNER_RESPONSE', created_at: validTs, model: 'gemini-4-neon', input_tokens: 10_000, output_tokens: 1_000 }),
+    JSON.stringify({ type: 'PLANNER_RESPONSE', model: 'gemini-4-neon', input_tokens: 999_000, output_tokens: 100_000 }),
+    JSON.stringify({ type: 'PLANNER_RESPONSE', created_at: 'not-a-timestamp', model: 'gemini-4-neon', input_tokens: 888_000, output_tokens: 50_000 }),
+  ].join('\n') + '\n');
+
+  // Usage ledger has valid + missing/bad timestamps.
+  const usageRows = [
+    JSON.stringify({ t: validTs, provider: 'codex', model: 'gpt-6.2-sol', in: 5_000, out: 500 }),
+    JSON.stringify({ provider: 'codex', model: 'gpt-6.2-sol', in: 500_000, out: 50_000 }),
+    JSON.stringify({ t: 'invalid-date', provider: 'codex', model: 'gpt-6.2-sol', in: 400_000, out: 40_000 }),
+  ];
+  writeFileSync(join(magpieConfigDir, 'usage.jsonl'), usageRows.join('\n') + '\n');
+
+  const full = readTokenRatio({ brainDir, magpieConfigDir, sessionsDir, range: '1h', nowMs, cacheTtlMs: 0 });
+  assert.equal(full.gemini.in, 10_000);
+  assert.equal(full.gemini.out, 1_000);
+  assert.equal(full.gpt.in, 5_000);
+  assert.equal(full.gpt.out, 500);
+  assert.equal(full.truncated, false);
+  assert.equal(full.sources.usage_truncated, false);
+  assert.equal(full.sources.magpie_records, 1);
+
+  // Exceeding the tail byte cap sets truncated metadata without breaking parsing of the tail.
+  const paddedLines = [];
+  for (let i = 0; i < 40; i += 1) {
+    paddedLines.push(JSON.stringify({
+      t: new Date(nowMs - 40 * 60_000).toISOString(),
+      provider: 'codex', model: 'gpt-6.2-sol', in: 1_000, out: 0, pad: 'x'.repeat(80),
+    }));
+  }
+  paddedLines.push(JSON.stringify({ t: validTs, provider: 'codex', model: 'gpt-6.2-sol', in: 7_000, out: 0 }));
+  writeFileSync(join(magpieConfigDir, 'usage.jsonl'), paddedLines.join('\n') + '\n');
+
+  const truncSnap = readTokenRatio({
+    brainDir, magpieConfigDir, sessionsDir, range: '1h', nowMs, cacheTtlMs: 0, maxUsageTailBytes: 512,
+  });
+  assert.equal(truncSnap.truncated, true);
+  assert.equal(truncSnap.sources.usage_truncated, true);
+  assert.ok(truncSnap.gpt.in >= 7_000 && truncSnap.gpt.in < 47_000);
+
+  const budget = resolveBudget('balanced', {
+    brainDir, magpieConfigDir, sessionsDir, range: '1h', nowMs, cacheTtlMs: 0, maxUsageTailBytes: 512,
+  });
+  assert.equal(budget.truncated, true);
 });

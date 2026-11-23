@@ -6,8 +6,8 @@ import { resolveBudget } from '../magpie_plugin/lib/token-ratio.mjs';
 import { createExecutionTools } from '../magpie_plugin/lib/tools.mjs';
 import { readHostContext } from './host-context.mjs';
 import { APP_RESOURCE, APP_TOOLS, APP_URI, callAppTool, readAppResource } from './mcp-app.mjs';
-import { ACTIVE_STATES, buildWaitCommand, compactReceiptText, dispatchRun, interruptRun, readRun, replyToolCall, runWithinRoot, steerRun } from './runs.mjs';
-import { resolvePath, validateSessionId, withLock } from './state.mjs';
+import { ACTIVE_STATES, buildWaitCommand, compactReceiptText, dispatchRun, interruptRun, readRun, replyToolCall, runWithinRoot, steerRun, validateExecTimeoutSec } from './runs.mjs';
+import { lockStaleMsForBudget, resolvePath, validateSessionId, withLock } from './state.mjs';
 import { TOOLS } from './tool-schemas.mjs';
 export { TOOLS };
 
@@ -16,7 +16,7 @@ const short = (value, limit) => Array.from(String(value || '')).slice(0, limit).
 const bytes = (value) => Buffer.byteLength(JSON.stringify(value));
 const textResult = (data, extras) => ({ content: [{ type: 'text', text: JSON.stringify(data) }], ...extras });
 const VERSION = readJsonSafe(new URL('../package.json', import.meta.url))?.version
-  || readJsonSafe(new URL('../../plugin.json', import.meta.url))?.version || '0.4.0';
+  || readJsonSafe(new URL('../../plugin.json', import.meta.url))?.version || '0.4.1';
 
 function compact(payload) {
   const data = { ...payload };
@@ -39,6 +39,7 @@ function compactStatus(live, record, options) {
   if (record) {
     const item = { id: record.run_id, st: record.state, sid: record.session_id, title: short(record.title, 32) };
     if (ACTIVE_STATES.has(record.state)) item.wait = buildWaitCommand(record.run_id, options);
+    if (record.remote_turn_unconfirmed) item.unconfirmed = true;
     if (record.pending_tool_call) {
       const pending = record.pending_tool_call;
       item.ask = { call_id: pending.call_id, q: short(pending.arguments?.question, 100) };
@@ -73,6 +74,7 @@ async function control(args, options) {
   if (action === 'reply') return textResult(compact(replyToolCall(runId, String(args.call_id || ''), String(args.message || ''), options)));
   const liveArgs = {
     ...(runId ? { run_id: runId } : {}),
+    ...(args.host_conversation_id ? { host_conversation_id: args.host_conversation_id } : {}),
     ...(['session', 'all'].includes(args.scope) ? { scope: args.scope } : {}),
   };
   const { structuredContent } = await callAppTool('gempt_live_view', liveArgs, options);
@@ -92,16 +94,21 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
   if (!goal) throw new Error('`goal` is required.');
   const cwd = options.root && (args.cwd == null || typeof args.cwd === 'string')
     ? resolve(options.root, args.cwd || '.') : args.cwd;
-  const context = readHostContext(options.configPath);
-  const hostId = args.host_conversation_id || context.conversation_id;
-  const family = args.gemini_family || context.gemini_family;
   const sessionId = String(args.session_id || '').trim();
   if (name === 'gpt_ask') {
+    const context = readHostContext(options.configPath, cwd);
+    const hostId = args.host_conversation_id || context.conversation_id;
+    const family = args.gemini_family || context.gemini_family;
     const consult = createExecutionTools(options).consult;
     if (!cwd && args.file_paths != null) throw new Error('cwd is required when providing file_paths.');
     const execute = () => consult.execute({ goal, tier: args.tier, cwd, file_paths: args.file_paths,
       session_id: sessionId, gemini_family: family, mcp: true, host_conversation_id: hostId }, callCtx);
-    const res = sessionId ? await withLock(join(options.sessionsDir, `${validateSessionId(sessionId)}.node.lock`), execute) : await execute();
+    const cfg = readJsonSafe(options.configPath);
+    const consultBudgetSec = Math.max(300, Number(cfg?.limits?.consult_timeout_sec) || 180);
+    const res = sessionId
+      ? await withLock(join(options.sessionsDir, `${validateSessionId(sessionId)}.node.lock`), execute,
+        { staleMs: lockStaleMsForBudget(consultBudgetSec) })
+      : await execute();
     return textResult({ session_id: res.session_id, model: res.served_model, tier: res.tier, reasoning_effort: res.reasoning_effort,
       text: compactReceiptText(res.text, res.session_id) });
   }
@@ -110,10 +117,12 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
   if (access === 'inspect' && args.workspace === 'share') {
     throw new Error("workspace='share' is not allowed with read-only access ('inspect'); use workspace='inherit' for read-only inspection.");
   }
+  const timeoutSec = validateExecTimeoutSec(args.timeout_sec);
   const syncBudget = Number(env.GEMPT_GPT_RUN_SYNC_SEC);
   const waitSec = Number.isFinite(syncBudget) && syncBudget > 0 ? Math.min(syncBudget, 10) : 0;
   const res = await dispatchRun({ goal, cwd, access, workspace: args.workspace, title: args.title, tier: args.tier,
-    host_conversation_id: hostId, gemini_family: family, mcp: true, session_id: sessionId,
+    ...(timeoutSec !== undefined ? { timeout_sec: timeoutSec } : {}),
+    host_conversation_id: args.host_conversation_id, gemini_family: args.gemini_family, mcp: true, session_id: sessionId,
     background: args.background ?? waitSec === 0, sandbox: access === 'inspect' ? 'read-only' : undefined,
     expected_report: 'Report concisely: changed files, verification commands/results, and any remaining blockers. Omit verbose raw logs.',
   }, { ...options, waitSec, agent: typeof callCtx?.agent === 'string' ? callCtx.agent : undefined });

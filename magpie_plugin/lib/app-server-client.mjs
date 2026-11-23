@@ -104,6 +104,7 @@ export async function connectAppServer(state, onEvent = () => {}, { timeoutMs = 
   }
   return {
     request,
+    get disconnected() { return Boolean(failure); },
     reply: (id, result) => send({ id, result }),
     reject: (id) => send({ id, error: { code: -32601, message: 'Unsupported server request' } }),
     onFailure(callback) {

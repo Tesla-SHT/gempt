@@ -14,12 +14,13 @@
 import { readNativeRun, startNativeRun, waitForNativeRun } from './native-runs.mjs';
 import { findCodexCli } from './app-server-manager.mjs';
 import { runAppServer, TurnInterrupted } from './app-server-run.mjs';
+import { listActiveRoster, validateExecTimeoutSec } from '../../core/runs.mjs';
 import { validateSessionId } from '../../core/state.mjs';
 import { TOOLS } from '../../core/tool-schemas.mjs';
 import { getMcpEffort, getPairing } from '../../core/config.mjs';
 import { findApiBackup, pickDefaultSubscriptionModel } from '../../core/magpie.mjs';
 import { randomBytes } from 'node:crypto';
-import { existsSync, openSync, readSync, realpathSync, statSync, closeSync } from 'node:fs';
+import { existsSync, openSync, readSync, realpathSync, rmSync, statSync, closeSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import { homedir } from 'node:os';
@@ -1065,7 +1066,7 @@ export function createExecutionTools({
           reasoning_effort: { type: 'string', enum: [...VALID_EFFORTS_SET] },
           background: { type: 'boolean', description: 'Return a run_id immediately. Use gempt-wait to await completion or gempt_ctl for a status snapshot.' },
           run_id: { type: 'string', pattern: '^[a-f0-9]{32}$', description: 'Optional caller-generated ID; repeat delivery of the same job will not start another worker.' },
-          timeout_sec: { type: 'number', description: 'Execution timeout seconds (30-3600).' },
+          timeout_sec: { type: 'number', minimum: 30, maximum: 7200, description: 'Execution timeout seconds (30-7200).' },
         },
         required: ['goal', 'cwd'],
       },
@@ -1109,12 +1110,26 @@ export function createExecutionTools({
 
         let priorSession = null;
         if (args?.session_id) {
+          const busy = listActiveRoster({ limit: 5, sessionId: args.session_id, sessionsDir: resolvedSessionsDir, includeUnconfirmed: true })
+            .find((item) => item.run_id !== args.run_id);
+          if (busy) {
+            const detail = busy.remote_turn_unconfirmed
+              ? `Session '${args.session_id}' has an unconfirmed remote turn (${busy.run_id}); run gpt_ctl(action='interrupt', run_id='${busy.run_id}') to confirm/clear it, or omit session_id to start a new thread.`
+              : `Session '${args.session_id}' already has an active run (${busy.run_id}); wait for it to finish, steer it, or omit session_id to start a new thread.`;
+            throw Object.assign(new Error(detail), { status: 409 });
+          }
           priorSession = loadSession(resolvedSessionsDir, args.session_id);
           if (!priorSession) throw new Error(`Unknown exec session '${args.session_id}'.`);
           if (priorSession.mode && priorSession.mode !== 'exec') {
             throw new Error(`Session '${args.session_id}' is mode='${priorSession.mode}', not 'exec'.`);
           }
-          if (!priorSession.cwd || foldCase(realOrResolve(priorSession.cwd)) !== foldCase(workdir)) {
+          const priorCwd = priorSession.cwd ? foldCase(realOrResolve(priorSession.cwd)) : '';
+          const priorSourceCwd = priorSession.source_cwd ? foldCase(realOrResolve(priorSession.source_cwd)) : '';
+          const targetCwd = foldCase(workdir);
+          const resumedFromPrunedWorktree = Boolean(worktreePath && sourceCwd && (
+            priorCwd === foldCase(realOrResolve(sourceCwd)) || priorSourceCwd === foldCase(realOrResolve(sourceCwd))
+          ));
+          if (!priorCwd || (priorCwd !== targetCwd && !resumedFromPrunedWorktree)) {
             throw new Error(`Exec resume must stay in the original workspace '${priorSession.cwd || '-'}'.`);
           }
           if (!priorSession.sandbox || !VALID_SANDBOXES.includes(priorSession.sandbox)) {
@@ -1185,8 +1200,9 @@ export function createExecutionTools({
           isResume: Boolean(priorSession) && !sandboxUpgraded,
         });
 
-        const timeoutSec = args?.timeout_sec !== undefined
-          ? Math.max(30, Math.min(3600, Number(args.timeout_sec) || 600))
+        const explicitTimeout = validateExecTimeoutSec(args?.timeout_sec);
+        const timeoutSec = explicitTimeout !== undefined
+          ? explicitTimeout
           : Math.max(
             Number(runtime.cfg?.codex?.timeout_sec) || 600,
             effortTimeoutFloor(effort, { mode: 'exec' }),
@@ -1203,10 +1219,9 @@ export function createExecutionTools({
           host_conversation_id: hostId,
           paired_model: paired, session_id: sessionId, mode: 'exec', tier: resolved.tier, model: targetModel,
           reasoning_effort: effort, cwd: workdir, sandbox: effectiveSandbox, gateway: runtime.baseUrl, agent,
-          ...(worktreePath ? { worktree_path: worktreePath, source_cwd: sourceCwd } : {}),
+          ...(worktreePath ? { worktree_path: worktreePath, source_cwd: sourceCwd, worktree_pruned_at: null, pruned_worktree_path: null } : {}),
           ...(sandboxUpgraded ? { sandbox_upgraded: true } : {}),
         };
-        if (!sandboxUpgraded) saveSession(resolvedSessionsDir, session);
         let res;
         try {
           res = await runAppServer({
@@ -1223,7 +1238,10 @@ export function createExecutionTools({
             },
           });
         } catch (err) {
-          if (err instanceof TurnInterrupted) throw err;
+          if (!priorSession && !session.codex_thread_id) {
+            try { rmSync(sessionPath(resolvedSessionsDir, sessionId), { force: true }); } catch { /* Best effort. */ }
+          }
+          if (err instanceof TurnInterrupted || err?.remoteTurnUnconfirmed) throw err;
           const msg = String(err?.message || err);
           const hint = buildEscalationSuggestion({
             mode: 'exec',

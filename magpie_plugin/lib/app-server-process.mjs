@@ -1,5 +1,7 @@
 import { execFile, spawn, spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -53,6 +55,12 @@ export function pidAlive(pid) {
 
 export async function matchesAppServerProcess(pid, marker) {
   if (!pidAlive(pid) || typeof marker !== 'string' || !marker) return false;
+  if (process.platform === 'linux') {
+    try {
+      const cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replaceAll('\0', ' ');
+      if (cmdline) return cmdline.includes('--ws-token-file ') && cmdline.includes(marker);
+    } catch { /* Fall back to ps if /proc is unavailable. */ }
+  }
   try {
     const { stdout } = process.platform === 'win32'
       ? await execFileAsync(powershell, psArgs(`(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`),
@@ -81,4 +89,21 @@ export function terminateAppServer(child) {
   else {
     try { process.kill(child.pid, 'SIGTERM'); } catch (err) { if (err.code !== 'ESRCH') throw err; }
   }
+}
+
+export async function waitForProcessExit(pid, { timeoutMs = 3000, pollMs = 50, forceKillAfterMs = 0 } = {}) {
+  if (!pidAlive(pid)) return true;
+  if (pid === process.pid) return false;
+  const start = Date.now();
+  const deadline = start + Math.max(0, timeoutMs);
+  let forced = false;
+  while (Date.now() < deadline) {
+    if (!pidAlive(pid)) return true;
+    if (!forced && forceKillAfterMs > 0 && process.platform !== 'win32' && Date.now() - start >= forceKillAfterMs) {
+      forced = true;
+      try { process.kill(pid, 'SIGKILL'); } catch (err) { if (err.code === 'ESRCH') return true; }
+    }
+    await sleep(Math.min(pollMs, Math.max(1, deadline - Date.now())));
+  }
+  return !pidAlive(pid);
 }

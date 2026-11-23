@@ -14,19 +14,64 @@ import { test } from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { installAgy, resolveNodeExecutable, stagePluginBundle, validatePluginBundle } from '../core/agy-install.mjs';
+import { installAgy, resolveNodeExecutable, stagePluginBundle, syncInPlace, validatePluginBundle } from '../core/agy-install.mjs';
+import { assertSafeOutDir } from '../scripts/build-agy-plugin.mjs';
 import { contextPath, readHostContext, updateHostContext } from '../core/host-context.mjs';
 import { APP_RESOURCE, APP_URI, callAppTool, readAppResource } from '../core/mcp-app.mjs';
-import { handleTool } from '../core/mcp-server.mjs';
-import { buildWaitCommand, dispatchRun, interruptRun, listActiveRoster, readRun, replyToolCall, runDirectory,
-  saveRun, steerRun, waitForRun, waitForRuns } from '../core/runs.mjs';
-import { withLock } from '../core/state.mjs';
+import { handleTool, TOOLS } from '../core/mcp-server.mjs';
+import { buildWaitCommand, dispatchRun, interruptRun, isRecentUnconfirmedRun, listActiveRoster, readRun,
+  reconcileRunState, replyToolCall, runDirectory, saveRun, steerRun, waitForRun, waitForRuns } from '../core/runs.mjs';
+import { DEFAULT_LOCK_STALE_MS, isValidSessionId, lockStaleMsForBudget, validateSessionId, withLock } from '../core/state.mjs';
+import { linkTarget, listArguments, streamRenderKey, timelineMessages } from '../mcp_app/live-state.js';
 import { assertShareWorktree, ensureShareWorktree, pruneShareWorktrees,
   removeShareWorktree, worktreesRoot } from '../core/worktrees.mjs';
+import { runAppServer } from '../magpie_plugin/lib/app-server-run.mjs';
 
 const execFileAsync = promisify(execFile);
 const hookPath = fileURLToPath(new URL('../plugin/work_split_hook.mjs', import.meta.url));
 const cliPath = fileURLToPath(new URL('../bin/gempt.mjs', import.meta.url));
+
+test('Live builds the split pane and preserves host scope, safe link routes and exact transcript text', () => {
+  const bundle = readFileSync(new URL('../core/assets/mcp_app_live.html', import.meta.url), 'utf8');
+  const source = readFileSync(new URL('../mcp_app/index.html', import.meta.url), 'utf8').trimEnd().replace(/\r\n/g, '\n');
+  const styles = readFileSync(new URL('../mcp_app/styles.css', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+  assert.ok(bundle.includes(source.split('<!-- CSS -->')[0]));
+  assert.ok(bundle.includes(styles));
+  assert.match(bundle, /@media \(min-width: 780px\)[\s\S]+?grid-template-columns: 290px minmax\(0, 1fr\)/);
+  assert.match(bundle, /max-width: 760px; margin: 0 auto/);
+  assert.match(bundle, /id="scope-all"[^>]+>全部<\/button>/);
+  assert.match(bundle, /createTHead\(/);
+  assert.match(bundle, /com\.google\.antigravity\/toggle-aux-pane/);
+  assert.match(bundle, /ui\/open-link/);
+
+  assert.deepEqual(listArguments('session', null), { scope: 'session', limit: 50 });
+  assert.deepEqual(listArguments('session', 'selected'), { scope: 'session', limit: 50, host_conversation_id: 'selected' });
+  assert.deepEqual(listArguments('all', 'selected', 50), { scope: 'all', limit: 50, offset: 50 });
+  assert.deepEqual(linkTarget('https://example.org/test?q=a&b=c'), { kind: 'web', value: 'https://example.org/test?q=a&b=c' });
+  assert.equal(linkTarget('file:///C:/workspace/notes.md'), null);
+  assert.deepEqual(linkTarget('file:///C:/workspace/notes.md', null, { approved: true }), { kind: 'file', value: 'file:///C:/workspace/notes.md' });
+  assert.deepEqual(linkTarget('file:///C:/workspace/notes.md', null, { fileUris: { 'notes.md': 'file:///C:/workspace/notes.md' } }),
+    { kind: 'file', value: 'file:///C:/workspace/notes.md' });
+  assert.deepEqual(linkTarget('src/file name.md#L8', 'D:\\gempt'), { kind: 'file', value: 'file:///D:/gempt/src/file%20name.md#L8' });
+  assert.equal(linkTarget('C:\\workspace\\notes.md', 'D:\\gempt'), null);
+  assert.equal(linkTarget('../outside.md', 'D:\\gempt'), null);
+  for (const target of ['javascript:alert(1)', 'data:text/html,x', '//example.org/file', 'file://example.org/share/file']) {
+    assert.equal(linkTarget(target, 'D:/gempt'), null);
+  }
+
+  const first = { id: 'one', type: 'agent_message', text: 'First' };
+  const second = { id: 'two', type: 'agent_message', text: 'Second' };
+  const events = [first, { type: 'command', output: 'old' }, second];
+  assert.deepEqual([...timelineMessages(events, 'First paragraph\n\nSecond paragraph')], [
+    [first, 'First paragraph'], [second, 'Second paragraph'],
+  ]);
+  assert.deepEqual([...timelineMessages(events, 'Prior hidden message\n\nFirst\n\nSecond')], [
+    [second, 'Prior hidden message\n\nFirst\n\nSecond'],
+  ]);
+  const key = (timeline, text) => streamRenderKey('id', 'running', timeline, {}, { text, complete: true }, null, true);
+  assert.notEqual(key(events, 'same'), key(events, 'size'));
+  assert.notEqual(key(events, 'same'), key([first, { type: 'command', output: 'new' }, second], 'same'));
+});
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'gempt-node-'));
@@ -160,7 +205,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const bridge = join(target, 'work_split_hook.py');
   assert.equal(readFileSync(bridge, 'utf8').trimEnd().split('\n').length, 7);
   assert.ok(!existsSync(join(target, 'runtime', 'gempt')));
-  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.4.0' });
+  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.4.1' });
   const bundledSkills = new URL('../plugin/skills/', import.meta.url);
   assert.deepEqual(readdirSync(bundledSkills).sort(), ['gempt', 'gempt-chore']);
   assert.deepEqual(readdirSync(join(target, 'skills')).sort(), ['gempt', 'gempt-chore']);
@@ -171,7 +216,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const initialized = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' },
   }) });
-  assert.equal(initialized.result.serverInfo.version, '0.4.0');
+  assert.equal(initialized.result.serverInfo.version, '0.4.1');
   const response = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'resources/read', params: { uri: APP_URI },
   }) });
@@ -395,6 +440,10 @@ async function appFixture(t, f) {
           turns.delete(turnId);
         });
         event('turn/started', { turn: { id: turnId, status: 'inProgress' } });
+        if (params.input[0].text.includes('Disconnect the turn socket')) {
+          socket.end();
+          return;
+        }
         send({ id, result: { turn: { id: turnId } } });
         if (params.input[0].text.includes('Request a cross-check')) {
           send({ id: 'ask-rpc', method: 'item/tool/call', params: { threadId, turnId, callId: 'ask_1',
@@ -499,14 +548,25 @@ test('lock retries while an owner is alive and reclaims a malformed legacy recor
   assert.ok(!existsSync(lock));
 });
 
-test('expired lock owners preserve a replacement lock on release', async (t) => {
+test('live PID lock is not stolen past staleMs and replaced locks are preserved on release', async (t) => {
   const { root } = fixture(t);
   const lock = join(root, 'state.lock');
+  assert.equal(DEFAULT_LOCK_STALE_MS, 300_000);
+  assert.equal(lockStaleMsForBudget(180), 300_000);
+  assert.equal(lockStaleMsForBudget(600), 660_000);
   let releaseFirst;
   const first = withLock(lock, () => new Promise((resolve) => { releaseFirst = resolve; }));
   const expired = new Date(Date.now() - 10_000);
   utimesSync(lock, expired, expired);
   try {
+    await assert.rejects(
+      withLock(lock, () => {}, { attempts: 3, delayMs: 10, staleMs: 5_000 }),
+      { code: 'EEXIST' },
+    );
+    const exited = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+    assert.equal(exited.status, 0);
+    rmSync(lock);
+    writeFileSync(lock, `${exited.pid}:${Date.now() - 10_000}\n`);
     await withLock(lock, async () => {
       const replacement = readFileSync(lock, 'utf8');
       releaseFirst();
@@ -642,7 +702,15 @@ test('background dispatch reuses a shared worktree and upgrades inspect to a fre
 test('steer and interrupt send turn identity over WebSocket and ask_gemini relays file replies', async (t) => {
   const f = fixture(t);
   const packets = await appFixture(t, f);
-  const run = await dispatchRun({ goal: 'Hold this turn', cwd: f.cwd, background: true }, f);
+  const seed = await dispatchRun({ goal: 'Create a session to resume', cwd: f.cwd, background: true }, f);
+  const ready = await waitForRun(seed.run_id, { ...f, timeoutSec: 5 });
+  assert.equal(ready.state, 'finished', ready.error);
+  const args = { goal: 'Hold this turn', cwd: f.cwd, session_id: seed.session_id, background: true };
+  const competingId = process.platform === 'win32' ? seed.session_id.toUpperCase() : seed.session_id;
+  const claims = await Promise.allSettled([dispatchRun(args, f), dispatchRun({ ...args, session_id: competingId }, f)]);
+  assert.equal(claims.filter(({ status }) => status === 'fulfilled').length, 1);
+  assert.equal(claims.find(({ status }) => status === 'rejected').reason.status, 409);
+  const run = claims.find(({ status }) => status === 'fulfilled').value;
   const active = await until(() => {
     const record = readRun(run.run_id, f.sessionsDir);
     assert.notEqual(record.state, 'failed', record.error);
@@ -678,6 +746,59 @@ test('steer and interrupt send turn identity over WebSocket and ask_gemini relay
     { success: true, contentItems: [{ type: 'inputText', text: 'Confirmed.' }] });
 });
 
+test('exceptional turns attempt interruption on an open socket and after reconnecting', async (t) => {
+  const f = fixture(t);
+  const packets = await appFixture(t, f);
+  const asking = await dispatchRun({ goal: 'Request a cross-check', cwd: f.cwd, background: true }, f);
+  const waiting = await waitForRun(asking.run_id, { ...f, timeoutSec: 5 });
+  assert.equal(waiting.state, 'waiting_gemini', waiting.error);
+  const replies = join(runDirectory(asking.run_id, f.sessionsDir), 'tool_replies');
+  mkdirSync(replies);
+  writeFileSync(join(replies, 'ask_1.json'), '{}');
+  const failed = await until(() => {
+    const record = readRun(asking.run_id, f.sessionsDir);
+    return record.state === 'failed' && record;
+  });
+  assert.match(failed.error, /Invalid ask_gemini reply/);
+  assert.equal(failed.remote_turn_unconfirmed, undefined);
+  assert.ok(packets.some(({ method, params }) => method === 'turn/interrupt' && params.turnId === waiting.turn_id));
+
+  const disconnected = await dispatchRun({ goal: 'Disconnect the turn socket', cwd: f.cwd, background: true }, f);
+  const outcome = await waitForRun(disconnected.run_id, { ...f, timeoutSec: 5 });
+  assert.equal(outcome.state, 'failed', outcome.error);
+  assert.equal(outcome.remote_turn_unconfirmed, true);
+  assert.match(outcome.error, /Remote Codex turn may still be running/);
+  assert.ok(packets.some(({ method, params }) => method === 'turn/interrupt' && params.turnId === outcome.turn_id));
+});
+
+test('expired queued claims release occupancy, but old active sessions still protect their worktree', async (t) => {
+  const f = fixture(t);
+  initRepo(f.cwd);
+  const sessionId = 'occupied';
+  const worktree = ensureShareWorktree(f.cwd, sessionId, f.env).worktree_root;
+  const id = 'f'.repeat(32);
+  const file = join(runDirectory(id, f.sessionsDir), 'state.json');
+  const old = new Date(Date.now() - 120_000);
+  state(f, id, { session_id: sessionId, worktree_path: worktree, state: 'waiting_gemini' });
+  utimesSync(file, old, old);
+  for (let i = 1; i <= 101; i++) state(f, i.toString(16).padStart(32, '0'), {});
+  await assert.rejects(dispatchRun({ goal: 'Resume', cwd: f.cwd, session_id: sessionId, background: true }, f),
+    (error) => error.status === 409 && error.message.includes(id));
+  assert.deepEqual(pruneShareWorktrees(f.cwd, { env: f.env, maxAgeMs: 0 }), { removed: [], kept: [worktree] });
+
+  state(f, id, { session_id: sessionId, worktree_path: worktree, state: 'queued', created_at: old.toISOString(),
+    deadline: Date.now() / 1000 + 4500, source: 'magpie_exec' });
+  assert.match(readRun(id, f.sessionsDir).error, /worker startup timed out/);
+  const worker = fileURLToPath(new URL('../magpie_plugin/lib/exec-worker.mjs', import.meta.url));
+  const queued = readFileSync(file, 'utf8');
+  const late = spawnSync(process.execPath, [worker], { env: f.env, encoding: 'utf8', windowsHide: true,
+    input: JSON.stringify({ file, record: JSON.parse(queued), host: { sessionsDir: f.sessionsDir } }) });
+  assert.equal(late.status, 0, late.stderr);
+  assert.equal(readFileSync(file, 'utf8'), queued);
+  assert.equal(listActiveRoster({ ...f, sessionId }).length, 0);
+  assert.deepEqual(pruneShareWorktrees(f.cwd, { env: f.env, maxAgeMs: 0 }), { removed: [worktree], kept: [] });
+});
+
 test('wait batch returns the first ready run or waits for all and keeps waiting_gemini ready', async (t) => {
   const f = fixture(t);
   const first = 'a'.repeat(32);
@@ -700,6 +821,10 @@ test('wait batch returns the first ready run or waits for all and keeps waiting_
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(result.stdout).ready, batch.ready);
   }
+  state(f, second, { state: 'failed', error: 'fixture error' });
+  const failed = spawnSync(process.execPath, [waitScript, '--all', `${first},${second}`], { env: f.env, encoding: 'utf8' });
+  assert.equal(failed.status, 1, failed.stderr);
+  assert.equal(JSON.parse(failed.stdout).runs[first].state, 'waiting_gemini');
 });
 
 test('Live resource and run list bind to the active conversation and workspace', async (t) => {
@@ -736,13 +861,66 @@ test('Live run list defaults to an empty unbound session and can list all worksp
   assert.equal(scoped.scope, 'session');
   assert.equal(scoped.unbound_session, true);
   assert.deepEqual(scoped.runs, []);
-  assert.equal(scoped.app_server.version, '0.4.0');
+  assert.equal(scoped.app_server.version, '0.4.1');
 
   const { structuredContent: all } = await callAppTool('gempt_app_runs', { scope: 'all' }, opts);
   assert.equal(all.scope, 'all');
   assert.equal(all.unbound_session, false);
   assert.deepEqual(all.runs.map(({ run_id }) => run_id).sort(), [first, second]);
-  assert.equal(all.app_server.version, '0.4.0');
+  assert.equal(all.app_server.version, '0.4.1');
+});
+
+test('Live binds normalized workspaces and never selects another run for a filtered explicit ID', async (t) => {
+  const f = fixture(t);
+  const other = join(f.root, 'other');
+  mkdirSync(other);
+  await updateHostContext('first', [f.cwd + '/.'], { ...f, geminiFamily: 'pro' });
+  await updateHostContext('elsewhere', [other], { ...f, geminiFamily: 'flash' });
+  const nested = join(f.cwd, 'nested');
+  mkdirSync(nested);
+  const workspaceContext = readHostContext(f.configPath, nested);
+  assert.equal(workspaceContext.conversation_id, 'first');
+  assert.equal(workspaceContext.gemini_family, 'pro');
+  assert.equal(readHostContext(f.configPath).conversation_id, 'elsewhere');
+  await updateHostContext('child', [f.cwd], { ...f, geminiFamily: 'flash' });
+  await updateHostContext('child', [f.cwd], { ...f, parentId: 'first', geminiFamily: 'flash' });
+  assert.equal(readHostContext(f.configPath, nested).gemini_family, 'pro');
+  assert.equal(readHostContext(f.configPath, other).conversation_id, 'elsewhere');
+  assert.deepEqual(readHostContext(f.configPath, f.root), {});
+  await updateHostContext('latest', [f.cwd], f);
+  await updateHostContext('first', undefined, f);
+  assert.equal(readHostContext(f.configPath, nested).conversation_id, 'first');
+  assert.equal(readHostContext(f.configPath, nested).gemini_family, 'pro');
+
+  const current = '1'.repeat(32);
+  const previous = '2'.repeat(32);
+  state(f, current, { host_conversation_id: 'first' });
+  state(f, previous, { host_conversation_id: 'previous' });
+  for (let i = 3; i <= 23; i++) state(f, i.toString(16).padStart(32, '0'), { host_conversation_id: 'previous' });
+  const opts = { ...f, root: f.cwd };
+  const { structuredContent: excluded } = await handleTool('gpt_ctl', { run_id: previous }, f.env, opts);
+  assert.equal(excluded.active_conversation_id, 'first');
+  assert.equal(excluded.requested_run, false);
+  assert.equal(excluded.run_id, null);
+  assert.equal(excluded.stream, null);
+  assert.deepEqual(excluded.runs.map(({ run_id }) => run_id), [current]);
+  const { structuredContent: all } = await callAppTool('gempt_live_view', { scope: 'all', run_id: previous }, opts);
+  assert.equal(all.run_id, previous);
+  assert.equal(all.requested_run, true);
+  assert.equal(all.runs.length, 23);
+  const { structuredContent: page } = await callAppTool('gempt_app_runs', { scope: 'all', limit: 3 }, opts);
+  assert.equal(page.next_offset, 3);
+  const { structuredContent: rest } = await callAppTool('gempt_app_runs', { scope: 'all', offset: page.next_offset }, opts);
+  assert.deepEqual([...page.runs, ...rest.runs].map(({ run_id }) => run_id), all.runs.map(({ run_id }) => run_id));
+  const { structuredContent: bound } = await handleTool('gpt_ctl', { host_conversation_id: 'previous' }, f.env, opts);
+  assert.equal(bound.bound_conversation_id, 'previous');
+  assert.equal(bound.active_conversation_id, 'first');
+
+  for (const [name, fields] of Object.entries({ gpt_run: ['title', 'tier', 'background', 'host_conversation_id'],
+    gpt_ask: ['host_conversation_id'], gpt_ctl: ['host_conversation_id'] })) {
+    const { inputSchema } = TOOLS.find((tool) => tool.name === name);
+    for (const field of fields) assert.ok(Object.hasOwn(inputSchema.properties, field), `${name}.${field}`);
+  }
 });
 
 test('Live journal filters other turns, bounds events, and pages stable Unicode text and goals', async (t) => {
@@ -806,7 +984,7 @@ test('standalone NDJSON MCP advertises three model tools and four app tools and 
   const started = await request('initialize', { protocolVersion: '2026-test' });
   assert.equal(started.result.protocolVersion, '2026-test');
   assert.equal(started.result.serverInfo.name, 'gempt');
-  assert.equal(started.result.serverInfo.version, '0.4.0');
+  assert.equal(started.result.serverInfo.version, '0.4.1');
   send({ method: 'notifications/initialized' });
   assert.deepEqual((await request('ping')).result, {});
   const { tools } = (await request('tools/list')).result;
@@ -833,7 +1011,7 @@ test('standalone NDJSON MCP advertises three model tools and four app tools and 
   const asked = await request('tools/call', { name: 'gpt_ask', arguments: { goal: 'Summarize the fixture.' } });
   assert.equal(asked.result.isError, undefined, asked.result.content[0].text);
   assert.equal(JSON.parse(asked.result.content[0].text).text.includes('Consult answer.'), true);
-  const launch = await request('tools/call', { name: 'gpt_run', arguments: { goal: 'Inspect the fixture.', cwd: '.', access: 'inspect' } });
+  const launch = await request('tools/call', { name: 'gpt_run', arguments: { goal: 'Inspect the fixture.', access: 'inspect' } });
   assert.equal(launch.result.isError, false, launch.result.content[0].text);
   const run = JSON.parse(launch.result.content[0].text);
   assert.match(run.wait_command, new RegExp(`${run.run_id}$`));
@@ -841,4 +1019,384 @@ test('standalone NDJSON MCP advertises three model tools and four app tools and 
   assert.equal(complete.result?.sandbox, 'read-only', complete.error);
   child.stdin.end();
   assert.deepEqual(await exited, [0, null]);
+});
+
+test('waiting_gemini pauses execution timeout and deadline, and gpt_run validates timeout_sec', async (t) => {
+  const f = fixture(t);
+  await appFixture(t, f);
+  const gateway = JSON.parse(readFileSync(f.configPath, 'utf8')).magpie.base_url;
+  const runId = 'c'.repeat(32);
+  const runFile = join(runDirectory(runId, f.sessionsDir), 'state.json');
+  const initialDeadline = Date.now() / 1000 + 30;
+  saveRun(runFile, {
+    source: 'magpie_exec', run_id: runId, session_id: 'exec-pause-test', cwd: f.cwd,
+    state: 'running', pid: process.pid, deadline: initialDeadline,
+  });
+
+  const runPromise = runAppServer({
+    configPath: f.configPath, env: f.env, runFile, sessionId: 'exec-pause-test',
+    onIdentity() {}, prompt: 'Request a cross-check', cwd: f.cwd,
+    model: 'codex/gpt-6.2-sol', effort: 'medium', sandbox: 'workspace-write',
+    approvalPolicy: 'never', gatewayUrl: gateway, timeoutSec: 0.45,
+  });
+
+  const waiting = await until(() => {
+    const rec = readRun(runId, f.sessionsDir);
+    return rec.state === 'waiting_gemini' && rec;
+  });
+  assert.equal(waiting.pending_tool_call.call_id, 'ask_1');
+  assert.ok(waiting.waiting_since);
+
+  // Past record.deadline must not expire while in waiting_gemini with a live worker PID.
+  const waitingReconciled = reconcileRunState({
+    source: 'magpie_exec', run_id: runId, state: 'waiting_gemini', pid: process.pid,
+    deadline: Date.now() / 1000 - 3600, turn_id: 'turn-1',
+  });
+  assert.equal(waitingReconciled.state, 'waiting_gemini');
+  // Dead worker PID in waiting_gemini still reconciles to outcome_unknown + remote_turn_unconfirmed.
+  const exited = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+  const deadWaiting = reconcileRunState({
+    source: 'magpie_exec', run_id: runId, state: 'waiting_gemini', pid: exited.pid,
+    deadline: Date.now() / 1000 + 3600, turn_id: 'turn-1',
+  });
+  assert.equal(deadWaiting.state, 'outcome_unknown');
+  assert.equal(deadWaiting.remote_turn_unconfirmed, true);
+
+  // Wait longer than timeoutSec (0.45s) before replying; paused timer must not fire.
+  await sleep(650);
+  assert.equal(readRun(runId, f.sessionsDir).state, 'waiting_gemini');
+  assert.equal(replyToolCall(runId, 'ask_1', 'Approved.', f).ok, true);
+
+  const result = await runPromise;
+  assert.match(result.text, /Prior finding/);
+  const updated = JSON.parse(readFileSync(runFile, 'utf8'));
+  assert.ok(updated.waiting_gemini_sec >= 0.5, `expected waiting_gemini_sec >= 0.5, got ${updated.waiting_gemini_sec}`);
+  assert.ok(updated.deadline > initialDeadline, 'record deadline should extend after waiting_gemini');
+
+  // Verify gpt_run timeout_sec schema, bounds validation, and forwarding.
+  const runSchema = TOOLS.find((tool) => tool.name === 'gpt_run').inputSchema.properties.timeout_sec;
+  assert.equal(runSchema.minimum, 30);
+  assert.equal(runSchema.maximum, 7200);
+  for (const bad of [29, 7201, NaN, Infinity, '60', null]) {
+    await assert.rejects(handleTool('gpt_run', { goal: 'Check timeout', cwd: f.cwd, timeout_sec: bad }, f.env, f), /Invalid timeout_sec/);
+  }
+  const custom = await dispatchRun({ goal: 'Custom timeout run', cwd: f.cwd, timeout_sec: 7200, background: true }, f);
+  assert.ok(custom.deadline >= Date.now() / 1000 + 900 + 7180);
+  assert.equal((await waitForRun(custom.run_id, { ...f, timeoutSec: 5 })).state, 'finished');
+});
+
+test('remote_turn_unconfirmed blocks concurrent dispatch and worktree prune until interrupt clears it', async (t) => {
+  const f = fixture(t);
+  const subdir = initRepo(f.cwd);
+  const packets = await appFixture(t, f);
+
+  const first = await dispatchRun({ goal: 'Seed shared worktree', cwd: subdir, workspace: 'share', background: true }, f);
+  const seeded = await waitForRun(first.run_id, { ...f, timeoutSec: 5 });
+  assert.equal(seeded.state, 'finished', seeded.error);
+
+  const failedId = '9'.repeat(32);
+  state(f, failedId, {
+    session_id: seeded.session_id, cwd: seeded.cwd, worktree_path: seeded.worktree_path, source_cwd: subdir,
+    state: 'failed', codex_thread_id: seeded.codex_thread_id, turn_id: 'turn-unconfirmed',
+    remote_turn_unconfirmed: true, unconfirmed_at: new Date().toISOString(),
+    error: 'Remote Codex turn may still be running (no terminal status confirmed).',
+    config_path: f.configPath,
+  });
+
+  // Recent unconfirmed record is occupying: blocks roster idle, same-session dispatch, and worktree prune.
+  assert.equal(listActiveRoster({ ...f, sessionId: seeded.session_id }).length, 1);
+  assert.equal(listActiveRoster({ ...f, sessionId: seeded.session_id })[0].remote_turn_unconfirmed, true);
+  await assert.rejects(
+    dispatchRun({ goal: 'Concurrent resume', cwd: subdir, session_id: seeded.session_id, background: true }, f),
+    (err) => err.status === 409 && /unconfirmed remote turn/i.test(err.message),
+  );
+  assert.deepEqual(pruneShareWorktrees(f.cwd, { env: f.env, maxAgeMs: 0 }), { removed: [], kept: [seeded.worktree_path] });
+
+  // gpt_ctl status exposes unconfirmed flag.
+  const statusRes = await handleTool('gpt_ctl', { action: 'status', run_id: failedId }, f.env, f);
+  assert.equal(JSON.parse(statusRes.content[0].text).unconfirmed, true);
+
+  // gpt_ctl interrupt sends turn/interrupt and clears remote_turn_unconfirmed.
+  const cleared = await interruptRun(failedId, f);
+  assert.equal(cleared.ok, true);
+  assert.equal(cleared.cleared_unconfirmed, true);
+  assert.ok(packets.some(({ method, params }) => method === 'turn/interrupt' && params.turnId === 'turn-unconfirmed'));
+  assert.equal(readRun(failedId, f.sessionsDir).remote_turn_unconfirmed, undefined);
+  assert.equal(listActiveRoster({ ...f, sessionId: seeded.session_id }).length, 0);
+
+  // Also clears when app-server reports the turn is no longer active.
+  const goneId = '8'.repeat(32);
+  state(f, goneId, {
+    session_id: seeded.session_id, cwd: seeded.cwd, state: 'outcome_unknown',
+    codex_thread_id: seeded.codex_thread_id, turn_id: 'turn-gone',
+    remote_turn_unconfirmed: true, unconfirmed_at: new Date().toISOString(), config_path: f.configPath,
+  });
+  const clearedGone = await interruptRun(goneId, {
+    ...f,
+    connect: async () => ({
+      disconnected: false,
+      request: async () => { throw new Error('Turn not found'); },
+      close() {},
+    }),
+  });
+  assert.equal(clearedGone.cleared_unconfirmed, true);
+  assert.equal(readRun(goneId, f.sessionsDir).remote_turn_unconfirmed, undefined);
+
+  // Ancient unconfirmed run past hold window does not block forever.
+  const oldIso = new Date(Date.now() - 45 * 60 * 1000).toISOString();
+  assert.equal(isRecentUnconfirmedRun({
+    state: 'failed', remote_turn_unconfirmed: true, unconfirmed_at: oldIso, deadline: Date.now() / 1000 - 300,
+  }), false);
+
+  // After clearing, same-session dispatch succeeds.
+  const resumed = await dispatchRun({ goal: 'Resume after clear', cwd: subdir, session_id: seeded.session_id, background: true }, f);
+  assert.equal((await waitForRun(resumed.run_id, { ...f, timeoutSec: 5 })).state, 'finished');
+});
+
+test('pre-connect app-server failure does not leave an unbound session without codex_thread_id', async (t) => {
+  const f = fixture(t);
+  await appFixture(t, f);
+  // Seed one valid session first to verify resume failure also does not corrupt it.
+  const okRun = await dispatchRun({ goal: 'Healthy seed run', cwd: f.cwd, background: true }, f);
+  const okDone = await waitForRun(okRun.run_id, { ...f, timeoutSec: 5 });
+  assert.equal(okDone.state, 'finished', okDone.error);
+  const seedFile = join(f.sessionsDir, `${okDone.session_id}.json`);
+  const seedBefore = readFileSync(seedFile, 'utf8');
+
+  // Stop app-server state so connectAppServer fails before thread/start.
+  writeFileSync(f.env.GEMPT_APP_SERVER_STATE, JSON.stringify({ status: 'stopped' }));
+  const broken = await dispatchRun({ goal: 'Connect failure new session', cwd: f.cwd, background: true }, f);
+  const failed = await waitForRun(broken.run_id, { ...f, timeoutSec: 5 });
+  assert.equal(failed.state, 'failed');
+  assert.equal(existsSync(join(f.sessionsDir, `${broken.session_id}.json`)), false);
+
+  const brokenResume = await dispatchRun({ goal: 'Connect failure resume', cwd: f.cwd, session_id: okDone.session_id, background: true }, f);
+  const failedResume = await waitForRun(brokenResume.run_id, { ...f, timeoutSec: 5 });
+  assert.equal(failedResume.state, 'failed');
+  assert.equal(readFileSync(seedFile, 'utf8'), seedBefore);
+});
+
+test('pruning a clean shared worktree syncs session cwd back to main repo for future resumes', async (t) => {
+  const f = fixture(t);
+  const subdir = initRepo(f.cwd);
+  await appFixture(t, f);
+
+  const shared = await dispatchRun({ goal: 'Work in isolated worktree', cwd: subdir, workspace: 'share', background: true }, f);
+  const done = await waitForRun(shared.run_id, { ...f, timeoutSec: 5 });
+  assert.equal(done.state, 'finished', done.error);
+  const sessionFile = join(f.sessionsDir, `${done.session_id}.json`);
+  const beforePrune = JSON.parse(readFileSync(sessionFile, 'utf8'));
+  assert.equal(beforePrune.worktree_path, done.worktree_path);
+  assert.equal(beforePrune.cwd, join(done.worktree_path, 'project'));
+
+  assert.deepEqual(pruneShareWorktrees(f.cwd, { env: f.env, maxAgeMs: 0 }), { removed: [done.worktree_path], kept: [] });
+  assert.equal(existsSync(done.worktree_path), false);
+  const afterPrune = JSON.parse(readFileSync(sessionFile, 'utf8'));
+  assert.equal(afterPrune.cwd, subdir);
+  assert.equal(afterPrune.worktree_path, null);
+  assert.ok(afterPrune.worktree_pruned_at);
+  assert.equal(afterPrune.pruned_worktree_path, done.worktree_path);
+
+  // Resume with workspace='inherit' in main repo subdir succeeds.
+  const resumedInherit = await dispatchRun({ goal: 'Continue in main repo', cwd: subdir, session_id: done.session_id,
+    workspace: 'inherit', background: true }, f);
+  const doneInherit = await waitForRun(resumedInherit.run_id, { ...f, timeoutSec: 5 });
+  assert.equal(doneInherit.state, 'finished', doneInherit.error);
+  assert.equal(doneInherit.cwd, subdir);
+
+  // Resume with workspace='share' recreates worktree and succeeds.
+  const resumedShare = await dispatchRun({ goal: 'Continue in fresh worktree', cwd: subdir, session_id: done.session_id,
+    workspace: 'share', background: true }, f);
+  const doneShare = await waitForRun(resumedShare.run_id, { ...f, timeoutSec: 5 });
+  assert.equal(doneShare.state, 'finished', doneShare.error);
+  assert.equal(doneShare.worktree_path, done.worktree_path);
+});
+
+test('gempt-wait batch returns non-zero when first-ready item fails and session_id validation enforces strict rules', (t) => {
+  const f = fixture(t);
+  const waitScript = fileURLToPath(new URL('../core/wait.mjs', import.meta.url));
+  const failedId = '1'.repeat(32);
+  const unknownId = '2'.repeat(32);
+  const runningId = '3'.repeat(32);
+  const waitingId = '4'.repeat(32);
+  const finishedId = '5'.repeat(32);
+  state(f, failedId, { state: 'failed', error: 'boom' });
+  state(f, unknownId, { state: 'outcome_unknown' });
+  state(f, runningId, { state: 'running' });
+  state(f, waitingId, { state: 'waiting_gemini' });
+  state(f, finishedId, { state: 'finished' });
+
+  const batchFailed = spawnSync(process.execPath, [waitScript, `${failedId},${runningId}`], { env: f.env, encoding: 'utf8' });
+  assert.equal(batchFailed.status, 1, batchFailed.stderr);
+  assert.deepEqual(JSON.parse(batchFailed.stdout).ready, [failedId]);
+
+  const batchUnknown = spawnSync(process.execPath, [waitScript, `${unknownId},${runningId}`], { env: f.env, encoding: 'utf8' });
+  assert.equal(batchUnknown.status, 1, batchUnknown.stderr);
+  assert.deepEqual(JSON.parse(batchUnknown.stdout).ready, [unknownId]);
+
+  const batchFinished = spawnSync(process.execPath, [waitScript, `${finishedId},${runningId}`], { env: f.env, encoding: 'utf8' });
+  assert.equal(batchFinished.status, 0, batchFinished.stderr);
+  assert.deepEqual(JSON.parse(batchFinished.stdout).ready, [finishedId]);
+
+  const singleWaiting = spawnSync(process.execPath, [waitScript, waitingId], { env: f.env, encoding: 'utf8' });
+  assert.equal(singleWaiting.status, 0, singleWaiting.stderr);
+  assert.equal(JSON.parse(singleWaiting.stdout).state, 'waiting_gemini');
+
+  for (const good of ['exec-20261123-abc123', 'consult-1.2_3', 'session-a', 'a'.repeat(128)]) {
+    assert.equal(isValidSessionId(good), true, good);
+    assert.equal(validateSessionId(` ${good} `), good);
+  }
+  for (const bad of ['', '.', '..', '.hidden', '-flag', 'exec-a..b', 'exec-end.', 'a'.repeat(129), 'CON', 'nul.txt', '../escape', 'bad/id', 'bad\\id']) {
+    assert.equal(isValidSessionId(bad), false, bad);
+    assert.throws(() => validateSessionId(bad), /Invalid session_id/);
+  }
+});
+
+test('runAppServer interrupt confirmation window distinguishes confirmed vs unconfirmed timeout', async (t) => {
+  const f = fixture(t);
+  let delayInterruptMs = 80;
+  let emitCompletedOnInterrupt = true;
+  const server = createServer((req, res) => { res.statusCode = 404; res.end('{}'); });
+  const sockets = new Set();
+  server.on('upgrade', (req, socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    const accept = createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+    const frame = (opcode, body) => {
+      const header = body.length < 126 ? Buffer.from([0x80 | opcode, body.length])
+        : Buffer.from([0x80 | opcode, 126, body.length >> 8, body.length & 255]);
+      socket.write(Buffer.concat([header, body]));
+    };
+    const send = (data) => frame(1, Buffer.from(JSON.stringify({ jsonrpc: '2.0', ...data })));
+    let buffer = Buffer.alloc(0);
+    socket.on('data', (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      while (buffer.length >= 2) {
+        const opcode = buffer[0] & 15;
+        let length = buffer[1] & 127;
+        const offset = length === 126 ? 4 : 2;
+        if (buffer.length < offset) return;
+        if (offset === 4) length = buffer.readUInt16BE(2);
+        if (buffer.length < offset + 4 + length) return;
+        const mask = buffer.subarray(offset, offset + 4);
+        const body = buffer.subarray(offset + 4, offset + 4 + length);
+        for (let i = 0; i < body.length; i++) body[i] ^= mask[i % 4];
+        buffer = buffer.subarray(offset + 4 + length);
+        if (opcode === 8) { frame(8, body); socket.end(); continue; }
+        if (opcode !== 1) continue;
+        const { method, id, params } = JSON.parse(body.toString('utf8'));
+        if (method === 'initialized') continue;
+        if (method === 'initialize') send({ id, result: {} });
+        else if (method === 'thread/start') {
+          send({ id, result: { thread: { id: 'th-delay' }, cwd: params.cwd, modelProvider: params.modelProvider, sandbox: { type: 'workspaceWrite' } } });
+        } else if (method === 'turn/start') {
+          send({ method: 'turn/started', params: { threadId: params.threadId, turnId: 'tu-delay', turn: { id: 'tu-delay', status: 'inProgress' } } });
+          send({ id, result: { turn: { id: 'tu-delay' } } });
+        } else if (method === 'turn/interrupt') {
+          send({ id, result: {} });
+          if (emitCompletedOnInterrupt) {
+            setTimeout(() => {
+              if (!socket.destroyed) {
+                send({ method: 'turn/completed', params: { threadId: params.threadId, turnId: params.turnId, turn: { id: params.turnId, status: 'interrupted' } } });
+              }
+            }, delayInterruptMs);
+          }
+        }
+      }
+    });
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => {
+    for (const s of sockets) s.destroy();
+    return new Promise((resolve) => server.close(resolve));
+  });
+  const addr = `127.0.0.1:${server.address().port}`;
+  const gateway = `http://${addr}`;
+  f.env.GEMPT_APP_SERVER_STATE = join(f.root, 'delay-app-server.json');
+  writeFileSync(f.env.GEMPT_APP_SERVER_STATE, JSON.stringify({
+    status: 'running', ws_url: `ws://${addr}`, auth_header: 'Authorization', auth_token: 'tok', gateway_url: gateway,
+  }));
+
+  const id1 = '6'.repeat(32);
+  const file1 = join(runDirectory(id1, f.sessionsDir), 'state.json');
+  saveRun(file1, { source: 'magpie_exec', run_id: id1, session_id: 'exec-delay-1', cwd: f.cwd, state: 'running', pid: process.pid });
+  await assert.rejects(
+    runAppServer({
+      configPath: f.configPath, env: f.env, runFile: file1, sessionId: 'exec-delay-1', onIdentity() {},
+      prompt: 'Hold', cwd: f.cwd, model: 'codex/gpt-6.2-sol', effort: 'medium', sandbox: 'workspace-write',
+      approvalPolicy: 'never', gatewayUrl: gateway, timeoutSec: 0.12, interruptConfirmMs: 400,
+    }),
+    (err) => /timed out/.test(err.message) && !err.remoteTurnUnconfirmed,
+  );
+
+  emitCompletedOnInterrupt = false;
+  const id2 = '7'.repeat(32);
+  const file2 = join(runDirectory(id2, f.sessionsDir), 'state.json');
+  saveRun(file2, { source: 'magpie_exec', run_id: id2, session_id: 'exec-delay-2', cwd: f.cwd, state: 'running', pid: process.pid });
+  await assert.rejects(
+    runAppServer({
+      configPath: f.configPath, env: f.env, runFile: file2, sessionId: 'exec-delay-2', onIdentity() {},
+      prompt: 'Hold forever', cwd: f.cwd, model: 'codex/gpt-6.2-sol', effort: 'medium', sandbox: 'workspace-write',
+      approvalPolicy: 'never', gatewayUrl: gateway, timeoutSec: 0.12, interruptConfirmMs: 120,
+    }),
+    (err) => err.remoteTurnUnconfirmed === true && /Remote Codex turn may still be running/.test(err.message),
+  );
+});
+
+test('Live restricts out-of-workspace files, exposes remote_turn_unconfirmed, and hook applies swarm_split', async (t) => {
+  const f = fixture(t);
+  const inside = join(f.cwd, 'ok.txt');
+  const outside = join(f.root, 'secret.txt');
+  writeFileSync(inside, 'ok\n');
+  writeFileSync(outside, 'secret\n');
+  const id = '5'.repeat(32);
+  state(f, id, {
+    state: 'failed', codex_thread_id: 'th-1', turn_id: 'tu-1', remote_turn_unconfirmed: true,
+    progress: { phase: 'failed', touched_files: ['ok.txt', '../secret.txt', outside] },
+  });
+  const streamed = (await callAppTool('gempt_app_stream', { run_id: id }, { ...f, root: f.cwd })).structuredContent;
+  assert.equal(streamed.run.remote_turn_unconfirmed, true);
+  assert.equal(streamed.run.can_interrupt, true);
+  assert.ok(streamed.file_uris['ok.txt']);
+  assert.equal(streamed.file_uris['../secret.txt'], undefined);
+  assert.equal(streamed.file_uris[outside], undefined);
+  assert.equal(streamed.restricted_files['../secret.txt'], 'outside_workspace');
+  assert.equal(streamed.restricted_files[outside], 'outside_workspace');
+
+  mkdirSync(dirname(f.configPath), { recursive: true });
+  writeFileSync(join(dirname(f.configPath), 'app-server.json'),
+    JSON.stringify({ status: 'running', pid: process.pid, ws_url: 'ws://127.0.0.1:1' }));
+  writeFileSync(f.configPath, JSON.stringify({ routing_policy: { work_split: 'balanced', swarm_split: 'gpt_first' } }));
+  const env = { ...f.env, GEMPT_APP_SERVER_STATE: join(dirname(f.configPath), 'app-server.json') };
+  const swarmStart = jsonProcess(process.execPath, [hookPath], {
+    env: { ...env, GEMPT_SWARM_MODE: '1' },
+    input: JSON.stringify({ hookEventName: 'SessionStart', conversationId: 'swarm-worker', workspacePaths: [f.cwd] }),
+  });
+  assert.match(swarmStart.injectSteps[0].systemMessage.systemMessage, /80% GPT/);
+  writeFileSync(f.configPath, JSON.stringify({ routing_policy: { work_split: 'balanced', swarm_split: 'inherit' } }));
+  const inheritedStart = jsonProcess(process.execPath, [hookPath], {
+    env: { ...env, GEMPT_SWARM_MODE: '1' },
+    input: JSON.stringify({ hookEventName: 'SessionStart', conversationId: 'swarm-inherit', workspacePaths: [f.cwd] }),
+  });
+  assert.match(inheritedStart.injectSteps[0].systemMessage.systemMessage, /35% GPT/);
+});
+
+test('packaging guards unsafe output paths and rolls back in-place sync on verify failure', async (t) => {
+  const f = fixture(t);
+  assert.throws(() => assertSafeOutDir(f.root, { cwd: f.root, repoRoot: f.root, homeDir: f.root, tmpDir: f.root }), /Refusing/);
+  const staged = join(f.root, 'staged');
+  const target = join(f.root, 'target');
+  mkdirSync(staged);
+  mkdirSync(target);
+  writeFileSync(join(target, 'keep.txt'), 'original');
+  writeFileSync(join(staged, 'keep.txt'), 'updated');
+  writeFileSync(join(staged, 'added.txt'), 'extra');
+  await assert.rejects(
+    syncInPlace(staged, target, { verify: async () => { throw new Error('verify boom'); } }),
+    /verify boom/,
+  );
+  assert.equal(readFileSync(join(target, 'keep.txt'), 'utf8'), 'original');
+  assert.equal(existsSync(join(target, 'added.txt')), false);
 });

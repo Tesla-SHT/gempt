@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
 import { DEFAULT_AGY_TARGET, installAgy } from '../core/agy-install.mjs';
 import { serveStdio } from '../core/mcp-server.mjs';
-import { interruptRun, listActiveRoster, replyToolCall, steerRun } from '../core/runs.mjs';
+import { interruptRun, replyToolCall, steerRun } from '../core/runs.mjs';
 import { resolvePath } from '../core/state.mjs';
 import { runWait } from '../core/wait.mjs';
 import { pruneShareWorktrees } from '../core/worktrees.mjs';
@@ -136,8 +136,7 @@ async function main([command, ...args]) {
       const repoPath = resolvePath(value || process.cwd());
       const hours = values['max-age-hours'] !== undefined ? Number(values['max-age-hours']) : 168;
       if (!Number.isFinite(hours) || hours < 0) throw new Error('Invalid --max-age-hours value.');
-      const activePaths = new Set(listActiveRoster({ limit: 100 }).map((item) => item.worktree_path).filter(Boolean));
-      result = pruneShareWorktrees(repoPath, { activePaths, maxAgeMs: hours * 3600 * 1000 });
+      result = pruneShareWorktrees(repoPath, { maxAgeMs: hours * 3600 * 1000 });
       break;
     }
     case 'presets':

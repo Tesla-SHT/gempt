@@ -79,6 +79,8 @@
 
   let latestState = null;
   let stateFetch = null;
+  let stateSyncedAt = null;
+  let stateRefreshError = '';
   let nativePreviewTier = '';
   let currentDefaultSandbox = 'workspace-write';
   let currentFailoverMode = 'subscription_only';
@@ -109,7 +111,7 @@
     ratioRange = range;
     try { window.localStorage?.setItem(RATIO_RANGE_STORAGE_KEY, range); } catch {}
     updateRatioRangeControls();
-    void refreshState({ ratioChanged: true });
+    void refreshState();
   }
 
   function updateRatioRangeControls() {
@@ -245,15 +247,6 @@
     return 'mcp';
   }
 
-  function buildMcpChain(state) {
-    return Object.entries(state.pairings || {}).map(([family, model]) => ({
-      id: model === 'default' ? state.mcp_default_model : model,
-      human: `${titleCaseTier(family)} →`,
-      role: model === 'default' ? '默认模型' : '',
-      pairing: true,
-    }));
-  }
-
   function buildNativeChain(nativeTier) {
     const rawNodes = Array.isArray(nativeTier?.nodes) ? nativeTier.nodes : [];
     return rawNodes
@@ -296,9 +289,7 @@
     const configured = Boolean(state.configured);
 
     if (!reachable) {
-      banner.hidden = false;
-      banner.dataset.tone = 'warn';
-      textEl.textContent = '尚未连上本地 Magpie — 请先启动 Magpie，再点右上角刷新。';
+      banner.hidden = true;
       btn.hidden = true;
       return;
     }
@@ -367,10 +358,11 @@
       radio.disabled = !state.configured;
     }
     swarm.disabled = !state.configured;
-    swarm.value = state.swarm_split;
+    const validSwarm = state.swarm_split === 'inherit' || Object.hasOwn(profiles, state.swarm_split);
+    swarm.value = validSwarm ? state.swarm_split : 'inherit';
     renderPairings(state);
     const ordinary = profiles[state.work_split];
-    const team = profiles[state.swarm_split] || ordinary;
+    const team = profiles[swarm.value] || ordinary;
     const workDetail = $('work-detail');
     workDetail.textContent = ordinary?.detail || '';
     if (ordinary?.gpt_share !== 0 && state.tools?.exec_enabled === false) {
@@ -471,7 +463,9 @@
         label.append(select);
         list.append(label);
       }
-      const choices = [new Option('默认模型', 'default')];
+      const defaultModel = state.mcp_default_model;
+      const defaultLabel = defaultModel ? `默认模型 · ${humanizeModel(defaultModel)}` : '默认模型';
+      const choices = [new Option(defaultLabel, 'default')];
       for (const id of models) choices.push(new Option(humanizeModel(id), id));
       if (current !== 'default' && !models.includes(current)) {
         choices.push(new Option(humanizeModel(current) + '（未检测到）', current));
@@ -593,7 +587,7 @@
       const isPrimaryLike = node.role === 'primary' || node.role === 'planner';
       const isDashedLike = node.role === 'fallback' || node.role === 'utility';
       const li = document.createElement('li');
-      li.className = `route-node${isPrimaryLike ? ' is-primary' : ''}${isDashedLike ? ' is-fallback' : ''}${node.pairing ? ' is-pairing' : ''}`;
+      li.className = `route-node${isPrimaryLike ? ' is-primary' : ''}${isDashedLike ? ' is-fallback' : ''}`;
 
       const left = document.createElement('span');
       left.className = 'node-left';
@@ -606,8 +600,7 @@
       const code = document.createElement('code');
       code.className = 'pill-code';
       code.textContent = node.id;
-      if (!node.pairing) left.append(dot);
-      left.append(human, code);
+      left.append(dot, human, code);
 
       const role = document.createElement('span');
       role.className = 'node-role';
@@ -625,15 +618,14 @@
     const readyBadge = $('active-tier-ready-badge');
     const effortEl = $('active-tier-effort');
     const sourceTitle = $('source-title');
-    const sourceSub = $('source-sub');
-    const copyMcpBtn = $('copy-mcp-btn');
-    const copyRulesBtn = $('copy-rules-btn');
+    const sourceActions = $('source-actions');
+    const nativeCaption = $('native-client-caption');
     const slashBtn = $('active-slash-btn');
-    const hubBox = $('flow-hub-box');
     const hubModeText = $('hub-mode-text');
     const chainEl = $('route-chain');
-
-    if (hubBox) hubBox.title = state.magpie?.url || 'http://127.0.0.1:3425';
+    const isNative = viewMode === 'native';
+    sourceActions.hidden = isNative;
+    nativeCaption.hidden = chainEl.hidden = !isNative;
 
     if (viewMode === 'native') {
       const groupId = activeNativeTier?.group_id || `group/gempt-${nativePreviewTier}`;
@@ -652,12 +644,8 @@
       }
       if (effortEl) effortEl.textContent = '按意图自动分流';
       if (sourceTitle) sourceTitle.textContent = '外部客户端直连';
-      if (sourceSub) sourceSub.textContent = formatNativeClientSubtitle(state.clients);
-      if (copyMcpBtn) copyMcpBtn.hidden = true;
-      if (copyRulesBtn) copyRulesBtn.hidden = true;
-      if (slashBtn) slashBtn.hidden = true;
+      nativeCaption.textContent = formatNativeClientSubtitle(state.clients);
       if (hubModeText) hubModeText.textContent = '意图路由分流';
-      chainEl?.setAttribute('aria-label', '直连路由组成员');
       renderChainNodes(chainEl, buildNativeChain(activeNativeTier), '需先在 Magpie 接入 Gemini 与 Codex 模型');
       return;
     }
@@ -667,13 +655,8 @@
     if (readyBadge) readyBadge.hidden = true;
     if (effortEl) effortEl.textContent = formatEffortLabel(state.mcp_effort, state.auto_effort);
     if (sourceTitle) sourceTitle.textContent = 'Antigravity';
-    if (sourceSub) sourceSub.textContent = '原生 Gemini 按配对调用 GPT/Codex';
-    if (copyMcpBtn) copyMcpBtn.hidden = false;
-    if (copyRulesBtn) copyRulesBtn.hidden = false;
     if (slashBtn) slashBtn.hidden = !state.clients?.antigravity_installed;
     if (hubModeText) hubModeText.textContent = 'Codex 订阅';
-    chainEl?.setAttribute('aria-label', 'Gemini 与 GPT 配对');
-    renderChainNodes(chainEl, buildMcpChain(state), '尚未配置 Gemini 配对');
   }
 
   function renderReadiness(state) {
@@ -713,6 +696,7 @@
   }
 
   function formatRunMeta(run) {
+    if (run.remote_turn_unconfirmed) return '远端终态未确认';
     if (run.verification === 'passed') return '已通过';
     if (run.verification === 'failed' || run.state === 'failed') return '失败';
     if (run.state === 'waiting_gemini') return '等待 Gemini';
@@ -736,7 +720,9 @@
     if (!list || !count) return;
 
     const runs = (state.recent_runs || []).map((run) => ({
-      tone: run.verification === 'passed' ? 'ok' : (run.state === 'failed' || run.verification === 'failed' ? 'err' : 'neutral'),
+      tone: run.remote_turn_unconfirmed ? 'err'
+        : run.verification === 'passed' ? 'ok'
+        : (run.state === 'failed' || run.verification === 'failed' ? 'err' : 'neutral'),
       text: `执行 · ${titleCaseTier(run.tier || 'exec')} · ${run.title || run.cwd_name || run.run_id.slice(0, 8)}`,
       meta: formatRunMeta(run),
     }));
@@ -808,24 +794,6 @@
       radio.checked = radio.value === viewMode;
     }
 
-    const status = $('magpie-status');
-    const statusText = $('magpie-status-text');
-    if (status && statusText) {
-      if (!state.magpie?.reachable) {
-        status.dataset.state = 'offline';
-        statusText.textContent = '未连接';
-        status.title = state.magpie?.error || 'Magpie 暂不可达';
-      } else if (!state.subscription?.connected && !state.native_groups?.complete) {
-        status.dataset.state = 'warn';
-        statusText.textContent = '待登录 Codex 订阅';
-        status.title = state.magpie?.url || '';
-      } else {
-        status.dataset.state = 'online';
-        statusText.textContent = '已连接';
-        status.title = state.magpie?.url || '';
-      }
-    }
-
     renderSetupBanner(state, viewMode);
     renderControls(state, viewMode);
     renderReadiness(state);
@@ -878,32 +846,81 @@
     requestAnimationFrame(() => requestAnimationFrame(() => document.documentElement.classList.add('gp-ready')));
   }
 
-  async function refreshState({ manual = false, live = false, ratioChanged = false } = {}) {
+  function renderSyncStatus() {
+    const view = activityViews[activeTab];
+    const activity = view?.open || view;
+    const magpie = latestState?.magpie;
+    const offline = magpie?.reachable === false;
+    let message = '';
+    if (stateRefreshError) {
+      message = stateSyncedAt
+        ? `概览数据已过期 · 上次同步 ${dateTime.format(stateSyncedAt)} · ${stateRefreshError}`
+        : `加载概览失败 · ${stateRefreshError}`;
+    } else if (offline) {
+      message = 'Magpie 离线 · 请检查本地 Magpie 是否已启动';
+      if (stateSyncedAt) message += ` · 上次同步 ${dateTime.format(stateSyncedAt)}`;
+    } else if (activity?.refreshError) {
+      const label = view.kind === 'requests' ? '请求' : '会话';
+      message = `${label}数据已过期 · 上次同步 ${dateTime.format(activity.syncedAt)} · ${activity.refreshError}`;
+    }
+
+    $('overview').toggleAttribute('data-state-unavailable', Boolean(stateRefreshError && !latestState));
+    const banner = $('sync-banner');
+    const announcement = $('sync-announcement');
+    if (announcement.textContent !== message) {
+      announcement.textContent = message;
+      $('sync-message').textContent = message;
+    }
+    if (!message && document.activeElement === $('sync-retry')) $('refresh-btn').focus();
+    banner.hidden = !message;
+    const status = $('magpie-status');
+    const statusText = $('magpie-status-text');
+    if (stateRefreshError || offline) {
+      status.dataset.state = 'offline';
+      status.title = stateRefreshError || magpie.error || 'Magpie 暂不可达';
+      statusText.textContent = stateRefreshError ? (stateSyncedAt ? '同步失败' : '连接失败') : '未连接';
+    } else if (magpie) {
+      const ready = latestState.subscription?.connected || latestState.native_groups?.complete;
+      status.dataset.state = ready ? 'online' : 'warn';
+      status.title = magpie.url || '';
+      statusText.textContent = ready ? '已连接' : '待登录 Codex 订阅';
+    }
+  }
+
+  async function refreshState({ manual = false, live = false } = {}) {
     if (live && stateFetch) return;
     stateFetch?.abort();
     const abort = stateFetch = new AbortController();
     const refreshBtn = $('refresh-btn');
     if (manual && refreshBtn) refreshBtn.classList.add('is-spinning');
     try {
-      const res = await apiFetch(`/api/state?ratio_range=${ratioRange}${manual ? '&probe=1' : ''}`, { signal: abort.signal });
+      const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(POLL_MS)]);
+      const res = await apiFetch(`/api/state?ratio_range=${ratioRange}${manual ? '&probe=1' : ''}`, { signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       if (abort.signal.aborted) return;
-      if (live) {
+      if (typeof data?.magpie?.reachable !== 'boolean') throw new Error('状态响应格式无效');
+      if (live && latestState && !stateRefreshError && latestState.magpie?.reachable === data.magpie.reachable) {
         latestState = { ...latestState, app_server: data.app_server, active_runs: data.active_runs };
       } else {
         renderState(data);
       }
       renderLiveOverview(data);
+      if (data.magpie.reachable) stateSyncedAt = Date.now();
+      stateRefreshError = '';
+      renderSyncStatus();
       // The slow state refresh also discovers runs when an activity list is idle.
       const view = activityViews[activeTab];
       if (view && !view.open && !view.listFetch && !view.items.some(isActiveRun)
           && data.active_runs?.length) {
         void refreshActivityView(view);
       }
-      if (manual) showToast('状态已更新');
+      if (manual && data.magpie.reachable) showToast('状态已更新');
     } catch (err) {
-      if ((manual || ratioChanged) && !abort.signal.aborted) showToast(`刷新失败: ${err.message}`, 'error');
+      if (!abort.signal.aborted) {
+        stateRefreshError = err.name === 'TimeoutError' ? '连接超时' : err.message;
+        renderSyncStatus();
+      }
     } finally {
       if (stateFetch === abort) {
         stateFetch = null;
@@ -1778,8 +1795,15 @@
 
   function statusBadge(record) {
     const status = runState(record);
-    const badge = node('span', 'activity-status', statuses[status] || status);
+    const unconfirmed = Boolean(record?.remote_turn_unconfirmed);
+    const badge = node('span', 'activity-status', unconfirmed ? '远端终态未确认' : (statuses[status] || status));
     badge.dataset.status = status;
+    if (unconfirmed) {
+      badge.dataset.unconfirmed = 'true';
+      badge.title = '远端 Codex 回合可能仍在运行，请勿同会话盲目并发派发；可尝试中止以确认终态';
+      badge.style.color = 'var(--activity-amber, var(--gp-warn))';
+      badge.style.fontWeight = '600';
+    }
     if (record.retried) badge.append(' · 重试');
     return badge;
   }
@@ -1813,7 +1837,7 @@
         const res = await apiFetch(`/api/runs/${encodeURIComponent(id)}/interrupt`, { method: 'POST' });
         const payload = await res.json().catch(() => ({}));
         if (!res.ok || !payload.ok) throw new Error(payload.error || `HTTP ${res.status}`);
-        showToast('已发送中止请求');
+        showToast(run.remote_turn_unconfirmed ? '已发送中断确认请求' : '已发送中止请求');
       } catch (err) {
         showToast(`中止失败 · ${err.message}`, 'error');
       } finally {
@@ -1836,12 +1860,15 @@
         overviewRunTimes.set(run.run_id, request.timestamp);
         const row = $('active-run-list').querySelector(`[data-run-id="${run.run_id}"]`);
         const elapsed = row?.querySelector('.run-elapsed');
-        if (elapsed) elapsed.textContent = runElapsed(run, request.timestamp);
+        if (elapsed) {
+          elapsed.textContent = runElapsed(run, request.timestamp);
+          elapsed.hidden = !elapsed.textContent;
+        }
       }).finally(() => {
         if (overviewRunTimes.get(run.run_id) === null) overviewRunTimes.delete(run.run_id);
       }).catch(() => {});
     }
-    return '—';
+    return '';
   }
 
   function preview(className, value) {
@@ -1928,21 +1955,30 @@
       const head = node('div', 'active-run-meta');
       const title = node('strong', '', run.title || 'GPT 任务');
       title.title = run.cwd || '';
-      const phase = run.progress?.phase || run.state;
-      head.append(statusBadge(run.state === 'queued' ? { state: 'running' } : run), title,
-        node('span', 'run-phase', phases[phase] || phase),
-        node('span', 'run-elapsed', runElapsed(run, overviewRunTimes.get(run.run_id))));
+      const status = runState(run);
+      const phase = run.progress?.phase;
+      const phaseLabel = phases[phase] || phase;
+      head.append(statusBadge(run), title);
+      if (phaseLabel && phaseLabel !== (statuses[status] || status)) {
+        head.append(node('span', 'run-phase', phaseLabel));
+      }
+      const elapsed = node('span', 'run-elapsed', runElapsed(run, overviewRunTimes.get(run.run_id)));
+      elapsed.hidden = !elapsed.textContent;
+      head.append(elapsed);
       info.append(head);
       const command = run.progress?.recent_commands?.at(-1);
       const snippet = (typeof command === 'string' ? command : command?.command) || run.progress?.last_message;
       if (snippet) info.append(preview('run-preview', snippet));
       const question = pendingQuestion(run)?.question;
       if (question) info.append(preview('run-question', question));
+      if (run.remote_turn_unconfirmed) {
+        info.append(preview('run-question', '远端回合终态未确认：请勿同会话盲目并发派发，可点击「中止确认」向远端补发中断。'));
+      }
       const actions = node('div', 'active-run-actions');
       const detail = button('查看详情');
       detail.dataset.runAction = 'detail';
       detail.onclick = () => navigateActivityTab('requests', false, `run-${run.run_id}`);
-      const interrupt = interruptButton(run, '中止');
+      const interrupt = interruptButton(run, run.remote_turn_unconfirmed ? '中止确认' : '中止');
       actions.append(detail, interrupt);
       row.append(info, actions);
       if (run.run_id === focusedRunId) restoreFocus = focused.dataset.runAction === 'detail' ? detail : interrupt;
@@ -2201,6 +2237,9 @@
     add('时间', when(r.timestamp));
     add('模式', modes[r.mode]);
     add('状态', statusBadge(r));
+    if (r.remote_turn_unconfirmed) {
+      add('远端状态', '远端终态未确认（请勿同会话盲目并发派发，可尝试中止以确认终态）');
+    }
     add('Agent', r.agent);
     add('请求模型', r.requested_model);
     add('发送模型', r.sent_model);
@@ -2340,6 +2379,8 @@
       if (abort.signal.aborted) return;
       const session = view.kind === 'sessions';
       const run = session ? data.turns.findLast(isActiveRun) || data : data;
+      open.syncedAt = Date.now();
+      open.refreshError = '';
       open.active = isActiveRun(run);
       if (!session && data.run_id) open.runId = data.run_id;
       const rendered = JSON.stringify(data);
@@ -2350,8 +2391,8 @@
       if (runState(run)) head.append(statusBadge(run));
       const focusedInterrupt = body.contains(document.activeElement)
         && document.activeElement.dataset.runAction === 'interrupt';
-      const interrupt = run.run_id && ['running', 'waiting_gemini'].includes(runState(run))
-        ? interruptButton(run, '中止当前轮') : null;
+      const interrupt = run.run_id && (['running', 'waiting_gemini'].includes(runState(run)) || run.remote_turn_unconfirmed)
+        ? interruptButton(run, run.remote_turn_unconfirmed ? '尝试中止确认' : '中止当前轮') : null;
       if (interrupt) head.append(interrupt);
       if (session) {
         const exportButton = button('导出 Markdown');
@@ -2363,7 +2404,11 @@
       for (const details of body.querySelectorAll('details[data-event]')) details.open = expanded.has(details.dataset.event);
       if (focusedInterrupt) (interrupt || view.detail.querySelector('.activity-back')).focus({ preventScroll: true });
     } catch (err) {
-      if (abort.signal.aborted || (refresh && open.rendered)) return;
+      if (abort.signal.aborted) return;
+      if (refresh && open.rendered) {
+        open.refreshError = err.message;
+        return;
+      }
       open.rendered = null;
       const retry = button('重试');
       retry.onclick = () => loadActivityDetail(view);
@@ -2372,6 +2417,7 @@
       if (!abort.signal.aborted) {
         open.abort = null;
         body.removeAttribute('aria-busy');
+        renderSyncStatus();
         syncLivePoll();
       }
     }
@@ -2474,9 +2520,12 @@
         pagers[0].textContent = `显示另外 ${number(Math.min(data.total - end, activityPageSize))} 个`;
         pagers[0].disabled = false;
       }
+      view.syncedAt = Date.now();
+      view.refreshError = '';
     } catch (err) {
       if (abort.signal.aborted) return;
       if (refresh && view.loaded) {
+        view.refreshError = err.message;
         for (const control of pagers) control.disabled = control.dataset.page === 'newer' ? view.offset <= 0
           : view.kind === 'requests' && view.offset + view.items.length >= view.total;
         return;
@@ -2488,10 +2537,12 @@
       error.append(retry);
       view.results.replaceChildren(error);
       view.loaded = false;
+      view.refreshError = '';
     } finally {
       if (!abort.signal.aborted) {
         view.listFetch = null;
         view.results.removeAttribute('aria-busy');
+        renderSyncStatus();
         syncLivePoll();
       }
     }
@@ -2554,6 +2605,7 @@
       void refreshActivityView(view);
     }
     else if (latestState) renderLiveOverview(latestState);
+    renderSyncStatus();
     syncLivePoll();
   }
 
@@ -2729,8 +2781,8 @@
       selectRatioRange(btn.dataset.ratioRange);
       return;
     }
-    if (btn.id === 'refresh-btn') {
-      refreshState({ manual: true });
+    if (btn.id === 'refresh-btn' || btn.id === 'sync-retry') {
+      refreshState({ manual: btn.id === 'refresh-btn' });
       void refreshActivityView(activityViews[activeTab]);
       return;
     }
@@ -2777,6 +2829,6 @@
   updateRatioRangeControls();
   refreshState();
   setInterval(() => {
-    if (document.visibilityState === 'visible') refreshState();
+    if (document.visibilityState === 'visible' && !stateFetch) refreshState();
   }, POLL_MS);
 })();

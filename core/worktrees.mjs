@@ -1,8 +1,15 @@
 import { spawnSync } from 'node:child_process';
-import { lstatSync, mkdirSync, readdirSync, statSync } from 'node:fs';
+import { lstatSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
-import { resolvePath, validateSessionId, withinPath } from './state.mjs';
+import { listActiveRoster } from './runs.mjs';
+import { resolveSessionsDir } from './config.mjs';
+import { atomicJson, resolvePath, validateSessionId, withLockSync, withinPath } from './state.mjs';
+
+const sameOrWithin = (candidate, root) => {
+  const fold = (p) => process.platform === 'win32' ? p.toLowerCase() : p;
+  return withinPath(fold(candidate), fold(root));
+};
 
 export function worktreesRoot(env = process.env) {
   const override = env.GEMPT_WORKTREES_DIR?.trim();
@@ -67,7 +74,62 @@ export function ensureShareWorktree(cwd, sessionId, env = process.env) {
   };
 }
 
-export function removeShareWorktree(sourceRepo, worktreeRoot, env = process.env) {
+export function syncPrunedWorktreeSessions(sourceRepo, worktreeRoot, sessionsDir) {
+  const updated = [];
+  if (!sessionsDir) return updated;
+  const repoRoot = resolvePath(sourceRepo);
+  const target = resolvePath(worktreeRoot);
+  let entries;
+  try {
+    entries = readdirSync(sessionsDir, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT') return updated;
+    throw error;
+  }
+  const nowIso = new Date().toISOString();
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    const file = join(sessionsDir, entry.name);
+    let session;
+    try {
+      session = JSON.parse(readFileSync(file, 'utf8'));
+    } catch {
+      continue;
+    }
+    if (!session || typeof session !== 'object' || Array.isArray(session)) continue;
+    const wtPath = typeof session.worktree_path === 'string' && session.worktree_path.trim()
+      ? resolvePath(session.worktree_path) : '';
+    const cwdPath = typeof session.cwd === 'string' && session.cwd.trim()
+      ? resolvePath(session.cwd) : '';
+    const refsWorktree = (wtPath && sameOrWithin(wtPath, target)) || (cwdPath && sameOrWithin(cwdPath, target));
+    if (!refsWorktree) continue;
+    let fallbackCwd = repoRoot;
+    if (typeof session.source_cwd === 'string' && session.source_cwd.trim()) {
+      const src = resolvePath(session.source_cwd);
+      if (sameOrWithin(src, repoRoot) && statSync(src, { throwIfNoEntry: false })?.isDirectory()) {
+        fallbackCwd = src;
+      }
+    } else if (cwdPath && sameOrWithin(cwdPath, target)) {
+      const subdir = relative(target, cwdPath);
+      const mapped = resolvePath(join(repoRoot, subdir));
+      if (sameOrWithin(mapped, repoRoot) && statSync(mapped, { throwIfNoEntry: false })?.isDirectory()) {
+        fallbackCwd = mapped;
+      }
+    }
+    atomicJson(file, {
+      ...session,
+      cwd: fallbackCwd,
+      worktree_path: null,
+      worktree_pruned_at: nowIso,
+      pruned_worktree_path: session.worktree_path || target,
+      updated_at: nowIso,
+    });
+    updated.push(session.session_id || entry.name.slice(0, -5));
+  }
+  return updated;
+}
+
+export function removeShareWorktree(sourceRepo, worktreeRoot, env = process.env, { sessionsDir } = {}) {
   const root = worktreesRoot(env);
   if (!lstatSync(worktreeRoot, { throwIfNoEntry: false })?.isDirectory()) return false;
   const target = resolvePath(worktreeRoot);
@@ -78,10 +140,16 @@ export function removeShareWorktree(sourceRepo, worktreeRoot, env = process.env)
   const head = git(target, ['rev-parse', 'HEAD'], env);
   if (status.status !== 0 || status.stdout || head.status !== 0
       || git(source, ['merge-base', '--is-ancestor', head.stdout.trim(), 'HEAD'], env).status !== 0) return false;
-  return git(source, ['worktree', 'remove', target], env).status === 0;
+  const removed = git(source, ['worktree', 'remove', target], env).status === 0;
+  if (removed) {
+    const repoRoot = gitPath(source, '--show-toplevel', env) || source;
+    syncPrunedWorktreeSessions(repoRoot, target, sessionsDir ?? resolveSessionsDir(env.GEMPT_SESSIONS_DIR));
+  }
+  return removed;
 }
 
-export function pruneShareWorktrees(sourceRepo, { activePaths = new Set(), maxAgeMs = 7 * 24 * 3600 * 1000, env = process.env } = {}) {
+export function pruneShareWorktrees(sourceRepo, { activePaths = new Set(), maxAgeMs = 7 * 24 * 3600 * 1000, env = process.env,
+  sessionsDir = resolveSessionsDir(env.GEMPT_SESSIONS_DIR) } = {}) {
   const root = worktreesRoot(env);
   const repoRoot = gitPath(resolvePath(sourceRepo), '--show-toplevel', env);
   if (!repoRoot) return { removed: [], kept: [] };
@@ -107,7 +175,12 @@ export function pruneShareWorktrees(sourceRepo, { activePaths = new Set(), maxAg
       kept.push(candidate);
       continue;
     }
-    if (removeShareWorktree(repoRoot, candidate, env)) removed.push(candidate);
+    const pruned = withLockSync(join(sessionsDir, `${entry.name}.dispatch.lock`), () => {
+      const busy = listActiveRoster({ limit: Infinity, sessionsDir, includeUnconfirmed: true }).some(({ worktree_path: path, cwd: runCwd }) =>
+        (path && sameOrWithin(resolvePath(path), candidate)) || (runCwd && sameOrWithin(resolvePath(runCwd), candidate)));
+      return !busy && removeShareWorktree(repoRoot, candidate, env, { sessionsDir });
+    }, { staleMs: 120_000 });
+    if (pruned) removed.push(candidate);
     else kept.push(candidate);
   }
   git(repoRoot, ['worktree', 'prune'], env);

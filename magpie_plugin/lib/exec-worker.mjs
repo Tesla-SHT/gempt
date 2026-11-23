@@ -2,7 +2,7 @@ import { createExecutionTools } from './tools.mjs';
 import { readRun, saveRun } from '../../core/runs.mjs';
 import { TurnInterrupted } from './app-server-run.mjs';
 import { join } from 'node:path';
-import { withLock } from '../../core/state.mjs';
+import { lockStaleMsForBudget, withLock } from '../../core/state.mjs';
 
 const chunks = [];
 for await (const chunk of process.stdin) chunks.push(chunk);
@@ -10,16 +10,30 @@ const { file, record, args, host, agent } = JSON.parse(Buffer.concat(chunks).toS
 const running = { ...record, state: 'running', pid: process.pid, started_at: new Date().toISOString() };
 let outcome;
 try {
-  saveRun(file, running);
-  const tools = createExecutionTools({ ...host, execRunFile: file, newExecSession: record.session_id });
-  const result = await withLock(join(host.sessionsDir, `${record.session_id}.node.lock`),
-    () => tools.exec.execute({ ...args, run_id: record.run_id }, { agent }),
-    { attempts: 240, delayMs: 25 });
-  outcome = { state: 'finished', result };
+  const started = await withLock(join(host.sessionsDir, `${record.session_id}.dispatch.lock`), () => {
+    if (readRun(record.run_id, host.sessionsDir).state !== 'queued') return false;
+    saveRun(file, running);
+    return true;
+  }, { attempts: 80, delayMs: 25 });
+  if (started) {
+    const tools = createExecutionTools({ ...host, execRunFile: file, newExecSession: record.session_id });
+    const result = await withLock(join(host.sessionsDir, `${record.session_id}.node.lock`),
+      () => tools.exec.execute({ ...args, run_id: record.run_id }, { agent }),
+      { attempts: 240, delayMs: 25, staleMs: lockStaleMsForBudget(Number(args?.timeout_sec) || 3600) });
+    outcome = { state: 'finished', result };
+  }
 } catch (err) {
-  outcome = { state: err instanceof TurnInterrupted ? 'interrupted' : 'failed', error: String(err?.message || err) };
+  outcome = { state: err instanceof TurnInterrupted ? 'interrupted' : 'failed', error: String(err?.message || err),
+    ...(err?.remoteTurnUnconfirmed ? { remote_turn_unconfirmed: true, unconfirmed_at: new Date().toISOString() } : {}) };
 }
-const latest = readRun(record.run_id, host.sessionsDir);
-const finished = { ...latest, ...outcome, pending_tool_call: null, finished_at: new Date().toISOString() };
-if (finished.progress) Object.assign(finished.progress, { phase: outcome.state, updated_at: finished.finished_at });
-saveRun(file, finished);
+
+if (outcome) {
+  const latest = readRun(record.run_id, host.sessionsDir);
+  const finished = { ...latest, ...outcome, pending_tool_call: null, waiting_since: null, finished_at: new Date().toISOString() };
+  if (!outcome.remote_turn_unconfirmed) {
+    delete finished.remote_turn_unconfirmed;
+    delete finished.unconfirmed_at;
+  }
+  if (finished.progress) Object.assign(finished.progress, { phase: outcome.state, updated_at: finished.finished_at });
+  saveRun(file, finished);
+}

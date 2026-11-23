@@ -2,7 +2,7 @@ import { execFile, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync,
-  readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
+  readFileSync, readdirSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, delimiter, dirname, join } from 'node:path';
@@ -155,32 +155,160 @@ async function validate(staged, nodeBin, env) {
   return validatePluginBundle(staged, nodeBin, env, { portable: false });
 }
 
-function syncInPlace(staged, target) {
-  mkdirSync(target, { recursive: true });
-  const expected = new Set(readdirSync(staged));
-  for (const name of expected) {
-    const src = join(staged, name);
-    const dst = join(target, name);
-    const directory = statSync(src).isDirectory();
-    const existing = lstatSync(dst, { throwIfNoEntry: false });
-    if (existing && (existing.isSymbolicLink() || directory !== existing.isDirectory())) {
-      rmSync(dst, { recursive: true, force: true });
-    }
-    if (directory) {
-      syncInPlace(src, dst);
-    } else {
-      const tmp = join(target, `.gempt-${randomUUID()}.tmp`);
-      try {
-        copyFileSync(src, tmp);
-        renameSync(tmp, dst);
-      } finally {
-        rmSync(tmp, { force: true });
+function restoreFile(backupPath, dst) {
+  mkdirSync(dirname(dst), { recursive: true });
+  const tmp = join(dirname(dst), `.gempt-restore-${randomUUID()}.tmp`);
+  try {
+    copyFileSync(backupPath, tmp);
+    renameSync(tmp, dst);
+  } catch {
+    copyFileSync(backupPath, dst);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+function rollbackInPlace(actions) {
+  const errors = [];
+  for (let i = actions.length - 1; i >= 0; i--) {
+    const action = actions[i];
+    try {
+      if (action.type === 'created-file') {
+        rmSync(action.dst, { force: true });
+      } else if (action.type === 'created-dir') {
+        rmSync(action.dst, { recursive: true, force: true });
+      } else if (action.type === 'restore-file') {
+        restoreFile(action.backupPath, action.dst);
+      } else if (action.type === 'restore-moved') {
+        if (lstatSync(action.dst, { throwIfNoEntry: false })) {
+          rmSync(action.dst, { recursive: true, force: true });
+        }
+        try {
+          renameSync(action.backupPath, action.dst);
+        } catch {
+          cpSync(action.backupPath, action.dst, { recursive: true, verbatimSymlinks: true });
+        }
+      } else if (action.type === 'restore-entry') {
+        if (lstatSync(action.dst, { throwIfNoEntry: false })) {
+          rmSync(action.dst, { recursive: true, force: true });
+        }
+        if (action.isSymbolicLink && action.linkTarget !== undefined) {
+          symlinkSync(action.linkTarget, action.dst);
+        } else if (action.isDirectory) {
+          cpSync(action.backupPath, action.dst, { recursive: true, verbatimSymlinks: true });
+        } else {
+          restoreFile(action.backupPath, action.dst);
+        }
       }
+    } catch (rollbackError) {
+      errors.push(`${action.dst}: ${rollbackError.message}`);
     }
   }
-  for (const name of readdirSync(target)) {
-    if (!expected.has(name)) {
-      try { rmSync(join(target, name), { recursive: true, force: true }); } catch {}
+  return errors;
+}
+
+export async function syncInPlace(staged, target, { backupDir, verify } = {}) {
+  const ownBackup = !backupDir;
+  const backupRoot = backupDir || mkdtempSync(join(dirname(target), `.${basename(target)}-inplace-backup-`));
+  mkdirSync(backupRoot, { recursive: true });
+  const actions = [];
+  let seq = 0;
+  let keepBackup = false;
+
+  const nextBackupPath = (name) => join(backupRoot, `${seq++}-${name}`);
+
+  const backupAndRemoveEntry = (dst, existing) => {
+    const backupPath = nextBackupPath(basename(dst));
+    try {
+      renameSync(dst, backupPath);
+      actions.push({ type: 'restore-moved', dst, backupPath });
+      return;
+    } catch {
+      if (existing.isSymbolicLink()) {
+        const linkTarget = readlinkSync(dst);
+        rmSync(dst, { force: true });
+        actions.push({ type: 'restore-entry', dst, isSymbolicLink: true, linkTarget });
+        return;
+      }
+      if (existing.isDirectory()) {
+        cpSync(dst, backupPath, { recursive: true, verbatimSymlinks: true });
+        actions.push({ type: 'restore-entry', dst, backupPath, isDirectory: true });
+        rmSync(dst, { recursive: true, force: true });
+        return;
+      }
+      copyFileSync(dst, backupPath);
+      rmSync(dst, { force: true });
+      actions.push({ type: 'restore-entry', dst, backupPath, isDirectory: false });
+    }
+  };
+
+  const syncDir = (srcDir, dstDir) => {
+    if (!lstatSync(dstDir, { throwIfNoEntry: false })) {
+      mkdirSync(dstDir, { recursive: true });
+      actions.push({ type: 'created-dir', dst: dstDir });
+    }
+    const expected = new Set(readdirSync(srcDir));
+    for (const name of expected) {
+      const src = join(srcDir, name);
+      const dst = join(dstDir, name);
+      const directory = statSync(src).isDirectory();
+      const existing = lstatSync(dst, { throwIfNoEntry: false });
+      if (existing && (existing.isSymbolicLink() || directory !== existing.isDirectory())) {
+        backupAndRemoveEntry(dst, existing);
+      }
+      if (directory) {
+        syncDir(src, dst);
+      } else {
+        const current = lstatSync(dst, { throwIfNoEntry: false });
+        let backupPath;
+        if (current) {
+          backupPath = nextBackupPath(name);
+          copyFileSync(dst, backupPath);
+        }
+        const tmp = join(dstDir, `.gempt-${randomUUID()}.tmp`);
+        try {
+          copyFileSync(src, tmp);
+          renameSync(tmp, dst);
+        } finally {
+          rmSync(tmp, { force: true });
+        }
+        if (backupPath) {
+          actions.push({ type: 'restore-file', dst, backupPath });
+        } else {
+          actions.push({ type: 'created-file', dst });
+        }
+      }
+    }
+    for (const name of readdirSync(dstDir)) {
+      if (!expected.has(name)) {
+        const obsolete = join(dstDir, name);
+        const backupPath = nextBackupPath(name);
+        try {
+          renameSync(obsolete, backupPath);
+          actions.push({ type: 'restore-moved', dst: obsolete, backupPath });
+        } catch {}
+      }
+    }
+  };
+
+  try {
+    syncDir(staged, target);
+    if (verify) await verify(target);
+  } catch (error) {
+    const rollbackErrors = rollbackInPlace(actions);
+    if (rollbackErrors.length > 0) {
+      keepBackup = true;
+      const rollbackError = new Error(
+        `In-place update of ${target} failed and rollback encountered errors (${rollbackErrors.join('; ')}). Backup saved at ${backupRoot}.`,
+        { cause: error },
+      );
+      rollbackError.backupPath = backupRoot;
+      throw rollbackError;
+    }
+    throw error;
+  } finally {
+    if (ownBackup && !keepBackup) {
+      try { rmSync(backupRoot, { recursive: true, force: true }); } catch {}
     }
   }
 }
@@ -266,7 +394,15 @@ export async function installAgy({ target = DEFAULT_AGY_TARGET, source, force = 
           throw error;
         }
         if (!WINDOWS || !['EACCES', 'EBUSY', 'EPERM'].includes(error.code) || !existsSync(target)) throw error;
-        syncInPlace(staged, target);
+        try {
+          await syncInPlace(staged, target, {
+            backupDir: join(workspace, 'inplace-backup'),
+            verify: (dir) => validate(dir, nodeBin, env),
+          });
+        } catch (syncError) {
+          if (syncError?.backupPath) keepBackup = true;
+          throw syncError;
+        }
       }
       resetWindowsAcls([target]);
       const resolvedBinDir = resolvePath(binDir);

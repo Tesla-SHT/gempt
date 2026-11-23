@@ -26,12 +26,31 @@ export function withinPath(path, root) {
   return !isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`);
 }
 
+export const SESSION_ID_MAX_LEN = 128;
+export const DEFAULT_LOCK_STALE_MS = 300_000;
+const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const RESERVED_WIN_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
+
+export function isValidSessionId(sessionId) {
+  return typeof sessionId === 'string'
+    && SESSION_ID_RE.test(sessionId)
+    && !sessionId.includes('..')
+    && !sessionId.endsWith('.')
+    && !RESERVED_WIN_NAME.test(sessionId);
+}
+
 export function validateSessionId(sessionId) {
   const id = typeof sessionId === 'string' ? sessionId.trim() : '';
-  if (!/^[A-Za-z0-9_.-]+$/.test(id) || id.includes('..') || id === '.') {
+  if (!isValidSessionId(id)) {
     throw new Error(`Invalid session_id '${sessionId}'`);
   }
   return id;
+}
+
+export function lockStaleMsForBudget(timeoutSec) {
+  const budgetSec = Number(timeoutSec);
+  const budgetMs = Number.isFinite(budgetSec) && budgetSec > 0 ? Math.ceil(budgetSec * 1000) + 60_000 : 0;
+  return Math.max(DEFAULT_LOCK_STALE_MS, budgetMs);
 }
 
 export function atomicJson(path, data, { exclusive = false } = {}) {
@@ -60,7 +79,6 @@ function unlinkOwnedLock(path, owner) {
 }
 
 function staleLock(fd, info, staleMs) {
-  if (Date.now() - info.mtimeMs > staleMs) return true;
   const record = /^([1-9]\d*):\d+$/.exec(readFileSync(fd, 'utf8').trim());
   const pid = Number(record?.[1]);
   if (!record || pid > 0x7fffffff) return true;
@@ -68,7 +86,8 @@ function staleLock(fd, info, staleMs) {
     process.kill(pid, 0);
     return false;
   } catch (error) {
-    return error.code === 'ESRCH';
+    if (error.code === 'ESRCH') return true;
+    return false;
   }
 }
 
@@ -89,7 +108,7 @@ function reclaimLock(path, staleMs) {
 
 const syncWaitBuf = new Int32Array(new SharedArrayBuffer(4));
 
-export function withLockSync(path, operation, { attempts = 80, delayMs = 25, staleMs = 60_000 } = {}) {
+export function withLockSync(path, operation, { attempts = 80, delayMs = 25, staleMs = DEFAULT_LOCK_STALE_MS } = {}) {
   const parent = dirname(path);
   mkdirSync(parent, { recursive: true });
   const temp = join(parent, `.gempt-${randomUUID()}.tmp`);
@@ -121,7 +140,7 @@ export function withLockSync(path, operation, { attempts = 80, delayMs = 25, sta
   }
 }
 
-export async function withLock(path, operation, { attempts = 25, delayMs = 25, staleMs = 60_000 } = {}) {
+export async function withLock(path, operation, { attempts = 25, delayMs = 25, staleMs = DEFAULT_LOCK_STALE_MS } = {}) {
   const parent = dirname(path);
   mkdirSync(parent, { recursive: true });
   const temp = join(parent, `.gempt-${randomUUID()}.tmp`);

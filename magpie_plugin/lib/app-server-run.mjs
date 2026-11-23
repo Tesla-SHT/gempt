@@ -6,12 +6,18 @@ import { saveRun, toolReplyPath } from '../../core/runs.mjs';
 export class TurnInterrupted extends Error {}
 
 export async function runAppServer({ configPath, env, runFile, sessionId, onIdentity, prompt, cwd, model,
-  effort, sandbox, approvalPolicy, threadId, gatewayUrl, timeoutSec, sandboxUpgraded }) {
+  effort, sandbox, approvalPolicy, threadId, gatewayUrl, timeoutSec, sandboxUpgraded, interruptConfirmMs = 800 }) {
   const start = Date.now();
-  const deadline = start + timeoutSec * 1000;
-  const remaining = () => Math.max(1, deadline - Date.now());
+  let deadline = start + timeoutSec * 1000;
+  let pausedAt = null;
+  let pausedMs = 0;
+  let timerArmed = false;
+  const remaining = () => Math.max(1, deadline - (pausedAt ?? Date.now()));
   const directory = dirname(runFile);
   const record = JSON.parse(readFileSync(runFile, 'utf8'));
+  if (Number.isFinite(record.deadline)) {
+    record.deadline = Math.max(record.deadline, deadline / 1000 + 60);
+  }
   const state = readAppServerState(configPath, env);
   if (state.gateway_url?.replace(/\/+$/, '') !== gatewayUrl) {
     throw new Error('共享 codex app-server 的 Magpie 网关与 GemPT 配置不一致。');
@@ -24,7 +30,9 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
   let lastWrite = 0;
   let client;
   let acceptTurn = false;
+  let observedTurnId;
   let terminal;
+  let confirmResolve;
   let complete;
   let fail;
   const completion = new Promise((resolve, reject) => { complete = resolve; fail = reject; });
@@ -32,6 +40,41 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
   completion.catch(() => {});
   const progress = { phase: 'connecting', thread_id: threadId || null, turn_id: null, last_message: '',
     recent_commands: [], touched_files: [], token_usage: {} };
+  let poll;
+  let timeout;
+  const armTimeout = () => {
+    clearTimeout(timeout);
+    timeout = undefined;
+    if (!timerArmed || pausedAt !== null || terminal) return;
+    timeout = setTimeout(() => fail(new Error(`Codex turn timed out after ${timeoutSec}s.`)), remaining());
+  };
+  const finishPause = () => {
+    if (pausedAt === null) return;
+    const deltaMs = Math.max(0, Date.now() - pausedAt);
+    pausedAt = null;
+    pausedMs += deltaMs;
+    deadline += deltaMs;
+    record.waiting_since = null;
+    record.waiting_gemini_sec = Math.round((pausedMs / 1000) * 1000) / 1000;
+    if (Number.isFinite(record.deadline)) record.deadline += deltaMs / 1000;
+  };
+  const notifyTerminal = (turn) => {
+    terminal = turn;
+    confirmResolve?.(turn);
+  };
+  const waitForTerminal = (ms, socketClient) => {
+    if (terminal || ms <= 0) return Promise.resolve(terminal);
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        confirmResolve = undefined;
+        resolve(terminal);
+      };
+      const timer = setTimeout(done, ms);
+      confirmResolve = done;
+      socketClient?.onFailure?.(done);
+    });
+  };
   const save = (force = false) => {
     if (force || Date.now() - lastWrite >= 500) {
       lastWrite = Date.now();
@@ -48,6 +91,15 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
   };
   const pendingChanged = () => {
     const pending = tools.values().next().value;
+    if (pending && pausedAt === null) {
+      pausedAt = Date.now();
+      clearTimeout(timeout);
+      timeout = undefined;
+      record.waiting_since = new Date(pausedAt).toISOString();
+    } else if (!pending && pausedAt !== null) {
+      finishPause();
+      armTimeout();
+    }
     record.pending_tool_call = pending || null;
     progress.phase = record.state = pending ? 'waiting_gemini' : 'running';
     save(true);
@@ -79,10 +131,14 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
       if (id !== undefined) client.reject(id);
       return;
     }
-    appendFileSync(join(directory, 'events.jsonl'), JSON.stringify({ method, params, id, ...extra }) + '\n');
     const related = eventThread === progress.thread_id;
     const eventTurn = params.turnId ?? params.turn?.id;
     const sameTurn = !eventTurn || !progress.turn_id || eventTurn === progress.turn_id;
+    if (acceptTurn && related && sameTurn && eventTurn) {
+      if (method === 'turn/started' || method === 'item/tool/call') observedTurnId = eventTurn;
+      else if (method === 'turn/completed') notifyTerminal(params.turn);
+    }
+    appendFileSync(join(directory, 'events.jsonl'), JSON.stringify({ method, params, id, ...extra }) + '\n');
     if (id !== undefined) {
       if (!related || !sameTurn || terminal) {
         client.reject(id);
@@ -107,8 +163,10 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
         identity(params.threadId, eventTurn);
         break;
       case 'turn/completed':
+        finishPause();
+        clearTimeout(timeout);
+        timeout = undefined;
         identity(params.threadId, eventTurn);
-        terminal = params.turn;
         tools.clear();
         record.state = 'running';
         record.pending_tool_call = null;
@@ -142,8 +200,6 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     }
   };
 
-  let poll;
-  let timeout;
   save(true);
   try {
     client = await connectAppServer(state, onEvent);
@@ -183,7 +239,8 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
         if (!['ENOENT', 'EPERM', 'EBUSY'].includes(err.code)) fail(err);
       }
     }, 100);
-    timeout = setTimeout(() => fail(new Error(`Codex turn timed out after ${timeoutSec}s.`)), remaining());
+    timerArmed = true;
+    armTimeout();
     const turn = await completion;
     if (turn.status === 'interrupted') throw new TurnInterrupted('Codex turn interrupted.');
     if (turn.status !== 'completed') throw new Error(turn.error?.message || `Codex turn ${turn.status}.`);
@@ -192,8 +249,35 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     return { threadId: progress.thread_id, turnId: progress.turn_id, sandbox: Object.keys(SANDBOX_TYPES)[actual],
       text, elapsedSec: (Date.now() - start) / 1000, commands: [...commands.values()], usage };
   } catch (err) {
-    if (err.message.includes('timed out') && progress.turn_id) {
-      await client.request('turn/interrupt', { threadId: progress.thread_id, turnId: progress.turn_id }).catch(() => {});
+    clearInterval(poll);
+    clearTimeout(timeout);
+    timeout = undefined;
+    const turnId = progress.turn_id ?? observedTurnId;
+    if (!terminal && turnId) {
+      const params = { threadId: progress.thread_id, turnId };
+      let recovery;
+      try {
+        if (client && !client.disconnected) {
+          await client.request('turn/interrupt', params);
+          if (!terminal) await waitForTerminal(interruptConfirmMs, client);
+        }
+      } catch { /* If the socket failed during the interrupt, try a fresh connection. */ }
+      if (!terminal && (!client || client.disconnected)) {
+        try {
+          recovery = await connectAppServer(state, ({ method, params: event }) => {
+            if (method === 'turn/completed' && event?.threadId === params.threadId && event.turn?.id === params.turnId) {
+              notifyTerminal(event.turn);
+            }
+          });
+          await recovery.request('turn/interrupt', params);
+          if (!terminal) await waitForTerminal(interruptConfirmMs, recovery);
+        } catch { /* The original turn state is still unknown. */ }
+        finally { recovery?.close(); }
+      }
+    }
+    if (acceptTurn && !terminal) {
+      throw Object.assign(new Error(`Remote Codex turn may still be running (no terminal status confirmed). ${err.message}`,
+        { cause: err }), { remoteTurnUnconfirmed: true });
     }
     throw err;
   } finally {

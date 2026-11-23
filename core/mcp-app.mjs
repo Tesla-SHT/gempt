@@ -1,13 +1,13 @@
 import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readJsonSafe, workspaceName } from '../magpie_plugin/lib/backend.mjs';
 import { ACTIVE_STATES, interruptRun, readRun, runDirectory, stateEntries, steerRun } from './runs.mjs';
 import { readHostContext } from './host-context.mjs';
 import { resolvePath, withinPath } from './state.mjs';
 
 const APP_VERSION = readJsonSafe(new URL('../package.json', import.meta.url))?.version
-  || readJsonSafe(new URL('../../plugin.json', import.meta.url))?.version || '0.4.0';
+  || readJsonSafe(new URL('../../plugin.json', import.meta.url))?.version || '0.4.1';
 
 export const APP_URI = 'ui://gempt/live.html';
 export const APP_RESOURCE = {
@@ -39,7 +39,8 @@ function tool(name, description, properties, required) {
 }
 
 export const APP_TOOLS = Object.fromEntries([
-  tool('gempt_app_runs', 'List runs in GemPT Live.', { limit: { type: 'integer', minimum: 1, maximum: 50 }, ...SCOPE }),
+  tool('gempt_app_runs', 'List runs in GemPT Live.', { limit: { type: 'integer', minimum: 1, maximum: 50 },
+    offset: { type: 'integer', minimum: 0 }, ...SCOPE }),
   tool('gempt_app_stream', 'Read a run snapshot or continue a long transcript.', {
     run_id: RUN_ID, max_events: { type: 'integer', minimum: 1, maximum: 200 },
     text_offset: { type: 'integer', minimum: 0 }, text_revision: { type: 'integer', minimum: 1 },
@@ -130,12 +131,16 @@ function runSummary(record, compact = false) {
   const elapsed = number(result.elapsed_sec) ?? (started === null ? null
     : Math.round(Math.max(0, (finished ?? Date.now() / 1000) - started) * 10) / 10);
   const lastCommand = array(progress.recent_commands).at(-1);
+  const remoteTurnUnconfirmed = Boolean(record.remote_turn_unconfirmed);
   return {
     run_id: record.run_id, session_id: text(record.session_id, 128), state: text(record.state, 32),
     cwd: bounded(record.cwd, 8192), worktree_path: bounded(record.worktree_path, 8192) || null,
     title: record.title, workspace_name: bounded(workspaceName(record.source_cwd || record.cwd), 512),
     host_conversation_id: record.host_conversation_id ?? null,
     can_control: Boolean(['running', 'waiting_gemini'].includes(record.state) && record.codex_thread_id && record.turn_id),
+    can_interrupt: Boolean(remoteTurnUnconfirmed
+      || (['running', 'waiting_gemini'].includes(record.state) && record.codex_thread_id && record.turn_id)),
+    remote_turn_unconfirmed: remoteTurnUnconfirmed,
     model: text(result.model || record.model, 128), tier: text(result.tier || record.tier, 64),
     goal: bounded(record.goal, compact ? 512 : GOAL_BYTES), last_message: text(progress.last_message || result.text, 200),
     last_command: text(typeof lastCommand === 'string' ? lastCommand : lastCommand?.command, 160),
@@ -158,7 +163,7 @@ function workspaceRun(id, { root, sessionsDir }) {
 }
 
 function listRuns(args, { root, configPath, sessionsDir }) {
-  const context = readHostContext(configPath);
+  const context = readHostContext(configPath, root);
   const active = typeof context.conversation_id === 'string' ? context.conversation_id : null;
   const bound = args.host_conversation_id || active || null;
   const scope = args.scope ?? 'session';
@@ -177,10 +182,19 @@ function listRuns(args, { root, configPath, sessionsDir }) {
     }
   }
   items.sort((left, right) => Number(ACTIVE_STATES.has(right.state)) - Number(ACTIVE_STATES.has(left.state)));
+  const offset = args.offset ?? 0;
+  const limit = args.limit ?? (scope === 'all' ? Infinity : 20);
+  let budget = TEXT_BYTES;
+  const runs = [];
+  for (const item of items.slice(offset, offset + limit)) {
+    budget -= jsonSize(item) + 2;
+    if (budget < 0) break;
+    runs.push(item);
+  }
   return {
-    bound_conversation_id: bound, scope, unbound_session: !bound && scope === 'session',
+    active_conversation_id: active, bound_conversation_id: bound, scope, unbound_session: !bound && scope === 'session',
     bound_workspace_name: workspace, session_count: sessionCount,
-    runs: withinBudget(items.slice(0, args.limit ?? 20), TEXT_BYTES),
+    runs, next_offset: runs.length && offset + runs.length < items.length ? offset + runs.length : null,
     app_server: { name: 'gempt', version: APP_VERSION },
   };
 }
@@ -341,6 +355,35 @@ function readJournal(path, record) {
   }
 }
 
+function resolveAllowedFileUri(file, { cwd, allowedRoots }) {
+  if (typeof file !== 'string') return { allowed: false, reason: 'outside_workspace' };
+  const raw = file.trim();
+  if (!raw || /[\x00-\x1f\x7f]/.test(raw) || !allowedRoots.length) {
+    return { allowed: false, reason: 'outside_workspace' };
+  }
+  try {
+    let resolved;
+    const windowsPath = /^[a-z]:[\\/]/i.test(raw);
+    if (!windowsPath && /^[a-z][a-z\d+.-]*:/i.test(raw)) {
+      if (!/^file:\/\//i.test(raw)) return { allowed: false, reason: 'outside_workspace' };
+      const parsed = new URL(raw);
+      if (parsed.protocol !== 'file:' || parsed.hostname || parsed.username || parsed.password) {
+        return { allowed: false, reason: 'outside_workspace' };
+      }
+      resolved = resolvePath(fileURLToPath(parsed));
+    } else {
+      if (!cwd && !isAbsolute(raw)) return { allowed: false, reason: 'outside_workspace' };
+      resolved = resolvePath(cwd ? resolve(cwd, raw) : raw);
+    }
+    if (allowedRoots.some((base) => withinPath(resolved, base))) {
+      return { allowed: true, uri: pathToFileURL(resolved).href };
+    }
+  } catch {
+    // Unresolvable or malformed path stays restricted.
+  }
+  return { allowed: false, reason: 'outside_workspace' };
+}
+
 function stream(record, args, { root, sessionsDir }) {
   const journal = readJournal(join(runDirectory(record.run_id, sessionsDir), 'events.jsonl'), record);
   const offset = args.text_offset || 0;
@@ -371,13 +414,39 @@ function stream(record, args, { root, sessionsDir }) {
   }
   const files = journal.files.size ? [...journal.files] : array(progress.touched_files).filter((file) => typeof file === 'string');
   const touched = withinBudget([...files].reverse(), 8 * 1024).reverse();
-  const cwd = resolvePath(record.cwd);
-  const uris = touched.flatMap((file) => {
-    try {
-      const path = resolvePath(resolve(cwd, file));
-      return withinPath(path, root || cwd) ? [[file, pathToFileURL(path).href]] : [];
-    } catch { return []; }
-  });
+  const cwd = typeof record.cwd === 'string' && isAbsolute(record.cwd) ? resolvePath(record.cwd) : null;
+  const allowedRoots = [];
+  if (root) {
+    allowedRoots.push(root);
+    if (typeof record.worktree_path === 'string' && isAbsolute(record.worktree_path) && inWorkspace(record.source_cwd, root)) {
+      allowedRoots.push(resolvePath(record.worktree_path));
+    }
+  } else if (cwd) {
+    allowedRoots.push(cwd);
+  }
+  const candidateFiles = [];
+  const seenFiles = new Set();
+  const addCandidate = (file) => {
+    if (typeof file !== 'string' || seenFiles.has(file)) return;
+    seenFiles.add(file);
+    candidateFiles.push(file);
+  };
+  for (const file of touched) addCandidate(file);
+  for (const row of timeline) {
+    if (row.type === 'files') {
+      for (const file of array(row.paths)) addCandidate(file);
+    } else if (row.type === 'ask_gemini') {
+      for (const file of array(row.arguments?.media_paths)) addCandidate(file);
+    }
+  }
+  for (const file of array(record.pending_tool_call?.arguments?.media_paths)) addCandidate(file);
+  const uris = [];
+  const restricted = [];
+  for (const file of candidateFiles) {
+    const check = resolveAllowedFileUri(file, { cwd, allowedRoots });
+    if (check.allowed) uris.push([file, check.uri]);
+    else restricted.push([file, check.reason]);
+  }
   const totals = usage(firstObject(result.usage, journal.usage, progress.token_usage, record.usage));
   const input = totals.input_tokens ?? 0;
   const cached = totals.cached_input_tokens;
@@ -385,7 +454,8 @@ function stream(record, args, { root, sessionsDir }) {
     run: { ...runSummary(record), usage: totals }, timeline: withinBudget(timeline.reverse(), 56 * 1024).reverse(),
     ...journal.textPage(fullText), commands: withinBudget(commands.reverse(), 48 * 1024).reverse(),
     next_goal_offset: pageText(record.goal, 0, GOAL_BYTES).next_text_offset,
-    touched_files: touched, file_uris: Object.fromEntries(withinBudget(uris, 24 * 1024)), usage: totals,
+    touched_files: touched, file_uris: Object.fromEntries(withinBudget(uris, 24 * 1024)),
+    restricted_files: Object.fromEntries(withinBudget(restricted, 8 * 1024)), usage: totals,
     cache_hit_rate: input > 0 && cached !== undefined ? Math.min(cached, input) / input : null,
   };
 }
@@ -414,17 +484,22 @@ export async function callAppTool(name, args = {}, opts = {}) {
   if (!schema) throw new Error(`Unknown tool: ${name}`);
   checkArgs(name, args, schema);
   if (name === 'gempt_app_runs') return result('GemPT Live runs.', listRuns(args, options));
-  let record = args.run_id ? workspaceRun(args.run_id, options) : null;
   if (live) {
     const data = listRuns(args, options);
-    if (data.scope === 'session' && record?.host_conversation_id !== data.bound_conversation_id) record = null;
-    for (const run of data.runs) {
-      if (record) break;
-      try { record = workspaceRun(run.run_id, options); } catch { /* The run can disappear after listing. */ }
+    const id = args.run_id ?? data.runs[0]?.run_id;
+    let record;
+    if (id) {
+      try { record = readRun(id, options.sessionsDir); } catch (error) {
+        if (error.status !== 404) throw error;
+      }
+      if (record && (!inWorkspace(record.source_cwd || record.cwd, options.root) ||
+          (data.scope === 'session' && (!data.bound_conversation_id ||
+           record.host_conversation_id !== data.bound_conversation_id)))) record = null;
     }
     return result('Opened GemPT Live.', { ...data, run_id: record?.run_id ?? null,
-      requested_run: Boolean(args.run_id), stream: record ? stream(record, {}, options) : null });
+      requested_run: Boolean(args.run_id && record), stream: record ? stream(record, {}, options) : null });
   }
+  const record = workspaceRun(args.run_id, options);
   if (name === 'gempt_app_stream') {
     if (args.goal_offset !== undefined) {
       const page = pageText(record.goal, args.goal_offset, GOAL_BYTES);

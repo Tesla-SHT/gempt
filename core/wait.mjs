@@ -45,8 +45,9 @@ export async function runWait(args, { sessionsDir, readOnly = false } = {}) {
     if (!ids || positionals.length > 1 || (values['run-id'] && values['run-ids'])) {
       throw new Error('Usage: gempt-wait [--all] RUN_ID[,RUN_ID...]');
     }
-    const wait = !readOnly || values.wait || values['wait-all'];
-    const result = wait ? await waitForRuns(ids, { waitAll: values.all || values['wait-all'], sessionsDir }) : (() => {
+    const waitAll = Boolean(values.all || values['wait-all']);
+    const wait = !readOnly || values.wait || waitAll;
+    const result = wait ? await waitForRuns(ids, { waitAll, sessionsDir }) : (() => {
       const runs = Object.fromEntries(ids.split(',').map((id) => id.trim()).filter(Boolean).map((id) => [id, readRun(id, sessionsDir)]));
       const active = Object.keys(runs).filter((id) => ['queued', 'running'].includes(runs[id].state));
       return { active, ready: Object.keys(runs).filter((id) => !active.includes(id)), runs };
@@ -55,7 +56,8 @@ export async function runWait(args, { sessionsDir, readOnly = false } = {}) {
     const records = Object.values(runs);
     const single = !values['run-ids'] && records.length === 1;
     console.log(JSON.stringify(single ? records[0] : { ...result, runs }));
-    return Number(wait && single && ['failed', 'interrupted', 'outcome_unknown'].includes(records[0].state));
+    const checked = (single || waitAll) ? records : result.ready.map((id) => runs[id]).filter(Boolean);
+    return Number(wait && checked.some(({ state }) => ['failed', 'interrupted', 'outcome_unknown'].includes(state)));
   } catch (error) {
     console.error(error.message);
     return 1;

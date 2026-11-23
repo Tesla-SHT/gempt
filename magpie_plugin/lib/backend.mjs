@@ -2,14 +2,15 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { resolveBudget } from './token-ratio.mjs';
 import { WORKLOAD } from '../../core/assets.mjs';
 import { resolveNodeExecutable } from '../../core/node-executable.mjs';
 import {
   DEFAULT_TIERS, DEFAULT_UTILITY, FEATURES, TIER_ORDER, VALID_FAILOVER_MODES, VALID_SANDBOXES,
-  buildTierView, expandUser, getMcpEffort, getPairing, hasApiSnapshot, isCodexModelId, normalizeDefaultTier,
-  readExistingConfigObject, readJsonSafe, readPluginExecOption, readPluginMcpToolsOption,
-  resolveConfigPath, resolveMagpieConfigDir, resolveSessionsDir, writeConfigAtomic,
+  buildTierView, editDefaultSandbox, editEffortSettings, editPairing, editWorkSplit, expandUser, getMcpEffort, getPairing,
+  hasApiSnapshot, isCodexModelId, normalizeDefaultTier, readJsonSafe, readPluginExecOption, readPluginMcpToolsOption,
+  resolveConfigPath, resolveMagpieConfigDir, resolveSessionsDir, validateEffortSettings, withConfigTransaction,
 } from '../../core/config.mjs';
 import {
   NATIVE_GROUP_SPECS, dedupe, defaultGatewayFromEnv, findApiBackup, pickDefaultSubscriptionModel, pickNativeGroupPlan,
@@ -397,7 +398,9 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
   }
   const magpieGroups = syncGroups ? await syncHarnessGroups(config, { dryRun }) : [];
   if (!dryRun) {
-    const written = writeConfigAtomic(resolvedConfigPath, config);
+    const written = withConfigTransaction(resolvedConfigPath, ({ data }) =>
+      isDeepStrictEqual(data, existing) ? { next: config }
+        : { ok: false, status: 409, error: '配置在初始化期间已被修改，请重试。' }, { create: true });
     if (!written.ok) return written;
   }
 
@@ -414,35 +417,91 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
   };
 }
 
-export async function setFailoverMode(mode, { configPath, probeTimeoutMs = 2000, candidate, probe } = {}) {
-  const normalized = String(mode || '').trim();
-  if (!VALID_FAILOVER_MODES.includes(normalized)) {
-    return {
-      ok: false,
-      status: 400,
-      error: `Invalid failover_mode '${String(mode ?? '')}'. Expected one of: ${VALID_FAILOVER_MODES.join(', ')}.`,
-    };
+export function setFailoverMode(mode, options) {
+  return updateSettings({ failover_mode: mode }, options);
+}
+
+export async function updateSettings(settings, { configPath, probeTimeoutMs = 2000, candidate, probe } = {}) {
+  const edits = {
+    default_sandbox: editDefaultSandbox,
+    pairing: (loaded, value) => {
+      if (!value || typeof value !== 'object' || Array.isArray(value) ||
+          Object.keys(value).some((key) => key !== 'family' && key !== 'model')) {
+        return { ok: false, status: 400, error: 'Invalid pairing.' };
+      }
+      return editPairing(loaded, value.family, value.model);
+    },
+    work_split: (loaded, value) => editWorkSplit(loaded, 'work_split', value),
+    swarm_split: (loaded, value) => editWorkSplit(loaded, 'swarm_split', value),
+  };
+  const effortKeys = ['auto_effort', 'mcp_effort', 'tier_effort', 'tier'];
+  const keys = settings && Object.keys(settings);
+  if (!keys?.length || typeof settings !== 'object' || Array.isArray(settings) ||
+      keys.some((key) => !Object.hasOwn(edits, key) && key !== 'failover_mode' && !effortKeys.includes(key)) ||
+      (keys.includes('tier') && !keys.includes('tier_effort') && !keys.includes('auto_effort'))) {
+    return { ok: false, status: 400, error: 'Invalid settings.' };
+  }
+  const hasMode = keys.includes('failover_mode');
+  const mode = typeof settings.failover_mode === 'string' ? settings.failover_mode.trim() : '';
+  if (hasMode && !VALID_FAILOVER_MODES.includes(mode)) {
+    return { ok: false, status: 400, error: `Invalid failover_mode. Expected one of: ${VALID_FAILOVER_MODES.join(', ')}.` };
   }
 
-  const loaded = candidate ? { ok: true, data: candidate, path: resolveConfigPath(configPath) } : readExistingConfigObject(configPath);
-  if (!loaded.ok) return loaded;
+  const hasEffort = effortKeys.some((key) => keys.includes(key));
+  const effort = { autoEffort: settings.auto_effort, mcpEffort: settings.mcp_effort,
+    tierEffort: settings.tier_effort, tier: settings.tier };
+  const invalid = hasEffort && validateEffortSettings(effort);
+  if (invalid) return invalid;
 
-  const current = loaded.data;
+  let probeKey;
+  const plan = (loaded) => {
+    const draft = { ...loaded };
+    const response = { ok: true, status: 200 };
+    for (const [key, edit] of Object.entries(edits)) {
+      if (!keys.includes(key)) continue;
+      const result = edit(draft, settings[key]);
+      if (!result.next) return result;
+      draft.data = result.next;
+      Object.assign(response, result.response);
+    }
+    if (hasMode) {
+      const baseUrl = String(draft.data.magpie?.base_url || defaultGatewayFromEnv()).replace(/\/+$/, '');
+      const apiKey = resolveMagpieApiKey({ magpie: { ...draft.data.magpie, base_url: baseUrl } });
+      const inputs = [baseUrl, apiKey, resolveExcludedTokens(draft.data)];
+      const key = JSON.stringify(inputs);
+      if (probe && probeKey === undefined) probeKey = key;
+      const result = planFailover(draft.data, mode, key === probeKey ? probe : undefined);
+      if (!result) return { probeInputs: inputs, probeKey: key };
+      if (!result.ok) return result;
+      draft.data = result.config;
+      Object.assign(response, { failover_mode: mode, config_path: loaded.path });
+    }
+    if (hasEffort) {
+      const result = editEffortSettings(draft, effort);
+      if (!result.next) return result;
+      draft.data = result.next;
+      Object.assign(response, result.response);
+    }
+    if (candidate) return { ok: true, config: draft.data };
+    return { next: draft.data, response: hasMode || hasEffort || keys.includes('default_sandbox') ? response : undefined };
+  };
+
+  for (;;) {
+    const result = candidate ? plan({ data: candidate, path: resolveConfigPath(configPath) })
+      : withConfigTransaction(configPath, plan);
+    if (!result.probeInputs) return result;
+    // Probe without the config lock, then plan again with the latest on-disk settings.
+    const [url, key, excluded] = result.probeInputs;
+    probe = await probeMagpie(url, key, probeTimeoutMs, excluded);
+    probeKey = result.probeKey;
+  }
+}
+
+function planFailover(current, normalized, probe) {
   const curPolicy = current.routing_policy && typeof current.routing_policy === 'object' ? current.routing_policy : {};
   const curTiers = current.tiers && typeof current.tiers === 'object' ? current.tiers : {};
   const nextPolicy = { ...curPolicy, failover_mode: normalized };
   const nextTiers = { ...curTiers };
-
-  const baseUrl = String(current.magpie?.base_url || defaultGatewayFromEnv()).replace(/\/+$/, '');
-  const apiKey = resolveMagpieApiKey({ magpie: { ...(current.magpie || {}), base_url: baseUrl } });
-  const excludedTokens = resolveExcludedTokens(current);
-  let cachedProbe = probe || null;
-  const ensureProbe = async () => {
-    if (!cachedProbe) {
-      cachedProbe = await probeMagpie(baseUrl, apiKey, probeTimeoutMs, excludedTokens);
-    }
-    return cachedProbe;
-  };
 
   if (normalized === 'subscription_only') {
     const usesGroupOrApi = TIER_ORDER.some((t) => {
@@ -484,7 +543,7 @@ export async function setFailoverMode(mode, { configPath, probeTimeoutMs = 2000,
 
       let subPlan = null;
       if (!primary) {
-        const probe = await ensureProbe();
+        if (!probe) return null;
         subPlan = pickSubscriptionPlan(probe);
         primary = subPlan?.tiers?.[t]?.consult_model || '';
       }
@@ -502,7 +561,8 @@ export async function setFailoverMode(mode, { configPath, probeTimeoutMs = 2000,
           const memberEsc = members.find((m) => isCodexModelId(m) && m !== primary);
           if (memberEsc) escalateModel = memberEsc;
           else {
-            if (!subPlan) subPlan = pickSubscriptionPlan(await ensureProbe());
+            if (!probe) return null;
+            subPlan ||= pickSubscriptionPlan(probe);
             escalateModel = subPlan?.tiers?.opus?.escalate_model || '';
           }
         }
@@ -541,7 +601,7 @@ export async function setFailoverMode(mode, { configPath, probeTimeoutMs = 2000,
       }
       delete nextPolicy.api_fallback_snapshot;
     } else {
-      const probe = await ensureProbe();
+      if (!probe) return null;
       if (!probe.reachable) {
         return {
           ok: false,
@@ -580,19 +640,5 @@ export async function setFailoverMode(mode, { configPath, probeTimeoutMs = 2000,
     }
   }
 
-  const next = {
-    ...current,
-    routing_policy: nextPolicy,
-    tiers: nextTiers,
-  };
-  if (candidate) return { ok: true, config: next };
-  const written = writeConfigAtomic(loaded.path, next);
-  if (!written.ok) return written;
-
-  return {
-    ok: true,
-    status: 200,
-    failover_mode: normalized,
-    config_path: loaded.path,
-  };
+  return { ok: true, config: { ...current, routing_policy: nextPolicy, tiers: nextTiers } };
 }
