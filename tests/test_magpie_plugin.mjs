@@ -1,5 +1,6 @@
 import { Worker } from 'node:worker_threads';
 import test from 'node:test';
+import { resolvePath } from '../core/state.mjs';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { createHash } from 'node:crypto';
@@ -49,7 +50,7 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files, version }] = JSON.parse(stdout);
-  assert.equal(version, '0.6.0');
+  assert.equal(version, '0.6.1');
   const paths = files.map((file) => file.path);
   assert.deepEqual(paths.filter((path) => /^plugin\/skills\/[^/]+\/SKILL\.md$/.test(path)).sort(),
     ['plugin/skills/gempt-chore/SKILL.md', 'plugin/skills/gempt/SKILL.md']);
@@ -831,7 +832,7 @@ test('backend readState exposes multi-client state, native groups, MCP snippet, 
 });
 
 test('page server supports native groups and lossless failover round-trip with a unified MCP consultation', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'gempt-magpie-srv-'));
+  const dir = resolvePath(mkdtempSync(join(tmpdir(), 'gempt-magpie-srv-')));
   const magpie = await startMockMagpie();
   const cfgPath = join(dir, 'config.json');
   const magpieDir = join(dir, 'magpie-cfg');
@@ -1645,7 +1646,7 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
 
   const app = await startMockAppServer();
   const appState = join(dir, 'app-server-connection.json');
-  const env = { ...process.env, GEMPT_APP_SERVER_STATE: appState };
+  const env = { ...process.env, GEMPT_APP_SERVER_STATE: appState, CODEX_CLI_PATH: process.execPath };
   writeFileSync(appState, JSON.stringify({ ws_url: app.url, status: 'running', auth_token: 'fixture-capability',
     auth_header: 'Authorization', gateway_url: magpie.url }));
 
@@ -2531,7 +2532,7 @@ test('mcpTools false disables duplicate Magpie GemPT tool registration', async (
 
 test('Magpie marketplace check shape and inspect+share guard hold', async () => {
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '0.6.0');
+  assert.equal(pkg.version, '0.6.1');
   assert.ok(pkg.keywords.includes('magpie-plugin'));
   assert.ok(pkg.files.includes('THIRD_PARTY_LICENSES.txt'));
   assert.ok(pkg.magpie?.summary?.en && pkg.magpie?.summary?.zh);

@@ -332,7 +332,7 @@ export function stateEntries(sessionsDir) {
 
 export function runWithinRoot(record, root) {
   const cwd = record.source_cwd || record.cwd;
-  return !root || (typeof cwd === 'string' && withinPath(resolvePath(cwd), root));
+  return !root || (typeof cwd === 'string' && withinPath(resolvePath(cwd), resolvePath(root)));
 }
 
 export function listActiveRoster({ limit = 20, root, hostConversationId, sessionId, sessionsDir, includeUnconfirmed = true } = {}) {

@@ -9,7 +9,7 @@ description: >-
 
 # gempt — Gemini × GPT 协作编排手册
 
-GemPT v0.6.0 使用 Node.js（`>= 20.11.0`）。Antigravity 的 `gempt_gempt` MCP 提供 `gpt_run`、`gpt_ask`、`gpt_ctl`，按 Hydrogen、Neon、Carbon 家族配对 GPT/Codex。Magpie HTTP MCP 对应 `gempt_run`、`gempt_ask`、`gempt_ctl`。其他 Agent 可在模型栏直接选 `group/gempt-{sonnet,opus,fable}`。
+GemPT v0.6.1 使用 Node.js（`>= 20.11.0`）。Antigravity 的 `gempt_gempt` MCP 提供 `gpt_run`、`gpt_ask`、`gpt_ctl`，按 Hydrogen、Neon、Carbon 家族配对 GPT/Codex。Magpie HTTP MCP 对应 `gempt_run`、`gempt_ask`、`gempt_ctl`。其他 Agent 可在模型栏直接选 `group/gempt-{sonnet,opus,fable}`。
 
 > 启用本插件时，`rules/AGENTS.md` 会常驻生效；按 Magpie 面板的 5 档工作分工（0% / 15% / 35% / 60% / 80%）决定何时委派。
 

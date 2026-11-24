@@ -1,4 +1,4 @@
-# GemPT v0.6.0
+# GemPT v0.6.1
 
 [中文文档](./README.md) · [Antigravity Plugin README](./plugin/README.md) · [Third-Party Licenses](./THIRD_PARTY_LICENSES.txt)
 
@@ -22,7 +22,7 @@ Search for **GemPT** directly in the Magpie Plugin Marketplace, or install from 
 
 ```bash
 # Recommended: install from the GitHub release tag
-magpie plugin add github:yizhang-dream/gempt#v0.6.0
+magpie plugin add github:yizhang-dream/gempt#v0.6.1
 ```
 
 > **Note:** `gempt` is not yet published on the npm registry; do not run bare `magpie plugin add gempt` yet (it returns 404).
@@ -33,10 +33,10 @@ Open **Plugins → GemPT** in Magpie and click **Enable Subscription Config** (o
 
 ```bash
 # Recommended: one-command install from the GitHub release tag
-npx --yes github:yizhang-dream/gempt#v0.6.0 install-agy
+npx --yes github:yizhang-dream/gempt#v0.6.1 install-agy
 ```
 
-> **Note:** Since `gempt` is not yet published on the npm registry, use the GitHub tag above or install from a local checkout (bare `npx --yes gempt@0.6.0 install-agy` is not yet active).
+> **Note:** Since `gempt` is not yet published on the npm registry, use the GitHub tag above or install from a local checkout (bare `npx --yes gempt@0.6.1 install-agy` is not yet active).
 
 From a local checkout:
 - **Linux / macOS**: `bash install.sh`

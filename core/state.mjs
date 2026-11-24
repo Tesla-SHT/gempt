@@ -13,7 +13,7 @@ export function resolvePath(path) {
 
 function resolveExistingPrefix(path) {
   try {
-    return realpathSync(path);
+    return process.platform === 'win32' ? realpathSync.native(path) : realpathSync(path);
   } catch (error) {
     if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error;
     const parent = dirname(path);

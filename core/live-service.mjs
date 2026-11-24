@@ -108,7 +108,7 @@ function runSummary(record, compact = false) {
 }
 
 function workspaceScope({ root, workspaceRoots }) {
-  return workspaceRoots ?? (root ? [root] : null);
+  return (workspaceRoots ?? (root ? [root] : null))?.map((path) => resolvePath(path)) ?? null;
 }
 
 function inWorkspace(cwd, roots) {

@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { serveAppServerSocket } from './app-server-fixture.mjs';
 import { once } from 'node:events';
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync,
-  rmSync, utimesSync, writeFileSync } from 'node:fs';
+  realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { syncBuiltinESMExports } from 'node:module';
 import { homedir, tmpdir } from 'node:os';
@@ -77,7 +77,7 @@ test('Live builds the split pane and preserves host scope, safe link routes and 
 });
 
 function fixture(t) {
-  const root = mkdtempSync(join(tmpdir(), 'gempt-node-'));
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'gempt-node-')));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const configPath = join(root, 'config', 'config.json');
   const sessionsDir = join(root, 'sessions');
@@ -215,7 +215,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const bridge = join(target, 'work_split_hook.py');
   assert.equal(readFileSync(bridge, 'utf8').trimEnd().split('\n').length, 7);
   assert.ok(!existsSync(join(target, 'runtime', 'gempt')));
-  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.6.0' });
+  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.6.1' });
   const bundledSkills = new URL('../plugin/skills/', import.meta.url);
   assert.deepEqual(readdirSync(bundledSkills).sort(), ['gempt', 'gempt-chore']);
   assert.deepEqual(readdirSync(join(target, 'skills')).sort(), ['gempt', 'gempt-chore']);
@@ -235,7 +235,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const initialized = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' },
   }) });
-  assert.equal(initialized.result.serverInfo.version, '0.6.0');
+  assert.equal(initialized.result.serverInfo.version, '0.6.1');
   const response = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'resources/read', params: { uri: APP_URI },
   }) });
@@ -450,61 +450,65 @@ test('packaged native sidecar serves shared assets and authenticates scoped APIs
     stdio: ['ignore', 'pipe', 'inherit'],
   });
   const exited = once(child, 'exit');
-  t.after(async () => { child.kill(); await exited; });
-  const scanner = createInterface({ input: child.stdout });
-  const [line] = await once(scanner, 'line', { signal: AbortSignal.timeout(5000) });
-  const base = 'http://' + line.match(/listening on (127[.]0[.]0[.]1:[0-9]+)/)[1];
-  const html = await fetch(base).then((response) => response.text());
-  assert.match(html, /loadScript\('gempt-preload\.js'\)/);
-  assert.match(html, /loadScript\('app\.js',/);
-  assert.doesNotMatch(html, /<script type="module"/);
-  assert.equal(await fetch(base + '/index.html').then((response) => response.text()), html);
-  assert.match(html, /id="view-console"/);
-  const preload = await fetch(base + '/gempt-preload.js');
-  assert.equal(preload.status, 200);
-  const preloadSource = await preload.text();
-  assert.match(preloadSource, /['"]\.\/_sidecar\/get-conversation-metadata/);
-  assert.match(preloadSource, /const resolveProjectId = \(\) => projectIdPromise \?\?=/);
-  const css = await fetch(base + '/styles.css');
-  assert.match(css.headers.get('content-type'), /^text\/css/);
-  assert.match(await css.text(), /var\(--background/);
-  const js = await fetch(base + '/app.js');
-  assert.match(js.headers.get('content-type'), /javascript/);
-  assert.doesNotMatch(await js.text(), /@modelcontextprotocol|Invalid Zod|@cfworker/);
-  assert.equal((await fetch(base + '/missing.js')).status, 404);
+  try {
+    const scanner = createInterface({ input: child.stdout });
+    const [line] = await once(scanner, 'line', { signal: AbortSignal.timeout(5000) });
+    const base = 'http://' + line.match(/listening on (127[.]0[.]0[.]1:[0-9]+)/)[1];
+    const html = await fetch(base).then((response) => response.text());
+    assert.match(html, /loadScript\('gempt-preload\.js'\)/);
+    assert.match(html, /loadScript\('app\.js',/);
+    assert.doesNotMatch(html, /<script type="module"/);
+    assert.equal(await fetch(base + '/index.html').then((response) => response.text()), html);
+    assert.match(html, /id="view-console"/);
+    const preload = await fetch(base + '/gempt-preload.js');
+    assert.equal(preload.status, 200);
+    const preloadSource = await preload.text();
+    assert.match(preloadSource, /['"]\.\/_sidecar\/get-conversation-metadata/);
+    assert.match(preloadSource, /const resolveProjectId = \(\) => projectIdPromise \?\?=/);
+    const css = await fetch(base + '/styles.css');
+    assert.match(css.headers.get('content-type'), /^text\/css/);
+    assert.match(await css.text(), /var\(--background/);
+    const js = await fetch(base + '/app.js');
+    assert.match(js.headers.get('content-type'), /javascript/);
+    assert.doesNotMatch(await js.text(), /@modelcontextprotocol|Invalid Zod|@cfworker/);
+    assert.equal((await fetch(base + '/missing.js')).status, 404);
 
-  const call = (path, payload = {}, key = token, method = 'POST') => fetch(base + '/api', {
-    method, headers: { 'content-type': 'application/json', ...(key ? { 'x-sidecar-token': key } : {}) },
-    body: JSON.stringify({ path: './api/' + path, ...payload }),
-  });
-  for (const method of ['POST', 'PUT', 'DELETE']) {
-    assert.equal((await call('settings', { body: { codex_timeout_sec: 900 } }, '', method)).status, 401);
+    const call = (path, payload = {}, key = token, method = 'POST') => fetch(base + '/api', {
+      method, headers: { 'content-type': 'application/json', ...(key ? { 'x-sidecar-token': key } : {}) },
+      body: JSON.stringify({ path: './api/' + path, ...payload }),
+    });
+    for (const method of ['POST', 'PUT', 'DELETE']) {
+      assert.equal((await call('settings', { body: { codex_timeout_sec: 900 } }, '', method)).status, 401);
+    }
+    assert.equal((await call('summary', {}, 'bad-token')).status, 401);
+    assert.equal((await fetch(base + '/api', { method: 'POST', headers: { origin: 'null' },
+      body: JSON.stringify({ path: './api/summary' }),
+    })).headers.get('access-control-allow-origin'), null);
+    const opaqueSummary = await fetch(base + '/api?token=' + token, { method: 'POST', headers: { origin: 'null' },
+      body: JSON.stringify({ path: './api/summary' }),
+    });
+    assert.equal(opaqueSummary.status, 200);
+    assert.equal(opaqueSummary.headers.get('access-control-allow-origin'), 'null');
+    assert.ok((await opaqueSummary.json()).routing);
+    assert.equal((await fetch(base + '/api?token=' + token + '&path=./api/summary', { method: 'POST' })).status, 200);
+    assert.equal((await fetch(base + '/api')).status, 405);
+    const workspaceUris = [pathToFileURL(f.cwd).href];
+    const list = await call('live/runs', { workspaceUris }).then((response) => response.json());
+    assert.equal(list.active_conversation_id, active);
+    assert.deepEqual(list.runs.map((run) => run.run_id), [id]);
+    const all = await call('live/runs?scope=all', { workspaceUris }).then((response) => response.json());
+    assert.deepEqual(new Set(all.runs.map((run) => run.run_id)), new Set([id, otherConversation]));
+    const multi = await call('live/runs', { workspaceUris: [...workspaceUris, pathToFileURL(alternate).href] })
+      .then((response) => response.json());
+    assert.deepEqual(new Set(multi.runs.map((run) => run.run_id)), new Set([id, otherWorkspace]));
+    assert.equal((await call('live/stream?run_id=' + otherWorkspace, { workspaceUris })).status, 403);
+    assert.equal((await call('requests?format=csv')).headers.get('content-type'), 'text/csv; charset=utf-8');
+    assert.equal((await call('settings', { body: { codex_timeout_sec: 900 } })).status, 200);
+    assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).codex.timeout_sec, 900);
+  } finally {
+    child.kill();
+    await exited;
   }
-  assert.equal((await call('summary', {}, 'bad-token')).status, 401);
-  assert.equal((await fetch(base + '/api', { method: 'POST', headers: { origin: 'null' },
-    body: JSON.stringify({ path: './api/summary' }),
-  })).headers.get('access-control-allow-origin'), null);
-  const opaqueSummary = await fetch(base + '/api?token=' + token, { method: 'POST', headers: { origin: 'null' },
-    body: JSON.stringify({ path: './api/summary' }),
-  });
-  assert.equal(opaqueSummary.status, 200);
-  assert.equal(opaqueSummary.headers.get('access-control-allow-origin'), 'null');
-  assert.ok((await opaqueSummary.json()).routing);
-  assert.equal((await fetch(base + '/api?token=' + token + '&path=./api/summary', { method: 'POST' })).status, 200);
-  assert.equal((await fetch(base + '/api')).status, 405);
-  const workspaceUris = [pathToFileURL(f.cwd).href];
-  const list = await call('live/runs', { workspaceUris }).then((response) => response.json());
-  assert.equal(list.active_conversation_id, active);
-  assert.deepEqual(list.runs.map((run) => run.run_id), [id]);
-  const all = await call('live/runs?scope=all', { workspaceUris }).then((response) => response.json());
-  assert.deepEqual(new Set(all.runs.map((run) => run.run_id)), new Set([id, otherConversation]));
-  const multi = await call('live/runs', { workspaceUris: [...workspaceUris, pathToFileURL(alternate).href] })
-    .then((response) => response.json());
-  assert.deepEqual(new Set(multi.runs.map((run) => run.run_id)), new Set([id, otherWorkspace]));
-  assert.equal((await call('live/stream?run_id=' + otherWorkspace, { workspaceUris })).status, 403);
-  assert.equal((await call('requests?format=csv')).headers.get('content-type'), 'text/csv; charset=utf-8');
-  assert.equal((await call('settings', { body: { codex_timeout_sec: 900 } })).status, 200);
-  assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).codex.timeout_sec, 900);
 });
 
 function git(cwd, ...args) {
@@ -1042,13 +1046,13 @@ test('Live run list defaults to an empty unbound session and can list all worksp
   assert.equal(scoped.scope, 'session');
   assert.equal(scoped.unbound_session, true);
   assert.deepEqual(scoped.runs, []);
-  assert.equal(scoped.app_server.version, '0.6.0');
+  assert.equal(scoped.app_server.version, '0.6.1');
 
   const { structuredContent: all } = await callAppTool('gempt_app_runs', { scope: 'all' }, opts);
   assert.equal(all.scope, 'all');
   assert.equal(all.unbound_session, false);
   assert.deepEqual(all.runs.map(({ run_id }) => run_id).sort(), [first, second]);
-  assert.equal(all.app_server.version, '0.6.0');
+  assert.equal(all.app_server.version, '0.6.1');
 });
 
 test('Live binds normalized workspaces and never selects another run for a filtered explicit ID', async (t) => {
@@ -1184,7 +1188,9 @@ test('standalone NDJSON MCP keeps the GemPT resource and app-only tools without 
   await appFixture(t, f);
   await updateHostContext('host', [f.cwd], f);
   state(f, 'd'.repeat(32), { goal: '🚦'.repeat(120), host_conversation_id: 'host' });
-  const file = fileURLToPath(new URL('../core/mcp-server.mjs', import.meta.url));
+  const linkedCore = join(f.root, 'linked core');
+  symlinkSync(fileURLToPath(new URL('../core/', import.meta.url)), linkedCore, process.platform === 'win32' ? 'junction' : 'dir');
+  const file = join(linkedCore, 'mcp-server.mjs');
   const child = spawn(process.execPath, [file], { env: f.env, stdio: ['pipe', 'pipe', 'pipe'] });
   t.after(() => child.kill());
   const exited = once(child, 'exit');
@@ -1202,7 +1208,7 @@ test('standalone NDJSON MCP keeps the GemPT resource and app-only tools without 
   const started = await request('initialize', { protocolVersion: '2026-test' });
   assert.equal(started.result.protocolVersion, '2026-test');
   assert.equal(started.result.serverInfo.name, 'gempt');
-  assert.equal(started.result.serverInfo.version, '0.6.0');
+  assert.equal(started.result.serverInfo.version, '0.6.1');
   send({ method: 'notifications/initialized' });
   assert.deepEqual((await request('ping')).result, {});
   const { tools } = (await request('tools/list')).result;

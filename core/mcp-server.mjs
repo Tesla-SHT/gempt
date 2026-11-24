@@ -1,6 +1,6 @@
 import { createInterface } from 'node:readline';
 import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
 import { GEMPT_VERSION } from './config.mjs';
 import { readHostContext } from './host-context.mjs';
@@ -187,4 +187,4 @@ export async function serveStdio(input = process.stdin, output = process.stdout,
   await Promise.all(pending);
 }
 
-if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) await serveStdio();
+if (process.argv[1] && resolvePath(process.argv[1]) === resolvePath(fileURLToPath(import.meta.url))) await serveStdio();
