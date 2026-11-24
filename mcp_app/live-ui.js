@@ -1,9 +1,11 @@
+import { bindLanguage, locale, localizedFormat, tr, errorText } from '../magpie_plugin/ui/i18n.js';
 import { mountConsole } from "../magpie_plugin/ui/app.js";
 import { icon } from "./icons.js";
 import { renderMarkdown } from "./markdown.js";
 import { linkTarget, listArguments, streamRenderKey, timelineMessages } from "./live-state.js";
 
 export function mountLive({ transport, host, sidecar }) {
+  const applyLanguage = bindLanguage(document.body);
   const embedded = Boolean(host);
   const params = new URLSearchParams(location.search);
   const tabs = ["live", "overview", "requests", "sessions"];
@@ -13,8 +15,8 @@ export function mountLive({ transport, host, sidecar }) {
     failed: "失败", interrupted: "已中止", outcome_unknown: "状态未确认",
   };
   const systemTheme = matchMedia("(prefers-color-scheme: dark)");
-  const number = new Intl.NumberFormat("zh-CN");
-  const percent = new Intl.NumberFormat("zh-CN", { style: "percent", maximumFractionDigits: 1 });
+  const number = localizedFormat(Intl.NumberFormat);
+  const percent = localizedFormat(Intl.NumberFormat, { style: "percent", maximumFractionDigits: 1 });
   const $ = (id) => document.getElementById(id);
   const node = (tag, text, className) => {
     const element = document.createElement(tag);
@@ -26,7 +28,7 @@ export function mountLive({ transport, host, sidecar }) {
     const el = $(id);
     if (el && el.textContent !== value) el.textContent = value;
   };
-  const statusLabel = (run) => statuses[run?.state] || "未知";
+  const statusLabel = (run) => tr(statuses[run?.state]) || tr("未知");
   const basename = (p) => String(p || "").split(/[\\/]/).filter(Boolean).pop() || String(p || "");
 
   let ready = false;
@@ -34,6 +36,10 @@ export function mountLive({ transport, host, sidecar }) {
   let appTab = "live";
   let sharedConsole;
   let latestMagpieStatus;
+  let routingSummary;
+  let languagePreference = "auto";
+  let savingLanguage = false;
+  let languageRevision = 0;
   let replyBusy = false;
   let replyKey = "";
   let submittedReply = "";
@@ -137,9 +143,12 @@ export function mountLive({ transport, host, sidecar }) {
       const mode = params.get("mode")?.trim().toLowerCase();
       sharedConsole = mountConsole($("view-console"), transport, {
         queryViewMode: ["mcp", "native"].includes(mode) ? mode : "",
-        onState: (state) => applyRoutingBadge({
-          gpt_share: state.work_profiles?.[state.work_split]?.gpt_share, native_swarm: state.native_swarm,
-        }),
+        onState: (state) => {
+          if (!savingLanguage && state.ui?.language) setLanguage(state.ui.language);
+          applyRoutingBadge({ gpt_share: state.work_profiles?.[state.work_split]?.gpt_share, native_swarm: state.native_swarm });
+        },
+        onLanguage: saveLanguage,
+        refreshGateway: () => void Promise.resolve(magpieCheck).then(() => refreshMagpieStatus(true)),
         navigate,
         showToast: (message, kind) => toast(message, "", kind),
         copyText: copy,
@@ -147,7 +156,7 @@ export function mountLive({ transport, host, sidecar }) {
       if (latestMagpieStatus) sharedConsole.patchGatewayStatus(latestMagpieStatus);
     }
     sharedConsole?.setTab(tab, { id, work });
-    if (!live && (connectFailed || (ready && !supportsTools))) showConsoleError("当前宿主未开放控制台工具。");
+    if (!live && (connectFailed || (ready && !supportsTools))) showConsoleError(tr("当前宿主未开放控制台工具。"));
     clearTimeout(listTimer);
     clearTimeout(streamTimer);
     if (live) {
@@ -177,14 +186,16 @@ export function mountLive({ transport, host, sidecar }) {
   function renderMagpieStatus(status) {
     const dot = $("magpie-status");
     dot.dataset.state = status.reachable === null ? "checking" : status.reachable ? "online" : "offline";
-    dot.title = status.reachable === null ? "正在检查 Magpie 连接" : status.reachable ? "Magpie 在线" : "Magpie 离线";
+    dot.title = status.reachable === null ? tr("正在检查 Magpie 连接") : status.reachable ? tr("Magpie 在线") : tr("Magpie 离线");
     dot.setAttribute("aria-label", dot.title);
   }
 
   function refreshMagpieStatus(force = false) {
     if (magpieCheck) return magpieCheck;
+    const revision = languageRevision;
     magpieCheck = transport.getMagpieStatus(force).then((status) => {
       latestMagpieStatus = status;
+      if (!savingLanguage && status.ui?.language && revision === languageRevision) setLanguage(status.ui.language);
       renderMagpieStatus(status);
       sharedConsole?.patchGatewayStatus(status);
     }).catch(() => renderMagpieStatus({ reachable: false })).finally(() => { magpieCheck = null; });
@@ -208,15 +219,50 @@ export function mountLive({ transport, host, sidecar }) {
 
   function applyRoutingBadge(routing) {
     if (!routing || !Number.isFinite(routing.gpt_share)) return;
-    const mode = routing.gpt_share === 0 ? "关闭" : routing.native_swarm ? "Swarm" : "直调";
+    routingSummary = routing;
+    const mode = routing.gpt_share === 0 ? tr("关闭") : routing.native_swarm ? "Swarm" : tr("直调");
     put("routing-badge", `${routing.gpt_share}% · ${mode}`);
     $("routing-badge").disabled = false;
   }
 
+  function setLanguage(preference) {
+    if (languagePreference === preference) return;
+    languagePreference = preference;
+    const previous = locale();
+    applyLanguage(preference);
+    if (locale() === previous) return;
+    if (latestMagpieStatus) renderMagpieStatus(latestMagpieStatus);
+    applyRoutingBadge(routingSummary);
+    delete $("stream").dataset.key;
+    render();
+    sharedConsole?.renderLanguage();
+  }
+
+  async function saveLanguage(preference) {
+    if (!supportsTools || savingLanguage) return;
+    const previous = languagePreference;
+    savingLanguage = true;
+    languageRevision++;
+    $("language-toggle").disabled = true;
+    setLanguage(preference);
+    try {
+      await transport.saveSettings({ ui: { language: preference } });
+      toast(tr("语言设置已保存"));
+    } catch (error) {
+      setLanguage(previous);
+      toast(tr("无法保存语言：{0}", errorText(error.message)), "", "error");
+    } finally {
+      savingLanguage = false;
+      $("language-toggle").disabled = false;
+    }
+  }
+
+  $("language-toggle").onclick = () => void saveLanguage(locale() === "zh" ? "en" : "zh");
+
   function formatElapsed(seconds) {
     if (seconds == null) return "";
     const elapsed = Math.max(0, Math.floor(seconds));
-    return elapsed < 60 ? `${elapsed} 秒` : `${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒`;
+    return elapsed < 60 ? tr("{0} 秒", elapsed) : tr("{0} 分 {1} 秒", Math.floor(elapsed / 60), elapsed % 60);
   }
 
   function groupSessions(runList) {
@@ -260,8 +306,8 @@ export function mountLive({ transport, host, sidecar }) {
       if (!host) throw new Error("File previews require a host");
       await host.openLink(target);
     } catch {
-      if (target.kind === "file") toast("当前视图无法打开文件预览。", path);
-      else toast("当前视图无法打开链接。");
+      if (target.kind === "file") toast(tr("当前视图无法打开文件预览。"), path);
+      else toast(tr("当前视图无法打开链接。"));
     }
   }
 
@@ -279,8 +325,8 @@ export function mountLive({ transport, host, sidecar }) {
     }
     const chip = node("span", "", "file-chip is-restricted");
     const outside = restrictedReason === "outside_workspace";
-    chip.title = outside ? `${path}（位于工作区外，已禁止预览）` : `${path}（仅只读显示）`;
-    chip.append(icon("file"), node("span", basename(path)), node("span", outside ? "工作区外" : "只读", "file-chip-tag"));
+    chip.title = outside ? tr("{0}（位于工作区外，已禁止预览）", path) : tr("{0}（仅只读显示）", path);
+    chip.append(icon("file"), node("span", basename(path)), node("span", outside ? tr("工作区外") : tr("只读"), "file-chip-tag"));
     return chip;
   }
 
@@ -368,11 +414,11 @@ export function mountLive({ transport, host, sidecar }) {
     $("clear-live-session").hidden = !linkedSession;
     if (!sessions.length && !loading) {
       if (connectFailed || !supportsTools) {
-        put("empty-title", "任务列表暂不可用");
-        put("empty-message", connectFailed ? "请重新打开此页面。" : "当前宿主未开放实时工具调用。");
+        put("empty-title", tr("任务列表暂不可用"));
+        put("empty-message", connectFailed ? tr("请重新打开此页面。") : tr("当前宿主未开放实时工具调用。"));
       } else {
-        put("empty-title", scope === "all" ? "暂无任务" : "当前会话暂无任务");
-        put("empty-message", scope === "all" ? "发起任务后，执行进度会显示在这里。" : "可发起任务，或切换到「全部」查看记录。");
+        put("empty-title", scope === "all" ? tr("暂无任务") : tr("当前会话暂无任务"));
+        put("empty-message", scope === "all" ? tr("发起任务后，执行进度会显示在这里。") : tr("可发起任务，或切换到「全部」查看记录。"));
       }
     }
 
@@ -395,10 +441,10 @@ export function mountLive({ transport, host, sidecar }) {
       const meta = node("span", "", "sc-meta");
       meta.append(node("span", statusLabel(run)));
       if (run.worktree_path) meta.append(node("span", "Worktree", "run-kind"));
-      if (run.remote_turn_unconfirmed) meta.append(node("span", "远端终态未确认", "unconfirmed-badge"));
+      if (run.remote_turn_unconfirmed) meta.append(node("span", tr("远端终态未确认"), "unconfirmed-badge"));
       const elapsed = formatElapsed(run.elapsed_sec);
       if (elapsed) meta.append(node("span", elapsed));
-      if (session.runs.length > 1) meta.append(node("span", `${session.runs.length} 轮`));
+      if (session.runs.length > 1) meta.append(node("span", tr("{0} 轮", session.runs.length)));
       if (scope === "all" && run.workspace_name) meta.append(node("span", run.workspace_name, "sc-workspace"));
       const preview = sessionPreview(run);
       card.append(buildStatusGlyph(run.state), label, icon("chevron", "sc-chevron"), meta);
@@ -467,7 +513,7 @@ export function mountLive({ transport, host, sidecar }) {
       button.setAttribute("aria-controls", "turn-panel");
       button.setAttribute("aria-selected", String(chosen));
       button.tabIndex = chosen ? 0 : -1;
-      button.append(buildStatusGlyph(turn.state), node("span", `第 ${index + 1} 轮`));
+      button.append(buildStatusGlyph(turn.state), node("span", tr("第 {0} 轮", index + 1)));
       button.addEventListener("click", () => {
         openSessionDetail(turn.run_id, { focus: false });
         $(button.id)?.focus({ preventScroll: true });
@@ -501,10 +547,10 @@ export function mountLive({ transport, host, sidecar }) {
         const head = node("div", "", "msg-head");
         const button = node("button", "", "copy-btn");
         button.type = "button";
-        button.append(icon("copy"), "复制全文");
+        button.append(icon("copy"), tr("复制全文"));
         button.disabled = !transcript.complete;
         button.addEventListener("click", () => void copy(fullText || text));
-        head.append(node("span", "GPT 输出"), button);
+        head.append(node("span", tr("GPT 输出")), button);
         box.append(head);
       }
       box.append(renderMarkdown(text, options));
@@ -516,21 +562,21 @@ export function mountLive({ transport, host, sidecar }) {
       const stepKey = `${event.type}-${event.id || index}`;
       if (event.type === "reasoning") {
         const preview = (event.text || "").replace(/\s+/g, " ").trim();
-        li.append(buildStepDetails(stepKey, "think", preview ? `思考：${preview}` : "思考", "", event.text, { prose: true }));
+        li.append(buildStepDetails(stepKey, "think", preview ? tr("思考：{0}", preview) : tr("思考"), "", event.text, { prose: true }));
       } else if (event.type === "command") {
         const running = event.exit_code == null;
-        li.append(buildStepDetails(stepKey, "terminal", event.command || "执行命令",
-          running ? "执行中" : `退出码 ${event.exit_code}`,
+        li.append(buildStepDetails(stepKey, "terminal", event.command || tr("执行命令"),
+          running ? tr("执行中") : tr("退出码 {0}", event.exit_code),
           [event.command, event.output].filter(Boolean).join("\n\n"), { failed: !running && event.exit_code !== 0 }));
       } else if (event.type === "files") {
         const paths = event.paths || [];
         const body = node("div", "", "step-files step-body");
         body.append(...paths.map((path) => makeFileChip(path, fileUris[path], restrictedFiles[path])));
-        li.append(buildStepDetails(stepKey, "files", `变更 ${event.count || paths.length} 个文件`, "", body));
+        li.append(buildStepDetails(stepKey, "files", tr("变更 {0} 个文件", event.count || paths.length), "", body));
       } else if (event.type === "ask_gemini") {
         if (pendingAsk && (pendingAsk.call_id === event.id ||
             pendingAsk.arguments?.question === event.arguments?.question)) return [];
-        li.append(buildStepDetails(stepKey, "chat", event.arguments?.question || "请求主对话回复", "",
+        li.append(buildStepDetails(stepKey, "chat", event.arguments?.question || tr("请求主对话回复"), "",
           event.arguments?.context, { prose: true }));
       } else if (messages.has(event)) {
         li.append(message(messages.get(event), event === lastMessage));
@@ -546,7 +592,7 @@ export function mountLive({ transport, host, sidecar }) {
     if (!snapshot && !nodes.length) {
       const li = node("li", "", "skeleton-stream");
       li.setAttribute("role", "status");
-      li.setAttribute("aria-label", "正在加载执行流");
+      li.setAttribute("aria-label", tr("正在加载执行流"));
       nodes.push(li);
     } else if (isActive() && !pendingAsk) {
       const li = node("li", "", "streaming-indicator");
@@ -556,7 +602,7 @@ export function mountLive({ transport, host, sidecar }) {
       const li = node("li", "", "empty");
       const symbol = node("span", "", "empty-icon");
       symbol.append(icon("chat"));
-      li.append(symbol, node("p", "暂无输出", "empty-title"), node("p", "产生输出后会显示在这里。"));
+      li.append(symbol, node("p", tr("暂无输出"), "empty-title"), node("p", tr("产生输出后会显示在这里。")));
       nodes.push(li);
     }
 
@@ -569,14 +615,14 @@ export function mountLive({ transport, host, sidecar }) {
   function renderControls(run = currentRun()) {
     const usable = supportsTools && run?.can_control && !control;
     $("controls").hidden = !active.has(run?.state);
-    const instruction = "补充执行指令";
+    const instruction = tr("补充执行指令");
     $("steer").placeholder = instruction + "…";
     $("steer").setAttribute("aria-label", instruction);
     $("steer").disabled = !usable;
     $("send-steer").disabled = !usable || !$("steer").value.trim();
     $("interrupt").disabled = !usable;
     $("cancel-interrupt").hidden = !confirming;
-    put("interrupt", confirming ? "确认中止" : "中止");
+    put("interrupt", confirming ? tr("确认中止") : tr("中止"));
     const canConfirmInterrupt = Boolean(supportsTools && run?.remote_turn_unconfirmed && (run?.can_interrupt ?? run?.can_control));
     $("unconfirmed-interrupt").hidden = !canConfirmInterrupt;
     $("unconfirmed-interrupt").disabled = !canConfirmInterrupt || Boolean(control);
@@ -595,7 +641,7 @@ export function mountLive({ transport, host, sidecar }) {
     $("reply-form").hidden = !supportsTools;
     $("reply-message").disabled = replyBusy || submittedReply === replyKey;
     syncReplyButton();
-    put("ask-question", ask.question || "正在等待回应");
+    put("ask-question", ask.question || tr("正在等待回应"));
     $("ask-context").hidden = !ask.context;
     put("ask-context", ask.context || "");
     const media = ask.media_paths || [];
@@ -636,11 +682,11 @@ export function mountLive({ transport, host, sidecar }) {
     try {
       await transport.live("reply", { run_id: run.run_id, call_id: callId, message });
       submittedReply = key;
-      if (replyKey === key) notice("reply-status", "已发送回复。");
+      if (replyKey === key) notice("reply-status", tr("已发送回复。"));
       void refreshStream();
       void refreshRuns();
     } catch (error) {
-      if (replyKey === key) notice("reply-status", error.message);
+      if (replyKey === key) notice("reply-status", errorText(error.message));
     } finally {
       replyBusy = false;
       if (currentRun()) renderAsk(currentRun());
@@ -654,11 +700,11 @@ export function mountLive({ transport, host, sidecar }) {
     const { question, context, media_paths: media } = pending.arguments || {};
     const attach = action === "attach";
     const content = [{ type: "text", text: [
-      attach ? "GemPT 任务正在等待主对话回复。" : "请查看并处理这条 GemPT 任务的提问。",
+      attach ? tr("GemPT 任务正在等待主对话回复。") : tr("请查看并处理这条 GemPT 任务的提问。"),
       question, context, ...(media || []),
-      `任务 ID ${run.run_id}`,
-      `提问 ID ${pending.call_id}`,
-      "请在主对话回复后，通过 gpt_ctl 的 reply 操作将回答交回任务。",
+      tr("任务 ID {0}", run.run_id),
+      tr("提问 ID {0}", pending.call_id),
+      tr("请在主对话回复后，通过 gpt_ctl 的 reply 操作将回答交回任务。"),
     ].filter(Boolean).join("\n\n") }];
     bridgeBusy = true;
     renderAsk(run);
@@ -666,9 +712,9 @@ export function mountLive({ transport, host, sidecar }) {
       const result = attach ? await host.updateModelContext({ content }, { timeout: 5000 })
         : await host.sendMessage({ role: "user", content }, { timeout: 5000 });
       if (result.isError) throw new Error("Host rejected the request");
-      toast(attach ? "已附带上下文，随下一条主对话消息发送。" : "已在主对话中发送提醒。");
+      toast(attach ? tr("已附带上下文，随下一条主对话消息发送。") : tr("已在主对话中发送提醒。"));
     } catch {
-      toast("当前视图无法发送，请回到任务所属的主对话处理。");
+      toast(tr("当前视图无法发送，请回到任务所属的主对话处理。"));
     } finally {
       bridgeBusy = false;
       if (currentRun()) renderAsk(currentRun());
@@ -691,8 +737,8 @@ export function mountLive({ transport, host, sidecar }) {
     if (unconfirmed) {
       const canConfirmInterrupt = Boolean(supportsTools && (run.can_interrupt ?? run.can_control));
       put("unconfirmed-text", canConfirmInterrupt
-        ? "远端 Codex 回合可能仍在运行。请勿对同一会话盲目并发派发；可点击「尝试中断确认」向远端补发中断。"
-        : "远端 Codex 回合可能仍在运行。请勿对同一会话盲目并发派发，待确认远端结束后再继续。");
+        ? tr("远端 Codex 回合可能仍在运行。请勿对同一会话盲目并发派发；可点击「尝试中断确认」向远端补发中断。")
+        : tr("远端 Codex 回合可能仍在运行。请勿对同一会话盲目并发派发，待确认远端结束后再继续。"));
     }
     $("open-run-session").hidden = !run.session_id;
 
@@ -706,13 +752,13 @@ export function mountLive({ transport, host, sidecar }) {
     put("elapsed", formatElapsed(run.elapsed_sec) || "—");
     put("tokens", tokens == null ? "—" : number.format(tokens));
     put("cache", rate == null ? "—" : percent.format(rate));
-    put("goal", fullGoal ?? (run.goal || "未记录任务目标"));
+    put("goal", fullGoal ?? (run.goal || tr("未记录任务目标")));
     $("detail-worktree").hidden = !run.worktree_path;
     put("workspace", run.worktree_path || run.cwd || "—");
     put("run-id", run.run_id);
     put("session-id", run.session_id || "—");
     $("session-id").disabled = !run.session_id;
-    notice("run-error", run.error || "");
+    notice("run-error", errorText(run.error || ""));
     renderAsk(run);
     renderStream();
   }
@@ -757,8 +803,8 @@ export function mountLive({ transport, host, sidecar }) {
       }
     } catch (error) {
       if (generation === selection) {
-        if (!currentRun()) notice("list-error", error.message);
-        else notice("stream-error", error.message);
+        if (!currentRun()) notice("list-error", errorText(error.message));
+        else notice("stream-error", errorText(error.message));
       }
     } finally {
       if (goalLoading === generation) goalLoading = null;
@@ -832,7 +878,7 @@ export function mountLive({ transport, host, sidecar }) {
   }
 
   async function refreshRuns() {
-    if (!canFetch()) return;
+    if (!canFetch() && !(sidecar && appTab === "live" && ready && !listLoaded)) return;
     if (readingList) { listWanted = true; return; }
     readingList = true;
     listWanted = false;
@@ -862,7 +908,7 @@ export function mountLive({ transport, host, sidecar }) {
     } catch (error) {
       if (version === listVersion) {
         listLoaded = true;
-        notice("list-error", error.message);
+        notice("list-error", errorText(error.message));
         render();
       }
     } finally {
@@ -898,7 +944,7 @@ export function mountLive({ transport, host, sidecar }) {
       await loadMoreTranscript(data);
       if (snapshot === data) notice("stream-error");
     } catch (error) {
-      if (generation === selection) notice("stream-error", error.message);
+      if (generation === selection) notice("stream-error", errorText(error.message));
     } finally {
       readingStream = false;
       if (streamWanted) void refreshStream();
@@ -923,7 +969,7 @@ export function mountLive({ transport, host, sidecar }) {
     control = name;
     confirming = false;
     renderControls();
-    setControlStatus("发送中…");
+    setControlStatus(tr("发送中…"));
     try {
       await transport.live(name, args);
       if (generation !== selection) return;
@@ -952,7 +998,7 @@ export function mountLive({ transport, host, sidecar }) {
       field.select();
       return;
     }
-    toast(message || "已复制。");
+    toast(message || tr("已复制。"));
   }
 
   function onHostContext(context) {
@@ -978,7 +1024,7 @@ export function mountLive({ transport, host, sidecar }) {
     requestedCount = runs.length;
     if (explicit) {
       void loadMoreTranscript(data.stream).catch((error) => {
-        if (snapshot === data.stream) notice("stream-error", error.message);
+        if (snapshot === data.stream) notice("stream-error", errorText(error.message));
       });
       scheduleStream();
     }
@@ -1039,7 +1085,7 @@ export function mountLive({ transport, host, sidecar }) {
   });
   $("attach-context").addEventListener("click", () => void bridgeAsk("attach"));
   $("remind-host").addEventListener("click", () => void bridgeAsk("remind"));
-  $("toast-copy").addEventListener("click", () => void copy(toastPath, "已复制路径。"));
+  $("toast-copy").addEventListener("click", () => void copy(toastPath, tr("已复制路径。")));
   $("toast-dismiss").addEventListener("click", () => toast(""));
   $("turn-strip").addEventListener("keydown", (event) => {
     const tabs = [...$("turn-strip").querySelectorAll('[role="tab"]')];
@@ -1068,14 +1114,14 @@ export function mountLive({ transport, host, sidecar }) {
   });
   $("send-steer").addEventListener("click", () => {
     const message = $("steer").value.trim();
-    if (message) void sendControl("steer", { run_id: selected, message }, "已发送纠偏指令");
+    if (message) void sendControl("steer", { run_id: selected, message }, tr("已发送纠偏指令"));
   });
   $("interrupt").addEventListener("click", () => {
     if (!confirming) { confirming = true; renderControls(); return; }
-    void sendControl("interrupt", { run_id: selected }, "已请求中止当前回合");
+    void sendControl("interrupt", { run_id: selected }, tr("已请求中止当前回合"));
   });
   $("unconfirmed-interrupt").addEventListener("click", () => {
-    void sendControl("interrupt", { run_id: selected }, "已尝试向远端发送中断确认");
+    void sendControl("interrupt", { run_id: selected }, tr("已尝试向远端发送中断确认"));
   });
   $("cancel-interrupt").addEventListener("click", () => { confirming = false; renderControls(); });
 
@@ -1085,9 +1131,12 @@ export function mountLive({ transport, host, sidecar }) {
   });
 
   function start() {
+    $("language-toggle").disabled = !supportsTools;
     render();
     if (supportsTools) {
-      void transport.getSummary().then(({ routing, magpie }) => {
+      const revision = languageRevision;
+      void transport.getSummary().then(({ routing, magpie, ui }) => {
+        if (ui?.language && revision === languageRevision) setLanguage(ui.language);
         applyRoutingBadge(routing);
         if (!magpieCheck && $("magpie-status").dataset.state === "checking") renderMagpieStatus(magpie);
       }).catch(() => {});
@@ -1114,8 +1163,8 @@ export function mountLive({ transport, host, sidecar }) {
       start();
     }).catch((error) => {
       connectFailed = true;
-      notice("list-error", error.message);
-      showConsoleError(error.message);
+      notice("list-error", errorText(error.message));
+      showConsoleError(errorText(error.message));
       render();
     });
   } else {
@@ -1148,20 +1197,27 @@ export function mountLive({ transport, host, sidecar }) {
     if (sidecar) {
       document.documentElement.dataset.sidecar = "";
       let hasWorkspace = false;
-      sidecar.onWorkspaceChange(() => {
-        if (!hasWorkspace) { hasWorkspace = true; return; }
+      sidecar.onWorkspaceChange((uris) => {
+        const first = !hasWorkspace;
+        hasWorkspace = true;
+        // The initial request can already be in flight. Apply a late workspace
+        // scope while retaining the URL's original run or session selection.
+        if (first && !uris.length) return;
         listVersion++;
-        lockedConversation = null;
-        linkedSession = null;
+        if (!first) {
+          lockedConversation = null;
+          linkedSession = null;
+        }
         requestedCount = 0;
         nextOffset = null;
         lastListConversation = null;
         listLoaded = false;
         runs = [];
-        resetSelection();
-        if (appTab === "live") updateHash("live");
+        resetSelection(first ? selected : null);
+        if (!first && appTab === "live") updateHash("live");
         render();
         void refreshRuns();
+        if (first && selected) void refreshStream();
       });
     } else {
       $("scope-session").hidden = true;

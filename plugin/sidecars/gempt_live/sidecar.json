@@ -3,7 +3,7 @@
   "args": ["main.mjs"],
   "restart_policy": "always",
   "display_name": "GemPT",
-  "description": "Follow and control GemPT runs and open the GemPT Console.",
+  "description": "Follow and control GPT/Codex runs and manage GemPT settings in Antigravity.",
   "has_web_ui": true,
   "agent_permissions": {
     "allows_user_interactions": false

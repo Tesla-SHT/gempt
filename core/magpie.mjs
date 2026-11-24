@@ -42,7 +42,7 @@ function discoverLocalMagpieClientKey() {
   return '';
 }
 
-export function resolveMagpieApiKey(cfg, targetUrl = '') {
+export function resolveMagpieApiKey(cfg, targetUrl = '', { allowLocalFallback = true } = {}) {
   const magpieCfg = cfg?.magpie || {};
   const endpoint = String(magpieCfg.base_url || DEFAULT_MAGPIE_URL).replace(/\/+$/, '');
   const cleanTarget = String(targetUrl || '').replace(/\/+$/, '');
@@ -53,14 +53,14 @@ export function resolveMagpieApiKey(cfg, targetUrl = '') {
   if (endpoint !== trusted) {
     return String(magpieCfg.api_key || '').trim();
   }
-  const envName = String(magpieCfg.api_key_env || 'GEMPT_MAGPIE_API_KEY').trim();
+  const envName = String(magpieCfg.api_key_env ?? 'GEMPT_MAGPIE_API_KEY').trim();
   if (envName) {
     const envVal = String(process.env[envName] || '').trim();
     if (envVal) return envVal;
   }
   const cfgVal = String(magpieCfg.api_key || '').trim();
   if (cfgVal) return cfgVal;
-  if (endpoint !== DEFAULT_MAGPIE_URL) return '';
+  if (endpoint !== DEFAULT_MAGPIE_URL || !allowLocalFallback) return '';
   return discoverLocalMagpieClientKey() || 'magpie';
 }
 
@@ -285,6 +285,7 @@ function emptyProbeResult(url, error) {
     reachable: false,
     url,
     total_models: 0,
+    models: [],
     codex_models: [],
     openai_models: [],
     gemini_models: [],
@@ -310,6 +311,7 @@ export function probeMagpie(baseUrl = DEFAULT_MAGPIE_URL, apiKey = '', timeoutMs
 
   const client = parsed.protocol === 'https:' ? https : http;
   const headers = { Accept: 'application/json' };
+  if (apiKey && !/^[\x20-\x7e]+$/.test(apiKey)) return Promise.resolve(emptyProbeResult(cleanedUrl, 'Invalid gateway credential.'));
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
   return new Promise((resolveProbe) => {
@@ -344,7 +346,8 @@ export function probeMagpie(baseUrl = DEFAULT_MAGPIE_URL, apiKey = '', timeoutMs
           }
           try {
             const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-            const models = Array.isArray(body?.data) ? body.data : [];
+            if (totalBytes > maxBytes || !Array.isArray(body?.data)) throw new Error('Invalid model catalog');
+            const models = body.data;
             const visibleIds = [];
             const codexSet = new Set();
             const openaiSet = new Set();
@@ -353,8 +356,8 @@ export function probeMagpie(baseUrl = DEFAULT_MAGPIE_URL, apiKey = '', timeoutMs
             const harnessGroups = [];
             const nativeGroups = [];
             for (const item of models) {
-              const id = String(item?.id || '');
-              if (!id || isExcludedModel(id, excludedTokens)) continue;
+              const id = typeof item?.id === 'string' ? item.id : '';
+              if (!id || (apiKey && (id === apiKey || (apiKey.length >= 8 && id.includes(apiKey)))) || isExcludedModel(id, excludedTokens)) continue;
               const owned = String(item?.owned_by || '').toLowerCase();
               const label = String(item?.magpie_label || '').toLowerCase();
               const isGroup = id.startsWith('group/') || id.startsWith('auto/') || label.includes('routing group');
@@ -388,6 +391,7 @@ export function probeMagpie(baseUrl = DEFAULT_MAGPIE_URL, apiKey = '', timeoutMs
               reachable: true,
               url: cleanedUrl,
               total_models: visibleIds.length,
+              models: visibleIds,
               codex_models: codexModels,
               openai_models: openaiModels,
               gemini_models: geminiModels,
@@ -397,8 +401,8 @@ export function probeMagpie(baseUrl = DEFAULT_MAGPIE_URL, apiKey = '', timeoutMs
               native_groups: nativeGroups,
               error: '',
             });
-          } catch (err) {
-            finish(emptyProbeResult(cleanedUrl, `Invalid JSON: ${err.message}`));
+          } catch {
+            finish(emptyProbeResult(cleanedUrl, 'Invalid gateway model response.'));
           }
         });
       },

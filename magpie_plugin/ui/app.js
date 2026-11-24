@@ -1,6 +1,9 @@
+import { mountAdvancedSettings } from './advanced-settings.js';
+import { tr, locale, localizedFormat, errorText } from './i18n.js';
+
 // Shared Console controller. Host adapters provide transport and host integration.
 export function mountConsole(root, transport, {
-  queryViewMode = '', onState, navigate, showToast, copyText,
+  queryViewMode = '', onState, navigate, showToast, copyText, onLanguage, refreshGateway,
 } = {}) {
   const POLL_MS = 15000;
   const LIVE_POLL_MS = 2800;
@@ -19,6 +22,8 @@ export function mountConsole(root, transport, {
   const scrollTarget = root;
   let visible = false;
   const pendingSettings = new Set();
+  const advanced = mountAdvancedSettings($, { transport, showToast, onLanguage, refreshGateway,
+    refresh: () => refreshState({ replace: true }), init: activateSubscriptionConfig });
 
   const EFFORT_LABELS = {
     none: '思考：关',
@@ -83,6 +88,7 @@ export function mountConsole(root, transport, {
   let currentViewMode = queryViewMode || readStoredMode();
   let ratioRange = readStoredRatioRange();
   let ratioFetch;
+  let latestRatio;
   let runStateFetch;
   let locateWork = false;
 
@@ -131,20 +137,20 @@ export function mountConsole(root, transport, {
   function titleCaseTier(id) {
     if (!id) return 'Sonnet';
     if (id === 'mcp') return 'MCP';
-    if (id === 'paired') return 'Gemini 配对';
-    if (id.startsWith('paired:')) return `${titleCaseTier(id.slice(7))} 配对`;
+    if (id === 'paired') return tr('Gemini 配对');
+    if (id.startsWith('paired:')) return tr("{0} 配对", titleCaseTier(id.slice(7)));
     return id.charAt(0).toUpperCase() + id.slice(1);
   }
 
   function formatEffortLabel(effort, auto) {
-    if (auto) return '智能思考';
+    if (auto) return tr('智能思考');
     const raw = String(effort || 'medium').trim().toLowerCase();
-    return EFFORT_LABELS[raw] || `思考：${raw}`;
+    return tr(EFFORT_LABELS[raw]) || tr("思考：{0}", raw);
   }
 
   function humanizeModel(rawId) {
     const id = String(rawId || '').trim();
-    if (!id) return '未知模型';
+    if (!id) return tr('未知模型');
     if (id.startsWith('group/')) return id.slice('group/'.length);
     const tail = id.includes('/') ? id.slice(id.indexOf('/') + 1) : id;
     return tail
@@ -186,14 +192,14 @@ export function mountConsole(root, transport, {
 
   function formatNativeSummary(nativeTier) {
     const chain = buildNativeChain(nativeTier);
-    if (!chain.length) return '尚未检测到 Gemini + Codex 订阅模型';
+    if (!chain.length) return tr('尚未检测到 Gemini + Codex 订阅模型');
     const planner = chain.find((n) => n.role === 'planner')?.human || '';
     const coders = chain.filter((n) => n.role === 'coder' || n.role === 'escalate').map((n) => n.human);
     const hasUtil = chain.some((n) => n.role === 'utility');
     let text = planner && coders.length
       ? `${planner} → ${coders.join(' / ')}`
       : (coders.join(' / ') || planner);
-    if (hasUtil) text += ' · DeepSeek 压缩';
+    if (hasUtil) text += tr(' · DeepSeek 压缩');
     return text;
   }
 
@@ -201,7 +207,7 @@ export function mountConsole(root, transport, {
     const ext = clients?.external_clients || [];
     if (!ext.length) return 'Claude Code · ZCode · OpenCode · Cursor';
     const slice = ext.slice(0, 3);
-    return `${slice.join(' · ')} · 任意客户端`;
+    return tr("{0} · 任意客户端", slice.join(' · '));
   }
 
   function renderSetupBanner(state, viewMode) {
@@ -224,7 +230,7 @@ export function mountConsole(root, transport, {
       if (!subReady && !state.native_groups?.complete) {
         banner.hidden = false;
         banner.dataset.tone = 'warn';
-        textEl.textContent = '尚未检测到 Codex 订阅 — 请先在 Magpie 左侧接入你的 ChatGPT / Codex 订阅账号，完成后点右上角刷新。';
+        textEl.textContent = tr('尚未检测到 Codex 订阅 — 请先在 Magpie 左侧接入你的 ChatGPT / Codex 订阅账号，完成后点右上角刷新。');
         btn.hidden = true;
         return;
       }
@@ -242,11 +248,11 @@ export function mountConsole(root, transport, {
     banner.hidden = false;
     if (!subReady) {
       banner.dataset.tone = 'warn';
-      textEl.textContent = '尚未检测到 Codex 订阅 — 请先在 Magpie 左侧接入你的 ChatGPT / Codex 订阅账号，完成后点右上角刷新即可自动连上。';
+      textEl.textContent = tr('尚未检测到 Codex 订阅 — 请先在 Magpie 左侧接入你的 ChatGPT / Codex 订阅账号，完成后点右上角刷新即可自动连上。');
       btn.hidden = true;
     } else {
       banner.dataset.tone = 'ready';
-      textEl.textContent = '已检测到 Codex 订阅，可以启用 Antigravity MCP 编排。';
+      textEl.textContent = tr('已检测到 Codex 订阅，可以启用 Antigravity MCP 编排。');
       btn.hidden = false;
       btn.disabled = false;
     }
@@ -260,7 +266,8 @@ export function mountConsole(root, transport, {
     const list = $('work-options');
     const swarm = $('swarm-split');
     if (!list.children.length) {
-      swarm.add(new Option('跟随普通对话', 'inherit'));
+      swarm.replaceChildren();
+      swarm.add(new Option(tr('跟随普通对话'), 'inherit'));
       for (const [id, profile] of Object.entries(profiles)) {
         const isOff = profile.gpt_share === 0;
         const label = document.createElement('label');
@@ -271,12 +278,12 @@ export function mountConsole(root, transport, {
         radio.name = 'work_split';
         radio.value = id;
         const title = document.createElement('strong');
-        title.textContent = profile.label;
+        title.textContent = tr(profile.label);
         const weight = document.createElement('small');
-        weight.textContent = isOff ? '纯 Gemini · 不派单' : 'GPT 约 ' + profile.gpt_share + '%';
+        weight.textContent = isOff ? tr('纯 Gemini · 不派单') : tr('GPT 约 {0}%', profile.gpt_share);
         label.append(radio, title, weight);
         list.append(label);
-        swarm.add(new Option(isOff ? profile.label + ' · 纯 Gemini' : profile.label + ' · ' + weight.textContent, id));
+        swarm.add(new Option(isOff ? tr(profile.label) + tr(' · 纯 Gemini') : tr(profile.label) + ' · ' + weight.textContent, id));
       }
     }
     for (const radio of list.querySelectorAll('input')) {
@@ -291,22 +298,23 @@ export function mountConsole(root, transport, {
     const ordinary = profiles[state.work_split];
     const team = profiles[swarm.value] || ordinary;
     const workDetail = $('work-detail');
-    workDetail.textContent = ordinary?.detail || '';
+    workDetail.textContent = tr(ordinary?.detail || '');
     if (ordinary?.gpt_share !== 0 && state.tools?.exec_enabled === false) {
-      workDetail.textContent += ' Magpie 的 gempt_run 当前允许只读调查。要允许写入，请在 GemPT 插件选项开启 exec。';
+      workDetail.textContent += tr(' Magpie 的 gempt_run 当前允许只读调查。要允许写入，请在 GemPT 插件选项开启 exec。');
     }
     $('swarm-detail').textContent = team?.gpt_share === 0
-      ? team.detail
-      : (team?.label || '') + ' · 协调者拆单和解说，成员按各自职责派单，核验者独立检查。';
+      ? tr(team.detail)
+      : tr(team?.label || '') + tr(' · 协调者拆单和解说，成员按各自职责派单，核验者独立检查。');
   }
 
   function formatCompactTokens(n) {
     const num = Number(n || 0);
     if (!Number.isFinite(num) || num <= 0) return '0';
-    if (num >= 1e8) return `${(num / 1e8).toFixed(2)} 亿`;
+    if (locale() === 'en') return number(num, true);
+    if (num >= 1e8) return tr("{0} 亿", (num / 1e8).toFixed(2));
     if (num >= 1e4) {
       const w = num / 1e4;
-      return w >= 100 ? `${Math.round(w)} 万` : `${w.toFixed(1)} 万`;
+      return w >= 100 ? tr("{0} 万", Math.round(w)) : tr("{0} 万", w.toFixed(1));
     }
     return num.toLocaleString('en-US');
   }
@@ -321,9 +329,10 @@ export function mountConsole(root, transport, {
   function renderTokenRatio(ratio) {
     const card = $('token-ratio-card');
     if (!card) return;
+    latestRatio = ratio;
     card.hidden = !ratio;
     if (!ratio) return;
-    const rangeTitle = RATIO_RANGE_TITLES[ratio.range] || RATIO_RANGE_TITLES['24h'];
+    const rangeTitle = tr(RATIO_RANGE_TITLES[ratio.range]) || tr(RATIO_RANGE_TITLES['24h']);
     const title = $('token-ratio-title');
     if (title) title.textContent = rangeTitle;
     const badge = $('token-ratio-badge');
@@ -336,7 +345,7 @@ export function mountConsole(root, transport, {
     const metaEl = $('token-ratio-meta');
 
     if (badge) {
-      badge.textContent = RATIO_STATUS[ratio.status] || RATIO_STATUS.no_data;
+      badge.textContent = tr(RATIO_STATUS[ratio.status]) || tr(RATIO_STATUS.no_data);
       badge.dataset.tone = ratio.status === 'observing' ? 'ok' : 'neutral';
     }
     const target = Number(ratio.target_gpt_share || 0);
@@ -349,29 +358,29 @@ export function mountConsole(root, transport, {
     if (tick) {
       tick.hidden = !(target > 0 && target < 100);
       tick.style.left = `${target}%`;
-      tick.title = `GPT 参考目标 ${target}%`;
+      tick.title = tr("GPT 参考目标 {0}%", target);
     }
     if (track) {
       track.setAttribute('aria-label', hasData
-        ? `${rangeTitle}，GPT 占 ${gptPct.toFixed(1)}%，Gemini 占 ${gemPct.toFixed(1)}%，GPT 参考目标 ${target}%`
-        : `${rangeTitle}，暂无可计算的工作量占比，GPT 参考目标 ${target}%`);
+        ? tr("{0}，GPT 占 {1}%，Gemini 占 {2}%，GPT 参考目标 {3}%", rangeTitle, gptPct.toFixed(1), gemPct.toFixed(1), target)
+        : tr("{0}，暂无可计算的工作量占比，GPT 参考目标 {1}%", rangeTitle, target));
     }
 
     if (gptText) {
       gptText.textContent = hasData
         ? `GPT ${gptPct.toFixed(1)}% · ${formatCompactTokens(ratio.gpt_tokens)}`
-        : 'GPT 暂无数据';
-      gptText.title = hasData ? `GPT 总 Token ${formatCompactTokens(ratio.gpt_tokens)}（含缓存）` : '';
+        : tr('GPT 暂无数据');
+      gptText.title = hasData ? tr("GPT 总 Token {0}（含缓存）", formatCompactTokens(ratio.gpt_tokens)) : '';
     }
     if (gemText) {
       gemText.textContent = hasData
         ? `Gemini ${gemPct.toFixed(1)}% · ${formatCompactTokens(ratio.gemini_tokens)}`
-        : 'Gemini 暂无数据';
+        : tr('Gemini 暂无数据');
     }
     if (metaEl) {
       const total = ratio.actual_gpt_total_share;
-      metaEl.textContent = `参考目标 ${target}%${typeof total === 'number' ? ` · 含缓存 ${total.toFixed(1)}%` : ''}`;
-      metaEl.title = '主占比按工作量 in + 5×out 计算，「含缓存」为 GPT 占总 Token 的比例；仅观测，不自动催单或改档';
+      metaEl.textContent = tr("参考目标 {0}%{1}", target, typeof total === 'number' ? tr(" · 含缓存 {0}%", total.toFixed(1)) : '');
+      metaEl.title = tr('主占比按工作量 in + 5×out 计算，「含缓存」为 GPT 占总 Token 的比例；仅观测，不自动催单或改档');
     }
   }
 
@@ -390,11 +399,11 @@ export function mountConsole(root, transport, {
         list.append(label);
       }
       const defaultModel = state.mcp_default_model;
-      const defaultLabel = defaultModel ? `默认模型 · ${humanizeModel(defaultModel)}` : '默认模型';
+      const defaultLabel = defaultModel ? tr("默认模型 · {0}", humanizeModel(defaultModel)) : tr('默认模型');
       const choices = [new Option(defaultLabel, 'default')];
       for (const id of models) choices.push(new Option(humanizeModel(id), id));
       if (current !== 'default' && !models.includes(current)) {
-        choices.push(new Option(humanizeModel(current) + '（未检测到）', current));
+        choices.push(new Option(humanizeModel(current) + tr('（未检测到）'), current));
       }
       select.replaceChildren(...choices);
       select.value = current;
@@ -409,10 +418,11 @@ export function mountConsole(root, transport, {
     }
     const model = $('swarm-shell-model');
     const models = state.swarm_shell_models || [];
-    if (Array.from(model.options, (option) => option.value).join() !== models.join()) {
-      model.replaceChildren(...models.map((name) => new Option(name, name)));
+    const presets = $('swarm-shell-presets');
+    if (Array.from(presets.options, (option) => option.value).join() !== models.join()) {
+      presets.replaceChildren(...models.map((name) => new Option(name, name)));
     }
-    model.value = state.swarm_shell_model;
+    if (document.activeElement !== model || pendingSettings.has(model.name)) model.value = state.swarm_shell_model;
     model.disabled = !state.configured || pendingSettings.has(model.name);
     const timeout = $('codex-timeout');
     if (document.activeElement !== timeout) timeout.value = state.codex_timeout_sec ?? 3600;
@@ -441,9 +451,9 @@ export function mountConsole(root, transport, {
     }
     const sbxHint = $('sandbox-hint');
     if (sbxHint) {
-      const baseHint = SANDBOX_HINTS[currentDefaultSandbox] || currentDefaultSandbox;
+      const baseHint = tr(SANDBOX_HINTS[currentDefaultSandbox]) || currentDefaultSandbox;
       sbxHint.textContent = state.tools?.exec_enabled === false
-        ? `${baseHint} · gempt_run 仅限只读（插件选项设 exec: true 后可写）`
+        ? tr("{0} · gempt_run 仅限只读（插件选项设 exec: true 后可写）", baseHint)
         : baseHint;
     }
 
@@ -454,7 +464,7 @@ export function mountConsole(root, transport, {
     }
     const effHint = $('effort-hint');
     if (effHint) {
-      effHint.textContent = EFFORT_HINTS[currentEffortChoice] || formatEffortLabel(currentEffortChoice);
+      effHint.textContent = tr(EFFORT_HINTS[currentEffortChoice]) || formatEffortLabel(currentEffortChoice);
     }
 
     renderGatewayControls(state);
@@ -483,8 +493,8 @@ export function mountConsole(root, transport, {
         const fmHint = $('failover-hint');
         if (fmHint) {
           fmHint.textContent = !apiAvailable
-            ? '未检测到按量 openai/* 渠道，当前仅可用订阅直连'
-            : (FAILOVER_HINTS[currentFailoverMode] || FAILOVER_HINTS.subscription_only);
+            ? tr('未检测到按量 openai/* 渠道，当前仅可用订阅直连')
+            : (tr(FAILOVER_HINTS[currentFailoverMode]) || tr(FAILOVER_HINTS.subscription_only));
         }
       }
     }
@@ -499,24 +509,24 @@ export function mountConsole(root, transport, {
         pill.hidden = !installedSet.has(pill.getAttribute('data-copy'));
       }
       if (ng.complete) {
-        nativeCopy.textContent = '已就绪（3/3）· 在任意接入 Magpie 的客户端模型栏直接选下方 ID：';
+        nativeCopy.textContent = tr('已就绪（3/3）· 在任意接入 Magpie 的客户端模型栏直接选下方 ID：');
         nativePills.hidden = false;
         createBtn.hidden = true;
       } else if (ng.can_create) {
         const ready = Number(ng.ready_count || 0);
         nativeCopy.textContent = ready > 0
-          ? `已创建 ${ready}/3 个路由组，点击可补齐剩余直连路由组（不会覆盖已有组）：`
-          : '无需安装客户端插件 — 点击一键在 Magpie 创建 group/gempt-* 即可在任何客户端直选使用：';
+          ? tr("已创建 {0}/3 个路由组，点击可补齐剩余直连路由组（不会覆盖已有组）：", ready)
+          : tr('无需安装客户端插件 — 点击一键在 Magpie 创建 group/gempt-* 即可在任何客户端直选使用：');
         nativePills.hidden = ready === 0;
         createBtn.hidden = false;
         createBtn.disabled = false;
-        createBtn.textContent = ready > 0 ? '补齐缺失路由组' : '一键创建直连路由组';
+        createBtn.textContent = ready > 0 ? tr('补齐缺失路由组') : tr('一键创建直连路由组');
       } else {
-        nativeCopy.textContent = ng.missing_reason || '需要 Magpie 中同时接入 Gemini 与 Codex 订阅模型后才能创建直连路由组。';
+        nativeCopy.textContent = tr(ng.missing_reason) || tr('需要 Magpie 中同时接入 Gemini 与 Codex 订阅模型后才能创建直连路由组。');
         nativePills.hidden = true;
         createBtn.hidden = false;
         createBtn.disabled = true;
-        createBtn.textContent = '一键创建直连路由组';
+        createBtn.textContent = tr('一键创建直连路由组');
       }
     }
   }
@@ -559,7 +569,7 @@ export function mountConsole(root, transport, {
 
       const role = document.createElement('span');
       role.className = 'node-role';
-      role.textContent = NODE_ROLE_LABELS[node.role] || node.role;
+      role.textContent = tr(NODE_ROLE_LABELS[node.role]) || node.role;
 
       li.append(left);
       if (node.role) li.append(role);
@@ -589,19 +599,19 @@ export function mountConsole(root, transport, {
       if (targetBtn) {
         targetBtn.textContent = groupId;
         targetBtn.setAttribute('data-copy', groupId);
-        targetBtn.title = `点击复制 ${groupId}`;
+        targetBtn.title = tr("点击复制 {0}", groupId);
         targetBtn.hidden = false;
       }
       if (readyBadge) {
         readyBadge.hidden = false;
         readyBadge.dataset.tone = installed ? 'ok' : 'warn';
-        readyBadge.textContent = installed ? '已就绪' : '未创建';
+        readyBadge.textContent = installed ? tr('已就绪') : tr('未创建');
       }
-      if (effortEl) effortEl.textContent = '按意图自动分流';
-      if (sourceTitle) sourceTitle.textContent = '外部客户端直连';
+      if (effortEl) effortEl.textContent = tr('按意图自动分流');
+      if (sourceTitle) sourceTitle.textContent = tr('外部客户端直连');
       nativeCaption.textContent = formatNativeClientSubtitle(state.clients);
-      if (hubModeText) hubModeText.textContent = '意图路由分流';
-      renderChainNodes(chainEl, buildNativeChain(activeNativeTier), '需先在 Magpie 接入 Gemini 与 Codex 模型');
+      if (hubModeText) hubModeText.textContent = tr('意图路由分流');
+      renderChainNodes(chainEl, buildNativeChain(activeNativeTier), tr('需先在 Magpie 接入 Gemini 与 Codex 模型'));
       return;
     }
 
@@ -611,7 +621,7 @@ export function mountConsole(root, transport, {
     if (effortEl) effortEl.textContent = formatEffortLabel(state.mcp_effort, state.auto_effort);
     if (sourceTitle) sourceTitle.textContent = 'Antigravity';
     if (slashBtn) slashBtn.hidden = !state.clients?.antigravity_installed;
-    if (hubModeText) hubModeText.textContent = 'Codex 订阅';
+    if (hubModeText) hubModeText.textContent = tr('Codex 订阅');
   }
 
   function renderReadiness(state) {
@@ -623,7 +633,7 @@ export function mountConsole(root, transport, {
     if (chipNative && chipNativeVal) {
       const ready = Number(ng.ready_count || 0);
       chipNative.dataset.tone = ng.complete ? 'ok' : (ready > 0 ? 'warn' : 'neutral');
-      chipNativeVal.textContent = ng.complete ? '3/3 已就绪' : (ready > 0 ? `${ready}/3` : '未创建');
+      chipNativeVal.textContent = ng.complete ? tr('3/3 已就绪') : (ready > 0 ? `${ready}/3` : tr('未创建'));
     }
 
     const chipMcp = $('chip-mcp');
@@ -632,13 +642,13 @@ export function mountConsole(root, transport, {
       if (clients.native_tools_registered) {
         chipMcp.dataset.tone = 'ok';
         const agentCount = Array.isArray(clients.native_tools_agents) ? clients.native_tools_agents.length : 0;
-        chipMcpVal.textContent = agentCount > 0 ? `已自动同步 ${agentCount} 端` : 'Magpie 自动托管';
+        chipMcpVal.textContent = agentCount > 0 ? tr("已自动同步 {0} 端", agentCount) : tr('Magpie 自动托管');
       } else if (clients.magpie_mcp_registered) {
         chipMcp.dataset.tone = 'ok';
-        chipMcpVal.textContent = 'Magpie MCP 已接入';
+        chipMcpVal.textContent = tr('Magpie MCP 已接入');
       } else {
         chipMcp.dataset.tone = 'neutral';
-        chipMcpVal.textContent = '复制独立配置';
+        chipMcpVal.textContent = tr('复制独立配置');
       }
     }
 
@@ -646,27 +656,27 @@ export function mountConsole(root, transport, {
     const chipAgyVal = $('chip-agy-val');
     if (chipAgy && chipAgyVal) {
       chipAgy.dataset.tone = clients.antigravity_installed ? 'ok' : 'neutral';
-      chipAgyVal.textContent = clients.antigravity_installed ? '插件已安装' : '未安装';
+      chipAgyVal.textContent = clients.antigravity_installed ? tr('插件已安装') : tr('未安装');
     }
   }
 
   function formatRunMeta(run) {
-    if (run.remote_turn_unconfirmed) return '远端终态未确认';
-    if (run.verification === 'passed') return '已通过';
-    if (run.verification === 'failed' || run.state === 'failed') return '失败';
-    if (run.state === 'waiting_gemini') return '等待 Gemini';
-    if (run.state === 'interrupted') return '已中止';
-    if (run.state === 'running' || run.state === 'queued') return '进行中';
-    if (run.state === 'finished') return '已完成';
-    if (run.state === 'outcome_unknown') return '状态未知';
-    return run.state || '已记录';
+    if (run.remote_turn_unconfirmed) return tr('远端终态未确认');
+    if (run.verification === 'passed') return tr('已通过');
+    if (run.verification === 'failed' || run.state === 'failed') return tr('失败');
+    if (run.state === 'waiting_gemini') return tr('等待 Gemini');
+    if (run.state === 'interrupted') return tr('已中止');
+    if (run.state === 'running' || run.state === 'queued') return tr('进行中');
+    if (run.state === 'finished') return tr('已完成');
+    if (run.state === 'outcome_unknown') return tr('状态未知');
+    return run.state || tr('已记录');
   }
 
   function formatGroupStatus(status) {
     const code = Number(status || 0);
-    if (code >= 200 && code < 400) return '正常';
+    if (code >= 200 && code < 400) return tr('正常');
     if (code >= 400) return `HTTP ${code}`;
-    return '已记录';
+    return tr('已记录');
   }
 
   function renderActivity(state) {
@@ -678,7 +688,7 @@ export function mountConsole(root, transport, {
       tone: run.remote_turn_unconfirmed ? 'err'
         : run.verification === 'passed' ? 'ok'
         : (run.state === 'failed' || run.verification === 'failed' ? 'err' : 'neutral'),
-      text: `执行 · ${titleCaseTier(run.tier || 'exec')} · ${run.title || run.cwd_name || run.run_id.slice(0, 8)}`,
+      text: tr("执行 · {0} · {1}", titleCaseTier(run.tier || 'exec'), run.title || run.cwd_name || run.run_id.slice(0, 8)),
       meta: formatRunMeta(run),
       runId: run.run_id, sessionId: run.session_id,
     }));
@@ -686,32 +696,32 @@ export function mountConsole(root, transport, {
       const agentTag = sess.agent ? ` · ${sess.agent}` : '';
       return {
         tone: 'ok',
-        text: `${sess.mode === 'exec' ? '执行' : '咨询'} · ${titleCaseTier(sess.tier || 'sonnet')}${agentTag} · ${sess.title || sess.cwd_name || 'GPT 任务'}`,
-        meta: `${Math.max(1, Math.floor((sess.turns || 0) / 2))} 轮`,
+        text: `${sess.mode === 'exec' ? tr('执行') : tr('咨询')} · ${titleCaseTier(sess.tier || 'sonnet')}${agentTag} · ${sess.title || sess.cwd_name || tr('GPT 任务')}`,
+        meta: tr("{0} 轮", Math.max(1, Math.floor((sess.turns || 0) / 2))),
         sessionId: sess.session_id, hasLive: sess.has_live_run,
       };
     });
     const groupCalls = (state.recent_group_calls || []).map((call) => {
       const status = Number(call.status || 0);
       const tone = status >= 200 && status < 400 ? 'ok' : (status >= 400 ? 'err' : 'neutral');
-      const clientLabel = call.agent || '外部客户端';
+      const clientLabel = call.agent || tr('外部客户端');
       const servedLabel = call.served_model ? ` (${humanizeModel(call.served_model)})` : '';
       return {
         tone,
-        text: `路由组 · ${titleCaseTier(call.tier || 'sonnet')} · ${clientLabel}${servedLabel}`,
+        text: tr("路由组 · {0} · {1}{2}", titleCaseTier(call.tier || 'sonnet'), clientLabel, servedLabel),
         meta: formatGroupStatus(status),
       };
     });
 
     const rows = [...runs, ...sessions, ...groupCalls].slice(0, 5);
     const totals = state.activity_totals;
-    count.textContent = totals ? `${number(totals.requests)} 个请求 · ${number(totals.sessions)} 个会话 · ${number(totals.runs)} 次运行` : '—';
+    count.textContent = totals ? tr("{0} 个请求 · {1} 个会话 · {2} 次运行", number(totals.requests), number(totals.sessions), number(totals.runs)) : '—';
     list.replaceChildren();
 
     if (!rows.length) {
       const li = document.createElement('li');
       li.className = 'recent-empty';
-      li.textContent = '暂无最近委派或路由组记录。';
+      li.textContent = tr('暂无最近委派或路由组记录。');
       list.appendChild(li);
       return;
     }
@@ -758,6 +768,7 @@ export function mountConsole(root, transport, {
 
     renderSetupBanner(state, viewMode);
     renderControls(state, viewMode);
+    advanced.render(state);
     renderReadiness(state);
 
     renderTierRoutes(state, viewMode);
@@ -767,9 +778,9 @@ export function mountConsole(root, transport, {
     if (state.utility) {
       if (choreModel) choreModel.textContent = state.utility.model;
       if (choreSub) {
-        const parts = ['仅咨询'];
-        if (state.utility.use_for_magpie_compact) parts.push('自动压缩上下文');
-        if (state.utility.fallback_models?.length) parts.push(`+${state.utility.fallback_models.length} 备用`);
+        const parts = [tr('仅咨询')];
+        if (state.utility.use_for_magpie_compact) parts.push(tr('自动压缩上下文'));
+        if (state.utility.fallback_models?.length) parts.push(tr("+{0} 备用", state.utility.fallback_models.length));
         choreSub.textContent = parts.join(' · ');
       }
     }
@@ -809,7 +820,7 @@ export function mountConsole(root, transport, {
         if (radio) radio.checked = tierId === nativePreviewTier;
         if (pillEl) pillEl.textContent = nativeInfo?.group_id || `group/gempt-${tierId}`;
         if (subEl) subEl.textContent = formatNativeSummary(nativeInfo);
-        if (effortEl) effortEl.textContent = nativeInfo?.installed ? '已就绪' : '未创建';
+        if (effortEl) effortEl.textContent = nativeInfo?.installed ? tr('已就绪') : tr('未创建');
       }
     }
 
@@ -818,13 +829,14 @@ export function mountConsole(root, transport, {
 
   let gatewayStatus;
 
-  function patchGatewayStatus({ overview, ...magpie }) {
+  function patchGatewayStatus({ overview, ui, ...magpie }) {
     gatewayStatus = { ...overview, magpie };
     if (!latestState || latestState.magpie.url !== magpie.url) return;
     latestState = { ...latestState, ...gatewayStatus };
     if (!visible || activeTab !== 'overview') return;
     renderSetupBanner(latestState, currentViewMode);
     renderPairings(latestState);
+    advanced.render(latestState);
     renderGatewayControls(latestState);
     renderReadiness(latestState);
     renderTierRoutes(latestState, currentViewMode);
@@ -848,14 +860,14 @@ export function mountConsole(root, transport, {
     let message = '';
     if (!view && stateRefreshError) {
       message = stateSyncedAt
-        ? `概览数据已过期 · 上次同步 ${dateTime.format(stateSyncedAt)} · ${stateRefreshError}`
-        : `加载概览失败 · ${stateRefreshError}`;
+        ? tr("概览数据已过期 · 上次同步 {0} · {1}", dateTime.format(stateSyncedAt), errorText(stateRefreshError))
+        : tr("加载概览失败 · {0}", errorText(stateRefreshError));
     } else if (!view && offline) {
-      message = 'Magpie 离线 · 请检查本地 Magpie 是否已启动';
-      if (stateSyncedAt) message += ` · 上次同步 ${dateTime.format(stateSyncedAt)}`;
+      message = tr('Magpie 离线 · 请检查本地 Magpie 是否已启动');
+      if (stateSyncedAt) message += tr(" · 上次同步 {0}", dateTime.format(stateSyncedAt));
     } else if (activity?.refreshError) {
-      const label = view.kind === 'requests' ? '请求' : '会话';
-      message = `${label}数据已过期 · 上次同步 ${dateTime.format(activity.syncedAt)} · ${activity.refreshError}`;
+      const label = view.kind === 'requests' ? tr('请求') : tr('会话');
+      message = tr("{0}数据已过期 · 上次同步 {1} · {2}", label, dateTime.format(activity.syncedAt), errorText(activity.refreshError));
     }
 
     $('overview').toggleAttribute('data-state-unavailable', Boolean(stateRefreshError && !latestState));
@@ -878,7 +890,7 @@ export function mountConsole(root, transport, {
       const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(POLL_MS)]);
       let data = await transport.getState({ signal });
       if (abort.signal.aborted) return;
-      if (!data?.magpie) throw new Error('状态响应格式无效');
+      if (!data?.magpie) throw new Error(tr('状态响应格式无效'));
       if (gatewayStatus?.magpie.url === data.magpie.url
           && (gatewayStatus !== previousGatewayStatus || data.magpie.reachable === null)) {
         data = { ...data, ...gatewayStatus };
@@ -912,8 +924,8 @@ export function mountConsole(root, transport, {
     } catch {
       if (!abort.signal.aborted) {
         $('token-ratio-card').hidden = false;
-        $('token-ratio-title').textContent = RATIO_RANGE_TITLES[ratioRange];
-        $('token-ratio-badge').textContent = '读取失败';
+        $('token-ratio-title').textContent = tr(RATIO_RANGE_TITLES[ratioRange]);
+        $('token-ratio-badge').textContent = tr('读取失败');
       }
     } finally {
       if (ratioFetch === abort) ratioFetch = null;
@@ -929,7 +941,7 @@ export function mountConsole(root, transport, {
       if (latestState) latestState = { ...latestState, ...data };
       renderLiveOverview(data);
     } catch (error) {
-      if (!abort.signal.aborted) $('active-run-list').title = error.message;
+      if (!abort.signal.aborted) $('active-run-list').title = errorText(error.message);
     } finally {
       if (runStateFetch === abort) runStateFetch = null;
     }
@@ -937,12 +949,13 @@ export function mountConsole(root, transport, {
 
   async function activateSubscriptionConfig() {
     const btn = $('init-sub-btn');
-    if (btn) btn.disabled = true;
+    if (btn.disabled) return;
+    btn.disabled = true;
     try {
       await transport.runAction('init');
-      showToast('已启用全客户端共享配置');
+      showToast(tr('已启用全客户端共享配置'));
     } catch (err) {
-      showToast(`启用失败: ${err.message}`, 'error');
+      showToast(tr("启用失败: {0}", errorText(err.message)), 'error');
     } finally {
       if (btn) btn.disabled = false;
       await refreshState();
@@ -957,14 +970,14 @@ export function mountConsole(root, transport, {
       const createdCount = Array.isArray(payload.created) ? payload.created.length : 0;
       const skippedCount = Array.isArray(payload.skipped) ? payload.skipped.length : 0;
       if (createdCount > 0 && skippedCount > 0) {
-        showToast(`已补齐 ${createdCount} 个路由组（保留已有 ${skippedCount} 个）`);
+        showToast(tr("已补齐 {0} 个路由组（保留已有 {1} 个）", createdCount, skippedCount));
       } else if (createdCount > 0) {
-        showToast(`已创建 ${createdCount} 个直连路由组`);
+        showToast(tr("已创建 {0} 个直连路由组", createdCount));
       } else {
-        showToast('直连路由组已就绪');
+        showToast(tr('直连路由组已就绪'));
       }
     } catch (err) {
-      showToast(`创建失败: ${err.message}`, 'error');
+      showToast(tr("创建失败: {0}", errorText(err.message)), 'error');
     } finally {
       if (btn) btn.disabled = false;
       await refreshState();
@@ -993,7 +1006,7 @@ export function mountConsole(root, transport, {
         if (control.type === 'radio') control.checked = control.value === String(previousValue);
         else control.value = previousValue;
       }
-      showToast(`设置失败: ${err.message}`, 'error');
+      showToast(tr("设置失败: {0}", errorText(err.message)), 'error');
     } finally {
       pendingSettings.delete(groupName);
       for (const control of controls) control.disabled = !latestState?.configured;
@@ -1006,25 +1019,25 @@ export function mountConsole(root, transport, {
   function saveTimeout(seconds) {
     if (!latestState?.configured || typeof seconds !== 'number' || seconds < 30 || seconds > 7200 || !Number.isFinite(seconds)) return;
     $('codex-timeout').value = seconds;
-    void updateSetting('codex_timeout_sec', { codex_timeout_sec: seconds }, latestState.codex_timeout_sec, 'Codex 执行超时预算已保存');
+    void updateSetting('codex_timeout_sec', { codex_timeout_sec: seconds }, latestState.codex_timeout_sec, tr('Codex 执行超时预算已保存'));
   }
 
   function copyMcpConfig() {
     const jsonText = latestState?.mcp_snippet?.json;
     if (!jsonText) {
-      showToast('MCP 配置尚未就绪，请先刷新状态', 'error');
+      showToast(tr('MCP 配置尚未就绪，请先刷新状态'), 'error');
       return;
     }
-    copyText(jsonText, '已复制独立 MCP JSON 配置（仅非 Magpie 托管客户端需要）');
+    copyText(jsonText, tr('已复制独立 MCP JSON 配置（仅非 Magpie 托管客户端需要）'));
   }
 
   function copyRulesConfig() {
     const rulesText = latestState?.rules_snippet;
     if (!rulesText) {
-      showToast('协作规则尚未就绪，请先刷新状态', 'error');
+      showToast(tr('协作规则尚未就绪，请先刷新状态'), 'error');
       return;
     }
-    copyText(rulesText, '已复制协作规则（贴入 CLAUDE.md / AGENTS.md 等全局规则）');
+    copyText(rulesText, tr('已复制协作规则（贴入 CLAUDE.md / AGENTS.md 等全局规则）'));
   }
 
   // Ledger and session presentation adapted from Magpie's usage-page.js (MIT).
@@ -1047,11 +1060,11 @@ export function mountConsole(root, transport, {
   const activeRunStates = new Set(['queued', 'running', 'waiting_gemini']);
   const interrupts = new Set();
   const checks = { passed: '已通过', failed: '失败', unverified: '未验证', not_requested: '未要求' };
-  const exactNumber = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 3 });
-  const compactNumber = new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 });
+  const exactNumber = localizedFormat(Intl.NumberFormat, { maximumFractionDigits: 3 });
+  const compactNumber = localizedFormat(Intl.NumberFormat, { notation: 'compact', maximumFractionDigits: 1 });
   const dollar = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 8 });
-  const percent = new Intl.NumberFormat('zh-CN', { style: 'percent', maximumFractionDigits: 1 });
-  const dateTime = new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium', hour12: false });
+  const percent = localizedFormat(Intl.NumberFormat, { style: 'percent', maximumFractionDigits: 1 });
+  const dateTime = localizedFormat(Intl.DateTimeFormat, { dateStyle: 'short', timeStyle: 'medium', hour12: false });
   let activeTab = 'overview';
   let liveTimer = null;
 
@@ -1068,9 +1081,9 @@ export function mountConsole(root, transport, {
 
   const compactDollar = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const microDollar = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 4, maximumFractionDigits: 4 });
-  const percent2 = new Intl.NumberFormat('zh-CN', { style: 'percent', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const percent2 = localizedFormat(Intl.NumberFormat, { style: 'percent', minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const CHART_PALETTE = ['#a5b4fc', '#67e8f9', '#6ee7b7', '#fde047', '#f9a8d4', '#c4b5fd', '#fdba74', '#5eead4'];
-  const WEEKDAYS_ZH = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+  const WEEKDAYS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
   const reqUi = { metric: 'tokens', chartType: 'bar', dim: 'model', speedDim: 'model', heatmapMetric: 'tokens' };
   const sessUi = { topMetric: 'tokens', shapeMetric: 'turns' };
   let activityRefreshMs = 0;
@@ -1097,10 +1110,10 @@ export function mountConsole(root, transport, {
     const ms = Date.parse(value || '');
     if (!Number.isFinite(ms)) return '';
     const diff = Math.max(0, Math.floor((Date.now() - ms) / 1000));
-    if (diff < 60) return '刚刚';
-    if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
-    if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
-    return `${Math.floor(diff / 86400)} 天前`;
+    if (diff < 60) return tr('刚刚');
+    if (diff < 3600) return tr("{0} 分钟前", Math.floor(diff / 60));
+    if (diff < 86400) return tr("{0} 小时前", Math.floor(diff / 3600));
+    return tr("{0} 天前", Math.floor(diff / 86400));
   }
 
   function level4(value, max) {
@@ -1129,8 +1142,8 @@ export function mountConsole(root, transport, {
     if (sec == null) return '—';
     if (sec < 1) return `${number(Math.round(sec * 1000))} ms`;
     if (sec < 60) return `${number(Math.round(sec * 10) / 10)} s`;
-    if (sec < 3600) return `${Math.floor(sec / 60)} 分 ${Math.floor(sec % 60)} 秒`;
-    return `${Math.floor(sec / 3600)} 小时 ${Math.floor(sec / 60) % 60} 分`;
+    if (sec < 3600) return tr("{0} 分 {1} 秒", Math.floor(sec / 60), Math.floor(sec % 60));
+    return tr("{0} 小时 {1} 分", Math.floor(sec / 3600), Math.floor(sec / 60) % 60);
   }
 
   function when(value) {
@@ -1144,8 +1157,8 @@ export function mountConsole(root, transport, {
   }
 
   function filterLabel(key, value) {
-    if (key === 'mode') return modes[value] || value;
-    if (key === 'status') return statuses[value] || value;
+    if (key === 'mode') return tr(modes[value]) || value;
+    if (key === 'status') return tr(statuses[value]) || value;
     if (key === 'tier') return value && titleCaseTier(value);
     return value;
   }
@@ -1236,22 +1249,22 @@ export function mountConsole(root, transport, {
     const chartHead = node('div', 'analytics-head');
     const headLeft = node('div', 'analytics-head-left');
     headLeft.append(
-      makeSegGroup([['tokens', 'Token'], ['cost', '费用'], ['requests', '请求'], ['speed', '速度']], reqUi.metric, (v) => {
+      makeSegGroup([['tokens', 'Token'], ['cost', tr('费用')], ['requests', tr('请求')], ['speed', tr('速度')]], reqUi.metric, (v) => {
         reqUi.metric = v;
         renderRequestAnalytics(data);
-      }, '指标'),
-      makeSegGroup([['bar', '柱状'], ['line', '折线']], reqUi.chartType, (v) => {
+      }, tr('指标')),
+      makeSegGroup([['bar', tr('柱状')], ['line', tr('折线')]], reqUi.chartType, (v) => {
         reqUi.chartType = v;
         renderRequestAnalytics(data);
-      }, '图表类型'),
+      }, tr('图表类型')),
     );
     const headRight = node('div', 'analytics-head-right');
     headRight.append(
-      node('span', 'analytics-sub', '拆分维度'),
-      makeSegGroup([['model', '模型'], ['model_provider', '模型 · 供应商'], ['provider', '供应商'], ['tier', '档位']], reqUi.dim, (v) => {
+      node('span', 'analytics-sub', tr('拆分维度')),
+      makeSegGroup([['model', tr('模型')], ['model_provider', tr('模型 · 供应商')], ['provider', tr('供应商')], ['tier', tr('档位')]], reqUi.dim, (v) => {
         reqUi.dim = v;
         renderRequestAnalytics(data);
-      }, '拆分维度'),
+      }, tr('拆分维度')),
     );
     chartHead.append(headLeft, headRight);
     chartCard.append(chartHead);
@@ -1266,7 +1279,7 @@ export function mountConsole(root, transport, {
     };
     const maxY = Math.max(0, ...buckets.map(bucketTotal));
     if (!buckets.length || maxY <= 0) {
-      chartWrap.append(node('div', 'trend-empty', '当前时段暂无趋势数据'));
+      chartWrap.append(node('div', 'trend-empty', tr('当前时段暂无趋势数据')));
     } else {
       const W = 680;
       const H = 220;
@@ -1356,7 +1369,7 @@ export function mountConsole(root, transport, {
     const totalMetricSum = dimItems.reduce((acc, item) => acc + metricVal(item), 0);
     const maxLegendVal = Math.max(0, ...dimItems.map(metricVal));
     if (!dimItems.length) {
-      legend.append(node('div', 'analytics-sub', '暂无拆分维度数据'));
+      legend.append(node('div', 'analytics-sub', tr('暂无拆分维度数据')));
     } else {
       for (const item of dimItems) {
         const val = metricVal(item);
@@ -1379,14 +1392,14 @@ export function mountConsole(root, transport, {
         barTrack.append(barFill);
 
         const meta = node('div', 'legend-meta');
-        const parts = [`${number(item.requests)} 个请求`, `${number(item.total_tokens, true)} token`];
-        if (item.avg_speed != null) parts.push(`${number(Math.round(item.avg_speed))} token/秒 · ${number(item.timed_speed_count)} 次计时`);
-        if (item.avg_ttft_ms != null) parts.push(`首字 ${msText(item.avg_ttft_ms)}`);
-        if (item.cache_hit_rate != null) parts.push(`命中率 ${percent2.format(item.cache_hit_rate)}`);
+        const parts = [tr("{0} 个请求", number(item.requests)), `${number(item.total_tokens, true)} token`];
+        if (item.avg_speed != null) parts.push(tr("{0} token/秒 · {1} 次计时", number(Math.round(item.avg_speed)), number(item.timed_speed_count)));
+        if (item.avg_ttft_ms != null) parts.push(tr("首字 {0}", msText(item.avg_ttft_ms)));
+        if (item.cache_hit_rate != null) parts.push(tr("命中率 {0}", percent2.format(item.cache_hit_rate)));
         if (share != null) parts.push(`${Math.round(share * 100)}%`);
         meta.textContent = parts.join(' · ');
         if (item.failed > 0) {
-          meta.append(' · ', node('span', 'is-err', `${number(item.failed)} 次失败`));
+          meta.append(' · ', node('span', 'is-err', tr("{0} 次失败", number(item.failed))));
         }
         row.append(top, barTrack, meta);
         legend.append(row);
@@ -1402,12 +1415,12 @@ export function mountConsole(root, transport, {
       speedCard.replaceChildren();
       const sHead = node('div', 'analytics-head');
       const sLeft = node('div', 'analytics-head-left');
-      sLeft.append(node('h3', 'analytics-title', '模型速度'));
+      sLeft.append(node('h3', 'analytics-title', tr('模型速度')));
       const sRight = node('div', 'analytics-head-right');
-      sRight.append(makeSegGroup([['model', '模型'], ['provider', '供应商']], reqUi.speedDim, (v) => {
+      sRight.append(makeSegGroup([['model', tr('模型')], ['provider', tr('供应商')]], reqUi.speedDim, (v) => {
         reqUi.speedDim = v;
         renderRequestAnalytics(data);
-      }, '速度维度'));
+      }, tr('速度维度')));
       sHead.append(sLeft, sRight);
       speedCard.append(sHead);
 
@@ -1424,7 +1437,7 @@ export function mountConsole(root, transport, {
         row.append(
           nm,
           track,
-          node('span', 'speed-num', `${number(Math.round(r.avg_speed))} token/秒`),
+          node('span', 'speed-num', tr("{0} token/秒", number(Math.round(r.avg_speed)))),
           node('span', 'speed-muted', r.avg_ttft_ms != null ? msText(r.avg_ttft_ms) : '—'),
           node('span', 'speed-muted', number(r.timed_count)),
         );
@@ -1441,22 +1454,22 @@ export function mountConsole(root, transport, {
       const hHead = node('div', 'analytics-head');
       const hLeft = node('div', 'analytics-head-left');
       const hTitleWrap = node('div');
-      hTitleWrap.append(node('h3', 'analytics-title', '用量热力图'), node('span', 'analytics-sub', '最近 53 周的每日用量'));
+      hTitleWrap.append(node('h3', 'analytics-title', tr('用量热力图')), node('span', 'analytics-sub', tr('最近 53 周的每日用量')));
       hLeft.append(hTitleWrap);
       const hRight = node('div', 'analytics-head-right');
-      hRight.append(makeSegGroup([['tokens', 'Token'], ['requests', '请求'], ['cost', '费用']], reqUi.heatmapMetric, (v) => {
+      hRight.append(makeSegGroup([['tokens', 'Token'], ['requests', tr('请求')], ['cost', tr('费用')]], reqUi.heatmapMetric, (v) => {
         reqUi.heatmapMetric = v;
         renderRequestAnalytics(data);
-      }, '热力图指标'));
+      }, tr('热力图指标')));
       hHead.append(hLeft, hRight);
       heatCard.append(hHead);
 
       const hmVal = (d) => reqUi.heatmapMetric === 'requests' ? d.requests : reqUi.heatmapMetric === 'cost' ? d.cost_usd : d.tokens;
-      const hmFmt = (d) => reqUi.heatmapMetric === 'requests' ? `${number(d.requests)} 个请求`
+      const hmFmt = (d) => reqUi.heatmapMetric === 'requests' ? tr("{0} 个请求", number(d.requests))
         : reqUi.heatmapMetric === 'cost' ? shortCost(d.cost_usd) : `${number(d.tokens, true)} token`;
       const maxHm = Math.max(0, ...hm.days.map(hmVal));
       if (maxHm <= 0) {
-        heatCard.append(node('div', 'activity-empty', '当前指标暂无用量'));
+        heatCard.append(node('div', 'activity-empty', tr('当前指标暂无用量')));
         return;
       }
       const weeks = Math.ceil(hm.days.length / 7);
@@ -1472,19 +1485,19 @@ export function mountConsole(root, transport, {
         const m = d ? Number(d.date.slice(5, 7)) : 0;
         const nextM = nextD ? Number(nextD.date.slice(5, 7)) : 0;
         const skipEdge = w === 0 && nextM && nextM !== m;
-        const label = !skipEdge && m && String(m) !== lastMonth ? `${m}月` : '';
+        const label = !skipEdge && m && String(m) !== lastMonth ? tr("{0}月", m) : '';
         if (m) lastMonth = String(m);
         months.append(node('span', '', label));
       }
       const weekdays = node('div', 'heatmap-weekdays');
       for (let i = 0; i < 7; i += 1) {
-        weekdays.append(node('span', '', [0, 2, 4, 6].includes(i) ? WEEKDAYS_ZH[i] : ''));
+        weekdays.append(node('span', '', [0, 2, 4, 6].includes(i) ? tr(WEEKDAYS[i]) : ''));
       }
       const grid = node('div', 'heatmap-grid');
       for (const d of hm.days) {
         const cell = node('span', 'hm-cell');
         cell.dataset.lv = String(level4(hmVal(d), maxHm));
-        cell.title = `${d.date} · ${hmFmt(d)} · ${number(d.requests)} 次`;
+        cell.title = tr("{0} · {1} · {2} 次", d.date, hmFmt(d), number(d.requests));
         grid.append(cell);
       }
       inner.append(months, weekdays, grid);
@@ -1494,13 +1507,13 @@ export function mountConsole(root, transport, {
 
       const foot = node('div', 'heatmap-foot');
       const scale = node('div', 'heatmap-scale');
-      scale.append(node('span', '', '少'));
+      scale.append(node('span', '', tr('少')));
       for (let lv = 0; lv <= 4; lv += 1) {
         const c = node('span', 'hm-cell');
         c.dataset.lv = String(lv);
         scale.append(c);
       }
-      scale.append(node('span', '', '多'));
+      scale.append(node('span', '', tr('多')));
       foot.append(scale);
       heatCard.append(foot);
     }
@@ -1515,7 +1528,7 @@ export function mountConsole(root, transport, {
     const visible = rows.slice(0, 6);
     const maxTok = Math.max(1, ...visible.map((r) => r.total_tokens || 0));
     if (!visible.length) {
-      list.append(node('div', 'analytics-sub', '暂无数据'));
+      list.append(node('div', 'analytics-sub', tr('暂无数据')));
     } else {
       for (const r of visible) {
         const row = node('div', 'rank-row');
@@ -1536,7 +1549,7 @@ export function mountConsole(root, transport, {
     }
     card.append(list);
     if (rows.length > 6) {
-      card.append(node('div', 'rank-more', `还有 ${number(rows.length - 6)} 个`));
+      card.append(node('div', 'rank-more', tr("还有 {0} 个", number(rows.length - 6))));
     }
     return card;
   }
@@ -1552,13 +1565,13 @@ export function mountConsole(root, transport, {
     gridTop.hidden = gridBottom.hidden = false;
 
     // Card 1 & 2: Projects + Models
-    const projCard = renderRankCard('项目', analytics.projects || []);
-    const modCard = renderRankCard('模型', analytics.models || []);
+    const projCard = renderRankCard(tr('项目'), analytics.projects || []);
+    const modCard = renderRankCard(tr('模型'), analytics.models || []);
 
     // Card 3: Hour Matrix (7x24)
     const hourCard = node('section', 'analytics-card');
     const hHead = node('div', 'analytics-head');
-    hHead.append(node('h3', 'analytics-title', '按时段'), node('span', 'analytics-sub', analytics.hour_matrix?.tz || '本地时区'));
+    hHead.append(node('h3', 'analytics-title', tr('按时段')), node('span', 'analytics-sub', analytics.hour_matrix?.tz || tr('本地时区')));
     hourCard.append(hHead);
     const hmWrap = node('div', 'hour-matrix-wrap');
     const matrix = analytics.hour_matrix?.matrix || [];
@@ -1566,14 +1579,14 @@ export function mountConsole(root, transport, {
     const maxH = analytics.hour_matrix?.max || 0;
     for (let d = 0; d < 7; d += 1) {
       const row = node('div', 'hour-matrix-row');
-      row.append(node('span', 'hour-day-label', WEEKDAYS_ZH[d]));
+      row.append(node('span', 'hour-day-label', tr(WEEKDAYS[d])));
       const cells = node('div', 'hour-cells');
       for (let h = 0; h < 24; h += 1) {
         const v = matrix[d]?.[h] || 0;
         const c = counts[d]?.[h] || 0;
         const cell = node('span', 'hour-cell');
         cell.dataset.lv = String(level4(v, maxH));
-        cell.title = `${WEEKDAYS_ZH[d]} ${String(h).padStart(2, '0')}:00 · ${number(c)} 次 · ${number(v, true)} token`;
+        cell.title = tr("{0} {1}:00 · {2} 次 · {3} token", tr(WEEKDAYS[d]), String(h).padStart(2, '0'), number(c), number(v, true));
         cells.append(cell);
       }
       row.append(cells);
@@ -1585,16 +1598,16 @@ export function mountConsole(root, transport, {
     hourCard.append(hmWrap);
     const hFoot = node('div', 'heatmap-foot');
     if (analytics.hour_matrix?.busiest_label) {
-      hFoot.append(node('span', '', `最忙：${analytics.hour_matrix.busiest_label}`));
+      hFoot.append(node('span', '', tr("最忙：{0}", analytics.hour_matrix.busiest_label)));
     }
     const hScale = node('div', 'heatmap-scale');
-    hScale.append(node('span', '', '少'));
+    hScale.append(node('span', '', tr('少')));
     for (let lv = 0; lv <= 4; lv += 1) {
       const c = node('span', 'hm-cell');
       c.dataset.lv = String(lv);
       hScale.append(c);
     }
-    hScale.append(node('span', '', '多'));
+    hScale.append(node('span', '', tr('多')));
     hFoot.append(hScale);
     hourCard.append(hFoot);
 
@@ -1602,11 +1615,11 @@ export function mountConsole(root, transport, {
     const topCard = node('section', 'analytics-card');
     const tHead = node('div', 'analytics-head');
     tHead.append(
-      node('h3', 'analytics-title', '最耗会话'),
-      makeSegGroup([['tokens', 'Token'], ['cost', '费用'], ['active', '活跃']], sessUi.topMetric, (v) => {
+      node('h3', 'analytics-title', tr('最耗会话')),
+      makeSegGroup([['tokens', 'Token'], ['cost', tr('费用')], ['active', tr('活跃')]], sessUi.topMetric, (v) => {
         sessUi.topMetric = v;
         renderSessionAnalytics(view, data);
-      }, '排序指标'),
+      }, tr('排序指标')),
     );
     topCard.append(tHead);
     const topKey = sessUi.topMetric === 'cost' ? 'by_cost' : sessUi.topMetric === 'active' ? 'by_active' : 'by_tokens';
@@ -1619,7 +1632,7 @@ export function mountConsole(root, transport, {
       const body = node('span', 'top-sess-body');
       const title = node('span', 'top-sess-title', s.title);
       title.title = s.title;
-      const meta = node('span', 'top-sess-meta', [s.project, modes[s.mode], s.model, relativeTime(s.updated_at)].filter(Boolean).join(' · '));
+      const meta = node('span', 'top-sess-meta', [s.project, tr(modes[s.mode]), s.model, relativeTime(s.updated_at)].filter(Boolean).join(' · '));
       body.append(title, meta);
       const valText = sessUi.topMetric === 'cost' ? shortCost(s.cost_usd)
         : sessUi.topMetric === 'active' ? duration(s.active_sec) : number(s.total_tokens, true);
@@ -1636,13 +1649,13 @@ export function mountConsole(root, transport, {
     const shHead = node('div', 'analytics-head');
     const shLeft = node('div', 'analytics-head-left');
     shLeft.append(
-      node('h3', 'analytics-title', '会话形态'),
-      makeSegGroup([['turns', '轮次'], ['duration', '时长'], ['commands', '命令']], sessUi.shapeMetric, (v) => {
+      node('h3', 'analytics-title', tr('会话形态')),
+      makeSegGroup([['turns', tr('轮次')], ['duration', tr('时长')], ['commands', tr('命令')]], sessUi.shapeMetric, (v) => {
         sessUi.shapeMetric = v;
         renderSessionAnalytics(view, data);
-      }, '形态维度'),
+      }, tr('形态维度')),
     );
-    shHead.append(shLeft, node('span', 'analytics-sub', `${number(analytics.shapes?.total_sessions || 0)} 个会话`));
+    shHead.append(shLeft, node('span', 'analytics-sub', tr("{0} 个会话", number(analytics.shapes?.total_sessions || 0))));
     shapeCard.append(shHead);
 
     const bins = analytics.shapes?.[sessUi.shapeMetric] || [];
@@ -1666,13 +1679,13 @@ export function mountConsole(root, transport, {
     const tlHead = node('div', 'analytics-head');
     const toolsData = analytics.top_tools || { total_calls: 0, unique_count: 0, items: [] };
     tlHead.append(
-      node('h3', 'analytics-title', '常用命令 / 工具'),
-      node('span', 'analytics-sub', `${number(toolsData.total_calls)} 次调用 · ${number(toolsData.unique_count)} 种`),
+      node('h3', 'analytics-title', tr('常用命令 / 工具')),
+      node('span', 'analytics-sub', tr("{0} 次调用 · {1} 种", number(toolsData.total_calls), number(toolsData.unique_count))),
     );
     toolCard.append(tlHead);
     const tlList = node('div', 'tool-list');
     if (!toolsData.items.length) {
-      tlList.append(node('div', 'analytics-sub', '当前筛选范围内暂无命令调用记录'));
+      tlList.append(node('div', 'analytics-sub', tr('当前筛选范围内暂无命令调用记录')));
     } else {
       const maxCalls = Math.max(1, ...toolsData.items.map((t) => t.calls));
       for (const item of toolsData.items.slice(0, 6)) {
@@ -1683,7 +1696,7 @@ export function mountConsole(root, transport, {
         fill.style.width = `${Math.max(4, Math.round((item.calls / maxCalls) * 100))}%`;
         track.append(fill);
         top.append(node('span', 'tool-name', item.name), track, node('span', 'tool-count', number(item.calls)));
-        const metaParts = [`${number(item.sessions)} 个会话`, `${Math.round(item.share * 100)}%`];
+        const metaParts = [tr("{0} 个会话", number(item.sessions)), `${Math.round(item.share * 100)}%`];
         if (item.projects?.length) metaParts.push(item.projects.join(', '));
         box.append(top, node('div', 'tool-meta', metaParts.join(' · ')));
         tlList.append(box);
@@ -1697,65 +1710,65 @@ export function mountConsole(root, transport, {
   function renderActivitySummary(view, data) {
     const s = data.summary || {};
     if (view.kind === 'requests') {
-      renderHeadCost(view, s.cost_usd, s.unpriced_count > 0 ? `${number(s.unpriced_count)} 次调用未计价` : '');
-      const tokSub = `输入 ${number(s.input_tokens, true)} · 输出 ${number(s.output_tokens, true)} · 缓存 ${number(s.cache_read_tokens, true)}`;
+      renderHeadCost(view, s.cost_usd, s.unpriced_count > 0 ? tr("{0} 次调用未计价", number(s.unpriced_count)) : '');
+      const tokSub = tr("输入 {0} · 输出 {1} · 缓存 {2}", number(s.input_tokens, true), number(s.output_tokens, true), number(s.cache_read_tokens, true));
 
       const reqSub = node('div', 'kpi-sub');
       const reqLines = [];
       if (s.failed > 0) {
         const line = node('div');
-        line.append(node('span', 'is-err', `${number(s.failed)} 次失败`));
-        if (s.success_rate != null) line.append(` · 成功 ${percent.format(s.success_rate)}`);
+        line.append(node('span', 'is-err', tr("{0} 次失败", number(s.failed))));
+        if (s.success_rate != null) line.append(tr(" · 成功 {0}", percent.format(s.success_rate)));
         reqLines.push(line);
       } else if (s.success_rate != null) {
-        reqLines.push(node('div', '', `成功率 ${percent.format(s.success_rate)}`));
+        reqLines.push(node('div', '', tr("成功率 {0}", percent.format(s.success_rate))));
       }
-      if (s.retried > 0) reqLines.push(node('div', '', `${number(s.retried)} 次重试`));
-      if (s.interrupted > 0) reqLines.push(node('div', '', `${number(s.interrupted)} 次已中止`));
-      if (!reqLines.length && s.elapsed_sec != null) reqLines.push(node('div', '', `总耗时 ${duration(s.elapsed_sec)}`));
+      if (s.retried > 0) reqLines.push(node('div', '', tr("{0} 次重试", number(s.retried))));
+      if (s.interrupted > 0) reqLines.push(node('div', '', tr("{0} 次已中止", number(s.interrupted))));
+      if (!reqLines.length && s.elapsed_sec != null) reqLines.push(node('div', '', tr("总耗时 {0}", duration(s.elapsed_sec))));
       reqSub.append(...reqLines);
 
-      const costSub = s.unpriced_count > 0 ? `${number(s.unpriced_count)} 次调用未计价` : '按关联网关费率估算';
-      const speedVal = s.avg_speed != null ? `${number(Math.round(s.avg_speed))} token/秒` : '—';
-      const speedUnit = s.timed_speed_count > 0 ? `${number(s.timed_speed_count)} 次计时` : '';
+      const costSub = s.unpriced_count > 0 ? tr("{0} 次调用未计价", number(s.unpriced_count)) : tr('按关联网关费率估算');
+      const speedVal = s.avg_speed != null ? tr("{0} token/秒", number(Math.round(s.avg_speed))) : '—';
+      const speedUnit = s.timed_speed_count > 0 ? tr("{0} 次计时", number(s.timed_speed_count)) : '';
       const ttftSub = s.avg_ttft_ms != null
-        ? `首字平均 ${msText(s.avg_ttft_ms)} · ${number(s.timed_ttft_count)} 次计时`
-        : (s.elapsed_sec != null ? `总耗时 ${duration(s.elapsed_sec)}` : '暂无首字计时');
+        ? tr("首字平均 {0} · {1} 次计时", msText(s.avg_ttft_ms), number(s.timed_ttft_count))
+        : (s.elapsed_sec != null ? tr("总耗时 {0}", duration(s.elapsed_sec)) : tr('暂无首字计时'));
 
       view.stats.replaceChildren(
         makeRichKpi({ label: 'Token', value: number(s.total_tokens, true), title: number(s.total_tokens), sub: tokSub }),
-        makeRichKpi({ label: '请求', value: number(data.total), sub: reqSub }),
-        makeRichKpi({ label: '费用', value: shortCost(s.cost_usd, s.unpriced_count > 0), valueClass: 'is-cost', title: costText(s.cost_usd), sub: costSub }),
+        makeRichKpi({ label: tr('请求'), value: number(data.total), sub: reqSub }),
+        makeRichKpi({ label: tr('费用'), value: shortCost(s.cost_usd, s.unpriced_count > 0), valueClass: 'is-cost', title: costText(s.cost_usd), sub: costSub }),
         makeRichKpi({
-          label: '缓存命中率',
+          label: tr('缓存命中率'),
           value: s.cache_hit_rate != null ? percent2.format(s.cache_hit_rate) : '—',
           barRatio: s.cache_hit_rate ?? 0,
         }),
-        makeRichKpi({ label: '输出速度', value: speedVal, unit: speedUnit, sub: ttftSub }),
+        makeRichKpi({ label: tr('输出速度'), value: speedVal, unit: speedUnit, sub: ttftSub }),
       );
       renderRequestAnalytics(data);
     } else {
-      renderHeadCost(view, s.cost_usd, s.unpriced_models > 0 ? `${number(s.unpriced_models)} 个模型未计价` : '');
+      renderHeadCost(view, s.cost_usd, s.unpriced_models > 0 ? tr("{0} 个模型未计价", number(s.unpriced_models)) : '');
       if (view.summary) {
         view.summary.textContent = view.items.length < data.total
-          ? `显示 ${number(data.total)} 个中的 ${number(view.items.length)} 个` : `${number(data.total)} 个会话`;
+          ? tr("显示 {0} 个中的 {1} 个", number(data.total), number(view.items.length)) : tr("{0} 个会话", number(data.total));
       }
       const sessSub = s.median_tokens != null
-        ? `中位 ${number(s.median_tokens, true)} · p90 ${number(s.p90_tokens, true)}`
-        : `${number(s.requests)} 轮调用`;
-      const tokSub = `输入 ${number(s.input_tokens, true)} · 输出 ${number(s.output_tokens, true)}`;
-      const costSub = s.unpriced_models > 0 ? `${number(s.unpriced_models)} 个模型未计价` : '按关联网关费率估算';
-      const cacheSub = s.cache_hit_rate != null ? `命中率 ${percent2.format(s.cache_hit_rate)}` : '暂无缓存统计';
-      const activeSub = s.active_days > 0 ? `共 ${number(s.active_days)} 天` : '—';
-      const projSub = s.top_project ? `${s.top_project} 占 ${Math.round((s.top_project_share || 0) * 100)}%` : '—';
+        ? tr("中位 {0} · p90 {1}", number(s.median_tokens, true), number(s.p90_tokens, true))
+        : tr("{0} 轮调用", number(s.requests));
+      const tokSub = tr("输入 {0} · 输出 {1}", number(s.input_tokens, true), number(s.output_tokens, true));
+      const costSub = s.unpriced_models > 0 ? tr("{0} 个模型未计价", number(s.unpriced_models)) : tr('按关联网关费率估算');
+      const cacheSub = s.cache_hit_rate != null ? tr("命中率 {0}", percent2.format(s.cache_hit_rate)) : tr('暂无缓存统计');
+      const activeSub = s.active_days > 0 ? tr("共 {0} 天", number(s.active_days)) : '—';
+      const projSub = s.top_project ? tr("{0} 占 {1}%", s.top_project, Math.round((s.top_project_share || 0) * 100)) : '—';
 
       view.stats.replaceChildren(
-        makeRichKpi({ topFirst: true, label: '会话数', value: number(data.total), sub: sessSub }),
+        makeRichKpi({ topFirst: true, label: tr('会话数'), value: number(data.total), sub: sessSub }),
         makeRichKpi({ topFirst: true, label: 'TOKEN', value: number(s.total_tokens, true), title: number(s.total_tokens), sub: tokSub }),
-        makeRichKpi({ topFirst: true, label: '费用', value: shortCost(s.cost_usd, s.unpriced_models > 0), title: costText(s.cost_usd), sub: costSub }),
-        makeRichKpi({ topFirst: true, label: '缓存读取', value: number(s.cache_read_tokens, true), title: number(s.cache_read_tokens), sub: cacheSub }),
-        makeRichKpi({ topFirst: true, label: '活跃时长', value: duration(s.active_sec ?? s.elapsed_sec), sub: activeSub }),
-        makeRichKpi({ topFirst: true, label: '项目', value: number(s.projects ?? s.workspaces), sub: projSub }),
+        makeRichKpi({ topFirst: true, label: tr('费用'), value: shortCost(s.cost_usd, s.unpriced_models > 0), title: costText(s.cost_usd), sub: costSub }),
+        makeRichKpi({ topFirst: true, label: tr('缓存读取'), value: number(s.cache_read_tokens, true), title: number(s.cache_read_tokens), sub: cacheSub }),
+        makeRichKpi({ topFirst: true, label: tr('活跃时长'), value: duration(s.active_sec ?? s.elapsed_sec), sub: activeSub }),
+        makeRichKpi({ topFirst: true, label: tr('项目'), value: number(s.projects ?? s.workspaces), sub: projSub }),
       );
       renderSessionAnalytics(view, data);
     }
@@ -1772,15 +1785,15 @@ export function mountConsole(root, transport, {
   function statusBadge(record) {
     const status = runState(record);
     const unconfirmed = Boolean(record?.remote_turn_unconfirmed);
-    const badge = node('span', 'activity-status', unconfirmed ? '远端终态未确认' : (statuses[status] || status));
+    const badge = node('span', 'activity-status', unconfirmed ? tr('远端终态未确认') : (tr(statuses[status]) || status));
     badge.dataset.status = status;
     if (unconfirmed) {
       badge.dataset.unconfirmed = 'true';
-      badge.title = '远端 Codex 回合可能仍在运行，请勿同会话盲目并发派发；可尝试中止以确认终态';
+      badge.title = tr('远端 Codex 回合可能仍在运行，请勿同会话盲目并发派发；可尝试中止以确认终态');
       badge.style.color = 'var(--activity-amber, var(--gp-warn))';
       badge.style.fontWeight = '600';
     }
-    if (record.retried) badge.append(' · 重试');
+    if (record.retried) badge.append(tr(' · 重试'));
     return badge;
   }
 
@@ -1798,7 +1811,7 @@ export function mountConsole(root, transport, {
     control.dataset.runAction = 'interrupt';
     if (runState(run) === 'queued') {
       control.disabled = true;
-      control.title = '等待 Codex 启动当前轮';
+      control.title = tr('等待 Codex 启动当前轮');
       return control;
     }
     const id = run.run_id;
@@ -1809,9 +1822,9 @@ export function mountConsole(root, transport, {
       control.disabled = true;
       try {
         await transport.runAction('interrupt_run', { run_id: id });
-        showToast(run.remote_turn_unconfirmed ? '已发送中断确认请求' : '已发送中止请求');
+        showToast(run.remote_turn_unconfirmed ? tr('已发送中断确认请求') : tr('已发送中止请求'));
       } catch (err) {
-        showToast(`中止失败 · ${err.message}`, 'error');
+        showToast(tr("中止失败 · {0}", errorText(err.message)), 'error');
       } finally {
         interrupts.delete(id);
         control.disabled = false;
@@ -1852,23 +1865,23 @@ export function mountConsole(root, transport, {
     clearRestartConfirm();
     restartInFlight = true;
     if (chip) chip.disabled = true;
-    if (val) val.textContent = '重启中…';
+    if (val) val.textContent = tr('重启中…');
     try {
       await transport.runAction('restart_app_server', { force });
-      showToast('共享 Codex app-server 已重启');
+      showToast(tr('共享 Codex app-server 已重启'));
       await refreshState({ manual: false });
     } catch (err) {
       if (err.status === 409 && err.data?.active_runs && !force) {
         restartConfirmPending = true;
-        if (val) val.textContent = '再点强制重启';
-        showToast(err.message || '当前有运行中任务，再点一次将强制重启 Codex 服务', 'error');
+        if (val) val.textContent = tr('再点强制重启');
+        showToast(err.message || tr('当前有运行中任务，再点一次将强制重启 Codex 服务'), 'error');
         restartConfirmTimer = setTimeout(() => {
           clearRestartConfirm();
           if (latestState) renderLiveOverview(latestState);
         }, 5000);
         return;
       }
-      showToast(`重启失败: ${err.message}`, 'error');
+      showToast(tr("重启失败: {0}", errorText(err.message)), 'error');
       await refreshState({ manual: false });
     } finally {
       restartInFlight = false;
@@ -1882,10 +1895,10 @@ export function mountConsole(root, transport, {
     $('chip-app-server').disabled = unavailable || restartInFlight;
     $('chip-app-server').dataset.tone = server?.error ? 'warn' : server?.running ? 'ok' : 'neutral';
     if (!restartInFlight && !restartConfirmPending) {
-      $('chip-app-server-val').textContent = unavailable ? '未运行 · 在 Magpie 启动' : server?.error ? '异常 · 点此重启' : server?.running ? '运行中 · 重启' : '未运行 · 启动';
+      $('chip-app-server-val').textContent = unavailable ? tr('未运行 · 在 Magpie 启动') : server?.error ? tr('异常 · 点此重启') : server?.running ? tr('运行中 · 重启') : tr('未运行 · 启动');
     }
     const error = $('app-server-error');
-    error.textContent = server?.error || '';
+    error.textContent = errorText(server?.error || '');
     error.hidden = !server?.error;
 
     const runs = state.active_runs || [];
@@ -1899,13 +1912,13 @@ export function mountConsole(root, transport, {
       row.dataset.runId = run.run_id;
       const info = node('div', 'active-run-info');
       const head = node('div', 'active-run-meta');
-      const title = node('strong', '', run.title || 'GPT 任务');
+      const title = node('strong', '', run.title || tr('GPT 任务'));
       title.title = run.cwd || '';
       const status = runState(run);
       const phase = run.progress?.phase;
-      const phaseLabel = phases[phase] || phase;
+      const phaseLabel = tr(phases[phase]) || phase;
       head.append(statusBadge(run), title);
-      if (phaseLabel && phaseLabel !== (statuses[status] || status)) {
+      if (phaseLabel && phaseLabel !== (tr(statuses[status]) || status)) {
         head.append(node('span', 'run-phase', phaseLabel));
       }
       const elapsed = node('span', 'run-elapsed', runElapsed(run.started_at || run.created_at));
@@ -1918,13 +1931,13 @@ export function mountConsole(root, transport, {
       const question = pendingQuestion(run)?.question;
       if (question) info.append(preview('run-question', question));
       if (run.remote_turn_unconfirmed) {
-        info.append(preview('run-question', '远端回合终态未确认：请勿同会话盲目并发派发，可点击「中止确认」向远端补发中断。'));
+        info.append(preview('run-question', tr('远端回合终态未确认：请勿同会话盲目并发派发，可点击「中止确认」向远端补发中断。')));
       }
       const actions = node('div', 'active-run-actions');
-      const detail = button('查看详情');
+      const detail = button(tr('查看详情'));
       detail.dataset.runAction = 'detail';
       detail.onclick = () => navigate('live', { id: run.run_id, sessionId: run.session_id, focus: true });
-      const interrupt = interruptButton(run, run.remote_turn_unconfirmed ? '中止确认' : '中止');
+      const interrupt = interruptButton(run, run.remote_turn_unconfirmed ? tr('中止确认') : tr('中止'));
       actions.append(detail, interrupt);
       row.append(info, actions);
       if (run.run_id === focusedRunId) restoreFocus = focused.dataset.runAction === 'detail' ? detail : interrupt;
@@ -1934,10 +1947,10 @@ export function mountConsole(root, transport, {
   }
 
   const ledgerColumns = [
-    ['时间', 'when'], ['Agent', 'agent'], ['请求模型', 'model mobile-extra'], ['供应商 · 账号', 'provider mobile-extra'],
-    ['发送模型', 'model optional'], ['响应模型', 'model'], ['推理强度', 'optional'], ['输入', 'num'],
-    ['输出', 'num'], ['缓存写入', 'num optional'], ['缓存读取', 'num optional'], ['缓存命中率', 'num wide'],
-    ['费用', 'num'], ['TTFT', 'num wide'], ['耗时', 'num'], ['速度', 'num'], ['状态', ''],
+    [tr('时间'), 'when'], ['Agent', 'agent'], [tr('请求模型'), 'model mobile-extra'], [tr('供应商 · 账号'), 'provider mobile-extra'],
+    [tr('发送模型'), 'model optional'], [tr('响应模型'), 'model'], [tr('推理强度'), 'optional'], [tr('输入'), 'num'],
+    [tr('输出'), 'num'], [tr('缓存写入'), 'num optional'], [tr('缓存读取'), 'num optional'], [tr('缓存命中率'), 'num wide'],
+    [tr('费用'), 'num'], ['TTFT', 'num wide'], [tr('耗时'), 'num'], [tr('速度'), 'num'], [tr('状态'), ''],
   ];
 
   function renderLedger(view) {
@@ -1975,7 +1988,7 @@ export function mountConsole(root, transport, {
       const token = (value) => add(number(value, true), number(value));
       add(when(r.timestamp), r.timestamp);
       const agent = node('span', 'ledger-agent', r.agent || 'GemPT');
-      agent.append(node('span', 'activity-badge', modes[r.mode]));
+      agent.append(node('span', 'activity-badge', tr(modes[r.mode])));
       add(agent, r.title);
       add(r.requested_model, r.requested_model);
       add(providerText(r), providerText(r));
@@ -2008,7 +2021,7 @@ export function mountConsole(root, transport, {
     const icon = node('span', 'activity-session-icon', session.mode === 'exec' ? '>_' : '≡');
     icon.setAttribute('aria-hidden', 'true');
     const who = node('span', 'activity-session-who');
-    const title = node('strong', '', session.title || 'GPT 任务');
+    const title = node('strong', '', session.title || tr('GPT 任务'));
     title.title = session.title;
     const meta = node('small', '', [session.model, filterLabel('tier', session.tier), when(session.updated_at)].filter(Boolean).join(' · '));
     const folder = node('span', 'session-folder', session.cwd);
@@ -2020,18 +2033,18 @@ export function mountConsole(root, transport, {
     tokens.append(node('b', '', number(session.usage.total_tokens, true)));
     if (session.usage.total_tokens != null) {
       tokens.title = `${number(session.usage.total_tokens)} token`;
-      tokens.append(node('small', '', `输入 ${number(session.usage.input_tokens, true)} · 输出 ${number(session.usage.output_tokens, true)}`));
+      tokens.append(node('small', '', tr("输入 {0} · 输出 {1}", number(session.usage.input_tokens, true), number(session.usage.output_tokens, true))));
     }
     const arrow = node('span', 'activity-session-go', '›');
     arrow.setAttribute('aria-hidden', 'true');
-    summary.append(icon, who, node('span', 'activity-badge', modes[session.mode]));
+    summary.append(icon, who, node('span', 'activity-badge', tr(modes[session.mode])));
     if (isActiveRun(session) || session.state === 'interrupted') summary.append(statusBadge(session));
     summary.append(tokens,
-      node('span', 'activity-session-turns', `${number(session.turn_count)} 轮`), arrow);
+      node('span', 'activity-session-turns', tr("{0} 轮", number(session.turn_count))), arrow);
     summary.onclick = () => navigateActivityTab(view.kind, false, session.id);
     row.append(summary);
     if (session.live_run_id) {
-      const live = button('实时流 ›');
+      const live = button(tr('实时流 ›'));
       live.onclick = () => navigate('live', { id: session.live_run_id, sessionId: session.session_id, focus: true });
       row.append(live);
     }
@@ -2039,9 +2052,9 @@ export function mountConsole(root, transport, {
   }
 
   function copyButton(value, label) {
-    const copy = button('复制');
-    copy.setAttribute('aria-label', `复制${label}`);
-    copy.onclick = () => copyText(value, `已复制${label}`);
+    const copy = button(tr('复制'));
+    copy.setAttribute('aria-label', tr("复制{0}", label));
+    copy.onclick = () => copyText(value, tr("已复制{0}", label));
     return copy;
   }
 
@@ -2070,16 +2083,16 @@ export function mountConsole(root, transport, {
     if (!progress && !question) return [];
     const box = node('section', 'activity-detail-box');
     const info = node('dl', 'activity-detail-info');
-    detailLine(info, '当前阶段', phases[progress?.phase] || progress?.phase);
+    detailLine(info, tr('当前阶段'), tr(phases[progress?.phase]) || progress?.phase);
     box.append(info);
     const commands = progress?.recent_commands?.map((entry) => typeof entry === 'string' ? entry : [
-      entry.command, entry.exit_code == null ? '' : `退出码 ${entry.exit_code}`,
+      entry.command, entry.exit_code == null ? '' : tr("退出码 {0}", entry.exit_code),
     ].filter(Boolean).join('\n'));
-    detailText(box, '最近命令', commands?.join('\n\n'));
-    detailText(box, '已触及文件', progress?.touched_files?.join('\n'));
-    detailText(box, '实时输出摘要', progress?.last_message);
+    detailText(box, tr('最近命令'), commands?.join('\n\n'));
+    detailText(box, tr('已触及文件'), progress?.touched_files?.join('\n'));
+    detailText(box, tr('实时输出摘要'), progress?.last_message);
     if (question) {
-      detailText(box, '等待 Gemini 回复', [question.question, question.reason && `原因　${question.reason}`,
+      detailText(box, tr('等待 Gemini 回复'), [question.question, question.reason && tr("原因　{0}", question.reason),
         ...(question.media_paths || [])].filter(Boolean).join('\n'));
     }
     return box.querySelector('dt, pre') ? [box] : [];
@@ -2087,9 +2100,9 @@ export function mountConsole(root, transport, {
 
   function usageText(usage) {
     return usage.total_tokens == null ? '—' : [
-      `${number(usage.total_tokens)} token`, `输入 ${number(usage.input_tokens)}`, `输出 ${number(usage.output_tokens)}`,
-      `缓存读取 ${number(usage.cache_read_tokens)}`, `缓存写入 ${number(usage.cache_write_tokens)}`,
-      ...(usage.reasoning_tokens == null ? [] : [`推理 ${number(usage.reasoning_tokens)}`]),
+      `${number(usage.total_tokens)} token`, tr("输入 {0}", number(usage.input_tokens)), tr("输出 {0}", number(usage.output_tokens)),
+      tr("缓存读取 {0}", number(usage.cache_read_tokens)), tr("缓存写入 {0}", number(usage.cache_write_tokens)),
+      ...(usage.reasoning_tokens == null ? [] : [tr("推理 {0}", number(usage.reasoning_tokens))]),
     ].join(' · ');
   }
 
@@ -2104,16 +2117,16 @@ export function mountConsole(root, transport, {
   }
 
   const commandText = (entries) => entries.map((entry) => typeof entry === 'string' ? entry : [
-    entry?.command, entry?.exit_code == null ? '' : `退出码 ${entry.exit_code}`, entry?.output,
+    entry?.command, entry?.exit_code == null ? '' : tr("退出码 {0}", entry.exit_code), entry?.output,
   ].filter(Boolean).join('\n')).join('\n\n');
 
   const eventTitle = (event) => ({
-    reasoning: '思考过程摘要',
-    agent_message: event.phase === 'final_answer' ? '最终回复' : '中间消息',
-    command: event.exit_code == null ? '命令' : `命令 · 退出码 ${event.exit_code}`,
-    files: `触及文件 · ${event.count ?? 0}`,
-    ask_gemini: `ask_gemini · ${({ pending: '等待回复', resolved: '已回复', completed: '已完成',
-      inProgress: '进行中', failed: '失败' })[event.status] || event.status || '已记录'}`,
+    reasoning: tr('思考过程摘要'),
+    agent_message: event.phase === 'final_answer' ? tr('最终回复') : tr('中间消息'),
+    command: event.exit_code == null ? tr('命令') : tr("命令 · 退出码 {0}", event.exit_code),
+    files: tr("触及文件 · {0}", event.count ?? 0),
+    ask_gemini: `ask_gemini · ${({ pending: tr('等待回复'), resolved: tr('已回复'), completed: tr('已完成'),
+      inProgress: tr('进行中'), failed: tr('失败') })[event.status] || event.status || tr('已记录')}`,
   })[event.type];
 
   function eventText(event) {
@@ -2129,7 +2142,7 @@ export function mountConsole(root, transport, {
   function renderTimeline(turn) {
     if (!turn.timeline.length && !turn.timeline_truncated) return null;
     const section = node('section', 'activity-detail-text activity-trace');
-    section.append(node('h4', '', '执行轨迹'));
+    section.append(node('h4', '', tr('执行轨迹')));
     const list = node('ol', 'activity-events');
     for (const event of turn.timeline) {
       const item = node('li', 'activity-event');
@@ -2145,26 +2158,26 @@ export function mountConsole(root, transport, {
       list.append(item);
     }
     section.append(list);
-    if (turn.timeline_truncated) section.append(node('p', 'activity-muted', '仅显示可载入的近期事件。'));
+    if (turn.timeline_truncated) section.append(node('p', 'activity-muted', tr('仅显示可载入的近期事件。')));
     return section;
   }
 
   function renderGatewayRequests(rows) {
     if (!rows.length) return null;
     const section = node('section', 'activity-detail-text');
-    section.append(node('h4', '', `底层网关调用 · ${number(rows.length)} 次`));
+    section.append(node('h4', '', tr("底层网关调用 · {0} 次", number(rows.length))));
     const wrap = node('div', 'ledger-wrap activity-gateway-wrap');
     wrap.tabIndex = 0;
     wrap.setAttribute('role', 'region');
-    wrap.setAttribute('aria-label', '底层网关调用明细');
+    wrap.setAttribute('aria-label', tr('底层网关调用明细'));
     const table = node('table', 'activity-ledger activity-gateway');
     const columns = [
-      ['时间', (r) => when(r.timestamp)], ['请求模型', (r) => r.requested_model], ['发送模型', (r) => r.sent_model],
-      ['响应模型', (r) => r.model], ['供应商 · 账号', providerText], ['状态码', (r) => r.status_code],
-      ['TTFT', (r) => msText(r.ttft_ms)], ['耗时', (r) => msText(r.duration_ms)],
-      ['速度', (r) => speedText(r.tokens_per_sec)], ['输入', (r) => number(r.input_tokens)],
-      ['输出', (r) => number(r.output_tokens)], ['缓存读取', (r) => number(r.cache_read_tokens)],
-      ['缓存写入', (r) => number(r.cache_write_tokens)], ['费用', (r) => costText(r.cost_usd)],
+      [tr('时间'), (r) => when(r.timestamp)], [tr('请求模型'), (r) => r.requested_model], [tr('发送模型'), (r) => r.sent_model],
+      [tr('响应模型'), (r) => r.model], [tr('供应商 · 账号'), providerText], [tr('状态码'), (r) => r.status_code],
+      ['TTFT', (r) => msText(r.ttft_ms)], [tr('耗时'), (r) => msText(r.duration_ms)],
+      [tr('速度'), (r) => speedText(r.tokens_per_sec)], [tr('输入'), (r) => number(r.input_tokens)],
+      [tr('输出'), (r) => number(r.output_tokens)], [tr('缓存读取'), (r) => number(r.cache_read_tokens)],
+      [tr('缓存写入'), (r) => number(r.cache_write_tokens)], [tr('费用'), (r) => costText(r.cost_usd)],
     ];
     const header = table.createTHead().insertRow();
     for (const [label] of columns) {
@@ -2186,46 +2199,46 @@ export function mountConsole(root, transport, {
     const box = node('article', 'activity-detail-box');
     if (heading) {
       const head = node('header', 'activity-turn-head');
-      head.append(node('h3', '', heading), detailLink('requests', r.id, '查看该轮请求 ›'));
+      head.append(node('h3', '', heading), detailLink('requests', r.id, tr('查看该轮请求 ›')));
       box.append(head);
     }
     const info = node('dl', 'activity-detail-info');
     const add = (label, value, copy = false) => detailLine(info, label, value, copy);
-    add('时间', when(r.timestamp));
-    add('模式', modes[r.mode]);
-    add('状态', statusBadge(r));
+    add(tr('时间'), when(r.timestamp));
+    add(tr('模式'), tr(modes[r.mode]));
+    add(tr('状态'), statusBadge(r));
     if (r.remote_turn_unconfirmed) {
-      add('远端状态', '远端终态未确认（请勿同会话盲目并发派发，可尝试中止以确认终态）');
+      add(tr('远端状态'), tr('远端终态未确认（请勿同会话盲目并发派发，可尝试中止以确认终态）'));
     }
     add('Agent', r.agent);
-    add('请求模型', r.requested_model);
-    add('发送模型', r.sent_model);
-    add('响应模型', r.model);
-    add('供应商 · 账号', providerText(r));
-    add('档位', r.tier && titleCaseTier(r.tier));
-    add('推理强度', r.reasoning_effort);
-    add('耗时', duration(r.elapsed_sec));
+    add(tr('请求模型'), r.requested_model);
+    add(tr('发送模型'), r.sent_model);
+    add(tr('响应模型'), r.model);
+    add(tr('供应商 · 账号'), providerText(r));
+    add(tr('档位'), r.tier && titleCaseTier(r.tier));
+    add(tr('推理强度'), r.reasoning_effort);
+    add(tr('耗时'), duration(r.elapsed_sec));
     add('TTFT', msText(r.ttft_ms));
-    add('速度', speedText(r.tokens_per_sec));
-    add('费用', costText(r.cost_usd));
+    add(tr('速度'), speedText(r.tokens_per_sec));
+    add(tr('费用'), costText(r.cost_usd));
     add('Token', usageText(r.usage));
-    add('文件夹', r.cwd, true);
-    detailLine(info, '会话 ID', r.session_id, true, !heading && r.session_id
-      ? detailLink('sessions', r.session_id, '查看所属会话 ›') : null);
-    detailLine(info, '运行 ID', r.run_id, true, r.run_id
-      ? detailLink('live', r.run_id, '查看实时流 ›') : null);
-    add('Codex 线程 ID', r.codex_thread_id, true);
-    add('验证', checks[r.verification.status] || r.verification.status);
+    add(tr('文件夹'), r.cwd, true);
+    detailLine(info, tr('会话 ID'), r.session_id, true, !heading && r.session_id
+      ? detailLink('sessions', r.session_id, tr('查看所属会话 ›')) : null);
+    detailLine(info, tr('运行 ID'), r.run_id, true, r.run_id
+      ? detailLink('live', r.run_id, tr('查看实时流 ›')) : null);
+    add(tr('Codex 线程 ID'), r.codex_thread_id, true);
+    add(tr('验证'), tr(checks[r.verification.status]) || r.verification.status);
     box.append(info);
-    detailText(box, '目标', r.goal);
-    if (r.prompt !== r.goal) detailText(box, '提示词', r.prompt);
+    detailText(box, tr('目标'), r.goal);
+    if (r.prompt !== r.goal) detailText(box, tr('提示词'), r.prompt);
     if (!r.timeline.some((event) => event.type === 'agent_message' && event.phase === 'final_answer' && event.text === r.reply)) {
-      detailText(box, r.reply_is_preview ? '回复预览' : '回复', r.reply);
+      detailText(box, r.reply_is_preview ? tr('回复预览') : tr('回复'), r.reply);
     }
-    detailText(box, '错误', r.error);
-    detailText(box, '要求验证', r.verification.requested);
-    detailText(box, '验证检查', commandText(r.verification.checks));
-    if (!r.timeline.some((event) => event.type === 'command')) detailText(box, '执行的命令', commandText(r.commands));
+    detailText(box, tr('错误'), r.error);
+    detailText(box, tr('要求验证'), r.verification.requested);
+    detailText(box, tr('验证检查'), commandText(r.verification.checks));
+    if (!r.timeline.some((event) => event.type === 'command')) detailText(box, tr('执行的命令'), commandText(r.commands));
     const timeline = renderTimeline(r);
     if (timeline) box.append(timeline);
     const gateway = renderGatewayRequests(r.gateway_requests);
@@ -2237,19 +2250,19 @@ export function mountConsole(root, transport, {
     const box = node('section', 'activity-detail-box');
     const info = node('dl', 'activity-detail-info');
     const latestRun = session.turns.findLast((turn) => turn.run_id);
-    detailLine(info, '会话 ID', session.session_id, true, latestRun
-      ? detailLink('live', latestRun.run_id, '查看实时流 ›') : null);
-    detailLine(info, '文件夹', session.cwd, true);
-    detailLine(info, '模式', modes[session.mode]);
-    detailLine(info, '时间', session.created_at && session.created_at !== session.updated_at
+    detailLine(info, tr('会话 ID'), session.session_id, true, latestRun
+      ? detailLink('live', latestRun.run_id, tr('查看实时流 ›')) : null);
+    detailLine(info, tr('文件夹'), session.cwd, true);
+    detailLine(info, tr('模式'), tr(modes[session.mode]));
+    detailLine(info, tr('时间'), session.created_at && session.created_at !== session.updated_at
       ? `${when(session.created_at)} – ${when(session.updated_at)}` : when(session.updated_at));
-    detailLine(info, '轮次', number(session.turn_count));
+    detailLine(info, tr('轮次'), number(session.turn_count));
     detailLine(info, 'Token', usageText(session.usage));
-    detailLine(info, '耗时', duration(session.elapsed_sec));
-    detailLine(info, '总费用', costText(session.cost_usd));
+    detailLine(info, tr('耗时'), duration(session.elapsed_sec));
+    detailLine(info, tr('总费用'), costText(session.cost_usd));
     box.append(info);
     return [box, ...session.turns.map((turn) => renderTurn(turn, turn.turn == null
-      ? '执行记录' : `第 ${number(turn.turn)} 轮`))];
+      ? tr('执行记录') : tr("第 {0} 轮", number(turn.turn))))];
   }
 
   function downloadActivity(file, value) {
@@ -2274,25 +2287,25 @@ export function mountConsole(root, transport, {
       return `### ${label}\n\n${fence}text\n${value}\n${fence}\n\n`;
     };
     const meta = (label, value) => `- ${label}　${inline(value)}\n`;
-    let markdown = `# ${inline(session.title || 'GPT 会话')}\n\n`
-      + meta('会话 ID', session.session_id) + meta('文件夹', session.cwd || '—')
-      + meta('模式', modes[session.mode]) + meta('模型', session.model || '—')
-      + meta('创建', when(session.created_at)) + meta('更新', when(session.updated_at))
-      + meta('轮次', session.turn_count) + meta('总费用', costText(session.cost_usd)) + '\n';
+    let markdown = `# ${inline(session.title || tr('GPT 会话'))}\n\n`
+      + meta(tr('会话 ID'), session.session_id) + meta(tr('文件夹'), session.cwd || '—')
+      + meta(tr('模式'), tr(modes[session.mode])) + meta(tr('模型'), session.model || '—')
+      + meta(tr('创建'), when(session.created_at)) + meta(tr('更新'), when(session.updated_at))
+      + meta(tr('轮次'), session.turn_count) + meta(tr('总费用'), costText(session.cost_usd)) + '\n';
     for (const turn of session.turns) {
       const events = (kind) => turn.timeline.filter((event) => event.type === kind);
       const loggedCommands = events('command');
       const commands = [...turn.commands, ...loggedCommands.filter((event) =>
         !turn.commands.some((prior) => (typeof prior === 'string' ? prior : prior.command) === event.command))];
-      markdown += `## ${turn.turn == null ? '执行记录' : `第 ${turn.turn} 轮`}\n\n`
-        + meta('请求 ID', turn.id) + meta('时间', when(turn.timestamp)) + meta('模型', turn.model || '—')
-        + meta('状态', statuses[runState(turn)] || runState(turn))
-        + meta('验证', checks[turn.verification.status] || turn.verification.status || '—') + '\n'
-        + textSection('目标', turn.goal) + textSection('思考过程摘要', events('reasoning').map(eventText).join('\n\n'))
-        + textSection('回复', turn.reply || events('agent_message').map(eventText).join('\n\n'))
-        + textSection('命令', commandText(commands)) + textSection('要求验证', turn.verification.requested)
-        + textSection('验证结果', commandText(turn.verification.checks));
-      if (turn.timeline_truncated) markdown += '部分轨迹已截断。\n\n';
+      markdown += `## ${turn.turn == null ? tr('执行记录') : tr("第 {0} 轮", turn.turn)}\n\n`
+        + meta(tr('请求 ID'), turn.id) + meta(tr('时间'), when(turn.timestamp)) + meta(tr('模型'), turn.model || '—')
+        + meta(tr('状态'), tr(statuses[runState(turn)]) || runState(turn))
+        + meta(tr('验证'), tr(checks[turn.verification.status]) || turn.verification.status || '—') + '\n'
+        + textSection(tr('目标'), turn.goal) + textSection(tr('思考过程摘要'), events('reasoning').map(eventText).join('\n\n'))
+        + textSection(tr('回复'), turn.reply || events('agent_message').map(eventText).join('\n\n'))
+        + textSection(tr('命令'), commandText(commands)) + textSection(tr('要求验证'), turn.verification.requested)
+        + textSection(tr('验证结果'), commandText(turn.verification.checks));
+      if (turn.timeline_truncated) markdown += tr('部分轨迹已截断。\n\n');
     }
     downloadActivity(`${session.session_id}.md`, new Blob([markdown], { type: 'text/markdown;charset=utf-8' }));
   }
@@ -2334,31 +2347,14 @@ export function mountConsole(root, transport, {
         data = await fetchDetail(open.id);
       }
       if (abort.signal.aborted) return;
-      const session = view.kind === 'sessions';
-      const run = session ? data.turns.findLast(isActiveRun) || data : data;
       open.syncedAt = Date.now();
       open.refreshError = '';
-      if (!session && data.run_id) open.runId = data.run_id;
+      if (view.kind === 'requests' && data.run_id) open.runId = data.run_id;
       const rendered = JSON.stringify(data);
       if (open.rendered === rendered && !body.querySelector('button:disabled')) return;
       open.rendered = rendered;
-      const head = node('header', 'activity-detail-head');
-      head.append(node('h2', '', data.title || (session ? 'GPT 会话' : '请求详情')));
-      if (runState(run)) head.append(statusBadge(run));
-      const focusedInterrupt = body.contains(document.activeElement)
-        && document.activeElement.dataset.runAction === 'interrupt';
-      const interrupt = run.run_id && (['running', 'waiting_gemini'].includes(runState(run)) || run.remote_turn_unconfirmed)
-        ? interruptButton(run, run.remote_turn_unconfirmed ? '尝试中止确认' : '中止当前轮') : null;
-      if (interrupt) head.append(interrupt);
-      if (session) {
-        const exportButton = button('导出 Markdown');
-        exportButton.onclick = () => exportSession(data);
-        head.append(exportButton);
-      }
-      const expanded = new Set([...body.querySelectorAll('details[open]')].map((details) => details.dataset.event));
-      body.replaceChildren(head, ...renderRunProgress(run), ...(session ? renderSessionDetail(data) : [renderTurn(data)]));
-      for (const details of body.querySelectorAll('details[data-event]')) details.open = expanded.has(details.dataset.event);
-      if (focusedInterrupt) (interrupt || view.detail.querySelector('.activity-back')).focus({ preventScroll: true });
+      open.data = data;
+      renderActivityDetail(view, data);
     } catch (err) {
       if (abort.signal.aborted) return;
       if (refresh && open.rendered) {
@@ -2366,9 +2362,10 @@ export function mountConsole(root, transport, {
         return;
       }
       open.rendered = null;
-      const retry = button('重试');
+      open.data = null;
+      const retry = button(tr('重试'));
       retry.onclick = () => loadActivityDetail(view);
-      body.replaceChildren(node('p', 'activity-empty', `读取详情失败（${err.message}）`), retry);
+      body.replaceChildren(node('p', 'activity-empty', tr("读取详情失败（{0}）", errorText(err.message))), retry);
     } finally {
       if (!abort.signal.aborted) {
         open.abort = null;
@@ -2379,14 +2376,37 @@ export function mountConsole(root, transport, {
     }
   }
 
+  function renderActivityDetail(view, data) {
+    const body = view.detail.querySelector('.activity-detail-body');
+    const session = view.kind === 'sessions';
+    const run = session ? data.turns.findLast(isActiveRun) || data : data;
+    const head = node('header', 'activity-detail-head');
+    head.append(node('h2', '', data.title || (session ? tr('GPT 会话') : tr('请求详情'))));
+    if (runState(run)) head.append(statusBadge(run));
+    const focusedInterrupt = body.contains(document.activeElement)
+      && document.activeElement.dataset.runAction === 'interrupt';
+    const interrupt = run.run_id && (['running', 'waiting_gemini'].includes(runState(run)) || run.remote_turn_unconfirmed)
+      ? interruptButton(run, run.remote_turn_unconfirmed ? tr('尝试中止确认') : tr('中止当前轮')) : null;
+    if (interrupt) head.append(interrupt);
+    if (session) {
+      const exportButton = button(tr('导出 Markdown'));
+      exportButton.onclick = () => exportSession(data);
+      head.append(exportButton);
+    }
+    const expanded = new Set([...body.querySelectorAll('details[open]')].map((details) => details.dataset.event));
+    body.replaceChildren(head, ...renderRunProgress(run), ...(session ? renderSessionDetail(data) : [renderTurn(data)]));
+    for (const details of body.querySelectorAll('details[data-event]')) details.open = expanded.has(details.dataset.event);
+    if (focusedInterrupt) (interrupt || view.detail.querySelector('.activity-back')).focus({ preventScroll: true });
+  }
+
   function openActivityDetail(view, id) {
     view.open?.abort?.abort();
     const runId = /^run-([a-f0-9]{32})$/.exec(id)?.[1];
     view.open = { id, linkId: id, runId, scroll: root.scrollTop };
-    const back = button(view.kind === 'requests' ? '‹ 请求' : '‹ 会话', 'activity-link activity-back');
+    const back = button(view.kind === 'requests' ? tr('‹ 请求') : tr('‹ 会话'), 'activity-link activity-back');
     back.onclick = () => navigateActivityTab(view.kind);
     const body = node('div', 'activity-detail-body');
-    body.append(node('p', 'activity-empty', view.kind === 'sessions' ? '正在读取会话…' : '正在读取请求…'));
+    body.append(node('p', 'activity-empty', view.kind === 'sessions' ? tr('正在读取会话…') : tr('正在读取请求…')));
     view.detail.replaceChildren(back, body);
     view.list.hidden = true;
     view.detail.hidden = false;
@@ -2416,7 +2436,7 @@ export function mountConsole(root, transport, {
     const pagers = view.list.querySelectorAll('[data-page]');
     for (const control of pagers) control.disabled = true;
     view.results.setAttribute('aria-busy', 'true');
-    if (!view.loaded) view.results.replaceChildren(node('div', 'activity-empty', '正在读取记录…'));
+    if (!view.loaded) view.results.replaceChildren(node('div', 'activity-empty', tr('正在读取记录…')));
     try {
       const fetchPage = () => transport.listActivity(view.kind, {
         ...Object.fromEntries(query),
@@ -2435,47 +2455,11 @@ export function mountConsole(root, transport, {
       if (offset > 0 && data.total <= offset && !append) {
         return loadActivityList(view, Math.max(0, Math.ceil(data.total / activityPageSize) - 1) * activityPageSize, false, refresh);
       }
-      const focusedId = view.results.contains(document.activeElement) && document.activeElement.dataset.activityId;
       view.loaded = true;
       view.offset = data.offset;
       view.total = data.total;
-      if (append) {
-        const drawn = new Set(view.items.map((row) => row.id));
-        const next = data.items.filter((row) => !drawn.has(row.id));
-        view.items.push(...next);
-        view.results.append(...next.map((session) => sessionRow(view, session)));
-      } else {
-        view.items = data.items;
-        if (!data.items.length) {
-          const filtered = query.get('q') || [...query.keys()].some((key) => !['q', 'offset', 'limit'].includes(key));
-          const message = view.kind === 'requests' ? (filtered ? '没有符合这些筛选条件的请求。' : '暂无请求。')
-            : (filtered ? '没有匹配的会话。' : '暂无会话。');
-          view.results.replaceChildren(node('div', 'activity-empty', message));
-        } else if (view.kind === 'requests') {
-          renderLedger(view);
-        } else {
-          view.results.replaceChildren(...view.items.map((session) => sessionRow(view, session)));
-        }
-      }
-      if (focusedId) {
-        const row = [...view.results.querySelectorAll('[data-activity-id]')]
-          .find((row) => row.dataset.activityId === focusedId);
-        row?.focus({ preventScroll: true });
-      }
-      setActivityFacets(view, data.facets);
-      renderActivitySummary(view, data);
-      const end = view.offset + data.items.length;
-      if (view.kind === 'requests') {
-        const pager = view.list.querySelector('.activity-pager');
-        pager.hidden = data.total <= activityPageSize;
-        pager.querySelector('span').textContent = `第 ${number(view.offset + 1)}–${number(end)} 条，共 ${number(data.total)} 条`;
-        pagers[0].disabled = view.offset <= 0;
-        pagers[1].disabled = end >= data.total;
-      } else {
-        pagers[0].hidden = end >= data.total;
-        pagers[0].textContent = `显示另外 ${number(Math.min(data.total - end, activityPageSize))} 个`;
-        pagers[0].disabled = false;
-      }
+      view.page = { data, query, end: view.offset + data.items.length };
+      renderActivityList(view, append);
       view.syncedAt = Date.now();
       view.refreshError = '';
     } catch (err) {
@@ -2486,13 +2470,14 @@ export function mountConsole(root, transport, {
           : view.kind === 'requests' && view.offset + view.items.length >= view.total;
         return;
       }
-      const retry = button('重试');
+      const retry = button(tr('重试'));
       // Rebuild the first page if a failed load replaced its rows.
       retry.onclick = () => loadActivityList(view);
-      const error = node('div', 'activity-empty', `读取记录失败（${err.message}） `);
+      const error = node('div', 'activity-empty', tr("读取记录失败（{0}） ", errorText(err.message)));
       error.append(retry);
       view.results.replaceChildren(error);
       view.loaded = false;
+      view.page = null;
       view.refreshError = '';
     } finally {
       if (!abort.signal.aborted) {
@@ -2501,6 +2486,48 @@ export function mountConsole(root, transport, {
         renderSyncStatus();
         syncLivePoll();
       }
+    }
+  }
+
+  function renderActivityList(view, append = false, replaceItems = true) {
+    const { data, query, end } = view.page;
+    const pagers = view.list.querySelectorAll('[data-page]');
+    const focusedId = view.results.contains(document.activeElement) && document.activeElement.dataset.activityId;
+    if (append) {
+      const drawn = new Set(view.items.map((row) => row.id));
+      const next = data.items.filter((row) => !drawn.has(row.id));
+      view.items.push(...next);
+      view.results.append(...next.map((session) => sessionRow(view, session)));
+    } else {
+      if (replaceItems) view.items = data.items;
+      if (!view.items.length) {
+        const filtered = query.get('q') || [...query.keys()].some((key) => !['q', 'offset', 'limit'].includes(key));
+        const message = view.kind === 'requests' ? (filtered ? tr('没有符合这些筛选条件的请求。') : tr('暂无请求。'))
+          : (filtered ? tr('没有匹配的会话。') : tr('暂无会话。'));
+        view.results.replaceChildren(node('div', 'activity-empty', message));
+      } else if (view.kind === 'requests') {
+        renderLedger(view);
+      } else {
+        view.results.replaceChildren(...view.items.map((session) => sessionRow(view, session)));
+      }
+    }
+    if (focusedId) {
+      const row = [...view.results.querySelectorAll('[data-activity-id]')]
+        .find((row) => row.dataset.activityId === focusedId);
+      row?.focus({ preventScroll: true });
+    }
+    setActivityFacets(view, data.facets);
+    renderActivitySummary(view, data);
+    if (view.kind === 'requests') {
+      const pager = view.list.querySelector('.activity-pager');
+      pager.hidden = data.total <= activityPageSize;
+      pager.querySelector('span').textContent = tr("第 {0}–{1} 条，共 {2} 条", number(view.offset + 1), number(end), number(data.total));
+      pagers[0].disabled = view.offset <= 0;
+      pagers[1].disabled = end >= data.total;
+    } else {
+      pagers[0].hidden = end >= data.total;
+      pagers[0].textContent = tr("显示另外 {0} 个", number(Math.min(data.total - end, activityPageSize)));
+      pagers[0].disabled = false;
     }
   }
 
@@ -2603,8 +2630,8 @@ export function mountConsole(root, transport, {
       debounce = setTimeout(() => loadActivityList(view), 180);
     };
     const ranges = view.kind === 'requests'
-      ? [['today', '今天'], ['24h', '24 小时'], ['7d', '7 天'], ['30d', '30 天'], ['all', '全部']]
-      : [['today', '今天'], ['7d', '7 天'], ['30d', '30 天'], ['90d', '90 天'], ['all', '全部']];
+      ? [['today', tr('今天')], ['24h', tr('24 小时')], ['7d', tr('7 天')], ['30d', tr('30 天')], ['all', tr('全部')]]
+      : [['today', tr('今天')], ['7d', tr('7 天')], ['30d', tr('30 天')], ['90d', tr('90 天')], ['all', tr('全部')]];
     const rangeControls = ranges.map(([range, label]) => {
       const control = button(label);
       control.setAttribute('aria-pressed', String(range === view.range));
@@ -2670,7 +2697,7 @@ export function mountConsole(root, transport, {
       const { csv } = await transport.listActivity('requests', { ...query, format: 'csv' });
       downloadActivity('gempt-requests.csv', new Blob([csv], { type: 'text/csv;charset=utf-8' }));
     } catch (error) {
-      showToast(`导出失败（${error.message}）`, 'error');
+      showToast(tr("导出失败（{0}）", errorText(error.message)), 'error');
     } finally {
       exportCsv.disabled = false;
     }
@@ -2687,34 +2714,35 @@ export function mountConsole(root, transport, {
       nativePreviewTier = target.value;
       renderState(latestState);
     } else if (target.name === 'work_split' || target.name === 'swarm_split') {
-      updateSetting(target.name, { [target.name]: target.value }, latestState[target.name], '工作分工已保存，下次派单生效');
+      updateSetting(target.name, { [target.name]: target.value }, latestState[target.name], tr('工作分工已保存，下次派单生效'));
     } else if (target.name === 'native_swarm' || target.name === 'swarm_shell_model') {
       const value = target.name === 'native_swarm' ? target.value === 'true' : target.value;
-      void updateSetting(target.name, { [target.name]: value }, latestState[target.name], 'Swarm 派单设置已保存');
+      void updateSetting(target.name, { [target.name]: value }, latestState[target.name], tr('Swarm 派单设置已保存'));
     } else if (target.dataset.family) {
       const family = target.dataset.family;
-      updateSetting(target.name, { pairing: { family, model: target.value } }, latestState.pairings[family], '配对已保存，下个新任务生效');
+      updateSetting(target.name, { pairing: { family, model: target.value } }, latestState.pairings[family], tr('配对已保存，下个新任务生效'));
     } else if (target.name === 'default_sandbox') {
-      const label = SANDBOX_NAMES[target.value] || target.value;
-      updateSetting('default_sandbox', { default_sandbox: target.value }, currentDefaultSandbox, `Codex 执行权限已切为${label}`);
+      const label = tr(SANDBOX_NAMES[target.value]) || target.value;
+      updateSetting('default_sandbox', { default_sandbox: target.value }, currentDefaultSandbox, tr("Codex 执行权限已切为{0}", label));
     } else if (target.name === 'active_effort') {
       const payload = target.value === 'auto'
         ? { auto_effort: true }
         : { auto_effort: false, mcp_effort: target.value };
-      const label = EFFORT_NAMES[target.value] || target.value;
+      const label = tr(EFFORT_NAMES[target.value]) || target.value;
       const toastMsg = target.value === 'auto'
-        ? '已开启智能定档（low..xhigh，续跑锁档）'
-        : `思考强度已切为${label}`;
+        ? tr('已开启智能定档（low..xhigh，续跑锁档）')
+        : tr("思考强度已切为{0}", label);
       updateSetting('active_effort', payload, currentEffortChoice, toastMsg);
     } else if (target.name === 'failover_mode') {
-      const label = target.value === 'api_fallback' ? 'API 兜底' : '仅订阅';
-      updateSetting('failover_mode', { failover_mode: target.value }, currentFailoverMode, `容灾模式已切为${label}`);
+      const label = target.value === 'api_fallback' ? tr('API 兜底') : tr('仅订阅');
+      updateSetting('failover_mode', { failover_mode: target.value }, currentFailoverMode, tr("容灾模式已切为{0}", label));
     }
   });
 
   const timeoutInput = $('codex-timeout');
   timeoutInput.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && !event.isComposing && timeoutInput.reportValidity()) {
+      event.preventDefault();
       saveTimeout(timeoutInput.valueAsNumber);
     }
   });
@@ -2784,7 +2812,24 @@ export function mountConsole(root, transport, {
   setInterval(() => {
     if (visible && activeTab === 'overview' && document.visibilityState === 'visible') void refresh();
   }, POLL_MS);
-  return { setTab, refresh, patchGatewayStatus };
+  function renderLanguage() {
+    if (latestState) {
+      $('work-options').replaceChildren();
+      renderState(latestState);
+      renderLiveOverview(latestState);
+    }
+    if (activeTab === 'overview' && latestRatio) renderTokenRatio(latestRatio);
+    for (const view of Object.values(activityViews)) {
+      if (view.page) renderActivityList(view, false, false);
+      if (view.open) {
+        view.detail.querySelector('.activity-back').textContent = view.kind === 'requests' ? tr('‹ 请求') : tr('‹ 会话');
+        if (view.open.data) renderActivityDetail(view, view.open.data);
+      }
+    }
+    renderSyncStatus();
+  }
+
+  return { setTab, refresh, patchGatewayStatus, renderLanguage };
 }
 
 const preferences = new Map();

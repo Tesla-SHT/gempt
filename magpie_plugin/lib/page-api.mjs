@@ -5,6 +5,8 @@ import {
   initSubscriptionConfig,
   isActivityId,
   listDispatchActivity,
+  probeGatewaySettings,
+  resetSettings,
   readState,
   readOverview,
   readRoutingSummary,
@@ -123,6 +125,11 @@ export async function dispatchPageApi({ method, url, rawPath = url.pathname, rea
   if (method === 'POST' && pathname === '/api/tier') {
     const body = await readBody();
     const result = setDefaultTier(body?.tier, { configPath });
+    return reply(result.status, result);
+  }
+  if (method === 'POST' && (pathname === '/api/probe-gateway' || pathname === '/api/reset-settings')) {
+    const body = await readBody();
+    const result = pathname === '/api/probe-gateway' ? await probeGatewaySettings(body, options) : resetSettings(body, options);
     return reply(result.status, result);
   }
   if (method === 'POST' && pathname === '/api/settings') {

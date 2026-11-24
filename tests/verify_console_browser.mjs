@@ -15,7 +15,7 @@ import { updateHostContext } from '../core/host-context.mjs';
 import { runDirectory, saveRun } from '../core/runs.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
 
-const output = process.env.GEMPT_VERIFY_DIR || '/tmp/gempt-verify';
+const output = process.env.GEMPT_VERIFY_DIR || '/tmp/gempt-v060-verify';
 const root = mkdtempSync(join(tmpdir(), 'gempt-verify-'));
 const configPath = join(root, 'config.json');
 const sessionsDir = join(root, 'sessions');
@@ -44,6 +44,9 @@ const sidecarToken = 'browser-fixture-token';
 const sidecarPrefix = '/sidecar/gempt/gempt_live';
 const magpiePrefix = '/magpie/gempt';
 const sidecarRequests = [];
+let authorizeSidecarAtGateway = false;
+let sidecarFailure;
+let blockedSidecarScript = false;
 const controlPackets = [];
 const controlSockets = new Set();
 const codexToken = 'browser-codex-fixture';
@@ -92,6 +95,18 @@ const backend = createServer(async (req, res) => {
     const path = (incoming.pathname.slice(prefix.length) || '/') + incoming.search;
     const headers = { ...req.headers, host: new URL(origin).host };
     if (headers.origin === incoming.origin) headers.origin = origin;
+    if (prefix === sidecarPrefix && /^\/(gempt-preload\.js|styles\.css|app\.js)$/.test(path.split('?')[0])) {
+      if (blockedSidecarScript && path.startsWith('/app.js')) return res.writeHead(404).end('missing script');
+      if (!authorizeSidecarAtGateway && incoming.searchParams.get('token') !== sidecarToken) {
+        return res.writeHead(401).end('unauthorized');
+      }
+    }
+    if (prefix === sidecarPrefix && path === '/api') {
+      if (sidecarFailure) {
+        return res.writeHead(sidecarFailure, { 'content-type': 'application/json' }).end('{}');
+      }
+      if (authorizeSidecarAtGateway) headers['x-sidecar-token'] = sidecarToken;
+    }
     const proxy = request(origin + path, { method: req.method, headers }, (upstream) => {
       if (prefix === sidecarPrefix) {
         sidecarRequests.push({ publicPath: incoming.pathname, path, method: req.method, authenticated: headers['x-sidecar-token'] === sidecarToken,
@@ -125,10 +140,16 @@ const backend = createServer(async (req, res) => {
   }
   if (incoming.pathname === '/native-host' && sidecarOrigin) {
     const bare = incoming.searchParams.has('bare');
-    const src = sidecarPrefix + (bare ? '' : '/') + '?token=' + sidecarToken
-      + '&amp;theme=dark&amp;conversationId=' + host + (bare ? '#live/' + runId : '');
+    const opaque = incoming.searchParams.has('opaque');
+    const noWorkspace = incoming.searchParams.has('no-workspace');
+    const path = bare ? '' : incoming.searchParams.has('index') ? '/index.html' : '/';
+    const light = incoming.searchParams.get('theme') === 'light';
+    const src = sidecarPrefix + path + '?theme=' + (light ? 'light' : 'dark')
+      + (incoming.searchParams.has('tokenless') ? '' : '&amp;token=' + sidecarToken)
+      + (incoming.searchParams.has('tokenless') ? '' : '&amp;conversationId=' + host)
+      + (bare ? '#live/' + runId : '');
     res.setHeader('Content-Type', 'text/html');
-    return res.end(`<!doctype html><link rel="icon" href="data:,"><iframe id="sidecar" src="${src}" style="position:fixed;inset:0;border:0;width:100%;height:100%"></iframe>
+    return res.end(`<!doctype html><link rel="icon" href="data:,"><iframe id="sidecar" src="${src}" ${opaque ? 'sandbox="allow-scripts"' : ''} style="position:fixed;inset:0;border:0;width:100%;height:100%"></iframe>
       <script>
       const frame = document.getElementById('sidecar');
       window.addEventListener('message', (event) => {
@@ -137,10 +158,11 @@ const backend = createServer(async (req, res) => {
       window.setWorkspace = (workspaceUris) => frame.contentWindow.postMessage({ type: 'workspace-change', payload: { workspaceUris } }, '*');
       frame.onload = () => {
         frame.contentWindow.postMessage({ type: 'theme-change', payload: { cssVariables: {
-          '--background':'#17181b', '--foreground':'#ebedf3', '--card':'#202126', '--muted-foreground':'#adb3bf',
-          '--border':'#353842', '--primary':'#92b9fb'
+          '--background':'${light ? '#fdfdff' : '#17181b'}', '--foreground':'${light ? '#202633' : '#ebedf3'}',
+          '--card':'${light ? '#ffffff' : '#202126'}', '--muted-foreground':'${light ? '#555e70' : '#adb3bf'}',
+          '--border':'${light ? '#cdd3df' : '#353842'}', '--primary':'${light ? '#2057a8' : '#92b9fb'}'
         } } }, '*');
-        setWorkspace([${JSON.stringify(pathToFileURL(cwd).href)}]);
+        ${noWorkspace ? '' : `setWorkspace([${JSON.stringify(pathToFileURL(cwd).href)}]);`}
       };
       </script>`);
   }
@@ -167,7 +189,7 @@ function seed(url) {
   const brain = join(brainDir, host, '.system_generated', 'logs');
   for (const path of [sessionsDir, magpieConfigDir, cwd, brain, output]) mkdirSync(path, { recursive: true });
   writeFileSync(configPath, JSON.stringify({
-    version: 1, magpie: { base_url: url },
+    version: 1, magpie: { base_url: url }, ui: { language: 'zh' },
     codex: { default_sandbox: 'workspace-write', timeout_sec: 3600 },
     routing_policy: { work_split: 'gpt_first', swarm_split: 'inherit', native_swarm: true, mcp_effort: 'high' },
     tiers: { sonnet: { consult_model: model, exec_model: model, reasoning_effort: 'medium' },
@@ -341,7 +363,18 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
   async function assertGeometry(name) {
     const overflow = await evaluate(`return [document.documentElement, document.body, $('view-console'), $('live-panel')]
       .filter(el => el && !el.hidden).map(el => [el.id || el.tagName, el.scrollWidth, el.clientWidth]);`);
-    for (const [id, scroll, client] of overflow) assert.ok(scroll <= client, `${name} ${id} overflows ${scroll} > ${client}`);
+    const outside = overflow.some(([, scroll, client]) => scroll > client) ? await evaluate(
+      "return [...document.body.querySelectorAll('*')].filter(el => el.getBoundingClientRect().right > innerWidth + 1).map(el => [el.id || el.className || el.tagName, Math.round(el.getBoundingClientRect().right)]).slice(0, 18);") : [];
+    for (const [id, scroll, client] of overflow) assert.ok(scroll <= client, `${name} ${id} overflows ${scroll} > ${client} ${JSON.stringify(outside)}`);
+  }
+  async function assertTopbar(name) {
+    const boxes = await evaluate(`return [...document.querySelectorAll('.app-topbar .app-brand, .app-topbar button, #magpie-status')]
+      .map(el => [el.id || 'brand', el.getBoundingClientRect().toJSON()]);`);
+    for (const [index, [id, box]] of boxes.entries()) {
+      assert.ok(box.width > 0, name + ' hides ' + id);
+      assert.ok(box.left >= 0 && box.right <= await evaluate('return innerWidth;'), name + ' clips ' + id);
+      if (index) assert.ok(box.left >= boxes[index - 1][1].right, name + ' overlaps ' + id);
+    }
   }
   async function shot(name) {
     await assertGeometry(name);
@@ -418,7 +451,7 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
   await click('console-copy-close');
   await evaluate("document.querySelector('[data-ratio-range=\"7d\"]').click();");
   await until(() => evaluate("return $('token-ratio-title').textContent.includes('7 天');"), 'token ratio preset');
-  await evaluate("document.querySelector('[data-timeout=\"1800\"]').click();");
+  await evaluate("$('advanced-settings').open = true; document.querySelector('[data-timeout=\"1800\"]').click();");
   await until(() => evaluate("return document.querySelector('[data-timeout=\"1800\"]').getAttribute('aria-pressed') === 'true';"), 'saved timeout preset');
   await evaluate("const field = $('codex-timeout'); field.value = '2400'; field.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));");
   await until(() => JSON.parse(readFileSync(configPath)).codex.timeout_sec === 2400, 'manual timeout saved in opaque iframe');
@@ -556,7 +589,7 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
       && $('magpie-status').dataset.state === 'online' && Number.parseFloat($('token-ratio-gpt-bar').style.width) > 0;`), 'native Console and token data');
     await evaluate("document.querySelector('[data-ratio-range=\"7d\"]').click();");
     await until(() => evaluate("return $('token-ratio-title').textContent.includes('7 天') && !$('token-ratio-card').hidden;"), 'native token range change');
-    await evaluate("document.querySelector('[data-timeout=\"1800\"]').click();");
+    await evaluate("$('advanced-settings').open = true; document.querySelector('[data-timeout=\"1800\"]').click();");
     await until(() => evaluate("return document.querySelector('[data-timeout=\"1800\"]').getAttribute('aria-pressed') === 'true';"), 'native Settings via sidecar auth');
     assert.equal(JSON.parse(readFileSync(configPath)).codex.timeout_sec, 1800);
     await shot('agy-native-console-dark');
@@ -572,22 +605,126 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
     await until(() => evaluate(`return !!document.querySelector('.session-card[data-run-id="${sidecarRunId}"]');`), 'native workspace-change refresh');
     assert.equal(await evaluate(`return !!document.querySelector('.session-card[data-run-id="${runId}"]');`), false);
 
+
+    const resize = (width, height) => cdp('Emulation.setDeviceMetricsOverride', {
+      width, height, deviceScaleFactor: 1, mobile: false,
+    });
+    await open(url + '/native-host', 460, 1170, true);
+    await click('tab-overview');
+    await until(() => evaluate("return $('view-console').classList.contains('gp-ready') && $('gateway-url').value;"), 'settings initialized');
+    assert.equal(await evaluate("return $('advanced-settings').open;"), false);
+    await evaluate("document.querySelector('#advanced-settings summary').click();");
+    assert.equal(await evaluate("return $('advanced-settings').open && $('tab-overview').textContent;"), '概览');
+
+    const fill = (id, value) => evaluate(`const field = $(${JSON.stringify(id)});
+      field.value = ${JSON.stringify(value)}; field.dispatchEvent(new Event('input', { bubbles: true }));`);
+    await fill('gateway-url', url + '/');
+    await fill('gateway-key', 'sidecar-draft-key-1234');
+    await fill('gateway-key-env', 'GEMPT_BROWSER_TOKEN');
+    await click('gateway-test');
+    await until(() => evaluate("return $('gateway-result').textContent.includes('4 个模型');"), 'native unsaved gateway draft probe');
+    assert.equal(JSON.parse(readFileSync(configPath)).magpie.api_key, undefined);
+    await fill('utility-model', 'vendor/chore:fast');
+    await fill('utility-effort', 'high');
+    await fill('excluded-models', ' vendor/ignore, vendor/experimental ');
+    await fill('consult-timeout', '240');
+    await fill('codex-extra-args', '--strict-config --analytics-default-enabled');
+    await click('advanced-save');
+    await until(() => evaluate("return $('gateway-key').placeholder === '••••1234' && !$('gateway-key').value && $('advanced-save').disabled;"), 'native settings saved and key masked');
+    const settings = JSON.parse(readFileSync(configPath));
+    assert.equal(settings.magpie.base_url, url);
+    assert.equal(settings.magpie.api_key, 'sidecar-draft-key-1234');
+    assert.equal(settings.magpie.api_key_env, 'GEMPT_BROWSER_TOKEN');
+    assert.deepEqual(settings.routing_policy.excluded_models, ['vendor/ignore', 'vendor/experimental']);
+    assert.equal(settings.utility.model, 'vendor/chore:fast');
+    assert.equal(settings.utility.reasoning_effort, 'high');
+    assert.equal(settings.limits.consult_timeout_sec, 240);
+    assert.deepEqual(settings.codex.extra_args, ['--strict-config', '--analytics-default-enabled']);
+
+    await evaluate("const model = $('swarm-shell-model'); model.value = 'vendor/custom-shell:v2'; model.dispatchEvent(new Event('change', { bubbles: true }));");
+    await until(() => JSON.parse(readFileSync(configPath)).routing_policy.swarm_shell_model === 'vendor/custom-shell:v2', 'native custom Swarm model');
+    await until(() => evaluate("return !$('swarm-shell-model').disabled;"), 'native custom Swarm save settled');
+    await click('advanced-reset');
+    assert.equal(await evaluate("return !$('reset-confirm').hidden && $('reset-keep-gateway').checked;"), true);
+    await click('reset-cancel');
+
+    await click('gateway-test');
+    await until(() => evaluate("return $('gateway-result').dataset.state === 'ok';"), 'native saved gateway probe');
+    for (const language of ['zh', 'en']) {
+      if (language === 'en') {
+        await fill('utility-model', 'vendor/chore:draft');
+        await click('language-toggle');
+        await until(() => evaluate("return document.documentElement.lang === 'en' && !$('language-toggle').disabled;"), 'language switch persisted');
+        assert.equal(await evaluate("return $('utility-model').value;"), 'vendor/chore:draft');
+        await click('advanced-save');
+        await until(async () => JSON.parse(readFileSync(configPath)).utility.model === 'vendor/chore:draft'
+          && await evaluate("return !$('gateway-test').disabled;"), 'English settings save');
+        await click('gateway-test');
+        await until(() => evaluate("return $('gateway-result').textContent.includes('4 models');"), 'English probe result');
+        assert.equal(await evaluate("return [...document.querySelectorAll('.app-tabs button')].map(x => x.textContent).join('|');"), 'Live|Overview|Requests|Sessions');
+        assert.equal(await evaluate("return document.querySelector('#advanced-settings summary').textContent;"), 'Connection & Advanced Settings');
+        assert.match(await evaluate("return $('work-detail').textContent;"), /GPT handles substantive tasks/);
+      }
+      for (const width of [420, 460]) {
+        await resize(width, 1170);
+        await assertGeometry(language + ' ' + width);
+        await assertTopbar(language + ' ' + width);
+      }
+      await click('toast-dismiss');
+      await evaluate("document.querySelector('#advanced-settings summary').scrollIntoView({ block: 'start' });");
+      await shot('sidecar-' + language + '-overview-dark');
+    }
+    assert.equal(JSON.parse(readFileSync(configPath)).ui.language, 'en');
+    await click('tab-requests');
+    await until(() => evaluate("return !!document.querySelector('#requests [data-activity-id]');"), 'English native Requests');
+    await click('tab-sessions');
+    await until(() => evaluate("return !!document.querySelector('#sessions [data-activity-id]');"), 'English native Sessions');
+    await open(url + '/native-host?theme=light', 460, 820, true);
+    await until(() => evaluate("return document.documentElement.lang === 'en' && !!document.querySelector('.session-card');"), 'native English Live applies saved language');
+    assert.equal(await evaluate("return document.documentElement.dataset.theme;"), 'light');
+    await assertTopbar('English native Live light');
+    await shot('sidecar-en-live-light');
+    // Restore the fixture before the remaining lifecycle and authentication checks.
+    const restored = await handleTool('gempt_app_console_settings', { ui: { language: 'zh' },
+      magpie: { api_key: '', api_key_env: '' }, codex: { extra_args: [] } }, env, { configPath, sessionsDir, magpieConfigDir });
+    assert.equal(restored.structuredContent.ui.language, 'zh');
+
     await open(url + '/native-host?bare', 460, 820, true);
     await until(() => evaluate("return $('detail-title').textContent === '核对双端控制台与迁移';"), 'native slashless entry and deep-linked run');
     assert.equal(await evaluate('return location.pathname + location.search + location.hash;'),
-      sidecarPrefix + '/?token=' + sidecarToken + '&theme=dark&conversationId=' + host + '#live/' + runId);
+      sidecarPrefix + '/?theme=dark&token=' + sidecarToken + '&conversationId=' + host + '#live/' + runId);
     assert.ok(sidecarRequests.some(({ publicPath, status }) => publicPath === sidecarPrefix && status === 200),
       'gateway served the slashless HTML directly');
     for (const asset of ['gempt-preload.js', 'styles.css', 'app.js']) {
-      assert.ok(sidecarRequests.some(({ path, method, status }) => path === '/' + asset && method === 'GET' && status === 200), asset);
+      assert.ok(sidecarRequests.some(({ path, method, status }) =>
+        path === '/' + asset + '?token=' + sidecarToken && method === 'GET' && status === 200), asset);
     }
     const apiRequests = sidecarRequests.filter(({ path }) => path === '/api');
     assert.ok(apiRequests.length > 0 && apiRequests.every(({ method, authenticated, status }) =>
       method === 'POST' && authenticated && status === 200), 'native reads and mutations use authenticated POSTs');
-    const metadataRequests = sidecarRequests.filter(({ path }) => path === '/_sidecar/get-conversation-metadata');
-    assert.equal(metadataRequests.length, 2, 'each navigation triggers the SDK metadata request under the prefix');
-    assert.ok(metadataRequests.every(({ method, authenticated, status }) =>
-      method === 'POST' && authenticated && status === 200), 'SDK metadata requests use authenticated POSTs');
+    await open(url + '/native-host?no-workspace&index', 460, 820, true);
+    await until(() => evaluate(`return $('list-loading').hidden && !$('routing-badge').disabled
+      && !!document.querySelector('.session-card[data-run-id="${runId}"]');`), 'native startup without workspace metadata');
+    assert.equal(await evaluate('return location.pathname;'), sidecarPrefix + '/index.html');
+    const noWorkspaceFrame = (await cdp('Page.getFrameTree')).frameTree.frame;
+    await cdp('Runtime.evaluate', { contextId: contexts.get(noWorkspaceFrame.id),
+      expression: `setWorkspace([${JSON.stringify(pathToFileURL(sidecarWorkspace).href)}])` });
+    await until(() => evaluate(`return !!document.querySelector('.session-card[data-run-id="${sidecarRunId}"]')
+      && !document.querySelector('.session-card[data-run-id="${runId}"]');`), 'late first workspace narrows the run list');
+
+    await open(url + '/native-host?opaque&no-workspace', 460, 820, true);
+    await until(() => evaluate(`return self.origin === 'null' && !!window.sidecar && !$('routing-badge').disabled
+      && !!document.querySelector('.session-card[data-run-id="${runId}"]');`), 'opaque native iframe starts with authenticated data');
+    assert.ok(sidecarRequests.some(({ path, method, authenticated, status }) =>
+      path === '/api?token=' + sidecarToken && method === 'POST' && !authenticated && status === 200));
+
+    authorizeSidecarAtGateway = true;
+    await open(url + '/native-host?tokenless&no-workspace', 460, 820, true);
+    await until(() => evaluate(`return !$('routing-badge').disabled
+      && !!document.querySelector('.session-card[data-run-id="${runId}"]');`), 'gateway-authenticated native iframe without a query token');
+    authorizeSidecarAtGateway = false;
+    assert.ok(!sidecarRequests.some(({ path }) => path === '/_sidecar/get-conversation-metadata'),
+      'startup never invokes the SDK metadata subprocess');
   }
 
   await open(url + magpiePrefix + '/?theme=dark', 900, 820, false);
@@ -599,7 +736,19 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
   assert.deepEqual(notFound, [], 'Chrome received no 404 responses');
   assert.deepEqual(errors, [], 'Chrome console and uncaught errors');
   assert.deepEqual(external, [], 'No external asset or network requests');
-  console.log('Chrome OK · Magpie HTTP, MCP App and prefixed native Sidecar (both entry URLs) · four tabs, details, token ratio, settings, reply, steer and interrupt · 0 HTTP 404s, 0 console errors');
+  console.log('Chrome OK · Magpie HTTP, MCP App and native Sidecar · prefixed, slashless, index, opaque, gateway-authenticated and late-workspace startup · four tabs, details, token ratio, settings and controls · 0 HTTP 404s, 0 console errors');
+  for (const status of [401, 404, 500]) {
+    sidecarFailure = status;
+    await open(url + '/native-host?no-workspace', 460, 820, true);
+    await until(() => evaluate(`return $('list-loading').hidden && !$('list-error').hidden
+      && $('list-error').textContent === 'HTTP ${status}';`), 'native error banner for HTTP ' + status);
+  }
+  sidecarFailure = undefined;
+  blockedSidecarScript = true;
+  await open(url + '/native-host', 460, 820, true);
+  await until(() => evaluate(`return $('list-loading').hidden && !$('list-error').hidden
+    && $('list-error').textContent.includes('脚本加载失败');`), 'native startup banner for missing script');
+  console.log('Chrome OK · native HTTP 401, 404, 500 and a missing script replace skeletons with an error');
   chrome.kill();
   await exited;
 } finally {

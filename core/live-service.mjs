@@ -540,6 +540,8 @@ export function checkArgs(name, args, { properties, required = [] }) {
     if (field.type === 'string') {
       valid = typeof value === 'string' && (!field.pattern || new RegExp(field.pattern).test(value))
         && (!field.enum || field.enum.includes(value));
+    } else if (field.type === 'array') {
+      valid = Array.isArray(value) && field.items.type === 'string' && value.every((item) => typeof item === 'string');
     } else if (field.type === 'boolean') {
       valid = typeof value === 'boolean';
     } else {

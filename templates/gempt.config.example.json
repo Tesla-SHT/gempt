@@ -79,6 +79,9 @@
     "use_for_magpie_compact": true,
     "use_as_classifier": false
   },
+  "ui": {
+    "language": "auto"
+  },
   "limits": {
     "max_internal_rounds": 3,
     "max_context_file_bytes": 131072,

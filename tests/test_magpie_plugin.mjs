@@ -49,7 +49,7 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files, version }] = JSON.parse(stdout);
-  assert.equal(version, '0.5.1');
+  assert.equal(version, '0.6.0');
   const paths = files.map((file) => file.path);
   assert.deepEqual(paths.filter((path) => /^plugin\/skills\/[^/]+\/SKILL\.md$/.test(path)).sort(),
     ['plugin/skills/gempt-chore/SKILL.md', 'plugin/skills/gempt/SKILL.md']);
@@ -160,6 +160,8 @@ test('UI token-ratio card offers all ranges, shows observation states and has no
   };
   const renderTokenRatio = runInNewContext(`${constants.join('\n')}\n${renderSource}\nrenderTokenRatio`, {
     $: (id) => elements[id],
+    latestRatio: undefined,
+    tr: (str, ...args) => args.length ? str.replace(/\{(\d+)\}/g, (_, i) => args[i]) : str,
   });
   for (const [range, titleText, target, status, badgeText] of [
     ['1h', '1 小时内实际 Token 占比', 0, 'off', '已关闭'],
@@ -203,10 +205,12 @@ test('UI shows tiers only for direct routing and offers exactly two Antigravity 
   assert.ok(renderTierRoutes);
   const renderState = runInNewContext(`let latestState, currentViewMode, nativePreviewTier, onState, locateWork;\nconst pendingSettings = new Set();\n${renderSource}\n${renderTierRoutes}\nrenderState`, {
     $: (id) => elements[id],
+    tr: (str, ...args) => args.length ? str.replace(/\{(\d+)\}/g, (_, i) => args[i]) : str,
     root: { querySelectorAll: () => [] },
     resolveEffectiveViewMode: (state) => state.mode,
     renderSetupBanner: noop,
     renderControls: noop,
+    advanced: { render: noop },
     renderReadiness: noop,
     renderActiveRoute: (_state, tier, mode) => routeModes.push([tier?.group_id, mode]),
     renderActivity: noop,
@@ -2527,7 +2531,7 @@ test('mcpTools false disables duplicate Magpie GemPT tool registration', async (
 
 test('Magpie marketplace check shape and inspect+share guard hold', async () => {
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '0.5.1');
+  assert.equal(pkg.version, '0.6.0');
   assert.ok(pkg.keywords.includes('magpie-plugin'));
   assert.ok(pkg.files.includes('THIRD_PARTY_LICENSES.txt'));
   assert.ok(pkg.magpie?.summary?.en && pkg.magpie?.summary?.zh);
@@ -3044,4 +3048,116 @@ test('token-ratio skips unparseable timestamps and flags truncated usage.jsonl m
     brainDir, magpieConfigDir, sessionsDir, range: '1h', nowMs, cacheTtlMs: 0, maxUsageTailBytes: 512,
   });
   assert.equal(budget.truncated, true);
+});
+
+test('advanced HTTP settings validate, protect credentials, probe drafts and reset defaults', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-advanced-settings-'));
+  const configPath = join(dir, 'config.json');
+  const secret = 'fixture-only-gateway-secret-1234';
+  const envName = 'GEMPT_TEST_ADVANCED_KEY';
+  const requests = [];
+  const gateway = http.createServer((req, res) => {
+    const authorization = req.headers.authorization;
+    requests.push([req.url, authorization]);
+    res.end(JSON.stringify({ data: [{ id: 'external/custom-v1' },
+      ...(authorization?.endsWith(secret) ? [{ id: secret }] : [])] }));
+  });
+  await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve));
+  const gatewayUrl = 'http://127.0.0.1:' + gateway.address().port;
+  const trustedBefore = process.env.GEMPT_TRUSTED_GATEWAY;
+  process.env.GEMPT_TRUSTED_GATEWAY = gatewayUrl + '/trusted';
+  process.env[envName] = secret;
+  writeFileSync(configPath, JSON.stringify({ version: 1, magpie: { base_url: gatewayUrl } }));
+  const svc = await startServer({ port: 0, configPath, sessionsDir: join(dir, 'sessions'), magpieConfigDir: dir });
+  t.after(async () => {
+    if (trustedBefore === undefined) delete process.env.GEMPT_TRUSTED_GATEWAY;
+    else process.env.GEMPT_TRUSTED_GATEWAY = trustedBefore;
+    delete process.env[envName];
+    await svc.close();
+    await new Promise((resolve) => gateway.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const auth = (await rawHttpGet({ port: svc.port, path: '/' })).text.match(/name="gempt-key" content="([^"]+)"/)[1];
+  const call = async (path, body) => {
+    const response = await fetch('http://127.0.0.1:' + svc.port + '/api/' + path, {
+      headers: { Origin: 'null', 'x-gempt-key': auth, 'Content-Type': 'application/json' },
+      ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }),
+    });
+    return [response.status, await response.json()];
+  };
+  const saved = {
+    magpie: { base_url: ' ' + gatewayUrl + '/// ', api_key: secret, api_key_env: envName },
+    routing_policy: { swarm_shell_model: 'vendor/custom:model@1', excluded_models: [' unused-provider  '] },
+    utility: { model: 'external/custom-v1', reasoning_effort: '' },
+    codex: { cli_path: process.execPath, extra_args: ['--strict-config'] },
+    limits: { consult_timeout_sec: 15 },
+    ui: { language: 'en' },
+  };
+  assert.equal((await call('settings', saved))[0], 200);
+  const config = () => JSON.parse(readFileSync(configPath, 'utf8'));
+  assert.equal(config().magpie.base_url, gatewayUrl);
+  assert.equal(config().magpie.api_key, secret);
+  for (const endpoint of ['overview', 'state']) {
+    const [status, data] = await call(endpoint);
+    assert.equal(status, 200);
+    assert.equal(data.magpie_api_key_configured, true);
+    assert.equal(data.magpie_api_key_hint, '••••1234');
+    assert.equal(data.magpie_api_key_env, envName);
+    assert.equal(data.magpie_base_url, gatewayUrl);
+    assert.equal(data.swarm_shell_model, saved.routing_policy.swarm_shell_model);
+    assert.deepEqual(data.excluded_models, ['unused-provider']);
+    assert.equal(data.utility.model, saved.utility.model);
+    assert.equal(data.utility.reasoning_effort, '');
+    assert.equal(data.codex_cli_path, process.execPath);
+    assert.equal(data.codex_cli_available, true);
+    assert.equal(data.codex_cli_resolved_path, process.execPath);
+    assert.deepEqual(data.codex_extra_args, ['--strict-config']);
+    assert.equal(data.consult_timeout_sec, 15);
+    assert.equal(data.ui.language, 'en');
+    assert.ok(!JSON.stringify(data).includes(secret));
+  }
+  assert.equal((await call('summary'))[1].ui.language, 'en');
+  const [probeStatus, probe] = await call('probe-gateway', {});
+  assert.equal(probeStatus, 200);
+  assert.equal(probe.reachable, true);
+  assert.ok(Number.isInteger(probe.latency_ms) && probe.latency_ms >= 0);
+  assert.deepEqual(probe.models, ['external/custom-v1']);
+  assert.deepEqual(requests.at(-1), ['/v1/models', 'Bearer ' + secret]);
+
+  assert.equal((await call('probe-gateway', { base_url: gatewayUrl + '/draft', api_key: 'draft-token' }))[1].reachable, true);
+  assert.deepEqual(requests.at(-1), ['/draft/v1/models', 'Bearer draft-token']);
+  await call('probe-gateway', { base_url: gatewayUrl + '/draft' });
+  assert.deepEqual(requests.at(-1), ['/draft/v1/models', undefined]);
+  await call('probe-gateway', { base_url: gatewayUrl + '/trusted', api_key_env: envName });
+  assert.deepEqual(requests.at(-1), ['/trusted/v1/models', 'Bearer ' + secret]);
+  assert.equal(config().magpie.base_url, gatewayUrl);
+
+  const prev = config();
+  for (const invalid of [
+    { swarm_shell_model: 'bad model' }, { swarm_shell_model: 'x\n' }, { swarm_shell_model: 'x'.repeat(129) },
+    { magpie: { base_url: 'ftp://example.com' } }, { magpie: { base_url: 'https://user:secret@example.com' } },
+    { magpie: { api_key_env: 'bad-env' } }, { magpie: { api_key: 'invalid\nkey' } },
+    { utility: { model: '' } }, { utility: { reasoning_effort: 'ultra' } },
+    { routing_policy: { excluded_models: ['\t'] } }, { codex: { extra_args: ['bad\narg'] } },
+    { codex: { cli_path: 'bin\0codex' } }, { limits: { consult_timeout_sec: 15.5 } },
+    { limits: { consult_timeout_sec: 1801 } }, { ui: { language: 'fr' } },
+  ]) {
+    assert.equal((await call('settings', { default_sandbox: 'read-only', ...invalid }))[0], 400);
+    assert.deepEqual(config(), prev);
+  }
+  assert.equal((await call('probe-gateway', { base_url: 'not-a-url' }))[0], 400);
+  assert.equal((await call('settings', { magpie: { api_key: '' } }))[0], 200);
+  assert.equal((await call('overview'))[1].magpie_api_key_configured, false);
+  await call('settings', { magpie: { api_key: secret } });
+  await call('settings', { magpie: { clear_api_key: true } });
+  assert.equal(config().magpie.api_key, '');
+  await call('settings', { magpie: { api_key: secret } });
+  assert.equal((await call('reset-settings', { keep_gateway: 'false' }))[0], 400);
+  assert.equal((await call('reset-settings', {}))[1].keep_gateway, true);
+  assert.deepEqual(config().magpie, { cli_path: '', ...prev.magpie });
+  assert.equal(config().ui.language, 'auto');
+  assert.equal(config().limits.consult_timeout_sec, 180);
+  assert.equal((await call('reset-settings', { keep_gateway: false }))[0], 200);
+  assert.equal(config().magpie.base_url, 'http://127.0.0.1:3425');
+  assert.equal(config().magpie.api_key, '');
 });

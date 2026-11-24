@@ -1,6 +1,6 @@
 {
   "name": "gempt",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Antigravity MCP orchestration with Gemini-to-Codex pairing and Magpie direct routing groups for other clients.",
   "author": {
     "name": "yizhang-dream",

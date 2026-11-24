@@ -1,5 +1,7 @@
 const actionPaths = {
   init: 'init',
+  probe_gateway: 'probe-gateway',
+  reset_settings: 'reset-settings',
   native_groups: 'native-groups',
   tier: 'tier',
   restart_app_server: 'app-server/restart',

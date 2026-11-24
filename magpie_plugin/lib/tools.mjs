@@ -17,7 +17,7 @@ import { runAppServer, TurnInterrupted } from './app-server-run.mjs';
 import { listActiveRoster } from '../../core/runs.mjs';
 import { validateSessionId } from '../../core/state.mjs';
 import { TOOLS } from '../../core/tool-schemas.mjs';
-import { getMcpEffort, getPairing } from '../../core/config.mjs';
+import { codexAppServerExtraArgs, getMcpEffort, getPairing, hasRuntimeConfig } from '../../core/config.mjs';
 import { findApiBackup, pickDefaultSubscriptionModel } from '../../core/magpie.mjs';
 import { randomBytes } from 'node:crypto';
 import { existsSync, openSync, readSync, realpathSync, rmSync, statSync, closeSync } from 'node:fs';
@@ -529,10 +529,10 @@ async function resolveRuntimeConfig({ configPath, tierForProbe, allowUtilityOnly
   const baseUrl = String(rawCfg?.magpie?.base_url || defaultGatewayFromEnv()).replace(/\/+$/, '');
   const trusted = String(env?.GEMPT_TRUSTED_GATEWAY || DEFAULT_MAGPIE_URL).replace(/\/+$/, '');
   const apiKey = rawCfg
-    ? resolveMagpieApiKey(rawCfg, baseUrl)
+    ? resolveMagpieApiKey({ magpie: { ...rawCfg.magpie, base_url: baseUrl } }, baseUrl)
     : (baseUrl === trusted || isLoopbackUrl(baseUrl) ? resolveMagpieApiKey({ magpie: { base_url: baseUrl } }) : '');
 
-  if (rawCfg) {
+  if (hasRuntimeConfig(rawCfg)) {
     return {
       configured: true,
       configSource: 'config',
@@ -637,7 +637,7 @@ function resolveTierTarget(cfg, requestedTier, { allowChore, escalate, effortOve
       tier: 'chore',
       failoverMode,
       model: String(util.model || DEFAULT_UTILITY.model),
-      effort: effortOverride || String(util.reasoning_effort || 'low'),
+      effort: effortOverride || String(util.reasoning_effort ?? 'low'),
       apiMode: String(util.api_mode || 'chat'),
       maxOutputTokens: Number(util.max_output_tokens || 4096),
       fallbackModels: Array.isArray(util.fallback_models) ? util.fallback_models.filter(Boolean).map(String) : [],
@@ -788,7 +788,7 @@ export function createExecutionTools({
         const rawCfg = readJsonSafe(resolveConfigPath(configPath));
         const baseUrl = String(args?.magpie_url || rawCfg?.magpie?.base_url || defaultGatewayFromEnv()).replace(/\/+$/, '');
         const apiKey = rawCfg
-          ? resolveMagpieApiKey(rawCfg, baseUrl)
+          ? resolveMagpieApiKey({ magpie: { ...rawCfg.magpie, base_url: baseUrl } }, baseUrl)
           : (isLoopbackUrl(baseUrl) ? resolveMagpieApiKey({ magpie: { base_url: baseUrl } }) : '');
         const probe = await probeMagpie(baseUrl, apiKey, probeTimeoutMs, resolveExcludedTokens(rawCfg || {}));
         const subPlan = pickSubscriptionPlan(probe);
@@ -936,11 +936,9 @@ export function createExecutionTools({
 
         const priorTurns = Array.isArray(priorSession?.turns) ? priorSession.turns : [];
         const messages = [...priorTurns, { role: 'user', content: prompt }];
-        const timeoutMs = Math.max(
-          10,
-          Number(limits.consult_timeout_sec) || 180,
-          effortTimeoutFloor(effort, { mode: 'consult' }),
-        ) * 1000;
+        const configuredTimeout = Number(limits.consult_timeout_sec) || 180;
+        const timeoutMs = (limits.consult_timeout_customized === true ? configuredTimeout
+          : Math.max(10, configuredTimeout, effortTimeoutFloor(effort, { mode: 'consult' }))) * 1000;
         const caller = apiMode === 'chat' ? callChat : callResponses;
         const candidates = [resolved.model, ...(resolved.fallbackModels || [])];
         const attemptedModels = [];
@@ -957,7 +955,7 @@ export function createExecutionTools({
               apiKey: runtime.apiKey,
               model: cand,
               messages,
-              reasoningEffort: resolved.tier === 'chore' && !args?.reasoning_effort ? '' : effort,
+              reasoningEffort: effort,
               instructions: resolved.tier === 'chore' ? 'Be concise, faithful to exact facts, and omit conversational filler.' : CONSULT_SYSTEM_PROMPT,
               maxOutputTokens: maxTokens,
               timeoutMs,
@@ -1202,7 +1200,8 @@ export function createExecutionTools({
 
         const timeoutSec = resolveExecTimeoutSec({ codex: runtime.cfg?.codex, timeoutSec: args.timeout_sec, effort });
 
-        if (runtime.cfg?.codex?.extra_args?.length) throw new Error('Unrestricted Codex extra_args conflict with gateway and sandbox enforcement.');
+        const extraArgs = runtime.cfg?.codex?.extra_args;
+        if (extraArgs?.length && codexAppServerExtraArgs(extraArgs).length !== extraArgs.length) throw new Error('Unrestricted Codex extra_args conflict with gateway and sandbox enforcement.');
         const sessionId = priorSession?.session_id || newExecSession;
         const agent = callingAgent(callCtx) || priorSession?.agent || '';
         const title = normalizeTitle(args.title, goal, workdir);

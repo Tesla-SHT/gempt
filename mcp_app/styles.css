@@ -525,3 +525,33 @@ body:has(#controls:not([hidden])):has(#live-panel:not([hidden])) #toast { inset-
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+.language-toggle {
+  flex: none;
+  white-space: nowrap;
+  padding: 2px 5px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted-ink);
+  font-size: 11px;
+}
+:root[lang="zh"] .language-toggle [lang="zh"],
+:root[lang="en"] .language-toggle [lang="en"] { color: var(--fg); font-weight: 650; }
+@media (max-width: 520px) {
+  .app-topbar { gap: 5px; padding-inline: 7px; font-size: 12px; }
+  .app-brand { gap: 2px; }
+  .app-brand svg { width: 16px; height: 16px; }
+  .app-tabs { gap: 0; }
+  .app-tabs button { padding-inline: 4px; font-size: 12px; }
+  .app-tools { gap: 4px; }
+  .routing-badge { padding-inline: 4px; }
+}
+@media (max-width: 440px) {
+  :root[lang="en"] .app-brand svg { display: none; }
+  :root[lang="en"] .app-tabs button { padding-inline: 2px; }
+  :root[lang="en"] #refresh-btn { width: 22px; padding: 2px; }
+}
+@media (max-width: 350px) {
+  #refresh-btn { display: none; }
+}

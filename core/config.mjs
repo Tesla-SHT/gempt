@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -7,7 +8,7 @@ import { RUNTIME_ROOT, resolvePluginRoot } from './bundle-paths.mjs';
 import { withLockSync } from './state.mjs';
 
 export const GEMPT_VERSION = readJsonSafe(join(RUNTIME_ROOT, 'package.json'))?.version
-  || readJsonSafe(join(resolvePluginRoot(), 'plugin.json'))?.version || '0.5.1';
+  || readJsonSafe(join(resolvePluginRoot(), 'plugin.json'))?.version || '0.6.0';
 export const TIER_ORDER = ['sonnet', 'opus', 'fable'];
 export const TIER_ALIASES = { lite: 'sonnet', mid: 'opus', max: 'fable' };
 export const VALID_SANDBOXES = ['read-only', 'workspace-write', 'danger-full-access'];
@@ -17,6 +18,14 @@ export const VALID_FAILOVER_MODES = ['subscription_only', 'api_fallback'];
 export const FEATURES = Object.freeze({ api_fallback: true });
 export const DEFAULT_MAGPIE_URL = 'http://127.0.0.1:3425';
 export const DEFAULT_MCP_EFFORT = 'medium';
+export const SAFE_MODEL_ID = /^[A-Za-z0-9._:/@-]{1,128}$/;
+export const UI_LANGUAGES = ['auto', 'zh', 'en'];
+export const UTILITY_EFFORTS = ['', 'low', 'medium', 'high'];
+export const DEFAULT_CONSULT_TIMEOUT_SEC = 180;
+
+export const hasRuntimeConfig = (cfg) => Boolean(cfg && Object.keys(cfg).some((key) => key !== 'ui'));
+export const getUiLanguage = (cfg) => UI_LANGUAGES.includes(cfg?.ui?.language) ? cfg.ui.language : 'auto';
+
 
 export const DEFAULT_TIERS = {
   sonnet: {
@@ -90,7 +99,7 @@ export function getMcpEffort(policy) {
 export function getNativeSwarmPolicy(policy) {
   return {
     native_swarm: typeof policy?.native_swarm === 'boolean' ? policy.native_swarm : WORKLOAD.native_swarm,
-    swarm_shell_model: WORKLOAD.swarm_shell_models.includes(policy?.swarm_shell_model)
+    swarm_shell_model: isSafeModelId(policy?.swarm_shell_model)
       ? policy.swarm_shell_model : WORKLOAD.swarm_shell_model,
   };
 }
@@ -216,9 +225,9 @@ export function readExistingConfigObject(configPath) {
 export function writeConfigAtomic(resolvedConfigPath, nextObj) {
   const parentDir = dirname(resolvedConfigPath);
   mkdirSync(parentDir, { recursive: true });
-  const tmpFile = join(parentDir, `.config.json.tmp.${process.pid}.${Date.now()}`);
+  const tmpFile = join(parentDir, `.config.json.tmp.${process.pid}.${randomUUID()}`);
   try {
-    writeFileSync(tmpFile, JSON.stringify(nextObj, null, 2) + '\n', 'utf-8');
+    writeFileSync(tmpFile, JSON.stringify(nextObj, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600, flag: 'wx' });
     renameSync(tmpFile, resolvedConfigPath);
     return { ok: true, status: 200, path: resolvedConfigPath };
   } catch (err) {
@@ -438,4 +447,67 @@ export function validateEffortSettings({ mcpEffort, tierEffort, tier, autoEffort
     else if (effort !== '' && !VALID_EFFORTS.includes(effort)) error = 'Invalid reasoning_effort.';
   }
   if (error) return { ok: false, status: 400, error };
+}
+
+const cleanText = (value) => typeof value === 'string' && !/[\p{Cc}\p{Zl}\p{Zp}]/u.test(value);
+const cleanArray = (value) => Array.isArray(value) && value.every((item) => cleanText(item) && item.trim());
+export const isSafeModelId = (value) => cleanText(value) && SAFE_MODEL_ID.test(value);
+
+export function normalizeGatewayUrl(value) {
+  if (!cleanText(value) || !/^https?:\/\/[^/\\\s]/i.test(value.trim()) || /[?#\\]/.test(value)) return;
+  try {
+    const url = new URL(value.trim());
+    if (!url.username && !url.password) return url.href.replace(/\/+$/, '');
+  } catch { /* Invalid URL. */ }
+}
+
+export const GATEWAY_SETTINGS = {
+  base_url: { type: 'string' },
+  api_key: { type: 'string' },
+  api_key_env: { type: 'string', pattern: '^(?:[A-Za-z_][A-Za-z0-9_]*)?$' },
+  clear_api_key: { type: 'boolean' },
+};
+
+const settingRules = {
+  magpie: {
+    base_url: (value) => normalizeGatewayUrl(value) !== undefined,
+    api_key: (value) => cleanText(value) && /^[\x20-\x7e]*$/.test(value),
+    api_key_env: (value) => cleanText(value) && /^(?:[A-Za-z_][A-Za-z0-9_]*)?$/.test(value),
+    clear_api_key: (value) => typeof value === 'boolean',
+  },
+  routing_policy: { swarm_shell_model: isSafeModelId, excluded_models: cleanArray },
+  utility: { model: (value) => cleanText(value) && /^\S{1,256}$/u.test(value.trim()), reasoning_effort: (value) => UTILITY_EFFORTS.includes(value) },
+  codex: { cli_path: cleanText, extra_args: cleanArray },
+  limits: { consult_timeout_sec: (value) => Number.isInteger(value) && value >= 15 && value <= 1800 },
+  ui: { language: (value) => UI_LANGUAGES.includes(value) },
+};
+
+export function editAdvancedSettings({ data }, section, fields, fallbackUrl = DEFAULT_MAGPIE_URL) {
+  const invalid = (name) => ({ ok: false, status: 400, error: 'Invalid ' + name + '.' });
+  if (!fields || typeof fields !== 'object' || Array.isArray(fields)) return invalid(section);
+  const rules = settingRules[section];
+  const patch = {};
+  for (const [key, value] of Object.entries(fields)) {
+    if (!Object.hasOwn(rules, key) || !rules[key](value)) return invalid(section + '.' + key);
+    patch[key] = Array.isArray(value) ? value.map((item) => item.trim())
+      : typeof value === 'string' ? value.trim() : value;
+  }
+  if (section === 'limits' && Object.hasOwn(patch, 'consult_timeout_sec')) patch.consult_timeout_customized = true;
+  if (section === 'magpie') {
+    if (patch.base_url !== undefined) {
+      patch.base_url = normalizeGatewayUrl(patch.base_url);
+      if (patch.base_url !== normalizeGatewayUrl(data.magpie?.base_url || fallbackUrl) && patch.api_key === undefined) {
+        patch.api_key = '';
+      }
+    }
+    if (patch.clear_api_key) patch.api_key = '';
+    delete patch.clear_api_key;
+  }
+  return { next: { ...data, [section]: { ...data[section], ...patch } } };
+}
+
+// The managed app-server owns the transport, provider, approval, and sandbox
+// flags. Only standalone flags without an argument can be passed through here.
+export function codexAppServerExtraArgs(args = []) {
+  return Array.isArray(args) ? args.filter((arg) => ['--strict-config', '--analytics-default-enabled'].includes(arg)) : [];
 }

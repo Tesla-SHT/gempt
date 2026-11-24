@@ -28,6 +28,7 @@
     <div class="app-tools">
       <span id="magpie-status" class="connection-dot" role="status" data-state="checking" title="正在检查 Magpie 连接" aria-label="正在检查 Magpie 连接"></span>
       <button id="routing-badge" class="routing-badge" type="button" title="查看工作分工" aria-label="查看工作分工" disabled>分工</button>
+      <button id="language-toggle" class="language-toggle" type="button" disabled title="切换界面语言" aria-label="切换界面语言"><span lang="zh">中</span><span aria-hidden="true"> / </span><span lang="en">EN</span></button>
       <button id="refresh-btn" class="icon-btn" type="button" title="刷新当前页" aria-label="刷新当前页" data-icon="refresh"></button>
     </div>
   </header>
@@ -272,26 +273,13 @@
             <div class="swarm-settings">
               <div class="swarm-choice">
                 <label for="swarm-shell-model" class="control-legend">Swarm 工位模型</label>
-                <select id="swarm-shell-model" name="swarm_shell_model" disabled></select>
+                <input id="swarm-shell-model" name="swarm_shell_model" list="swarm-shell-presets" maxlength="128" disabled>
+                <datalist id="swarm-shell-presets"></datalist>
               </div>
               <div class="swarm-choice">
                 <label for="swarm-split" class="control-legend">Swarm 工作分工</label>
                 <select id="swarm-split" name="swarm_split" aria-describedby="swarm-detail"></select>
                 <span id="swarm-detail" class="control-hint"></span>
-              </div>
-            </div>
-            <div class="control-fieldset timeout-form">
-              <label for="codex-timeout" class="control-legend">Codex 执行超时预算</label>
-              <div class="timeout-row">
-                <input id="codex-timeout" type="number" name="codex_timeout_sec" min="30" max="7200" step="any" value="3600" required disabled>
-                <span class="control-hint">秒</span>
-                <button type="button" class="pill-copy-btn" data-timeout-save disabled>保存</button>
-                <div class="timeout-presets" role="group" aria-label="超时预算预设">
-                  <button type="button" class="pill-copy-btn" data-timeout="600" disabled>600s</button>
-                  <button type="button" class="pill-copy-btn" data-timeout="1800" disabled>1800s</button>
-                  <button type="button" class="pill-copy-btn" data-timeout="3600" disabled>3600s</button>
-                  <button type="button" class="pill-copy-btn" data-timeout="7200" disabled>7200s</button>
-                </div>
               </div>
             </div>
             <fieldset id="pairing-controls" class="control-fieldset">
@@ -358,6 +346,73 @@
               <span id="failover-hint" class="control-hint">仅用 ChatGPT/Codex 订阅额度，不走按量付费 API</span>
             </fieldset>
           </div>
+
+          <details id="advanced-settings" class="advanced-settings">
+            <summary>连接与高级设置</summary>
+            <form id="advanced-form">
+              <fieldset>
+                <legend>Magpie 网关</legend>
+                <label class="advanced-field">网关地址<input id="gateway-url" type="url" required placeholder="http://127.0.0.1:3425"></label>
+                <div class="advanced-row">
+                  <label class="advanced-field">API 密钥<input id="gateway-key" type="password" autocomplete="new-password"></label>
+                  <button type="button" class="pill-copy-btn" id="gateway-clear">清除密钥</button>
+                </div>
+                <label class="advanced-field">密钥环境变量<input id="gateway-key-env" spellcheck="false"><span class="control-hint">环境变量仅用于本地网关或受信任的远程网关。</span></label>
+                <button type="button" class="pill-copy-btn" id="gateway-test">测试连接</button>
+                <output id="gateway-result" class="control-hint" aria-live="polite"></output>
+              </fieldset>
+              <fieldset>
+                <legend>模型与渠道</legend>
+                <label class="advanced-field">Chore 模型<input id="utility-model" list="gateway-models" maxlength="256" required></label>
+                <datalist id="gateway-models"></datalist>
+                <label class="advanced-field">Chore 思考强度<select id="utility-effort">
+                  <option value="">由模型决定</option><option value="low">低</option>
+                  <option value="medium">中</option><option value="high">高</option>
+                </select></label>
+                <label class="advanced-field">排除模型<textarea id="excluded-models" rows="2" placeholder="用逗号或换行分隔"></textarea></label>
+              </fieldset>
+              <fieldset>
+                <legend>Codex 运行时与超时</legend>
+                <label class="advanced-field">Codex CLI 路径<input id="codex-cli-path" spellcheck="false"></label>
+                <label class="advanced-field">咨询超时（秒）<input id="consult-timeout" type="number" min="15" max="1800" step="1" required></label>
+            <div class="control-fieldset timeout-form">
+              <label for="codex-timeout" class="control-legend">执行超时（秒）</label>
+              <div class="timeout-row">
+                <input id="codex-timeout" type="number" name="codex_timeout_sec" min="30" max="7200" step="any" value="3600" required disabled>
+                <button type="button" class="pill-copy-btn" data-timeout-save disabled>保存</button>
+                <div class="timeout-presets" role="group" aria-label="超时预算预设">
+                  <button type="button" class="pill-copy-btn" data-timeout="600" disabled>600s</button>
+                  <button type="button" class="pill-copy-btn" data-timeout="1800" disabled>1800s</button>
+                  <button type="button" class="pill-copy-btn" data-timeout="3600" disabled>3600s</button>
+                  <button type="button" class="pill-copy-btn" data-timeout="7200" disabled>7200s</button>
+                </div>
+              </div>
+            </div>
+                <label class="advanced-field">附加 CLI 参数<textarea id="codex-extra-args" rows="2" placeholder="用空格或换行分隔标志"></textarea><span class="control-hint">附加参数需兼容 GemPT 的网关与沙箱设置。支持 --strict-config 和 --analytics-default-enabled。</span></label>
+              </fieldset>
+              <div class="advanced-actions">
+                <button id="advanced-save" class="primary-btn" type="submit" disabled>保存设置</button>
+                <button id="language-auto" class="pill-copy-btn" type="button">跟随系统语言</button>
+              </div>
+              <fieldset>
+                <legend>诊断与重置</legend>
+                <label class="advanced-field">配置文件<input id="advanced-config-path" readonly></label>
+                <p id="codex-cli-status" class="control-hint"></p>
+                <div class="advanced-actions">
+                  <button id="advanced-init" class="pill-copy-btn" type="button">重新探测初始化</button>
+                  <button id="advanced-reset" class="pill-copy-btn" type="button" aria-controls="reset-confirm" aria-expanded="false">恢复默认设置</button>
+                </div>
+                <div id="reset-confirm" hidden>
+                  <p>将恢复默认模型、运行时和语言设置。</p>
+                  <label><input id="reset-keep-gateway" type="checkbox" checked> 保留当前网关设置</label>
+                  <div class="advanced-actions">
+                    <button id="reset-apply" class="pill-copy-btn" type="button">确认恢复</button>
+                    <button id="reset-cancel" class="pill-copy-btn" type="button">取消</button>
+                  </div>
+                </div>
+              </fieldset>
+            </form>
+          </details>
 
           <div id="native-controls-bar" class="native-controls" hidden>
             <p class="control-hint">直连组按回合选模型。需要 Gemini 解说 GPT 的工作结果时，请使用 MCP 编排与工作分工。</p>

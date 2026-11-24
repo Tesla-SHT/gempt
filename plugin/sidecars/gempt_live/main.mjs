@@ -29,11 +29,17 @@ const appServer = createAppServerManager({ observeOnly: true });
 const options = { appServer };
 const noStore = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
 
-// The SDK serves its own /preload.js with root-relative Agent API calls.
-// Expose the same host bridge with those calls scoped to this sidecar mount.
+// Keep the SDK's host bridge, scope its API calls to our mount, and defer
+// project lookup until an Agent API action needs it. GemPT never needs it.
 const preloadUrl = new URL('./preload.js', sdkUrl);
-const preload = readFileSync(existsSync(preloadUrl) ? preloadUrl : new URL('../preload.js', sdkUrl), 'utf8')
+const scopedPreload = readFileSync(existsSync(preloadUrl) ? preloadUrl : new URL('../preload.js', sdkUrl), 'utf8')
   .replace(/(['"`])\/_sidecar\//g, '$1./_sidecar/');
+const eagerProjectLookup = 'const projectIdPromise = (async () => {';
+const preload = scopedPreload.includes(eagerProjectLookup)
+  ? scopedPreload.replace(eagerProjectLookup,
+    'let projectIdPromise;\n  const resolveProjectId = () => projectIdPromise ??= (async () => {')
+    .replaceAll('await projectIdPromise;', 'await resolveProjectId();')
+  : scopedPreload;
 app.page('/gempt-preload.js', () => new Response(preload, {
   contentType: 'text/javascript; charset=utf-8', headers: noStore,
 }));
@@ -41,20 +47,49 @@ app.page('/gempt-preload.js', () => new Response(preload, {
 // The gateway may serve the same page with or without a trailing slash. The
 // SDK page handler cannot see the public URL, so normalize it before loading
 // the relative assets. Keep the query (including the SDK token) and deep link.
-const normalizeEntry = `if (!location.pathname.endsWith('/')) {
+const bootstrap = `if (!location.pathname.endsWith('/') && !location.pathname.endsWith('/index.html')) {
   const url = new URL(location.href);
   url.pathname += '/';
-  history.replaceState(history.state, '', url);
-}`;
-const entryHash = createHash('sha256').update(normalizeEntry).digest('base64');
+  try { history.replaceState(history.state, '', url); }
+  catch { location.replace(url); }
+}
+// Embedded frames can lose the gateway's SameSite cookie on subresources.
+const token = new URLSearchParams(location.search).get('token');
+const asset = (name) => './' + name + (token ? '?' + new URLSearchParams({ token }) : '');
+const style = document.createElement('link');
+style.rel = 'stylesheet';
+style.href = asset('styles.css');
+document.head.append(style);
+function loadScript(name, onerror) {
+  const script = document.createElement('script');
+  script.async = false;
+  script.src = asset(name);
+  if (onerror) script.addEventListener('error', onerror, { once: true });
+  document.head.append(script);
+}
+loadScript('gempt-preload.js');
+document.addEventListener('DOMContentLoaded', () => {
+  loadScript('app.js', () => {
+    const notice = document.getElementById('list-error');
+    notice.textContent = 'GemPT 脚本加载失败，请重新打开侧栏。';
+    notice.hidden = false;
+    document.getElementById('list-loading').hidden = true;
+    document.getElementById('list-wrap').setAttribute('aria-busy', 'false');
+  });
+}, { once: true });`;
+const entryHash = createHash('sha256').update(bootstrap).digest('base64');
 
-app.page('/', async () => {
+async function entryPage() {
   const { data, type } = await readPageAsset('/');
   const html = data.toString('utf8')
     .replace("script-src 'self';", `script-src 'self' 'sha256-${entryHash}';`)
-    .replace('<link rel="stylesheet"', `<script>${normalizeEntry}</script>\n  <script src="./gempt-preload.js"></script>\n  <link rel="stylesheet"`);
+    .replace('<link rel="stylesheet" href="./styles.css">', `<meta name="referrer" content="no-referrer">\n  <script>${bootstrap}</script>`)
+    .replace('<html ', '<html data-sidecar ')
+    .replace('<script type="module" src="./app.js"></script>', '');
   return new Response(html, { contentType: type, headers: noStore });
-});
+}
+app.page('/', entryPage);
+app.page('/index.html', entryPage);
 for (const path of ['/styles.css', '/app.js']) {
   app.page(path, async () => {
     const { data, type } = await readPageAsset(path);
@@ -70,12 +105,15 @@ function workspacePath(uri) {
   return null;
 }
 
-// The SDK only validates tokens on non-GET requests. Submit reads through
-// this authenticated endpoint too, because Live and history contain local data.
+// Live and history contain local data. Keep the SDK's token check on every
+// request, including those from an opaque iframe using its URL token.
+const apiHeaders = { ...noStore, 'Access-Control-Allow-Origin': 'null' };
 app.api('/api', async ({ path, body, conversationId, workspaceUris }) => {
   try {
     if (typeof path !== 'string' || !path.startsWith('./api/')) {
-      return new Response(JSON.stringify({ error: 'invalid API path' }), { status: 400, contentType: 'application/json' });
+      return new Response(JSON.stringify({ error: 'invalid API path' }), {
+        status: 400, contentType: 'application/json', headers: apiHeaders,
+      });
     }
     const url = new URL(path, 'http://localhost/');
     const rawPath = path.slice(1).split('?', 1)[0];
@@ -90,11 +128,12 @@ app.api('/api', async ({ path, body, conversationId, workspaceUris }) => {
         ? { workspaceRoots: workspaceUris.map(workspacePath).filter(Boolean) } : {}),
     });
     return new Response(typeof result.body === 'string' ? result.body : JSON.stringify(result.body), {
-      status: result.status, contentType: result.type, headers: noStore,
+      status: result.status, contentType: result.type, headers: apiHeaders,
     });
   } catch (error) {
+    if (!error.status || error.status >= 500) console.error('[gempt sidecar] Page API failed:', error);
     return new Response(JSON.stringify({ error: error.message }), {
-      status: error.status || 500, contentType: 'application/json', headers: noStore,
+      status: error.status || 500, contentType: 'application/json', headers: apiHeaders,
     });
   }
 });

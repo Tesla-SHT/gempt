@@ -46,7 +46,7 @@ const PKG = (() => {
   }
 })();
 
-const BUILD_ID = `${PKG.version || '0.5.1'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
+const BUILD_ID = `${PKG.version || '0.6.0'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
 const pidAlive = (pid) => {
   if (!Number.isSafeInteger(pid) || pid < 1) return false;
   try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }

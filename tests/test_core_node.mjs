@@ -215,7 +215,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const bridge = join(target, 'work_split_hook.py');
   assert.equal(readFileSync(bridge, 'utf8').trimEnd().split('\n').length, 7);
   assert.ok(!existsSync(join(target, 'runtime', 'gempt')));
-  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.5.1' });
+  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.6.0' });
   const bundledSkills = new URL('../plugin/skills/', import.meta.url);
   assert.deepEqual(readdirSync(bundledSkills).sort(), ['gempt', 'gempt-chore']);
   assert.deepEqual(readdirSync(join(target, 'skills')).sort(), ['gempt', 'gempt-chore']);
@@ -235,7 +235,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const initialized = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' },
   }) });
-  assert.equal(initialized.result.serverInfo.version, '0.5.1');
+  assert.equal(initialized.result.serverInfo.version, '0.6.0');
   const response = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'resources/read', params: { uri: APP_URI },
   }) });
@@ -455,12 +455,16 @@ test('packaged native sidecar serves shared assets and authenticates scoped APIs
   const [line] = await once(scanner, 'line', { signal: AbortSignal.timeout(5000) });
   const base = 'http://' + line.match(/listening on (127[.]0[.]0[.]1:[0-9]+)/)[1];
   const html = await fetch(base).then((response) => response.text());
-  assert.match(html, /<script src="\.\/gempt-preload\.js"><\/script>/);
-  assert.match(html, /<script type="module" src="\.\/app.js"><\/script>/);
+  assert.match(html, /loadScript\('gempt-preload\.js'\)/);
+  assert.match(html, /loadScript\('app\.js',/);
+  assert.doesNotMatch(html, /<script type="module"/);
+  assert.equal(await fetch(base + '/index.html').then((response) => response.text()), html);
   assert.match(html, /id="view-console"/);
   const preload = await fetch(base + '/gempt-preload.js');
   assert.equal(preload.status, 200);
-  assert.match(await preload.text(), /['"]\.\/_sidecar\/get-conversation-metadata/);
+  const preloadSource = await preload.text();
+  assert.match(preloadSource, /['"]\.\/_sidecar\/get-conversation-metadata/);
+  assert.match(preloadSource, /const resolveProjectId = \(\) => projectIdPromise \?\?=/);
   const css = await fetch(base + '/styles.css');
   assert.match(css.headers.get('content-type'), /^text\/css/);
   assert.match(await css.text(), /var\(--background/);
@@ -477,6 +481,15 @@ test('packaged native sidecar serves shared assets and authenticates scoped APIs
     assert.equal((await call('settings', { body: { codex_timeout_sec: 900 } }, '', method)).status, 401);
   }
   assert.equal((await call('summary', {}, 'bad-token')).status, 401);
+  assert.equal((await fetch(base + '/api', { method: 'POST', headers: { origin: 'null' },
+    body: JSON.stringify({ path: './api/summary' }),
+  })).headers.get('access-control-allow-origin'), null);
+  const opaqueSummary = await fetch(base + '/api?token=' + token, { method: 'POST', headers: { origin: 'null' },
+    body: JSON.stringify({ path: './api/summary' }),
+  });
+  assert.equal(opaqueSummary.status, 200);
+  assert.equal(opaqueSummary.headers.get('access-control-allow-origin'), 'null');
+  assert.ok((await opaqueSummary.json()).routing);
   assert.equal((await fetch(base + '/api?token=' + token + '&path=./api/summary', { method: 'POST' })).status, 200);
   assert.equal((await fetch(base + '/api')).status, 405);
   const workspaceUris = [pathToFileURL(f.cwd).href];
@@ -1029,13 +1042,13 @@ test('Live run list defaults to an empty unbound session and can list all worksp
   assert.equal(scoped.scope, 'session');
   assert.equal(scoped.unbound_session, true);
   assert.deepEqual(scoped.runs, []);
-  assert.equal(scoped.app_server.version, '0.5.1');
+  assert.equal(scoped.app_server.version, '0.6.0');
 
   const { structuredContent: all } = await callAppTool('gempt_app_runs', { scope: 'all' }, opts);
   assert.equal(all.scope, 'all');
   assert.equal(all.unbound_session, false);
   assert.deepEqual(all.runs.map(({ run_id }) => run_id).sort(), [first, second]);
-  assert.equal(all.app_server.version, '0.5.1');
+  assert.equal(all.app_server.version, '0.6.0');
 });
 
 test('Live binds normalized workspaces and never selects another run for a filtered explicit ID', async (t) => {
@@ -1189,7 +1202,7 @@ test('standalone NDJSON MCP keeps the GemPT resource and app-only tools without 
   const started = await request('initialize', { protocolVersion: '2026-test' });
   assert.equal(started.result.protocolVersion, '2026-test');
   assert.equal(started.result.serverInfo.name, 'gempt');
-  assert.equal(started.result.serverInfo.version, '0.5.1');
+  assert.equal(started.result.serverInfo.version, '0.6.0');
   send({ method: 'notifications/initialized' });
   assert.deepEqual((await request('ping')).result, {});
   const { tools } = (await request('tools/list')).result;
@@ -1766,4 +1779,53 @@ test('packaging guards unsafe output paths and rolls back in-place sync on verif
   );
   assert.equal(readFileSync(join(target, 'keep.txt'), 'utf8'), 'original');
   assert.equal(existsSync(join(target, 'added.txt')), false);
+});
+
+test('MCP console saves nested preferences and supports gateway actions', async (t) => {
+  const f = fixture(t);
+  const gateway = createServer((_req, res) => res.end(JSON.stringify({ data: [{ id: 'vendor/model:small' }] })));
+  gateway.listen(0, '127.0.0.1');
+  await once(gateway, 'listening');
+  t.after(() => gateway.close());
+  const url = 'http://127.0.0.1:' + gateway.address().port;
+  const set = (args) => callAppTool('gempt_app_console_settings', args, f);
+  const action = (args) => callAppTool('gempt_app_console_action', args, f);
+  const secret = 'mcp-fixture-value-z123';
+  assert.equal((await set({ ui: { language: 'zh' } })).structuredContent.configured, false);
+  assert.equal((await action({ action: 'reset_settings' })).structuredContent.keep_gateway, true);
+  const saved = await set({
+    magpie: { base_url: url + '/', api_key: secret, api_key_env: '' },
+    swarm_shell_model: 'vendor/shell:stable@v2',
+    routing_policy: { excluded_models: ['  model-to-skip  '] },
+    utility: { model: 'vendor/model:small', reasoning_effort: 'high' },
+    limits: { consult_timeout_sec: 1800 },
+    codex: { cli_path: '', extra_args: [' --strict-config '] },
+    ui: { language: 'en' },
+  });
+  const { structuredContent: state } = saved;
+  assert.equal(state.swarm_shell_model, 'vendor/shell:stable@v2');
+  assert.equal(state.magpie_base_url, url);
+  assert.equal(state.magpie_api_key_hint, '••••z123');
+  assert.equal(state.magpie_api_key_env, '');
+  assert.equal(state.utility.model, 'vendor/model:small');
+  assert.equal(state.utility.reasoning_effort, 'high');
+  assert.deepEqual(state.excluded_models, ['model-to-skip']);
+  assert.deepEqual(state.codex_extra_args, ['--strict-config']);
+  assert.equal(state.consult_timeout_sec, 1800);
+  assert.equal(state.ui.language, 'en');
+  assert.ok(!JSON.stringify(saved).includes(secret));
+  assert.equal((await callAppTool('gempt_app_summary', {}, f)).structuredContent.ui.language, 'en');
+  await assert.rejects(set({ swarm_shell_model: 'shell bad' }), /Invalid/);
+  await assert.rejects(set({ codex: { extra_args: [1] } }), /Invalid/);
+  await assert.rejects(set({ limits: { consult_timeout_sec: 14 } }), /Invalid/);
+  await assert.rejects(set({ ui: { language: 'de' } }), /Invalid/);
+  assert.equal((await set({ codex: { extra_args: ['bad\nflag'] } })).isError, true);
+  const probe = await action({ action: 'probe_gateway', base_url: url, api_key: 'draft-secret' });
+  assert.equal(probe.structuredContent.reachable, true);
+  assert.deepEqual(probe.structuredContent.models, ['vendor/model:small']);
+  assert.ok(!JSON.stringify(probe).includes('draft-secret'));
+  await action({ action: 'reset_settings', keep_gateway: true });
+  assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).magpie.api_key, secret);
+  await action({ action: 'reset_settings', keep_gateway: false });
+  assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).magpie.api_key, '');
 });

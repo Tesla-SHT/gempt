@@ -109,7 +109,7 @@ try {
     .replace("/* SCRIPT */", () => script.replace(/<\/script/gi, "<\\/script"));
   const http = await esbuild.build({
     absWorkingDir: fileURLToPath(source), nodePaths: [nodeModules], entryPoints: ["http-entry.js"],
-    bundle: true, format: "esm", minify: true, charset: "utf8", target: "es2022", metafile: true, write: false,
+    bundle: true, format: "iife", minify: true, charset: "utf8", target: "es2022", metafile: true, write: false,
   });
   if (Object.keys(http.metafile.inputs).some((path) => /(?:@modelcontextprotocol|@cfworker|[/\\]zod)[/\\]/.test(path))) {
     throw new Error("MCP dependencies leaked into the HTTP UI.");

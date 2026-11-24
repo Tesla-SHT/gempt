@@ -5,9 +5,11 @@ import { createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { basename, delimiter, dirname, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { defaultGatewayFromEnv, expandUser, readActiveRuns, readJsonSafe, resolveConfigPath, resolveMagpieApiKey } from './backend.mjs';
+import { readActiveRuns } from './activity.mjs';
+import { defaultGatewayFromEnv, resolveMagpieApiKey } from '../../core/magpie.mjs';
 import { appServerStatePath, connectAppServer } from './app-server-client.mjs';
 import { launchAppServer, matchesAppServerProcess, pidAlive, terminateAppServer, waitForProcessExit } from './app-server-process.mjs';
+import { codexAppServerExtraArgs, expandUser, readJsonSafe, resolveConfigPath } from '../../core/config.mjs';
 import { interruptRun as interruptCoreRun } from '../../core/runs.mjs';
 
 const STRIPPED_ENV = ['CODEX_WINDOWS_REGISTERED_CORE', 'CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY', 'CODEX_APP_TOOLS_PIPE_PATH',
@@ -93,8 +95,8 @@ function atomicState(path, record) {
   }
 }
 
-function configFingerprint(url, key) {
-  return createHash('sha256').update(`${url || ''}\0${key || ''}`).digest('hex').slice(0, 16);
+function configFingerprint(url, key, cli, extraArgs) {
+  return createHash('sha256').update(`${url || ''}\0${key || ''}`).update(cli || extraArgs.length ? JSON.stringify([cli, extraArgs]) : '').digest('hex').slice(0, 16);
 }
 
 function instanceSignature(rec) {
@@ -273,7 +275,8 @@ export function createAppServerManager({
     const raw = readJsonSafe(config) || {};
     const url = String(raw.magpie?.base_url || defaultGatewayFromEnv()).replace(/\/+$/, '');
     const key = resolveMagpieApiKey({ magpie: { ...raw.magpie, base_url: url } });
-    return { raw, url, key, hash: configFingerprint(url, key) };
+    const extraArgs = codexAppServerExtraArgs(raw.codex?.extra_args);
+    return { raw, url, key, extraArgs, hash: configFingerprint(url, key, raw.codex?.cli_path, extraArgs) };
   }
 
   async function probeConnection(target, timeoutMs = 800) {
@@ -294,7 +297,7 @@ export function createAppServerManager({
       retry();
       return;
     }
-    const { raw, url, key: gatewayKey, hash: cfgHash } = currentGatewayConfig();
+    const { raw, url, key: gatewayKey, extraArgs, hash: cfgHash } = currentGatewayConfig();
     gatewayUrl = url;
     const stale = readJsonSafe(stateFile);
     if (stale?.status === 'running' && alive(stale.pid)) {
@@ -344,7 +347,7 @@ export function createAppServerManager({
       for (const key of Object.keys(childEnv)) if (STRIPPED_ENV.includes(key.toUpperCase())) delete childEnv[key];
       childEnv.NO_PROXY = childEnv.no_proxy = '127.0.0.1,localhost,::1';
       const [bin, ...prefix] = invocation(cli, env);
-      const args = [...prefix, 'app-server', '--listen', wsUrl, '--ws-auth', 'capability-token', '--ws-token-file', tokenFile,
+      const args = [...prefix, 'app-server', ...extraArgs, '--listen', wsUrl, '--ws-auth', 'capability-token', '--ws-token-file', tokenFile,
         '-c', 'model_providers.gempt_gateway.name="Magpie"',
         '-c', 'model_providers.gempt_gateway.base_url=' + JSON.stringify(gatewayUrl + '/v1'),
         '-c', 'model_providers.gempt_gateway.wire_api="responses"', '-c', 'model_provider="gempt_gateway"'];

@@ -2261,3 +2261,47 @@ button.recent-text:hover { text-decoration: underline; }
 }
 
 }
+
+.swarm-choice input, .advanced-settings input:not([type="checkbox"]), .advanced-settings select,
+.advanced-settings textarea {
+  font: inherit;
+  font-size: 12px;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 30px;
+  padding: 5px 8px;
+  border: 1px solid var(--gp-border);
+  border-radius: var(--gp-control-radius);
+  background: var(--gp-card);
+  color: var(--gp-fg);
+}
+.swarm-choice input { width: min(100%, 240px); }
+.advanced-settings { margin-block-start: 12px; border-top: 1px solid var(--gp-border); min-width: 0; }
+.advanced-settings summary {
+  padding: 10px 0;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  color: var(--gp-fg);
+}
+.advanced-settings form { display: grid; gap: 12px; padding-block-end: 4px; }
+.advanced-settings fieldset {
+  min-width: 0;
+  padding: 8px 10px 10px;
+  margin: 0;
+  border: 1px solid var(--gp-border);
+  border-radius: var(--gp-control-radius);
+}
+.advanced-settings legend { font-size: 12px; font-weight: 600; padding-inline: 4px; }
+.advanced-field { display: grid; gap: 4px; font-size: 12px; min-width: 0; margin-block-end: 8px; }
+.advanced-field textarea { resize: vertical; }
+.advanced-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 8px; margin-block-end: 8px; }
+.advanced-row .advanced-field { margin: 0; }
+.advanced-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.advanced-settings .timeout-row { flex-wrap: wrap; margin-block: 4px 8px; }
+.advanced-settings output { margin-inline-start: 5px; overflow-wrap: anywhere; }
+#codex-cli-status { overflow-wrap: anywhere; margin-block: 4px 8px; }
+#reset-confirm { margin-block-start: 8px; font-size: 12px; }
+#reset-confirm p, #reset-confirm label { display: block; margin: 0 0 6px; }
+.advanced-settings output[data-state="ok"] { color: var(--gp-ok); }
+.advanced-settings output[data-state="error"] { color: var(--gp-err); }

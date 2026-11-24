@@ -1,11 +1,11 @@
 import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
 import { createNativeGroups, getDispatchActivity, initSubscriptionConfig, listDispatchActivity,
-  readOverview, readRoutingSummary, readPageMagpieStatus, readRunState, readRatio, setDefaultTier, updateSettings } from '../magpie_plugin/lib/backend.mjs';
+  probeGatewaySettings, resetSettings, readOverview, readRoutingSummary, readPageMagpieStatus, readRunState, readRatio, setDefaultTier, updateSettings } from '../magpie_plugin/lib/backend.mjs';
 import { createAppServerManager } from '../magpie_plugin/lib/app-server-manager.mjs';
 import { RATIO_RANGES } from '../magpie_plugin/lib/token-ratio.mjs';
 import { EXEC_TIMEOUT_MIN_SEC, EXEC_TIMEOUT_MAX_SEC } from '../magpie_plugin/lib/routing.mjs';
 import { WORKLOAD } from './assets.mjs';
-import { TIER_ORDER, VALID_EFFORTS, VALID_FAILOVER_MODES, VALID_SANDBOXES } from './config.mjs';
+import { GATEWAY_SETTINGS, SAFE_MODEL_ID, UI_LANGUAGES, UTILITY_EFFORTS, TIER_ORDER, VALID_EFFORTS, VALID_FAILOVER_MODES, VALID_SANDBOXES } from './config.mjs';
 import { interruptRun } from './runs.mjs';
 import { checkArgs, LIVE_OPERATIONS, runLiveOperation, workspaceRun } from './live-service.mjs';
 import { resolvePath } from './state.mjs';
@@ -34,13 +34,21 @@ const enumString = (values) => ({ type: 'string', enum: values });
 const shape = (properties, required) => ({ type: 'object', properties, additionalProperties: false,
   ...(required ? { required } : {}) });
 const PROFILES = Object.keys(WORKLOAD.profiles);
+const MODEL_ID = { type: 'string', pattern: SAFE_MODEL_ID.source };
+const STRING_ARRAY = { type: 'array', items: STRING };
 const SETTINGS = {
+  magpie: shape(GATEWAY_SETTINGS),
+  routing_policy: shape({ swarm_shell_model: MODEL_ID, excluded_models: STRING_ARRAY }),
+  utility: shape({ model: STRING, reasoning_effort: enumString(UTILITY_EFFORTS) }),
+  codex: shape({ cli_path: STRING, extra_args: STRING_ARRAY }),
+  limits: shape({ consult_timeout_sec: { type: 'integer', minimum: 15, maximum: 1800 } }),
+  ui: shape({ language: enumString(UI_LANGUAGES) }),
   default_sandbox: enumString(VALID_SANDBOXES),
   codex_timeout_sec: { type: 'number', minimum: EXEC_TIMEOUT_MIN_SEC, maximum: EXEC_TIMEOUT_MAX_SEC },
   work_split: enumString(PROFILES),
   swarm_split: enumString(['inherit', ...PROFILES]),
   native_swarm: BOOL,
-  swarm_shell_model: enumString(WORKLOAD.swarm_shell_models),
+  swarm_shell_model: MODEL_ID,
   pairing: shape({ family: enumString(Object.keys(WORKLOAD.pairings)), model: STRING }, ['family', 'model']),
   failover_mode: enumString(VALID_FAILOVER_MODES),
   auto_effort: BOOL,
@@ -50,6 +58,8 @@ const SETTINGS = {
 };
 const CONSOLE_ACTIONS = {
   init: shape({}),
+  probe_gateway: shape(GATEWAY_SETTINGS),
+  reset_settings: shape({ keep_gateway: BOOL }),
   native_groups: shape({}),
   tier: shape({ tier: SETTINGS.tier }, ['tier']),
   restart_app_server: shape({ force: BOOL }),
@@ -71,7 +81,7 @@ export const APP_TOOLS = Object.fromEntries([
   tool('gempt_app_console_state', 'Read GemPT Overview.', {}),
   tool('gempt_app_console_settings', 'Save GemPT Console settings and read the updated state.', SETTINGS),
   tool('gempt_app_console_action', 'Run a GemPT Console action.', {
-    action: enumString(Object.keys(CONSOLE_ACTIONS)), tier: SETTINGS.tier, force: BOOL, run_id: RUN_ID,
+    action: enumString(Object.keys(CONSOLE_ACTIONS)), ...GATEWAY_SETTINGS, keep_gateway: BOOL, tier: SETTINGS.tier, force: BOOL, run_id: RUN_ID,
   }, ['action']),
   tool('gempt_app_console_activity', 'Read a page or detail of GemPT Console activity.', {
     kind: enumString(['requests', 'sessions']), id: STRING, query: ACTIVITY_QUERY,
@@ -120,6 +130,8 @@ function consoleState(options) {
 async function consoleAction({ action, ...args }, options) {
   checkArgs(action, args, CONSOLE_ACTIONS[action]);
   switch (action) {
+    case 'probe_gateway': return probeGatewaySettings(args, options);
+    case 'reset_settings': return resetSettings(args, options);
     case 'init': return initSubscriptionConfig(options);
     case 'native_groups': return createNativeGroups(options);
     case 'tier': return setDefaultTier(args.tier, options);

@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { performance } from 'node:perf_hooks';
 import { join, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { resolveBudgetAsync } from './token-ratio.mjs';
@@ -7,9 +8,10 @@ import { WORKLOAD } from '../../core/assets.mjs';
 import { RUNTIME_ROOT, resolvePluginRoot } from '../../core/bundle-paths.mjs';
 import { resolveNodeExecutable } from '../../core/node-executable.mjs';
 import {
-  DEFAULT_TIERS, DEFAULT_UTILITY, FEATURES, TIER_ORDER, VALID_FAILOVER_MODES, VALID_SANDBOXES,
-  buildTierView, editDefaultSandbox, editEffortSettings, editPairing, editWorkSplit, expandUser, getMcpEffort, getNativeSwarmPolicy, getPairing,
-  hasApiSnapshot, isCodexModelId, normalizeDefaultTier, readJsonSafe, readPluginExecOption, readPluginMcpToolsOption,
+  DEFAULT_CONSULT_TIMEOUT_SEC, DEFAULT_TIERS, DEFAULT_UTILITY, FEATURES, TIER_ORDER, VALID_FAILOVER_MODES, VALID_SANDBOXES,
+  buildTierView, editAdvancedSettings, editDefaultSandbox, editEffortSettings, editPairing, editWorkSplit, expandUser,
+  getMcpEffort, getNativeSwarmPolicy, getPairing, getUiLanguage, hasApiSnapshot, hasRuntimeConfig,
+  isCodexModelId, isSafeModelId, normalizeDefaultTier, readJsonSafe, readPluginExecOption, readPluginMcpToolsOption,
   resolveConfigPath, resolveMagpieConfigDir, resolveSessionsDir, validateEffortSettings, withConfigTransaction,
 } from '../../core/config.mjs';
 import {
@@ -17,6 +19,7 @@ import {
   pickSubscriptionPlan, pickTierPlan, probeMagpie, readMagpieNativeGroups, resolveExcludedTokens,
   resolveMagpieApiKey, syncHarnessGroups,
 } from '../../core/magpie.mjs';
+import { findCodexCli } from './app-server-manager.mjs';
 import { configuredExecTimeoutSec, validateExecTimeoutSec } from './routing.mjs';
 import { readActiveRuns, readDispatchActivity, readExternalGroupUsage, readOverviewActivity, readRecentActivity } from './activity.mjs';
 
@@ -167,22 +170,23 @@ function gateway(configPath) {
 }
 
 function gatewayIdentity(config, url) {
-  const key = config ? resolveMagpieApiKey(config) : '';
+  const key = resolveMagpieApiKey({ magpie: { ...config?.magpie, base_url: url } });
   const excluded = resolveExcludedTokens(config);
   return { key, excluded, id: JSON.stringify([url, key, excluded]) };
 }
 
-function cachedProbe(path, url) {
+function cachedProbe(path, url, config) {
   const entry = probeCache.get(path);
-  return entry?.url === url ? entry.result : undefined;
+  return entry?.url === url && entry.id === gatewayIdentity(config, url).id ? entry.result : undefined;
 }
 
 export function readRoutingSummary({ configPath } = {}) {
   const { path, config, url } = gateway(configPath);
   const policy = config?.routing_policy;
   const profile = Object.hasOwn(WORKLOAD.profiles, policy?.work_split) ? policy.work_split : 'balanced';
-  const result = cachedProbe(path, url);
+  const result = cachedProbe(path, url, config);
   return {
+    ui: { language: getUiLanguage(config) },
     routing: { profile, gpt_share: WORKLOAD.profiles[profile].gpt_share,
       native_swarm: getNativeSwarmPolicy(policy).native_swarm },
     magpie: { reachable: result?.reachable ?? null, url, error: result?.error || '' },
@@ -272,8 +276,9 @@ function overviewGatewayFields(magpie, rawCfg, resolvedMagpieDir) {
 
 export async function readPageMagpieStatus(options = {}) {
   const magpie = await readMagpieStatus(options);
-  const { config } = gateway(options.configPath);
-  return { ...magpie, overview: overviewGatewayFields(magpie, config, resolveMagpieConfigDir(options.magpieConfigDir)) };
+  const { config, url } = gateway(options.configPath);
+  if (url !== magpie.url) return { reachable: null, url, ui: { language: getUiLanguage(config) } };
+  return { ...magpie, ui: { language: getUiLanguage(config) }, overview: overviewGatewayFields(magpie, config, resolveMagpieConfigDir(options.magpieConfigDir)) };
 }
 
 export function readRatio({ range = '24h', configPath, sessionsDir, magpieConfigDir, env } = {}) {
@@ -314,14 +319,14 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
   const resolvedSessionsDir = resolveSessionsDir(sessionsDir);
   const resolvedMagpieDir = resolveMagpieConfigDir(magpieConfigDir);
   const rawCfg = readJsonSafe(resolvedConfigPath);
-  const configured = Boolean(rawCfg);
+  const configured = hasRuntimeConfig(rawCfg);
 
   const policy = rawCfg?.routing_policy || {};
   const defaultTier = normalizeDefaultTier(policy.default_tier) || 'sonnet';
   const baseUrl = String(rawCfg?.magpie?.base_url || defaultGatewayFromEnv()).replace(/\/+$/, '');
   let magpie;
   if (overview) {
-    magpie = cachedProbe(resolvedConfigPath, baseUrl) ?? { reachable: null, url: baseUrl };
+    magpie = cachedProbe(resolvedConfigPath, baseUrl, rawCfg) ?? { reachable: null, url: baseUrl };
   } else {
     const { key, excluded } = gatewayIdentity(rawCfg, baseUrl);
     magpie = await probeMagpie(baseUrl, key, probeTimeoutMs, excluded);
@@ -340,12 +345,15 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     !configured && recommended?.tiers?.[id] ? recommended.tiers[id] : DEFAULT_TIERS[id],
   ));
 
+  const gatewayKey = rawCfg ? resolveMagpieApiKey({ magpie: { ...rawCfg.magpie, base_url: baseUrl } }, baseUrl, { allowLocalFallback: false }) : '';
+  const codexPath = rawCfg?.codex?.cli_path || '';
+  const resolvedCodexPath = findCodexCli(codexPath);
   const utilRaw = rawCfg?.utility || {};
   const utility = {
     label: String(utilRaw.label || DEFAULT_UTILITY.label),
     slash: '/gempt-chore',
     model: String(utilRaw.model || (!configured && recommended?.utility_model ? recommended.utility_model : DEFAULT_UTILITY.model)),
-    reasoning_effort: String(utilRaw.reasoning_effort || DEFAULT_UTILITY.reasoning_effort),
+    reasoning_effort: String(utilRaw.reasoning_effort ?? DEFAULT_UTILITY.reasoning_effort),
     fallback_models: Array.isArray(utilRaw.fallback_models) ? utilRaw.fallback_models.filter(Boolean).map(String) : [],
     use_for_magpie_compact: utilRaw.use_for_magpie_compact !== undefined ? Boolean(utilRaw.use_for_magpie_compact) : true,
   };
@@ -367,6 +375,19 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     features: { ...FEATURES },
     configured,
     config_path: resolvedConfigPath,
+    ui: { language: getUiLanguage(rawCfg) },
+    magpie_api_key_configured: Boolean(gatewayKey),
+    magpie_api_key_stored: Boolean(rawCfg?.magpie?.api_key?.trim?.()),
+    magpie_api_key_hint: gatewayKey ? '••••' + (gatewayKey.length > 4 ? gatewayKey.slice(-4) : '') : '',
+    magpie_api_key_env: rawCfg?.magpie?.api_key_env ?? 'GEMPT_MAGPIE_API_KEY',
+    magpie_base_url: baseUrl,
+    excluded_models: rawCfg?.routing_policy?.excluded_models || [],
+    codex_cli_path: codexPath,
+    codex_cli_resolved_path: resolvedCodexPath,
+    codex_cli_available: Boolean(resolvedCodexPath),
+    codex_auto_detected_path: codexPath ? findCodexCli() : resolvedCodexPath,
+    codex_extra_args: rawCfg?.codex?.extra_args || [],
+    consult_timeout_sec: rawCfg?.limits?.consult_timeout_sec ?? DEFAULT_CONSULT_TIMEOUT_SEC,
     work_split: workSplit,
     swarm_split: policy.swarm_split ?? 'inherit',
     ...getNativeSwarmPolicy(policy),
@@ -454,7 +475,7 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
     magpie: {
       base_url: baseUrl,
       api_key: String(existingMagpie.api_key || ''),
-      api_key_env: String(existingMagpie.api_key_env || 'GEMPT_MAGPIE_API_KEY'),
+      api_key_env: String(existingMagpie.api_key_env ?? 'GEMPT_MAGPIE_API_KEY'),
       cli_path: String(existingMagpie.cli_path || ''),
     },
     codex: {
@@ -481,13 +502,15 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
     tiers: plan.tiers,
     utility: {
       ...DEFAULT_UTILITY,
-      model: utilityModel ?? plan.utility_model,
+      ...existing.utility,
+      model: utilityModel ?? existing.utility?.model ?? plan.utility_model,
     },
+    ui: { language: getUiLanguage(existing) },
     limits: {
       max_internal_rounds: 3,
       max_context_file_bytes: 131072,
       max_total_context_bytes: 393216,
-      consult_timeout_sec: 180,
+      consult_timeout_sec: DEFAULT_CONSULT_TIMEOUT_SEC,
       ...existingLimits,
     },
   };
@@ -530,7 +553,10 @@ export function setFailoverMode(mode, options) {
 }
 
 export async function updateSettings(settings, { configPath, probeTimeoutMs = 2000, candidate, probe } = {}) {
+  const advancedEdits = Object.fromEntries(['magpie', 'routing_policy', 'utility', 'codex', 'limits', 'ui'].map((section) =>
+    [section, (loaded, value) => editAdvancedSettings(loaded, section, value, defaultGatewayFromEnv())]));
   const edits = {
+    ...advancedEdits,
     codex_timeout_sec: (loaded, value) => {
       try {
         if (validateExecTimeoutSec(value) === undefined) throw new Error('Missing codex_timeout_sec.');
@@ -540,7 +566,7 @@ export async function updateSettings(settings, { configPath, probeTimeoutMs = 20
       return { next: { ...loaded.data, codex: { ...loaded.data.codex, timeout_sec: value, timeout_sec_customized: true } } };
     },
     native_swarm: (loaded, value) => editSwarmSetting(loaded, 'native_swarm', value, typeof value === 'boolean'),
-    swarm_shell_model: (loaded, value) => editSwarmSetting(loaded, 'swarm_shell_model', value, WORKLOAD.swarm_shell_models.includes(value)),
+    swarm_shell_model: (loaded, value) => editSwarmSetting(loaded, 'swarm_shell_model', value, isSafeModelId(value)),
     default_sandbox: editDefaultSandbox,
     pairing: (loaded, value) => {
       if (!value || typeof value !== 'object' || Array.isArray(value) ||
@@ -559,6 +585,7 @@ export async function updateSettings(settings, { configPath, probeTimeoutMs = 20
       (keys.includes('tier') && !keys.includes('tier_effort') && !keys.includes('auto_effort'))) {
     return { ok: false, status: 400, error: 'Invalid settings.' };
   }
+  const create = keys.every((key) => Object.hasOwn(advancedEdits, key));
   const hasMode = keys.includes('failover_mode');
   const mode = typeof settings.failover_mode === 'string' ? settings.failover_mode.trim() : '';
   if (hasMode && !VALID_FAILOVER_MODES.includes(mode)) {
@@ -609,7 +636,7 @@ export async function updateSettings(settings, { configPath, probeTimeoutMs = 20
 
   for (;;) {
     const result = candidate ? plan({ data: candidate, path: resolveConfigPath(configPath) })
-      : withConfigTransaction(configPath, plan);
+      : withConfigTransaction(configPath, plan, { create });
     if (!result.probeInputs) return result;
     // Probe without the config lock, then plan again with the latest on-disk settings.
     const [url, key, excluded] = result.probeInputs;
@@ -767,4 +794,32 @@ function planFailover(current, normalized, probe) {
   }
 
   return { ok: true, config: { ...current, routing_policy: nextPolicy, tiers: nextTiers } };
+}
+
+export async function probeGatewaySettings(draft, { configPath, probeTimeoutMs = 2000 } = {}) {
+  const { config, url } = gateway(configPath);
+  const result = editAdvancedSettings({ data: config || {} }, 'magpie', draft, url);
+  if (!result.next) return result;
+  const baseUrl = result.next.magpie.base_url || url;
+  const key = resolveMagpieApiKey({ magpie: { ...result.next.magpie, base_url: baseUrl } });
+  const started = performance.now();
+  const probe = await probeMagpie(baseUrl, key, probeTimeoutMs);
+  return { ok: true, status: 200, reachable: probe.reachable, latency_ms: Math.round(performance.now() - started),
+    models: probe.models, total_models: probe.models.length, error: probe.error };
+}
+
+export function resetSettings(body, { configPath } = {}) {
+  if (!body || typeof body !== 'object' || Array.isArray(body) ||
+      Object.keys(body).some((key) => key !== 'keep_gateway') ||
+      (Object.hasOwn(body, 'keep_gateway') && typeof body.keep_gateway !== 'boolean')) {
+    return { ok: false, status: 400, error: 'Invalid keep_gateway.' };
+  }
+  const defaults = readJsonSafe(join(resolvePluginRoot(), 'templates', 'gempt.config.example.json'))
+    || readJsonSafe(join(RUNTIME_ROOT, 'templates', 'gempt.config.example.json'));
+  if (!defaults) return { ok: false, status: 500, error: 'GemPT default config is unavailable.' };
+  const keepGateway = body.keep_gateway ?? true;
+  return withConfigTransaction(configPath, ({ data, path }) => ({
+    next: { ...defaults, ...(keepGateway ? { magpie: { ...defaults.magpie, base_url: defaultGatewayFromEnv(), ...data.magpie } } : {}) },
+    response: { ok: true, status: 200, config_path: path, keep_gateway: keepGateway },
+  }), { create: true });
 }
