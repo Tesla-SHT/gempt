@@ -13,6 +13,7 @@ import { serveAppServerSocket } from './app-server-fixture.mjs';
 import { handleTool } from '../core/mcp-server.mjs';
 import { updateHostContext } from '../core/host-context.mjs';
 import { runDirectory, saveRun } from '../core/runs.mjs';
+import { resolvePath } from '../core/state.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
 
 const output = process.env.GEMPT_VERIFY_DIR || '/tmp/gempt-v060-verify';
@@ -274,6 +275,7 @@ try {
   seed(url);
   await updateHostContext(host, [cwd], { configPath });
   consoleServer = await startServer({ port: 0, configPath, sessionsDir, magpieConfigDir,
+    antigravityPluginDir: join(root, 'client plugins', 'gempt'), agyBinDir: join(root, 'commands with spaces'),
     manageAppServer: true, appServerOptions: { env, isPidAlive: (pid) => pid === process.pid, connect: async () => ({ close() {} }) } });
   const standaloneUrl = `http://127.0.0.1:${consoleServer.port}/?theme=dark`;
   consoleServer.server.on('request', (req) => requests.push(req.url));
@@ -399,6 +401,10 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
     assert.equal(await evaluate("return getComputedStyle($('view-console')).getPropertyValue('--gp-bg').trim();"), themeTokens[theme][0]);
     assert.equal(await selected('[name="native_swarm"]:checked'), 'true');
     assert.equal(await selected('#swarm-shell-model'), 'gemini-4-hydrogen-low');
+    assert.equal(await evaluate("return document.querySelector('[name=\"failover_mode\"]') === null;"), true);
+    assert.deepEqual(await evaluate(`return [...document.querySelector('[name="pair-hydrogen"]').options]
+      .filter(option => option.value !== 'default').map(option => [option.value, option.text]);`),
+      [model, 'codex/gpt-6.2-astra', 'gemini/gemini-4-neon-high', 'openai/gpt-5.4'].map(id => [id, id]));
     assert.equal(await selected('#codex-timeout'), '3600');
     assert.match(await evaluate("return $('routing-badge').textContent;"), /^80% · Swarm$/);
     assert.ok(Number.parseFloat(await evaluate("return $('token-ratio-gpt-bar').style.width;")) > 0);
@@ -511,6 +517,14 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
   assert.equal(requests.filter(path => path === '/api/overview').length, 1, 'gateway status patches the existing overview');
   assert.equal(requests.filter(path => path === '/api/magpie-status').length, 1, 'the status poll waits for the first probe');
   await shot('magpie-standalone-dark');
+  await evaluate("$('agy-setup').open = true;");
+  assert.equal(await evaluate("return $('agy-target').textContent;"), resolvePath(join(root, 'client plugins', 'gempt')));
+  assert.equal(await evaluate("return $('agy-bin').textContent;"), resolvePath(join(root, 'commands with spaces')));
+  await evaluate("$('agy-install').scrollIntoView({block:'center'});");
+  await shot('magpie-enable-antigravity');
+  await click('agy-install');
+  await until(() => evaluate("return $('agy-setup').hidden && !!$('agy-install-result').textContent;"), 'bundled integration installed');
+  assert.equal(JSON.parse(readFileSync(join(root, 'client plugins', 'gempt', 'plugin.json'))).name, 'gempt');
   assert.equal(requests.some(path => /^\/api\/(sessions|requests)/.test(path)), false);
   await evaluate("document.querySelector('[data-timeout=\"7200\"]').click();");
   await until(() => evaluate("return document.querySelector('[data-timeout=\"7200\"]').getAttribute('aria-pressed') === 'true';"), 'Magpie timeout update over HTTP');

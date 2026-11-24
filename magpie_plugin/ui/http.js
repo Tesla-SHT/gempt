@@ -1,4 +1,5 @@
 const actionPaths = {
+  install_agy: 'install-agy',
   init: 'init',
   probe_gateway: 'probe-gateway',
   reset_settings: 'reset-settings',

@@ -8,7 +8,7 @@ import { RUNTIME_ROOT, resolvePluginRoot } from './bundle-paths.mjs';
 import { withLockSync } from './state.mjs';
 
 export const GEMPT_VERSION = readJsonSafe(join(RUNTIME_ROOT, 'package.json'))?.version
-  || readJsonSafe(join(resolvePluginRoot(), 'plugin.json'))?.version || '0.6.1';
+  || readJsonSafe(join(resolvePluginRoot(), 'plugin.json'))?.version || '0.7.0';
 export const TIER_ORDER = ['sonnet', 'opus', 'fable'];
 export const TIER_ALIASES = { lite: 'sonnet', mid: 'opus', max: 'fable' };
 export const VALID_SANDBOXES = ['read-only', 'workspace-write', 'danger-full-access'];
@@ -296,8 +296,8 @@ export function setPairing(family, model, { configPath } = {}) {
 
 export function editPairing(loaded, family, model) {
   if (typeof family !== 'string' || !Object.hasOwn(WORKLOAD.pairings, family) ||
-      (model !== 'default' && (typeof model !== 'string' || !isCodexModelId(model) || model.trim() !== model))) {
-    return { ok: false, status: 400, error: '请选择有效的 Gemini 档位和 Codex 订阅模型。' };
+      !isPairingModelId(model)) {
+    return { ok: false, status: 400, error: '请选择有效的 Gemini 档位和 Magpie 模型。' };
   }
   const policy = loaded.data.routing_policy;
   return { next: { ...loaded.data, routing_policy: { ...policy, pairings: { ...policy?.pairings, [family]: model } } } };
@@ -452,6 +452,7 @@ export function validateEffortSettings({ mcpEffort, tierEffort, tier, autoEffort
 const cleanText = (value) => typeof value === 'string' && !/[\p{Cc}\p{Zl}\p{Zp}]/u.test(value);
 const cleanArray = (value) => Array.isArray(value) && value.every((item) => cleanText(item) && item.trim());
 export const isSafeModelId = (value) => cleanText(value) && SAFE_MODEL_ID.test(value);
+export const isPairingModelId = (value) => cleanText(value) && value.length > 0 && value.trim() === value;
 
 export function normalizeGatewayUrl(value) {
   if (!cleanText(value) || !/^https?:\/\/[^/\\\s]/i.test(value.trim()) || /[?#\\]/.test(value)) return;

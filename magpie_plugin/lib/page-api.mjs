@@ -101,6 +101,7 @@ export async function dispatchPageApi({ method, url, rawPath = url.pathname, rea
       sessionsDir,
       magpieConfigDir,
       antigravityPluginDir,
+      agyBinDir,
       execEnabled,
       mcpToolsEnabled,
       appServer,

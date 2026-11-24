@@ -47,9 +47,9 @@
   "swarm_shell_model": "gemini-4-hydrogen-low",
   "swarm_shell_models": ["gemini-4-hydrogen-low", "gemini-3.8-flash-low", "gpt-oss-120b-medium"],
   "pairings": {
-    "hydrogen": "codex/gpt-6.1-terra",
-    "neon": "codex/gpt-6.2-sol",
-    "carbon": "codex/gpt-6.2-astra"
+    "hydrogen": "default",
+    "neon": "default",
+    "carbon": "default"
   },
   "schema": {
     "type": "object",

@@ -1,11 +1,11 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { performance } from 'node:perf_hooks';
 import { join, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { resolveBudgetAsync } from './token-ratio.mjs';
 import { WORKLOAD } from '../../core/assets.mjs';
-import { RUNTIME_ROOT, resolvePluginRoot } from '../../core/bundle-paths.mjs';
+import { agyInstallPaths, RUNTIME_ROOT, resolvePluginRoot } from '../../core/bundle-paths.mjs';
+import { GEMPT_VERSION } from '../../core/config.mjs';
 import { resolveNodeExecutable } from '../../core/node-executable.mjs';
 import {
   DEFAULT_CONSULT_TIMEOUT_SEC, DEFAULT_TIERS, DEFAULT_UTILITY, FEATURES, TIER_ORDER, VALID_FAILOVER_MODES, VALID_SANDBOXES,
@@ -15,8 +15,8 @@ import {
   resolveConfigPath, resolveMagpieConfigDir, resolveSessionsDir, validateEffortSettings, withConfigTransaction,
 } from '../../core/config.mjs';
 import {
-  NATIVE_GROUP_SPECS, dedupe, defaultGatewayFromEnv, findApiBackup, pickDefaultSubscriptionModel, pickNativeGroupPlan,
-  pickSubscriptionPlan, pickTierPlan, probeMagpie, readMagpieNativeGroups, resolveExcludedTokens,
+  NATIVE_GROUP_SPECS, dedupe, defaultGatewayFromEnv, findApiBackup, pickDelegatePlan, pickNativeGroupPlan,
+  pickSubscriptionPlan, probeMagpie, readMagpieNativeGroups, resolveExcludedTokens,
   resolveMagpieApiKey, syncHarnessGroups,
 } from '../../core/magpie.mjs';
 import { findCodexCli } from './app-server-manager.mjs';
@@ -60,11 +60,10 @@ const CLIENT_LABELS = {
   mimocode: 'MimoCode',
 };
 
-export function detectClients({ magpieConfigDir, antigravityPluginDir } = {}) {
-  const agyDir = antigravityPluginDir
-    ? resolve(expandUser(antigravityPluginDir))
-    : resolve(join(homedir(), '.gemini', 'config', 'plugins', 'gempt'));
-  const antigravity_installed = existsSync(join(agyDir, 'plugin.json'));
+export function detectClients({ magpieConfigDir, antigravityPluginDir, agyBinDir } = {}) {
+  const { target: agyDir, binDir } = agyInstallPaths(antigravityPluginDir, agyBinDir);
+  const manifest = readJsonSafe(join(agyDir, 'plugin.json'));
+  const antigravity_installed = manifest?.name === 'gempt';
 
   const applied = readJsonSafe(join(magpieConfigDir, 'applied.json'));
   const appliedKeys = applied && !Array.isArray(applied) ? Object.keys(applied) : [];
@@ -117,6 +116,8 @@ export function detectClients({ magpieConfigDir, antigravityPluginDir } = {}) {
 
   return {
     antigravity_installed,
+    agy_install: { target: agyDir, bin_dir: binDir, bundled_version: GEMPT_VERSION,
+      installed_version: antigravity_installed ? manifest.version : null },
     magpie_clients: [...magpieSet],
     external_clients: [...externalSet],
     magpie_mcp_registered,
@@ -133,9 +134,7 @@ export function buildRulesSnippet() {
 const SAFE_MCP_ENV_KEYS = new Set(['PYTHONPATH', 'PYTHONUTF8', 'PYTHONIOENCODING', 'LANG', 'LC_ALL', 'GEMPT_CONFIG']);
 
 export function buildMcpSnippet({ antigravityPluginDir, repoRoot = RUNTIME_ROOT, preferInstalled = true } = {}) {
-  const agyDir = antigravityPluginDir
-    ? resolve(expandUser(antigravityPluginDir))
-    : resolve(join(homedir(), '.gemini', 'config', 'plugins', 'gempt'));
+  const { target: agyDir } = agyInstallPaths(antigravityPluginDir);
   const installedRuntime = join(agyDir, 'runtime');
   const installedConfig = preferInstalled ? readJsonSafe(join(agyDir, 'mcp_config.json')) : null;
   if (installedConfig?.mcpServers?.gempt?.command) {
@@ -253,7 +252,7 @@ function overviewGatewayFields(magpie, rawCfg, resolvedMagpieDir) {
   }
 
   return {
-    mcp_default_model: pickDefaultSubscriptionModel(magpie) || WORKLOAD.pairings.neon,
+    mcp_default_model: pickDelegatePlan(magpie)?.tiers.sonnet.consult_model || null,
     subscription: {
       connected: Boolean(magpie.codex_ready),
       codex_count: (magpie.codex_models || []).length,
@@ -314,7 +313,7 @@ export function readOverview(options = {}) {
   return readState({ ...options, overview: true });
 }
 
-export async function readState({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, execEnabled, mcpToolsEnabled, appServer, ratioRange = '24h', probeTimeoutMs = 2000, overview = false } = {}) {
+export async function readState({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, agyBinDir, execEnabled, mcpToolsEnabled, appServer, ratioRange = '24h', probeTimeoutMs = 2000, overview = false } = {}) {
   const resolvedConfigPath = resolveConfigPath(configPath);
   const resolvedSessionsDir = resolveSessionsDir(sessionsDir);
   const resolvedMagpieDir = resolveMagpieConfigDir(magpieConfigDir);
@@ -334,7 +333,7 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
   const { subscription, ...gatewayFields } = overviewGatewayFields(magpie, rawCfg, resolvedMagpieDir);
   const recommended = subscription.recommended;
   const pairings = Object.fromEntries(Object.keys(WORKLOAD.pairings).map((family) => [family, getPairing(policy, family)]));
-  const clients = detectClients({ magpieConfigDir: resolvedMagpieDir, antigravityPluginDir });
+  const clients = detectClients({ magpieConfigDir: resolvedMagpieDir, antigravityPluginDir, agyBinDir });
   const mcpSnippet = buildMcpSnippet({ antigravityPluginDir });
 
   const tiersObj = rawCfg?.tiers || {};
@@ -423,7 +422,7 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
 }
 
 export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000, sandbox, strategy,
-  utilityModel, failover = 'subscription_only', useGroups = false, syncGroups = false, dryRun = false,
+  utilityModel, failover, useGroups = false, syncGroups = false, dryRun = false,
   chooseSettings,
 } = {}) {
   const resolvedConfigPath = resolveConfigPath(configPath);
@@ -447,18 +446,17 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
   }
 
   const subscription = pickSubscriptionPlan(probe);
-  const plan = subscription || ((chooseSettings || failover === 'api_fallback')
-    ? pickTierPlan(probe.openai_models || [], probe.utility_candidates || []) : null);
+  const plan = pickDelegatePlan(probe);
   if (!plan) {
     return {
       ok: false,
       status: 400,
-      error: '未检测到 Codex 订阅模型，请先在 Magpie 中登录 ChatGPT/Codex 订阅账号。',
+      error: '请在 Magpie 接入可用于对话的模型后刷新。',
     };
   }
 
   if (chooseSettings) ({ sandbox, utilityModel, failover, syncGroups, useGroups } = await chooseSettings({
-    sandbox, utilityModel, failover: subscription ? failover : 'api_fallback', syncGroups, useGroups, plan,
+    sandbox, utilityModel, failover, syncGroups, useGroups, plan,
   }));
   if (failover === 'subscription_only' && !subscription) {
     return { ok: false, status: 400, error: '未检测到可用的 Codex 订阅模型。' };
@@ -493,7 +491,7 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
       ...getNativeSwarmPolicy(existingPolicy),
       pairings: existingPolicy.pairings ?? {},
       default_tier: defaultTier,
-      failover_mode: failover,
+        failover_mode: failover ?? 'paired',
       auto_effort: Boolean(existingPolicy.auto_effort),
       mcp_effort: getMcpEffort(existingPolicy),
       magpie_group_strategy: strategy || String(existingPolicy.magpie_group_strategy || 'pace'),
@@ -585,7 +583,7 @@ export async function updateSettings(settings, { configPath, probeTimeoutMs = 20
       (keys.includes('tier') && !keys.includes('tier_effort') && !keys.includes('auto_effort'))) {
     return { ok: false, status: 400, error: 'Invalid settings.' };
   }
-  const create = keys.every((key) => Object.hasOwn(advancedEdits, key));
+  const create = keys.every((key) => key === 'pairing' || Object.hasOwn(advancedEdits, key));
   const hasMode = keys.includes('failover_mode');
   const mode = typeof settings.failover_mode === 'string' ? settings.failover_mode.trim() : '';
   if (hasMode && !VALID_FAILOVER_MODES.includes(mode)) {

@@ -13,7 +13,7 @@ import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { runInNewContext } from 'node:vm';
-import { buildMcpSnippet, findMagpieCli, listDispatchActivity, normalizeTitle, readActiveRuns, readState, setDefaultSandbox, setDefaultTier } from '../magpie_plugin/lib/backend.mjs';
+import { buildMcpSnippet, findMagpieCli, initSubscriptionConfig, listDispatchActivity, normalizeTitle, readActiveRuns, readState, setDefaultSandbox, setDefaultTier } from '../magpie_plugin/lib/backend.mjs';
 import { createAppServerManager, resolveCodexInvocation } from '../magpie_plugin/lib/app-server-manager.mjs';
 import { buildEscalationSuggestion } from '../magpie_plugin/lib/routing.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
@@ -50,7 +50,7 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files, version }] = JSON.parse(stdout);
-  assert.equal(version, '0.6.1');
+  assert.equal(version, '0.7.0');
   const paths = files.map((file) => file.path);
   assert.deepEqual(paths.filter((path) => /^plugin\/skills\/[^/]+\/SKILL\.md$/.test(path)).sort(),
     ['plugin/skills/gempt-chore/SKILL.md', 'plugin/skills/gempt/SKILL.md']);
@@ -300,6 +300,29 @@ function startMockMagpie(modelsData, { onRequest } = {}) {
     });
   });
 }
+
+test('a fresh gateway with a single non-GPT delegate can consult before and after initialization', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-fresh-model-'));
+  const model = 'custom-provider/worker#fast';
+  const gateway = await startMockMagpie([{ id: model }]);
+  const previous = process.env.MAGPIE_ADDR;
+  process.env.MAGPIE_ADDR = gateway.url;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.MAGPIE_ADDR;
+    else process.env.MAGPIE_ADDR = previous;
+    await gateway.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const configPath = join(dir, 'config.json');
+  const tools = createExecutionTools({ configPath, sessionsDir: join(dir, 'sessions') });
+  const consult = args => tools.consult.execute({ goal: 'Reply OK', ...args });
+  assert.equal((await consult({ gemini_family: 'neon' })).model, model);
+  const init = await initSubscriptionConfig({ configPath });
+  assert.equal(init.ok, true);
+  assert.equal(init.plan.tiers.sonnet.exec_model, model);
+  assert.equal((await consult({ tier: 'opus' })).model, model);
+  assert.deepEqual(gateway.requests.map(request => request.body.model), [model, model]);
+});
 
 function rawHttpGet({ port, path, headers = {} }) {
   return new Promise((resolveReq, rejectReq) => {
@@ -1190,7 +1213,7 @@ test('settings batch validates atomically and failover preserves changes made du
   try {
     await Promise.race([probing, toggle.then((response) => assert.fail(`Failover returned ${response.status} before probing`))]);
     assert.equal(readFileSync(configPath, 'utf8'), original);
-    assert.equal((await post({ pairing: { family: 'hydrogen', model: 'codex/fixture' }, work_split: 'balanced' })).status, 200);
+    assert.equal((await post({ pairing: { family: 'hydrogen', model: 'group/custom-worker' }, work_split: 'balanced' })).status, 200);
   } finally {
     releaseProbe();
   }
@@ -1199,7 +1222,7 @@ test('settings batch validates atomically and failover preserves changes made du
   assert.equal(saved.codex.default_sandbox, 'read-only');
   assert.equal(saved.routing_policy.mcp_effort, 'high');
   assert.equal(saved.routing_policy.failover_mode, 'api_fallback');
-  assert.equal(saved.routing_policy.pairings.hydrogen, 'codex/fixture');
+  assert.equal(saved.routing_policy.pairings.hydrogen, 'group/custom-worker');
   assert.equal(saved.routing_policy.work_split, 'balanced');
 });
 
@@ -1777,13 +1800,13 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     const titledConsult = JSON.parse(readFileSync(join(sessDir, `${initial.session_id}.json`), 'utf8'));
     assert.equal(titledConsult.title, '表单 设计');
     assert.equal(titledConsult.host_conversation_id, 'consult-host');
-    assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6.1-terra');
-    config.routing_policy.pairings = { hydrogen: 'codex/gpt-6-luna' };
+    assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6.2-sol');
+    config.routing_policy.pairings = { hydrogen: 'custom-provider/worker-v2', carbon: 'codex/gpt-6.2-astra' };
     writeFileSync(cfgPath, JSON.stringify(config));
     await enabledTools.consult.execute({ goal: 'Continue', session_id: initial.session_id });
-    assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6.1-terra');
+    assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6.2-sol');
     await consult(hydrogenTask);
-    assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6-luna');
+    assert.equal(magpie.requests.at(-1).body.model, 'custom-provider/worker-v2');
     const explicitFable = await consult({ ...hydrogenTask, tier: 'fable' });
     assert.equal(explicitFable.tier, 'fable');
     assert.equal(magpie.requests.at(-1).body.model, 'codex/gpt-6.2-astra');
@@ -1857,10 +1880,10 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     config.routing_policy.auto_effort = false;
     writeFileSync(cfgPath, JSON.stringify(config));
     const pairedExec = await enabledTools.exec.execute({ ...hydrogenTask, sandbox: 'read-only', cwd: repoDir });
-    assert.equal(pairedExec.model, 'codex/gpt-6-luna');
+    assert.equal(pairedExec.model, 'custom-provider/worker-v2');
     assert.equal(pairedExec.tier, 'paired:hydrogen');
     assert.equal(pairedExec.reasoning_effort, 'xhigh');
-    assert.equal(app.packets.findLast((p) => p.method === 'turn/start').params.model, 'codex/gpt-6-luna');
+    assert.equal(app.packets.findLast((p) => p.method === 'turn/start').params.model, 'custom-provider/worker-v2');
     assert.equal(app.packets.findLast((p) => p.method === 'turn/start').params.effort, 'xhigh');
     config.routing_policy.auto_effort = true;
     writeFileSync(cfgPath, JSON.stringify(config));
@@ -2532,7 +2555,7 @@ test('mcpTools false disables duplicate Magpie GemPT tool registration', async (
 
 test('Magpie marketplace check shape and inspect+share guard hold', async () => {
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '0.6.1');
+  assert.equal(pkg.version, '0.7.0');
   assert.ok(pkg.keywords.includes('magpie-plugin'));
   assert.ok(pkg.files.includes('THIRD_PARTY_LICENSES.txt'));
   assert.ok(pkg.magpie?.summary?.en && pkg.magpie?.summary?.zh);

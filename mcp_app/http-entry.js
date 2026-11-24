@@ -49,5 +49,10 @@ if (document.documentElement.hasAttribute("data-sidecar")) {
   }
 } else {
   const apiKey = document.querySelector('meta[name="gempt-key"]')?.content;
-  mountLive({ transport: createHttpTransport(apiKey) });
+  const transport = createHttpTransport(apiKey);
+  if (apiKey) {
+    if (self.origin === 'null') transport.installPage = new URL('.', location.href).href;
+    else transport.installAgy = () => transport.runAction('install_agy');
+  }
+  mountLive({ transport });
 }

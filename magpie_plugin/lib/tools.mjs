@@ -17,8 +17,8 @@ import { runAppServer, TurnInterrupted } from './app-server-run.mjs';
 import { listActiveRoster } from '../../core/runs.mjs';
 import { validateSessionId } from '../../core/state.mjs';
 import { TOOLS } from '../../core/tool-schemas.mjs';
-import { codexAppServerExtraArgs, getMcpEffort, getPairing, hasRuntimeConfig } from '../../core/config.mjs';
-import { findApiBackup, pickDefaultSubscriptionModel } from '../../core/magpie.mjs';
+import { codexAppServerExtraArgs, getMcpEffort, getPairing, hasRuntimeConfig, isPairingModelId } from '../../core/config.mjs';
+import { pickDelegatePlan } from '../../core/magpie.mjs';
 import { randomBytes } from 'node:crypto';
 import { existsSync, openSync, readSync, realpathSync, rmSync, statSync, closeSync } from 'node:fs';
 import http from 'node:http';
@@ -548,17 +548,17 @@ async function resolveRuntimeConfig({ configPath, tierForProbe, allowUtilityOnly
   if (!probe.reachable) {
     throw new Error(`Cannot reach local Magpie gateway at ${baseUrl}: ${probe.error || 'offline'}`);
   }
-  const subPlan = pickSubscriptionPlan(probe);
+  const subPlan = pickDelegatePlan(probe);
   const wantUtility = allowUtilityOnly && String(tierForProbe || '').trim().toLowerCase() === 'chore';
   if (!subPlan && (!wantUtility || !(probe.utility_candidates || []).length)) {
-    throw new Error('未检测到 Codex 订阅模型，请先在 Magpie 中登录 ChatGPT/Codex 订阅账号。');
+    throw new Error('请在 Magpie 接入可用于对话的模型后刷新。');
   }
 
   const synthTiers = subPlan ? subPlan.tiers : DEFAULT_TIERS;
   const utilityModel = probe.utility_candidates?.[0] || subPlan?.utility_model || DEFAULT_UTILITY.model;
   return {
     configured: false,
-    configSource: 'auto_subscription',
+    configSource: probe.codex_ready ? 'auto_subscription' : 'auto_magpie',
     configPath: resolvedConfigPath,
     baseUrl,
     apiKey,
@@ -567,7 +567,7 @@ async function resolveRuntimeConfig({ configPath, tierForProbe, allowUtilityOnly
       version: 1,
       magpie: { base_url: baseUrl },
       codex: { default_sandbox: 'workspace-write', timeout_sec: DEFAULT_EXEC_TIMEOUT_SEC },
-      routing_policy: { default_tier: 'sonnet', failover_mode: 'subscription_only' },
+      routing_policy: { default_tier: 'sonnet', failover_mode: 'paired' },
       tiers: synthTiers,
       utility: { ...DEFAULT_UTILITY, model: utilityModel },
       limits: {
@@ -592,7 +592,7 @@ function shouldRetryFallback(err) {
   return !/redirect rejected/i.test(String(err?.message || ''));
 }
 
-async function pairedModel(runtime, args, session, probeTimeoutMs, consult) {
+async function pairedModel(runtime, args, session, probeTimeoutMs) {
   if (args.tier || (session && !session.paired_model)) return null;
   const { cfg } = runtime;
   const family = Object.hasOwn(WORKLOAD.pairings, args.gemini_family) ? args.gemini_family : '';
@@ -602,22 +602,16 @@ async function pairedModel(runtime, args, session, probeTimeoutMs, consult) {
     : (family ? `paired:${family}` : 'mcp');
   let model = session?.paired_model || getPairing(cfg.routing_policy, family);
   const excluded = resolveExcludedTokens(cfg);
-  const failoverMode = cfg.routing_policy?.failover_mode || 'subscription_only';
-  const useApiBackup = consult && failoverMode === 'api_fallback' && !isHarnessGroup(model);
-  let fallbackModels = [];
-  if (model === 'default' || useApiBackup) {
+  if (model === 'default') {
     const probe = runtime.probe ?? await probeMagpie(runtime.baseUrl, runtime.apiKey, probeTimeoutMs, excluded);
-    if (model === 'default') model = pickDefaultSubscriptionModel(probe) || WORKLOAD.pairings.neon;
-    if (useApiBackup) {
-      const backup = findApiBackup(model, probe.openai_models);
-      if (backup) fallbackModels = [backup];
-    }
+    model = pickDelegatePlan(probe)?.tiers.sonnet.consult_model;
+    if (!model) throw new Error('Select a Magpie delegate in GemPT.');
   }
-  if (!isCodexModelId(model) && !isHarnessGroup(model)) throw new Error('Gemini pairing requires a Codex subscription model.');
+  if (!isPairingModelId(model)) throw new Error('Invalid paired Magpie model ID.');
   if (excluded.some(token => model.toLowerCase().includes(token))) {
-    throw new Error('The paired Codex model is excluded. Change the pairing in GemPT.');
+    throw new Error('The paired Magpie model is excluded. Change the pairing in GemPT.');
   }
-  return { model, tier, failoverMode, fallbackModels };
+  return { model, tier, failoverMode: 'paired', fallbackModels: [] };
 }
 
 function resolveTierTarget(cfg, requestedTier, { allowChore, escalate, effortOverride } = {}) {
@@ -669,13 +663,13 @@ function resolveTierTarget(cfg, requestedTier, { allowChore, escalate, effortOve
     if (!isCodexModelId(model) && !isHarnessGroup(model)) {
       throw new Error(`Subscription-only mode requires a codex/* model for tier '${effectiveTier}', got '${model}'.`);
     }
-  } else if (!isAllowedFallbackTarget(model)) {
+  } else if (!(failoverMode === 'paired' ? isPairingModelId(model) : isAllowedFallbackTarget(model))) {
     throw new Error(`Unsupported target model '${model}' for tier '${effectiveTier}'.`);
   }
 
   const seenFallbacks = new Set([model]);
   const fallbackModels = [];
-  if (failoverMode !== 'subscription_only' && Array.isArray(tierCfg.fallback_models)) {
+  if (failoverMode === 'api_fallback' && Array.isArray(tierCfg.fallback_models)) {
     for (const item of tierCfg.fallback_models) {
       const fb = String(item || '').trim();
       if (!fb || seenFallbacks.has(fb)) continue;
@@ -703,7 +697,7 @@ async function resolveGptTarget(runtime, args, priorSession, { allowChore = fals
   if (explicitEffort && !VALID_EFFORTS_SET.has(explicitEffort)) {
     throw new Error(`Invalid reasoning_effort '${explicitEffort}'.`);
   }
-  const paired = await pairedModel(runtime, args, priorSession, probeTimeoutMs, allowChore);
+  const paired = await pairedModel(runtime, args, priorSession, probeTimeoutMs);
   const policy = cfg.routing_policy;
   const escalate = Boolean(args.escalate);
   const resolveTarget = (effortOverride) => {
@@ -901,7 +895,7 @@ export function createExecutionTools({
 
         const fileList = Array.isArray(args?.file_paths) ? args.file_paths : [];
         const effort = resolved.effort;
-        if (resolved.failoverMode === 'subscription_only' && resolved.tier !== 'chore' && isHarnessGroup(resolved.model)) {
+        if (!paired && resolved.failoverMode === 'subscription_only' && resolved.tier !== 'chore' && isHarnessGroup(resolved.model)) {
           await verifySubscriptionGroup(runtime.cfg, resolved.model);
         }
         const apiMode = args?.api_mode
@@ -1161,13 +1155,13 @@ export function createExecutionTools({
         const { resolved, autoEffortInfo, paired } = await resolveGptTarget(runtime, args, priorSession, { probeTimeoutMs });
 
         const targetModel = resolved.execModel || resolved.model;
-        if (resolved.failoverMode === 'subscription_only') {
+        if (!paired && resolved.failoverMode === 'subscription_only') {
           if (isHarnessGroup(targetModel)) {
             await verifySubscriptionGroup(runtime.cfg, targetModel);
           } else if (!isCodexModelId(targetModel)) {
             throw new Error(`Subscription-only exec requires a codex/* model, got '${targetModel}'.`);
           }
-        } else if (!isAllowedFallbackTarget(targetModel)) {
+        } else if (!paired && !(resolved.failoverMode === 'paired' ? isPairingModelId(targetModel) : isAllowedFallbackTarget(targetModel))) {
           throw new Error(`Unsupported exec model '${targetModel}' for tier '${resolved.tier}'.`);
         }
 

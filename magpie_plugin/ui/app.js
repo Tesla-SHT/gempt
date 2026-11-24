@@ -22,6 +22,8 @@ export function mountConsole(root, transport, {
   const scrollTarget = root;
   let visible = false;
   const pendingSettings = new Set();
+  let installingAgy = false;
+  let retryAgy = false;
   const advanced = mountAdvancedSettings($, { transport, showToast, onLanguage, refreshGateway,
     refresh: () => refreshState({ replace: true }), init: activateSubscriptionConfig });
 
@@ -52,11 +54,6 @@ export function mountConsole(root, transport, {
     'danger-full-access': '无沙箱限制，允许完整本地权限（请谨慎）',
   };
 
-  const FAILOVER_HINTS = {
-    subscription_only: '仅用 ChatGPT/Codex 订阅额度，不走按量付费 API',
-    api_fallback: '兼容调用可按原配置使用按量 API 兜底。Gemini 配对使用指定的订阅模型。',
-  };
-
   const EFFORT_HINTS = {
     medium: '中等思考，适合日常开发与常规修改',
     high: '高强度思考，适合跨文件排查与复杂工程',
@@ -83,7 +80,6 @@ export function mountConsole(root, transport, {
   let stateRefreshError = '';
   let nativePreviewTier = '';
   let currentDefaultSandbox = 'workspace-write';
-  let currentFailoverMode = 'subscription_only';
   let currentEffortChoice = 'high';
   let currentViewMode = queryViewMode || readStoredMode();
   let ratioRange = readStoredRatioRange();
@@ -239,20 +235,20 @@ export function mountConsole(root, transport, {
       return;
     }
 
-    if (configured && subReady) {
+    if (configured && state.magpie.models?.length) {
       banner.hidden = true;
       btn.hidden = true;
       return;
     }
 
     banner.hidden = false;
-    if (!subReady) {
+    if (!state.mcp_default_model) {
       banner.dataset.tone = 'warn';
-      textEl.textContent = tr('尚未检测到 Codex 订阅 — 请先在 Magpie 左侧接入你的 ChatGPT / Codex 订阅账号，完成后点右上角刷新即可自动连上。');
+      textEl.textContent = state.magpie.models?.length ? tr('请选择下属模型。') : tr('请在 Magpie 接入模型后刷新。');
       btn.hidden = true;
     } else {
       banner.dataset.tone = 'ready';
-      textEl.textContent = tr('已检测到 Codex 订阅，可以启用 Antigravity MCP 编排。');
+      textEl.textContent = tr('默认下属模型：{0}', state.mcp_default_model);
       btn.hidden = false;
       btn.disabled = false;
     }
@@ -386,7 +382,7 @@ export function mountConsole(root, transport, {
 
   function renderPairings(state) {
     const list = $('pairing-options');
-    const models = state.magpie?.codex_models || [];
+    const models = state.magpie?.models || [];
     for (const [family, current] of Object.entries(state.pairings || {})) {
       let select = list.querySelector(`[name="pair-${family}"]`);
       if (!select) {
@@ -401,13 +397,13 @@ export function mountConsole(root, transport, {
       const defaultModel = state.mcp_default_model;
       const defaultLabel = defaultModel ? tr("默认模型 · {0}", humanizeModel(defaultModel)) : tr('默认模型');
       const choices = [new Option(defaultLabel, 'default')];
-      for (const id of models) choices.push(new Option(humanizeModel(id), id));
+      for (const id of models) choices.push(new Option(id, id));
       if (current !== 'default' && !models.includes(current)) {
-        choices.push(new Option(humanizeModel(current) + tr('（未检测到）'), current));
+        choices.push(new Option(current + tr('（未检测到）'), current));
       }
       select.replaceChildren(...choices);
       select.value = current;
-      select.disabled = !state.configured;
+      select.disabled = !models.length || pendingSettings.has(select.name);
     }
   }
 
@@ -471,34 +467,6 @@ export function mountConsole(root, transport, {
   }
 
   function renderGatewayControls(state) {
-    const configured = Boolean(state.configured);
-    const failoverGroup = $('failover-control-group');
-    const apiEnabled = Boolean(state.features?.api_fallback);
-    currentFailoverMode = state.failover_mode || 'subscription_only';
-
-    if (failoverGroup) {
-      failoverGroup.hidden = !apiEnabled;
-      if (apiEnabled) {
-        const apiAvailable = Boolean(state.api_fallback?.available) || currentFailoverMode === 'api_fallback';
-        for (const radio of root.querySelectorAll('input[name="failover_mode"]')) {
-          radio.checked = radio.value === currentFailoverMode;
-          if (!configured) {
-            radio.disabled = true;
-          } else if (radio.value === 'api_fallback') {
-            radio.disabled = !apiAvailable;
-          } else {
-            radio.disabled = false;
-          }
-        }
-        const fmHint = $('failover-hint');
-        if (fmHint) {
-          fmHint.textContent = !apiAvailable
-            ? tr('未检测到按量 openai/* 渠道，当前仅可用订阅直连')
-            : (tr(FAILOVER_HINTS[currentFailoverMode]) || tr(FAILOVER_HINTS.subscription_only));
-        }
-      }
-    }
-
     const nativeCopy = $('native-status-copy');
     const nativePills = $('native-ready-pills');
     const createBtn = $('create-native-btn');
@@ -621,7 +589,7 @@ export function mountConsole(root, transport, {
     if (effortEl) effortEl.textContent = formatEffortLabel(state.mcp_effort, state.auto_effort);
     if (sourceTitle) sourceTitle.textContent = 'Antigravity';
     if (slashBtn) slashBtn.hidden = !state.clients?.antigravity_installed;
-    if (hubModeText) hubModeText.textContent = tr('Codex 订阅');
+    if (hubModeText) hubModeText.textContent = '';
   }
 
   function renderReadiness(state) {
@@ -657,6 +625,43 @@ export function mountConsole(root, transport, {
     if (chipAgy && chipAgyVal) {
       chipAgy.dataset.tone = clients.antigravity_installed ? 'ok' : 'neutral';
       chipAgyVal.textContent = clients.antigravity_installed ? tr('插件已安装') : tr('未安装');
+    }
+    const paths = clients.agy_install;
+    const setup = $('agy-setup');
+    setup.hidden = !paths || !(transport.installAgy || transport.installPage)
+      || (!retryAgy && clients.antigravity_installed && paths.installed_version === paths.bundled_version);
+    if (!setup.hidden) {
+      $('agy-setup-title').textContent = clients.antigravity_installed
+        ? tr('安装随包版本 {0}（当前 {1}）', paths.bundled_version, paths.installed_version || '—')
+        : tr('启用 Antigravity 集成');
+      $('agy-target').textContent = paths.target;
+      $('agy-bin').textContent = paths.bin_dir;
+      $('agy-install').hidden = !transport.installAgy;
+      $('agy-install').disabled = installingAgy;
+      $('agy-install-link').hidden = $('agy-copy-link').hidden = !transport.installPage;
+      if (transport.installPage) $('agy-install-link').href = transport.installPage;
+    }
+  }
+
+  async function installAgyAction() {
+    if (!transport.installAgy || installingAgy) return;
+    installingAgy = true;
+    $('agy-install').disabled = true;
+    const result = $('agy-install-result');
+    result.hidden = false;
+    result.textContent = tr('正在安装…');
+    try {
+      const installed = await transport.installAgy();
+      retryAgy = !installed.installed;
+      const message = retryAgy ? tr('安装未全部完成，可重试。') : tr('已安装。请在 Antigravity 中打开新会话；若未出现，请重启客户端。');
+      result.textContent = [message, ...(installed.warnings || [])].join(' ');
+      await refreshState({ replace: true });
+    } catch (error) {
+      retryAgy = true;
+      result.textContent = errorText(error.message);
+    } finally {
+      installingAgy = false;
+      $('agy-install').disabled = false;
     }
   }
 
@@ -2733,9 +2738,6 @@ export function mountConsole(root, transport, {
         ? tr('已开启智能定档（low..xhigh，续跑锁档）')
         : tr("思考强度已切为{0}", label);
       updateSetting('active_effort', payload, currentEffortChoice, toastMsg);
-    } else if (target.name === 'failover_mode') {
-      const label = target.value === 'api_fallback' ? tr('API 兜底') : tr('仅订阅');
-      updateSetting('failover_mode', { failover_mode: target.value }, currentFailoverMode, tr("容灾模式已切为{0}", label));
     }
   });
 
@@ -2768,6 +2770,14 @@ export function mountConsole(root, transport, {
     }
     if (btn.id === 'init-sub-btn') {
       activateSubscriptionConfig();
+      return;
+    }
+    if (btn.id === 'agy-install') {
+      void installAgyAction();
+      return;
+    }
+    if (btn.id === 'agy-copy-link' && transport.installPage) {
+      copyText(transport.installPage);
       return;
     }
     if (btn.id === 'create-native-btn') {

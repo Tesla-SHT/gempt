@@ -7,7 +7,7 @@ import { basename, delimiter, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import {
   DEFAULT_MAGPIE_URL, DEFAULT_TIERS, DEFAULT_UTILITY, TIER_ORDER, expandUser, isCodexModelId,
-  readJsonSafe, resolveConfigPath, resolveSessionsDir,
+  isPairingModelId, normalizeGatewayUrl, readJsonSafe, resolveConfigPath, resolveSessionsDir,
 } from './config.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -22,11 +22,7 @@ export function defaultGatewayFromEnv() {
   let raw = String(process.env.MAGPIE_ADDR || process.env.MAGPIE_GATEWAY || '').trim();
   if (!raw) return DEFAULT_MAGPIE_URL;
   if (!/^https?:\/\//i.test(raw)) raw = `http://${raw}`;
-  try {
-    return new URL(raw).origin;
-  } catch {
-    return DEFAULT_MAGPIE_URL;
-  }
+  return normalizeGatewayUrl(raw) || DEFAULT_MAGPIE_URL;
 }
 
 function discoverLocalMagpieClientKey() {
@@ -158,6 +154,16 @@ export function pickSubscriptionPlan(probe) {
   const codexIds = Array.isArray(probe?.codex_models) ? probe.codex_models : [];
   const utilityIds = Array.isArray(probe?.utility_candidates) ? probe.utility_candidates : [];
   return pickTierPlan(codexIds, utilityIds);
+}
+
+export function pickDelegatePlan(probe) {
+  const subscription = pickSubscriptionPlan(probe);
+  if (subscription) return subscription;
+  const available = (probe.models || []).filter(id => isPairingModelId(id)
+    && !id.startsWith('group/gempt-') && !/(?:embedding|rerank|image|tts|whisper|veo)/i.test(id));
+  const preferred = available.filter(id => /(?:^|[/-])gpt(?:[/-]|$)/i.test(id));
+  const models = preferred.length ? preferred : available;
+  return pickTierPlan(models, probe.utility_candidates?.length ? probe.utility_candidates : models);
 }
 
 export function pickTierPlan(models, utilityIds) {

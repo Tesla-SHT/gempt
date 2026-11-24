@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
-import { DEFAULT_AGY_TARGET, installAgy } from '../core/agy-install.mjs';
+import { installAgy } from '../core/agy-install.mjs';
+import { agyInstallPaths } from '../core/bundle-paths.mjs';
 import { handleTool, serveStdio } from '../core/mcp-server.mjs';
 import { ACTIVE_STATES, buildWaitCommand, compactReceiptText, dispatchRun, interruptRun, replyToolCall,
   steerRun, validateExecTimeoutSec } from '../core/runs.mjs';
@@ -61,12 +62,11 @@ async function settings(options) {
   const rl = createInterface({ input: process.stdin, output: process.stderr });
   const ask = async (label, fallback) => (await rl.question(`${label} [${fallback}] `)).trim() || fallback;
   try {
-    const failover = choose(await ask('Failover mode', options.failover), VALID_FAILOVER_MODES, 'failover');
     const sandbox = choose(await ask('Default Codex sandbox', options.sandbox || 'workspace-write'), VALID_SANDBOXES, 'sandbox');
     const utilityModel = await ask('Utility model', options.utilityModel ?? options.plan.utility_model);
     const syncGroups = /^y(?:es)?$/i.test(await ask('Sync Magpie harness groups? (y/n)', options.syncGroups ? 'y' : 'n'));
     const useGroups = syncGroups ? /^y(?:es)?$/i.test(await ask('Use the harness groups for GemPT tiers? (y/n)', 'y')) : options.useGroups;
-    return { failover, sandbox, utilityModel, syncGroups, useGroups };
+    return { failover: options.failover, sandbox, utilityModel, syncGroups, useGroups };
   } finally {
     rl.close();
   }
@@ -87,7 +87,7 @@ async function main([command, ...args]) {
   const configPath = resolveConfigPath(values.config);
   const config = readJsonSafe(configPath);
   const [value, second, third] = positionals;
-  const target = resolvePath(values.target || DEFAULT_AGY_TARGET);
+  const target = agyInstallPaths(values.target).target;
   let result;
   switch (command) {
     case 'mcp':

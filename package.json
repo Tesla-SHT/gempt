@@ -1,7 +1,7 @@
 {
   "name": "gempt",
-  "version": "0.6.1",
-  "description": "Antigravity MCP orchestration with Gemini-to-Codex pairing and Magpie direct routing groups for other clients.",
+  "version": "0.7.0",
+  "description": "Pair Gemini with models from your Magpie gateway, delegate repository work and manage runs from Antigravity or Magpie.",
   "author": {
     "name": "yizhang-dream",
     "url": "https://github.com/yizhang-dream"
@@ -76,8 +76,8 @@
   "magpie": {
     "name": "GemPT",
     "summary": {
-      "en": "Gemini-to-Codex pairing and MCP controls for Antigravity, plus direct Magpie routing groups for other clients.",
-      "zh": "为 Antigravity 提供 Gemini 与 Codex 配对及 MCP 精细控制，为其他客户端提供 Magpie 直连路由组。"
+      "en": "Gemini pairing with models from your Magpie gateway and MCP controls for Antigravity, plus direct Magpie routing groups for other clients.",
+      "zh": "让 Gemini 配对 Magpie 中的任意下属模型，在面板中启用 Antigravity 集成、查看和接管任务。"
     },
     "page": {
       "title": "GemPT",

@@ -9,7 +9,7 @@ description: >-
 
 # gempt — Gemini × GPT 协作编排手册
 
-GemPT v0.6.1 使用 Node.js（`>= 20.11.0`）。Antigravity 的 `gempt_gempt` MCP 提供 `gpt_run`、`gpt_ask`、`gpt_ctl`，按 Hydrogen、Neon、Carbon 家族配对 GPT/Codex。Magpie HTTP MCP 对应 `gempt_run`、`gempt_ask`、`gempt_ctl`。其他 Agent 可在模型栏直接选 `group/gempt-{sonnet,opus,fable}`。
+GemPT v0.7.0 使用 Node.js（`>= 20.11.0`）。Antigravity 的 `gempt_gempt` MCP 提供 `gpt_run`、`gpt_ask`、`gpt_ctl`，按 Hydrogen、Neon、Carbon 家族配对 Magpie 提供的下属模型。Magpie HTTP MCP 对应 `gempt_run`、`gempt_ask`、`gempt_ctl`。其他 Agent 可在模型栏直接选 `group/gempt-{sonnet,opus,fable}`。
 
 > 启用本插件时，`rules/AGENTS.md` 会常驻生效；按 Magpie 面板的 5 档工作分工（0% / 15% / 35% / 60% / 80%）决定何时委派。
 
@@ -80,7 +80,7 @@ Codex 默认执行预算为 3600 秒，等待 `ask_gemini` 回复期间暂停计
 
 工位 brief 示例：
 
-> 你是 GPT 工位 <name>，Coordinator ID 是 <coordinator_id>。本工位没有插件 MCP 或 Hook。用 `gempt run --cwd "$PWD" --workspace inherit --tier <tier> --host <coordinator_id> --title <name> --goal -`，从 stdin 传入任务 <目标、范围、约束、验收命令>。只读任务加 `--access inspect`。保存回执的 run_id 和 session_id，原样通过 `run_command(WaitMsBeforeAsync=500)` 跑 wait_command。把改动、验证和卡点发到看板。
+> 你是 GPT 工位 <name>，Coordinator ID 是 <coordinator_id>。本工位没有插件 MCP 或 Hook。用 `gempt run --cwd "$PWD" --workspace inherit --family <协调者的 Gemini 家族> --host <coordinator_id> --title <name> --goal -`，从 stdin 传入任务 <目标、范围、约束、验收命令>。只读任务加 `--access inspect`。保存回执的 run_id 和 session_id，原样通过 `run_command(WaitMsBeforeAsync=500)` 跑 wait_command。把改动、验证和卡点发到看板。
 >
 > 当前回合收到看板新指示时用 `gempt steer <run_id> "<message>"`；后续回合可加 `--session <session_id>`。如果等待返回 `waiting_gemini`，把 `pending_tool_call` 的问题发到看板，收到答复后用 `gempt reply-tool <run_id> <call_id> "<text>"` 回复，再执行原 wait_command。
 

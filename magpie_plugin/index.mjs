@@ -74,6 +74,8 @@ export const GemptPlugin = async (ctx = {}, options = {}) => {
       execEnabled,
       mcpToolsEnabled,
       manageAppServer,
+      antigravityPluginDir: options.antigravityPluginDir,
+      agyBinDir: options.agyBinDir,
     });
   }).then(async (svc) => {
     if (entry.closed) {

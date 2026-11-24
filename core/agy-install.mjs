@@ -4,16 +4,14 @@ import {
   chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync,
   readFileSync, readdirSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
-import { homedir } from 'node:os';
 import { basename, delimiter, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { RUNTIME_ROOT, resolvePluginRoot } from './bundle-paths.mjs';
 import { APP_RESOURCE, APP_TOOLS, APP_URI } from './mcp-app.mjs';
+import { agyInstallPaths, RUNTIME_ROOT, resolvePluginRoot } from './bundle-paths.mjs';
 import { resolveNodeExecutable } from './node-executable.mjs';
 import { atomicJson, resolvePath, withLock, withinPath } from './state.mjs';
 
 export { resolveNodeExecutable };
-export const DEFAULT_AGY_TARGET = join(homedir(), '.gemini', 'config', 'plugins', 'gempt');
 const WINDOWS = process.platform === 'win32';
 const quotePosix = (value) => `'${value.replaceAll("'", "'\\''")}'`;
 const quoteWindows = (value) => `"${value}"`;
@@ -402,7 +400,8 @@ function installWaitShim(target, nodeBin, binDir) {
 async function refresh(env) {
   const csrf = env.ANTIGRAVITY_CSRF_TOKEN?.trim();
   if (!csrf) return { refreshed: false, reason: 'ANTIGRAVITY_CSRF_TOKEN not present in environment' };
-  const address = env.ANTIGRAVITY_LS_ADDRESS?.trim() || 'localhost:5387';
+  const address = env.ANTIGRAVITY_LS_ADDRESS?.trim();
+  if (!address) return { refreshed: false, reason: 'Antigravity did not supply a language server address' };
   const url = `http://${address}/exa.language_server_pb.LanguageServerService/RefreshMcpServers`;
   try {
     const response = await fetch(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(3000),
@@ -415,11 +414,11 @@ async function refresh(env) {
   }
 }
 
-export async function installAgy({ target = DEFAULT_AGY_TARGET, source, force = false,
-  binDir = join(homedir(), 'bin'), env = process.env } = {}) {
-  target = resolvePath(target);
+export async function installAgy({ target, source, force = false, binDir, env = process.env } = {}) {
+  ({ target, binDir } = agyInstallPaths(target, binDir, env));
   source = source && resolvePath(source);
   const nodeBin = resolveNodeExecutable({ env });
+  if (!/^node(?:\.exe)?$/i.test(basename(nodeBin))) throw new Error('Node.js 20.11+ is required. Add Node.js to the PATH of the Magpie process and reopen Magpie.');
   if ([RUNTIME_ROOT, resolvePath(nodeBin), source].filter(Boolean).some((path) => withinPath(path, target))) {
     throw new Error(`Target ${target} contains the running GemPT package, source, or Node executable.`);
   }
