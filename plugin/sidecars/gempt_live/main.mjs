@@ -1,4 +1,5 @@
-import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -11,23 +12,47 @@ const { warmPageTelemetry } = await import(new URL('magpie_plugin/lib/backend.mj
 const { createAppServerManager } = await import(new URL('magpie_plugin/lib/app-server-manager.mjs', runtime));
 const { resolvePath } = await import(new URL('core/state.mjs', runtime));
 
-const { SidecarApp, Response } = await import('sidecar_sdk').catch((error) => {
+let sdkUrl;
+try {
+  sdkUrl = import.meta.resolve('sidecar_sdk');
+} catch (error) {
   if (error.code !== 'ERR_MODULE_NOT_FOUND' || !error.message.includes("'sidecar_sdk'")) throw error;
-  return import(pathToFileURL(join(homedir(), '.gemini', 'antigravity', 'lib', 'node_modules', 'sidecar_sdk', 'index.mjs')));
-});
+  sdkUrl = pathToFileURL(join(homedir(), '.gemini', 'antigravity', 'lib', 'node_modules', 'sidecar_sdk', 'index.mjs'));
+}
+const { SidecarApp, Response } = await import(sdkUrl);
 
 if (!process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN) {
-  throw new Error('GemPT Live requires ANTIGRAVITY_SIDECAR_UI_TOKEN.');
+  throw new Error('GemPT requires ANTIGRAVITY_SIDECAR_UI_TOKEN.');
 }
 const app = new SidecarApp();
 const appServer = createAppServerManager({ observeOnly: true });
 const options = { appServer };
 const noStore = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
 
+// The SDK serves its own /preload.js with root-relative Agent API calls.
+// Expose the same host bridge with those calls scoped to this sidecar mount.
+const preloadUrl = new URL('./preload.js', sdkUrl);
+const preload = readFileSync(existsSync(preloadUrl) ? preloadUrl : new URL('../preload.js', sdkUrl), 'utf8')
+  .replace(/(['"`])\/_sidecar\//g, '$1./_sidecar/');
+app.page('/gempt-preload.js', () => new Response(preload, {
+  contentType: 'text/javascript; charset=utf-8', headers: noStore,
+}));
+
+// The gateway may serve the same page with or without a trailing slash. The
+// SDK page handler cannot see the public URL, so normalize it before loading
+// the relative assets. Keep the query (including the SDK token) and deep link.
+const normalizeEntry = `if (!location.pathname.endsWith('/')) {
+  const url = new URL(location.href);
+  url.pathname += '/';
+  history.replaceState(history.state, '', url);
+}`;
+const entryHash = createHash('sha256').update(normalizeEntry).digest('base64');
+
 app.page('/', async () => {
   const { data, type } = await readPageAsset('/');
   const html = data.toString('utf8')
-    .replace(/(<link rel="stylesheet")/, '<script src="/preload.js"></script>\n  $1');
+    .replace("script-src 'self';", `script-src 'self' 'sha256-${entryHash}';`)
+    .replace('<link rel="stylesheet"', `<script>${normalizeEntry}</script>\n  <script src="./gempt-preload.js"></script>\n  <link rel="stylesheet"`);
   return new Response(html, { contentType: type, headers: noStore });
 });
 for (const path of ['/styles.css', '/app.js']) {

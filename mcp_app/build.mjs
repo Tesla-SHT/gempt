@@ -25,7 +25,7 @@ async function writeThirdPartyLicenses(nodeModulesDir, meta) {
     "Third-Party Open Source Licenses",
     "=================================",
     "",
-    "The prebuilt GemPT Live bundle (core/assets/mcp_app_live.html) bundles code from",
+    "The prebuilt GemPT bundle (core/assets/mcp_app_live.html) bundles code from",
     "the following third-party open-source packages:",
     "",
   ];
@@ -128,7 +128,7 @@ try {
     writeFile(new URL("app.js", httpOutput), http.outputFiles[0].text, "utf8"),
   ]);
   console.log(`GemPT HTTP UI · ${Buffer.byteLength(splitHtml) + Buffer.byteLength(splitCss) + http.outputFiles[0].contents.length} bytes across HTML, CSS and JS`);
-  console.log(`GemPT Live · ${Buffer.byteLength(html)} bytes · ${pkgs.length} third-party notices`);
+  console.log(`GemPT · ${Buffer.byteLength(html)} bytes · ${pkgs.length} third-party notices`);
 } finally {
   esbuild?.stop();
   await rm(temporary, { recursive: true, force: true, maxRetries: 3 });

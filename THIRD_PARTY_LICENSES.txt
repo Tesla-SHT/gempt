@@ -1,7 +1,7 @@
 Third-Party Open Source Licenses
 =================================
 
-The prebuilt GemPT Live bundle (core/assets/mcp_app_live.html) bundles code from
+The prebuilt GemPT bundle (core/assets/mcp_app_live.html) bundles code from
 the following third-party open-source packages:
 
 --------------------------------------------------------------------------------

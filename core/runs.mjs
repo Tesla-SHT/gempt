@@ -180,7 +180,7 @@ export async function waitForRun(runId, opts) {
 export function compactReceiptText(text, sessionId) {
   const chars = Array.from(String(text || ''));
   if (chars.length <= 3200) return chars.join('');
-  const ref = sessionId ? `session_id=${sessionId} / GemPT Live` : 'GemPT Live';
+  const ref = sessionId ? `session_id=${sessionId} / GemPT` : 'GemPT';
   return `${chars.slice(0, 2176).join('').trimEnd()}\n\n...[omitted ${chars.length - 3080} chars; full output in ${ref}]...\n\n${chars.slice(-904).join('').trimStart()}`;
 }
 

@@ -128,7 +128,7 @@ export async function validatePluginBundle(staged, nodeBin, env = process.env, {
   const sidecar = JSON.parse(readFileSync(join(staged, 'sidecars', 'gempt_live', 'sidecar.json'), 'utf8'));
   if (!sidecar.has_web_ui || sidecar.command !== (portable ? 'node' : nodeBin) || sidecar.args?.[0] !== 'main.mjs'
       || !sidecar.ui_config?.views?.some(({ path, entrypoint }) => path === '/' && entrypoint === 'SIDECAR_UI_ENTRYPOINT_AUX_PANE')) {
-    throw new Error('Invalid GemPT Live sidecar manifest.');
+    throw new Error('Invalid GemPT sidecar manifest.');
   }
   if (portable) {
     const mcp = JSON.parse(readFileSync(join(staged, 'mcp_config.json'), 'utf8'));
@@ -176,7 +176,7 @@ export async function validatePluginBundle(staged, nodeBin, env = process.env, {
       throw new Error('Staged MCP server must preserve the GemPT resource and leave Antigravity entrypoints to the sidecar.');
     }
     const resource = results.get(3)?.contents?.[0];
-    if (resource?.mimeType !== APP_RESOURCE.mimeType || !resource.text) throw new Error('Staged MCP server could not read GemPT Live.');
+    if (resource?.mimeType !== APP_RESOURCE.mimeType || !resource.text) throw new Error('Staged MCP server could not read GemPT.');
     const consoleResponse = packets.find(({ id }) => id === 4);
     const consoleState = consoleResponse?.result;
     if (consoleResponse?.error || !consoleState || consoleState.isError) {

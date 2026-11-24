@@ -157,5 +157,5 @@
     ],
     "additionalProperties": false
   },
-  "report": "Answer concisely in the user's language, leading with what the result means for them. List changed files, key checks (pass/fail), and any unresolved decisions briefly — omit raw diffs, file dumps, and verbose command logs (the user already sees live output in GemPT Live). For workspace tasks discover and read all relevant files yourself in cwd and carry the assigned task through verification. Do not spawn a nested team or call GemPT again."
+  "report": "Answer concisely in the user's language, leading with what the result means for them. List changed files, key checks (pass/fail), and any unresolved decisions briefly — omit raw diffs, file dumps, and verbose command logs (the user already sees live output in GemPT). For workspace tasks discover and read all relevant files yourself in cwd and carry the assigned task through verification. Do not spawn a nested team or call GemPT again."
 }

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { serveAppServerSocket } from './app-server-fixture.mjs';
 import { once } from 'node:events';
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync,
   rmSync, utimesSync, writeFileSync } from 'node:fs';
@@ -214,7 +215,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const bridge = join(target, 'work_split_hook.py');
   assert.equal(readFileSync(bridge, 'utf8').trimEnd().split('\n').length, 7);
   assert.ok(!existsSync(join(target, 'runtime', 'gempt')));
-  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.5.0' });
+  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.5.1' });
   const bundledSkills = new URL('../plugin/skills/', import.meta.url);
   assert.deepEqual(readdirSync(bundledSkills).sort(), ['gempt', 'gempt-chore']);
   assert.deepEqual(readdirSync(join(target, 'skills')).sort(), ['gempt', 'gempt-chore']);
@@ -222,13 +223,19 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const { command, args } = config.mcpServers.gempt;
   assert.equal(command, process.execPath);
   const sidecar = JSON.parse(readFileSync(join(target, 'sidecars', 'gempt_live', 'sidecar.json'), 'utf8'));
+  const manifest = JSON.parse(readFileSync(join(target, 'plugin.json'), 'utf8'));
+  assert.equal(manifest.displayName, 'GemPT');
+  assert.equal(sidecar.display_name, 'GemPT');
+  assert.deepEqual(sidecar.ui_config, { display_name: 'GemPT', views: [
+    { path: '/', entrypoint: 'SIDECAR_UI_ENTRYPOINT_AUX_PANE', title: 'GemPT' },
+  ] });
   assert.equal(sidecar.command, command);
   assert.deepEqual(sidecar.args, ['main.mjs']);
   assert.deepEqual(args, [join(target, 'runtime', 'core', 'mcp-server.mjs')]);
   const initialized = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' },
   }) });
-  assert.equal(initialized.result.serverInfo.version, '0.5.0');
+  assert.equal(initialized.result.serverInfo.version, '0.5.1');
   const response = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'resources/read', params: { uri: APP_URI },
   }) });
@@ -448,10 +455,12 @@ test('packaged native sidecar serves shared assets and authenticates scoped APIs
   const [line] = await once(scanner, 'line', { signal: AbortSignal.timeout(5000) });
   const base = 'http://' + line.match(/listening on (127[.]0[.]0[.]1:[0-9]+)/)[1];
   const html = await fetch(base).then((response) => response.text());
-  assert.match(html, /<script src="\/preload.js"><\/script>/);
+  assert.match(html, /<script src="\.\/gempt-preload\.js"><\/script>/);
   assert.match(html, /<script type="module" src="\.\/app.js"><\/script>/);
   assert.match(html, /id="view-console"/);
-  assert.equal((await fetch(base + '/preload.js')).status, 200);
+  const preload = await fetch(base + '/gempt-preload.js');
+  assert.equal(preload.status, 200);
+  assert.match(await preload.text(), /['"]\.\/_sidecar\/get-conversation-metadata/);
   const css = await fetch(base + '/styles.css');
   assert.match(css.headers.get('content-type'), /^text\/css/);
   assert.match(await css.text(), /var\(--background/);
@@ -468,6 +477,7 @@ test('packaged native sidecar serves shared assets and authenticates scoped APIs
     assert.equal((await call('settings', { body: { codex_timeout_sec: 900 } }, '', method)).status, 401);
   }
   assert.equal((await call('summary', {}, 'bad-token')).status, 401);
+  assert.equal((await fetch(base + '/api?token=' + token + '&path=./api/summary', { method: 'POST' })).status, 200);
   assert.equal((await fetch(base + '/api')).status, 405);
   const workspaceUris = [pathToFileURL(f.cwd).href];
   const list = await call('live/runs', { workspaceUris }).then((response) => response.json());
@@ -524,16 +534,8 @@ async function appFixture(t, f, controls = {}) {
     }
     sockets.add(socket);
     socket.on('close', () => sockets.delete(socket));
-    const accept = createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
-    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
-    function frame(opcode, body) {
-      const header = body.length < 126 ? Buffer.from([0x80 | opcode, body.length])
-        : Buffer.from([0x80 | opcode, 126, body.length >> 8, body.length & 255]);
-      socket.write(Buffer.concat([header, body]));
-    }
-    const send = (data) => frame(1, Buffer.from(JSON.stringify({ jsonrpc: '2.0', ...data })));
     let activeTurn;
-    function rpc(packet) {
+    serveAppServerSocket(req, socket, (packet, send) => {
       packets.push(packet);
       const { method, id, params } = packet;
       if (method === 'initialized') return;
@@ -575,24 +577,6 @@ async function appFixture(t, f, controls = {}) {
         return;
       }
       send({ id, result });
-    }
-    let buffer = Buffer.alloc(0);
-    socket.on('data', (chunk) => {
-      buffer = Buffer.concat([buffer, chunk]);
-      while (buffer.length >= 2) {
-        const opcode = buffer[0] & 15;
-        let length = buffer[1] & 127;
-        const offset = length === 126 ? 4 : 2;
-        if (buffer.length < offset) return;
-        if (offset === 4) length = buffer.readUInt16BE(2);
-        if (buffer.length < offset + 4 + length) return;
-        const mask = buffer.subarray(offset, offset + 4);
-        const body = buffer.subarray(offset + 4, offset + 4 + length);
-        for (let i = 0; i < body.length; i++) body[i] ^= mask[i % 4];
-        buffer = buffer.subarray(offset + 4 + length);
-        if (opcode === 1) rpc(JSON.parse(body.toString('utf8')));
-        else if (opcode === 8) { frame(8, body); socket.end(); }
-      }
     });
   });
   server.listen(0, '127.0.0.1');
@@ -1045,13 +1029,13 @@ test('Live run list defaults to an empty unbound session and can list all worksp
   assert.equal(scoped.scope, 'session');
   assert.equal(scoped.unbound_session, true);
   assert.deepEqual(scoped.runs, []);
-  assert.equal(scoped.app_server.version, '0.5.0');
+  assert.equal(scoped.app_server.version, '0.5.1');
 
   const { structuredContent: all } = await callAppTool('gempt_app_runs', { scope: 'all' }, opts);
   assert.equal(all.scope, 'all');
   assert.equal(all.unbound_session, false);
   assert.deepEqual(all.runs.map(({ run_id }) => run_id).sort(), [first, second]);
-  assert.equal(all.app_server.version, '0.5.0');
+  assert.equal(all.app_server.version, '0.5.1');
 });
 
 test('Live binds normalized workspaces and never selects another run for a filtered explicit ID', async (t) => {
@@ -1205,7 +1189,7 @@ test('standalone NDJSON MCP keeps the GemPT resource and app-only tools without 
   const started = await request('initialize', { protocolVersion: '2026-test' });
   assert.equal(started.result.protocolVersion, '2026-test');
   assert.equal(started.result.serverInfo.name, 'gempt');
-  assert.equal(started.result.serverInfo.version, '0.5.0');
+  assert.equal(started.result.serverInfo.version, '0.5.1');
   send({ method: 'notifications/initialized' });
   assert.deepEqual((await request('ping')).result, {});
   const { tools } = (await request('tools/list')).result;

@@ -2,19 +2,19 @@
   "command": "node",
   "args": ["main.mjs"],
   "restart_policy": "always",
-  "display_name": "GemPT Live",
+  "display_name": "GemPT",
   "description": "Follow and control GemPT runs and open the GemPT Console.",
   "has_web_ui": true,
   "agent_permissions": {
     "allows_user_interactions": false
   },
   "ui_config": {
-    "display_name": "GemPT Live",
+    "display_name": "GemPT",
     "views": [
       {
         "path": "/",
         "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
-        "title": "GemPT Live"
+        "title": "GemPT"
       }
     ]
   }

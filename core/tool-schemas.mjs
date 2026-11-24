@@ -19,7 +19,7 @@ export const TOOLS = [
       workspace: { type: 'string', enum: ['inherit', 'share'], default: 'inherit',
         description: "'share' creates/reuses an isolated git worktree bound to session_id." },
       session_id: { type: 'string', description: 'Optional GPT session_id to continue.' },
-      title: { type: 'string', description: 'Optional short title for GemPT Live.' },
+      title: { type: 'string', description: 'Optional short title for GemPT.' },
       tier: { type: 'string', description: 'Optional explicit Codex tier.' },
       timeout_sec: { type: 'number', minimum: 30, maximum: 7200,
         description: 'Execution timeout in seconds (30–7200, default 3600; excludes waiting_gemini time).' },
@@ -37,7 +37,7 @@ export const TOOLS = [
       session_id: { type: 'string', description: 'Optional consult session_id to continue.' },
     }, ['goal']),
   tool('gpt_ctl',
-    'Control runs (steer/interrupt/reply) or read a compact status snapshot (<=500B, no polling). Open the native GemPT Live panel at sidecar://gempt/gempt_live/.',
+    'Control runs (steer/interrupt/reply) or read a compact status snapshot (<=500B, no polling). Open the native GemPT panel at sidecar://gempt/gempt_live/.',
     {
       action: { type: 'string', enum: ['status', 'steer', 'interrupt', 'reply'], default: 'status',
         description: 'Control action (default: status).' },
@@ -45,7 +45,7 @@ export const TOOLS = [
       message: { type: 'string', description: 'Steering message (steer) or answer text (reply).' },
       call_id: { type: 'string', description: 'Pending ask_gemini call_id (reply only).' },
       host_conversation_id: { type: 'string', description: 'Optional Antigravity conversation ID for status.' },
-      scope: { type: 'string', enum: ['session', 'all'], default: 'session', description: 'Run listing scope for status / GemPT Live.' },
+      scope: { type: 'string', enum: ['session', 'all'], default: 'session', description: 'Run listing scope for status / GemPT.' },
     }, undefined, LIVE_META),
   ...Object.values(APP_TOOLS),
 ];

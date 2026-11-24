@@ -63,7 +63,7 @@ const ACTIVITY_QUERY = shape({
 
 export const APP_TOOLS = Object.fromEntries([
   ...Object.entries(LIVE_OPERATIONS).filter(([name]) => name !== 'open').map(([name, schema]) =>
-    tool(`gempt_app_${name}`, `GemPT Live: ${name}.`, schema.properties, schema.required)),
+    tool(`gempt_app_${name}`, `GemPT: ${name}.`, schema.properties, schema.required)),
   tool('gempt_app_summary', 'Read the cached routing and connection summary.', {}),
   tool('gempt_app_magpie_status', 'Refresh the Magpie connection status.', { force: BOOL }),
   tool('gempt_app_active_runs', 'Read current run and app-server status.', {}),
@@ -87,12 +87,12 @@ export function readAppResource({ env = process.env } = {}) {
     if (cachedResource?.version === version) {
       return { contents: [{ ...APP_RESOURCE, text: cachedResource.html }] };
     }
-    if (size >= MAX_HTML) throw new Error('GemPT Live HTML must be smaller than 10 MiB.');
+    if (size >= MAX_HTML) throw new Error('GemPT HTML must be smaller than 10 MiB.');
     const byteLength = Number(size);
     const raw = Buffer.alloc(byteLength);
     const bytes = readSync(fd, raw, 0, byteLength, 0);
     const html = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(raw.subarray(0, bytes));
-    if (!html.trim()) throw new Error('GemPT Live HTML must be non-empty.');
+    if (!html.trim()) throw new Error('GemPT HTML must be non-empty.');
     cachedResource = { version, html };
     return { contents: [{ ...APP_RESOURCE, text: html }] };
   } finally {
@@ -142,7 +142,7 @@ export async function callAppTool(name, args = {}, opts = {}) {
   const operation = live ? 'open' : name.slice('gempt_app_'.length);
   if (Object.hasOwn(LIVE_OPERATIONS, operation) && (live || name.startsWith('gempt_app_'))) {
     const data = await runLiveOperation(operation, args, options);
-    return result(live ? 'Opened GemPT Live.' : 'GemPT Live.', data);
+    return result(live ? 'Opened GemPT.' : 'GemPT.', data);
   }
   const schema = APP_TOOLS[name]?.inputSchema;
   if (!schema) throw new Error(`Unknown tool: ${name}`);

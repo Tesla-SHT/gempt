@@ -1,14 +1,15 @@
-// Run from the repo root after npm run build:mcp-app. Requires local Chrome.
+// Run from the repo root after npm run build:mcp-app. Requires Chrome and the Antigravity Sidecar SDK.
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
-import { createServer } from 'node:http';
+import { createServer, request } from 'node:http';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { serveAppServerSocket } from './app-server-fixture.mjs';
 import { handleTool } from '../core/mcp-server.mjs';
 import { updateHostContext } from '../core/host-context.mjs';
 import { runDirectory, saveRun } from '../core/runs.mjs';
@@ -35,16 +36,22 @@ const tokenKeys = ['background-primary', 'background-secondary', 'background-ter
   'text-secondary', 'text-tertiary', 'border-primary', 'border-secondary'];
 const calls = [];
 const requests = [];
-let consoleServer, chrome, ws, sidecarChild, sidecarUrl;
+let consoleServer, chrome, ws, sidecarChild, sidecarOrigin;
 let gatewayDelay = 0;
 const sidecarWorkspace = join(root, 'Sidecar workspace');
 const sidecarRunId = 'b'.repeat(32);
 const sidecarToken = 'browser-fixture-token';
+const sidecarPrefix = '/sidecar/gempt/gempt_live';
+const magpiePrefix = '/magpie/gempt';
+const sidecarRequests = [];
+const controlPackets = [];
+const controlSockets = new Set();
+const codexToken = 'browser-codex-fixture';
 const appHtml = readFileSync(new URL('../core/assets/mcp_app_live.html', import.meta.url));
 const priorRunId = 'd'.repeat(32);
 const appPath = join(root, 'app-server.json');
 const env = { ...process.env, GEMPT_CONFIG: configPath, GEMPT_SESSIONS_DIR: sessionsDir,
-  MAGPIE_CONFIG_DIR: magpieConfigDir, GEMPT_APP_SERVER_STATE: appPath };
+  MAGPIE_CONFIG_DIR: magpieConfigDir, GEMPT_APP_SERVER_STATE: appPath, GEMPT_AGY_BRAIN_DIR: brainDir };
 process.env.GEMPT_AGY_BRAIN_DIR = brainDir;
 
 function hostHtml(theme) {
@@ -76,6 +83,26 @@ function hostHtml(theme) {
 }
 
 const backend = createServer(async (req, res) => {
+  const incoming = new URL(req.url, 'http://' + req.headers.host);
+  for (const [prefix, origin] of [
+    [sidecarPrefix, sidecarOrigin],
+    [magpiePrefix, consoleServer && `http://127.0.0.1:${consoleServer.port}`],
+  ]) {
+    if (!origin || (incoming.pathname !== prefix && !incoming.pathname.startsWith(prefix + '/'))) continue;
+    const path = (incoming.pathname.slice(prefix.length) || '/') + incoming.search;
+    const headers = { ...req.headers, host: new URL(origin).host };
+    if (headers.origin === incoming.origin) headers.origin = origin;
+    const proxy = request(origin + path, { method: req.method, headers }, (upstream) => {
+      if (prefix === sidecarPrefix) {
+        sidecarRequests.push({ publicPath: incoming.pathname, path, method: req.method, authenticated: headers['x-sidecar-token'] === sidecarToken,
+          status: upstream.statusCode });
+      }
+      res.writeHead(upstream.statusCode, upstream.headers);
+      upstream.pipe(res);
+    });
+    proxy.on('error', (error) => { res.writeHead(502).end(error.message); });
+    return req.pipe(proxy);
+  }
   res.setHeader('Content-Type', 'application/json');
   if (req.url === '/v1/models') {
     if (gatewayDelay) await sleep(gatewayDelay);
@@ -96,9 +123,12 @@ const backend = createServer(async (req, res) => {
       return res.end(JSON.stringify({ isError: true, content: [{ type: 'text', text: error.message }] }));
     }
   }
-  if (req.url === '/native-host' && sidecarUrl) {
+  if (incoming.pathname === '/native-host' && sidecarOrigin) {
+    const bare = incoming.searchParams.has('bare');
+    const src = sidecarPrefix + (bare ? '' : '/') + '?token=' + sidecarToken
+      + '&amp;theme=dark&amp;conversationId=' + host + (bare ? '#live/' + runId : '');
     res.setHeader('Content-Type', 'text/html');
-    return res.end(`<!doctype html><iframe id="sidecar" src="${sidecarUrl}" style="position:fixed;inset:0;border:0;width:100%;height:100%"></iframe>
+    return res.end(`<!doctype html><link rel="icon" href="data:,"><iframe id="sidecar" src="${src}" style="position:fixed;inset:0;border:0;width:100%;height:100%"></iframe>
       <script>
       const frame = document.getElementById('sidecar');
       window.addEventListener('message', (event) => {
@@ -114,8 +144,23 @@ const backend = createServer(async (req, res) => {
       };
       </script>`);
   }
-  res.setHeader('Content-Type', 'text/html');
-  return res.end(hostHtml(new URL(req.url, 'http://localhost').searchParams.get('theme') || 'dark'));
+  if (incoming.pathname === '/') {
+    res.setHeader('Content-Type', 'text/html');
+    return res.end(hostHtml(incoming.searchParams.get('theme') || 'dark'));
+  }
+  res.writeHead(404).end('Not found');
+});
+
+backend.on('upgrade', (req, socket) => {
+  assert.equal(req.url, '/codex');
+  assert.equal(req.headers.authorization, 'Bearer ' + codexToken);
+  controlSockets.add(socket);
+  socket.on('close', () => controlSockets.delete(socket));
+  serveAppServerSocket(req, socket, ({ id, method, params }, send) => {
+    if (method === 'initialized') return;
+    if (method !== 'initialize') controlPackets.push({ method, params });
+    send({ id, result: {} });
+  });
 });
 
 function seed(url) {
@@ -128,7 +173,8 @@ function seed(url) {
     tiers: { sonnet: { consult_model: model, exec_model: model, reasoning_effort: 'medium' },
       opus: { consult_model: model, exec_model: model, reasoning_effort: 'high' } },
   }));
-  writeFileSync(appPath, JSON.stringify({ status: 'running', pid: process.pid, ws_url: 'ws://127.0.0.1:1', gateway_url: url }));
+  writeFileSync(appPath, JSON.stringify({ status: 'running', pid: process.pid,
+    ws_url: url.replace('http:', 'ws:') + '/codex', auth_header: 'Authorization', auth_token: codexToken, gateway_url: url }));
   const records = [];
   const titles = ['控制台路由回归检查', '分析会话统计的来源', '请求时间范围与分页', '核对模型配对', '修复任务列表焦点', '梳理重试与终态', '只读审查工作区'];
   for (const [i, title] of titles.entries()) {
@@ -211,15 +257,22 @@ try {
   consoleServer.server.on('request', (req) => requests.push(req.url));
 
   const sdk = join(homedir(), '.gemini', 'antigravity', 'lib', 'node_modules', 'sidecar_sdk');
-  if (existsSync(join(sdk, 'index.mjs'))) {
+  assert.ok(existsSync(join(sdk, 'index.mjs')), 'The Antigravity Sidecar SDK is required for the native gateway regression');
+  {
+    const agentApi = join(root, 'agentapi-fixture');
+    writeFileSync(agentApi, `#!/usr/bin/env node
+const [subcommand, action, id] = process.argv.slice(2);
+if (subcommand !== 'agentapi' || action !== 'get-conversation-metadata' || id !== ${JSON.stringify(host)}) process.exit(1);
+console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { projectId: 'browser-project' } } } }));
+`, { mode: 0o755 });
     // Launch the source sidecar without --import to exercise its installed SDK lookup.
     const entry = fileURLToPath(new URL('../plugin/sidecars/gempt_live/main.mjs', import.meta.url));
     sidecarChild = spawn(process.execPath, [entry], { cwd: dirname(entry), env: { ...env,
       ANTIGRAVITY_LS_ADDRESS: '127.0.0.1:0', ANTIGRAVITY_CSRF_TOKEN: 'fixture', ANTIGRAVITY_CONVERSATION_ID: host,
+      ANTIGRAVITY_AGENTAPI_EXE: agentApi,
       ANTIGRAVITY_SIDECAR_WEB_PORT: '0', ANTIGRAVITY_SIDECAR_UI_TOKEN: sidecarToken }, stdio: ['ignore', 'pipe', 'inherit'] });
     const [line] = await once(createInterface({ input: sidecarChild.stdout }), 'line', { signal: AbortSignal.timeout(5000) });
-    sidecarUrl = 'http://' + line.match(/listening on (127[.]0[.]0[.]1:[0-9]+)/)[1]
-      + '/?token=' + sidecarToken + '&theme=dark';
+    sidecarOrigin = 'http://' + line.match(/listening on (127[.]0[.]0[.]1:[0-9]+)/)[1];
   }
 
   chrome = spawn(process.env.CHROME || 'google-chrome', ['--headless=new', '--no-sandbox', '--disable-gpu',
@@ -235,6 +288,7 @@ try {
 
   const errors = [];
   const external = [];
+  const notFound = [];
   const contexts = new Map();
   const responses = new Map();
   let num = 0;
@@ -246,8 +300,9 @@ try {
     else if (method === 'Runtime.exceptionThrown') errors.push(params.exceptionDetails.exception?.description || params.exceptionDetails.text);
     else if (method === 'Runtime.consoleAPICalled' && params.type === 'error') errors.push(params.args.map(arg => arg.value).join(' '));
     else if (method === 'Log.entryAdded' && params.entry.level === 'error') errors.push(params.entry.text);
+    else if (method === 'Network.responseReceived' && params.response.status === 404) notFound.push(params.response.url);
     else if (method === 'Network.requestWillBeSent' && /^https?:/.test(params.request.url)
-      && ![url, new URL(standaloneUrl).origin, sidecarUrl && new URL(sidecarUrl).origin].includes(new URL(params.request.url).origin)) external.push(params.request.url);
+      && ![url, new URL(standaloneUrl).origin].includes(new URL(params.request.url).origin)) external.push(params.request.url);
     const pair = responses.get(id);
     if (pair) {
       responses.delete(id);
@@ -276,8 +331,10 @@ try {
     await cdp('Page.navigate', { url: target });
     contextId = await until(async () => {
       const { frameTree } = await cdp('Page.getFrameTree');
-      const expected = target.endsWith('/native-host') ? sidecarUrl : url + '/app';
-      const frame = embedded ? frameTree.childFrames?.find(child => child.frame.url === expected)?.frame : frameTree.frame;
+      const native = new URL(target).pathname === '/native-host';
+      const frame = embedded ? frameTree.childFrames?.find(({ frame }) => native
+        ? frame.url.startsWith(url + sidecarPrefix)
+        : frame.url === url + '/app')?.frame : frameTree.frame;
       return frame && contexts.get(frame.id);
     }, target);
   }
@@ -454,7 +511,7 @@ try {
   await until(() => evaluate("return $('reply-status').textContent === '已发送回复。';"), 'Magpie Live reply over HTTP');
   assert.equal(JSON.parse(readFileSync(join(runPath, 'tool_replies', 'ask_1.json'))).answer, 'HTTP 可以继续。');
   assert.ok(requests.some(path => path.startsWith('/api/sessions?')));
-  if (sidecarUrl) {
+  {
     mkdirSync(sidecarWorkspace);
     saveRun(join(runDirectory(sidecarRunId, sessionsDir), 'state.json'), {
       run_id: sidecarRunId, session_id: 'exec-other-workspace', title: '另一个工作区',
@@ -463,6 +520,7 @@ try {
     await open(url + '/native-host', 460, 820, true);
     await until(() => evaluate(`return !!document.querySelector('.session-card[data-run-id="${runId}"]');`), 'native Live starts in the active conversation and project');
     assert.equal(await evaluate("return $('tab-live').getAttribute('aria-selected');"), 'true');
+    assert.equal(await evaluate('return window.sidecar.conversationId;'), host);
     assert.equal(await evaluate("return getComputedStyle(document.body).backgroundColor;"), 'rgb(23, 24, 27)');
     assert.equal(await evaluate(`return !!document.querySelector('.session-card[data-run-id="${sidecarRunId}"]');`), false);
     await shot('agy-native-live-dark');
@@ -478,21 +536,70 @@ try {
       const state = await evaluate("return { toast: $('toast-message').textContent, chip: document.querySelector('#ask-media .file-chip').outerHTML };");
       throw new Error(`${error.message} · ${JSON.stringify({ expectedPreview, preview: await preview(), state })}`);
     });
+    await evaluate("$('steer').value = 'Continue with the gateway check.'; $('steer').dispatchEvent(new Event('input')); $('send-steer').click();");
+    await until(() => evaluate("return $('control-status').textContent === '已发送纠偏指令';"), 'native authenticated steer');
+    await click('interrupt');
+    assert.equal(await evaluate("return $('interrupt').textContent;"), '确认中止');
+    await click('interrupt');
+    await until(() => evaluate("return $('control-status').textContent === '已请求中止当前回合';"), 'native authenticated interrupt');
+    assert.deepEqual(controlPackets, [
+      { method: 'turn/steer', params: { threadId: 'console-codex-thread', expectedTurnId: 'verification-turn',
+        input: [{ type: 'text', text: 'Continue with the gateway check.' }] } },
+      { method: 'turn/interrupt', params: { threadId: 'console-codex-thread', turnId: 'verification-turn' } },
+    ]);
+    rmSync(join(runPath, 'tool_replies', 'ask_1.json'));
+    await evaluate("$('reply-message').value = '可以通过侧栏继续。'; $('reply-message').dispatchEvent(new Event('input')); $('send-reply').click();");
+    await until(() => evaluate("return $('reply-status').textContent === '已发送回复。';"), 'native authenticated reply');
+    assert.equal(JSON.parse(readFileSync(join(runPath, 'tool_replies', 'ask_1.json'))).answer, '可以通过侧栏继续。');
     await click('tab-overview');
-    await until(() => evaluate("return $('view-console').classList.contains('gp-ready') && !$('token-ratio-card').hidden;"), 'native Console');
+    await until(() => evaluate(`return $('view-console').classList.contains('gp-ready') && !$('token-ratio-card').hidden
+      && $('magpie-status').dataset.state === 'online' && Number.parseFloat($('token-ratio-gpt-bar').style.width) > 0;`), 'native Console and token data');
+    await evaluate("document.querySelector('[data-ratio-range=\"7d\"]').click();");
+    await until(() => evaluate("return $('token-ratio-title').textContent.includes('7 天') && !$('token-ratio-card').hidden;"), 'native token range change');
     await evaluate("document.querySelector('[data-timeout=\"1800\"]').click();");
     await until(() => evaluate("return document.querySelector('[data-timeout=\"1800\"]').getAttribute('aria-pressed') === 'true';"), 'native Settings via sidecar auth');
     assert.equal(JSON.parse(readFileSync(configPath)).codex.timeout_sec, 1800);
     await shot('agy-native-console-dark');
+    for (const tab of ['requests', 'sessions']) {
+      await click('tab-' + tab);
+      await until(() => evaluate(`return !!document.querySelector('#${tab} [data-activity-id]');`), 'native ' + tab);
+      await evaluate(`document.querySelector('#${tab} [data-activity-id]').click();`);
+      await until(() => evaluate(`return !!document.querySelector('#${tab}-detail .activity-detail-head');`), 'native ' + tab + ' detail');
+    }
     await cdp('Runtime.evaluate', { contextId: hostContextId,
       expression: `setWorkspace([${JSON.stringify(pathToFileURL(sidecarWorkspace).href)}])` });
     await click('tab-live');
     await until(() => evaluate(`return !!document.querySelector('.session-card[data-run-id="${sidecarRunId}"]');`), 'native workspace-change refresh');
     assert.equal(await evaluate(`return !!document.querySelector('.session-card[data-run-id="${runId}"]');`), false);
+
+    await open(url + '/native-host?bare', 460, 820, true);
+    await until(() => evaluate("return $('detail-title').textContent === '核对双端控制台与迁移';"), 'native slashless entry and deep-linked run');
+    assert.equal(await evaluate('return location.pathname + location.search + location.hash;'),
+      sidecarPrefix + '/?token=' + sidecarToken + '&theme=dark&conversationId=' + host + '#live/' + runId);
+    assert.ok(sidecarRequests.some(({ publicPath, status }) => publicPath === sidecarPrefix && status === 200),
+      'gateway served the slashless HTML directly');
+    for (const asset of ['gempt-preload.js', 'styles.css', 'app.js']) {
+      assert.ok(sidecarRequests.some(({ path, method, status }) => path === '/' + asset && method === 'GET' && status === 200), asset);
+    }
+    const apiRequests = sidecarRequests.filter(({ path }) => path === '/api');
+    assert.ok(apiRequests.length > 0 && apiRequests.every(({ method, authenticated, status }) =>
+      method === 'POST' && authenticated && status === 200), 'native reads and mutations use authenticated POSTs');
+    const metadataRequests = sidecarRequests.filter(({ path }) => path === '/_sidecar/get-conversation-metadata');
+    assert.equal(metadataRequests.length, 2, 'each navigation triggers the SDK metadata request under the prefix');
+    assert.ok(metadataRequests.every(({ method, authenticated, status }) =>
+      method === 'POST' && authenticated && status === 200), 'SDK metadata requests use authenticated POSTs');
   }
+
+  await open(url + magpiePrefix + '/?theme=dark', 900, 820, false);
+  await until(() => evaluate("return $('magpie-status')?.dataset.state === 'online' && !$('token-ratio-card')?.hidden;"), 'Magpie Console through a prefix');
+  await evaluate("document.querySelector('[data-timeout=\"3600\"]').click();");
+  await until(() => evaluate("return document.querySelector('[data-timeout=\"3600\"]').getAttribute('aria-pressed') === 'true';"), 'Magpie settings through a prefix');
+  assert.equal(JSON.parse(readFileSync(configPath)).codex.timeout_sec, 3600);
+
+  assert.deepEqual(notFound, [], 'Chrome received no 404 responses');
   assert.deepEqual(errors, [], 'Chrome console and uncaught errors');
   assert.deepEqual(external, [], 'No external asset or network requests');
-  console.log('Chrome OK · 360–1440px · HTTP, MCP App and native Sidecar, four tabs, lazy startup, bidirectional links, round switching, hash, replies, CSV, settings and copy dialog');
+  console.log('Chrome OK · Magpie HTTP, MCP App and prefixed native Sidecar (both entry URLs) · four tabs, details, token ratio, settings, reply, steer and interrupt · 0 HTTP 404s, 0 console errors');
   chrome.kill();
   await exited;
 } finally {
@@ -508,6 +615,7 @@ try {
     await exited;
   }
   await consoleServer?.close();
+  for (const socket of controlSockets) socket.destroy();
   backend.closeAllConnections();
   await new Promise(resolve => backend.close(resolve));
   rmSync(root, { recursive: true, force: true, maxRetries: 3 });
