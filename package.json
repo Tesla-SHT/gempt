@@ -1,6 +1,6 @@
 {
   "name": "gempt",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Antigravity MCP orchestration with Gemini-to-Codex pairing and Magpie direct routing groups for other clients.",
   "author": {
     "name": "yizhang-dream",
@@ -27,7 +27,7 @@
   "files": [
     "bin/gempt.mjs",
     "core/**/*.mjs",
-    "core/assets/*",
+    "core/assets/**/*",
     "magpie_plugin/index.mjs",
     "magpie_plugin/lib/*.mjs",
     "magpie_plugin/page/*.{html,js,svg}",
@@ -39,6 +39,7 @@
     "plugin/hooks.json",
     "plugin/work_split_hook.mjs",
     "plugin/assets/**/*",
+    "plugin/sidecars/**/*",
     "plugin/rules/AGENTS.md",
     "plugin/agents/*.md",
     "plugin/skills/*/SKILL.md",

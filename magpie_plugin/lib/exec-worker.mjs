@@ -19,7 +19,7 @@ try {
     const tools = createExecutionTools({ ...host, execRunFile: file, newExecSession: record.session_id });
     const result = await withLock(join(host.sessionsDir, `${record.session_id}.node.lock`),
       () => tools.exec.execute({ ...args, run_id: record.run_id }, { agent }),
-      { attempts: 240, delayMs: 25, staleMs: lockStaleMsForBudget(Number(args?.timeout_sec) || 3600) });
+      { attempts: 240, delayMs: 25, staleMs: lockStaleMsForBudget(record.execution_timeout_sec) });
     outcome = { state: 'finished', result };
   }
 } catch (err) {

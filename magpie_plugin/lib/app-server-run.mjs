@@ -11,13 +11,13 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
   let deadline = start + timeoutSec * 1000;
   let pausedAt = null;
   let pausedMs = 0;
-  let timerArmed = false;
+  let observeTurn;
+  const observedTurn = new Promise((resolve) => { observeTurn = resolve; });
   const remaining = () => Math.max(1, deadline - (pausedAt ?? Date.now()));
   const directory = dirname(runFile);
   const record = JSON.parse(readFileSync(runFile, 'utf8'));
-  if (Number.isFinite(record.deadline)) {
-    record.deadline = Math.max(record.deadline, deadline / 1000 + 60);
-  }
+  record.execution_timeout_sec = timeoutSec;
+  record.deadline = deadline / 1000;
   const state = readAppServerState(configPath, env);
   if (state.gateway_url?.replace(/\/+$/, '') !== gatewayUrl) {
     throw new Error('共享 codex app-server 的 Magpie 网关与 GemPT 配置不一致。');
@@ -45,7 +45,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
   const armTimeout = () => {
     clearTimeout(timeout);
     timeout = undefined;
-    if (!timerArmed || pausedAt !== null || terminal) return;
+    if (pausedAt !== null || terminal) return;
     timeout = setTimeout(() => fail(new Error(`Codex turn timed out after ${timeoutSec}s.`)), remaining());
   };
   const finishPause = () => {
@@ -56,7 +56,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     deadline += deltaMs;
     record.waiting_since = null;
     record.waiting_gemini_sec = Math.round((pausedMs / 1000) * 1000) / 1000;
-    if (Number.isFinite(record.deadline)) record.deadline += deltaMs / 1000;
+    record.deadline = deadline / 1000;
   };
   const notifyTerminal = (turn) => {
     terminal = turn;
@@ -119,6 +119,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
   };
 
   const onEvent = ({ method, params = {}, id, ...extra }) => {
+    if (method === 'turn/diff/updated' && id === undefined) return;
     // Shared codex app-server broadcasts thread/started to all clients. Never overwrite
     // progress.thread_id from broadcasts — bind strictly from thread/start|resume RPC response.
     if (method === 'thread/started') {
@@ -135,12 +136,16 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     const eventTurn = params.turnId ?? params.turn?.id;
     const sameTurn = !eventTurn || !progress.turn_id || eventTurn === progress.turn_id;
     if (acceptTurn && related && sameTurn && eventTurn) {
-      if (method === 'turn/started' || method === 'item/tool/call') observedTurnId = eventTurn;
-      else if (method === 'turn/completed') notifyTerminal(params.turn);
+      if (method === 'turn/started' || method === 'turn/completed'
+          || (id !== undefined && method === 'item/tool/call' && params.tool === 'ask_gemini')) {
+        observedTurnId = eventTurn;
+        observeTurn(eventTurn);
+      }
+      if (method === 'turn/completed') notifyTerminal(params.turn);
     }
     appendFileSync(join(directory, 'events.jsonl'), JSON.stringify({ method, params, id, ...extra }) + '\n');
     if (id !== undefined) {
-      if (!related || !sameTurn || terminal) {
+      if (!acceptTurn || !related || !sameTurn || terminal) {
         client.reject(id);
       } else if (method === 'item/tool/call') {
         if (params.tool === 'ask_gemini' && /^[A-Za-z0-9_-]{1,200}$/.test(params.callId)) {
@@ -159,7 +164,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     if (!acceptTurn || !related || !sameTurn) return;
     switch (method) {
       case 'turn/started':
-        progress.phase = 'running';
+        if (pausedAt === null) progress.phase = 'running';
         identity(params.threadId, eventTurn);
         break;
       case 'turn/completed':
@@ -223,9 +228,6 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     identity(thread.thread.id);
 
     acceptTurn = true;
-    const result = await client.request('turn/start', { threadId: progress.thread_id, input: textInput(prompt), model, effort,
-      cwd, approvalPolicy, sandboxPolicy: { type: SANDBOX_TYPES[sandbox] } }, remaining());
-    identity(progress.thread_id, result.turn.id);
     poll = setInterval(() => {
       try {
         const [id, pending] = tools.entries().next().value || [];
@@ -239,8 +241,13 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
         if (!['ENOENT', 'EPERM', 'EBUSY'].includes(err.code)) fail(err);
       }
     }, 100);
-    timerArmed = true;
     armTimeout();
+    // A matching turn event proves start even when the RPC acknowledgement is delayed.
+    // The short RPC timer can only fail startup before that proof arrives.
+    const acknowledgement = client.request('turn/start', { threadId: progress.thread_id, input: textInput(prompt), model, effort,
+      cwd, approvalPolicy, sandboxPolicy: { type: SANDBOX_TYPES[sandbox] } }, 15_000).then(({ turn }) => turn.id);
+    const startedTurnId = await Promise.race([observedTurn, acknowledgement, completion.then((turn) => turn.id)]);
+    identity(progress.thread_id, startedTurnId);
     const turn = await completion;
     if (turn.status === 'interrupted') throw new TurnInterrupted('Codex turn interrupted.');
     if (turn.status !== 'completed') throw new Error(turn.error?.message || `Codex turn ${turn.status}.`);

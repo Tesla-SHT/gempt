@@ -14,7 +14,7 @@
 import { readNativeRun, startNativeRun, waitForNativeRun } from './native-runs.mjs';
 import { findCodexCli } from './app-server-manager.mjs';
 import { runAppServer, TurnInterrupted } from './app-server-run.mjs';
-import { listActiveRoster, validateExecTimeoutSec } from '../../core/runs.mjs';
+import { listActiveRoster } from '../../core/runs.mjs';
 import { validateSessionId } from '../../core/state.mjs';
 import { TOOLS } from '../../core/tool-schemas.mjs';
 import { getMcpEffort, getPairing } from '../../core/config.mjs';
@@ -57,7 +57,7 @@ import {
 import {
   buildEscalationSuggestion,
   classifyTaskEffort,
-  effortTimeoutFloor,
+  DEFAULT_EXEC_TIMEOUT_SEC, effortTimeoutFloor, resolveExecTimeoutSec,
   isAstraModel,
 } from './routing.mjs';
 
@@ -566,7 +566,7 @@ async function resolveRuntimeConfig({ configPath, tierForProbe, allowUtilityOnly
     cfg: {
       version: 1,
       magpie: { base_url: baseUrl },
-      codex: { default_sandbox: 'workspace-write', timeout_sec: 600 },
+      codex: { default_sandbox: 'workspace-write', timeout_sec: DEFAULT_EXEC_TIMEOUT_SEC },
       routing_policy: { default_tier: 'sonnet', failover_mode: 'subscription_only' },
       tiers: synthTiers,
       utility: { ...DEFAULT_UTILITY, model: utilityModel },
@@ -1200,13 +1200,7 @@ export function createExecutionTools({
           isResume: Boolean(priorSession) && !sandboxUpgraded,
         });
 
-        const explicitTimeout = validateExecTimeoutSec(args?.timeout_sec);
-        const timeoutSec = explicitTimeout !== undefined
-          ? explicitTimeout
-          : Math.max(
-            Number(runtime.cfg?.codex?.timeout_sec) || 600,
-            effortTimeoutFloor(effort, { mode: 'exec' }),
-          );
+        const timeoutSec = resolveExecTimeoutSec({ codex: runtime.cfg?.codex, timeoutSec: args.timeout_sec, effort });
 
         if (runtime.cfg?.codex?.extra_args?.length) throw new Error('Unrestricted Codex extra_args conflict with gateway and sandbox enforcement.');
         const sessionId = priorSession?.session_id || newExecSession;

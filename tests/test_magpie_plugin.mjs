@@ -1,3 +1,4 @@
+import { Worker } from 'node:worker_threads';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -48,13 +49,15 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files, version }] = JSON.parse(stdout);
-  assert.equal(version, '0.4.1');
+  assert.equal(version, '0.5.0');
   const paths = files.map((file) => file.path);
   assert.deepEqual(paths.filter((path) => /^plugin\/skills\/[^/]+\/SKILL\.md$/.test(path)).sort(),
     ['plugin/skills/gempt-chore/SKILL.md', 'plugin/skills/gempt/SKILL.md']);
   for (const path of ['LICENSE', 'THIRD_PARTY_LICENSES.txt', 'README.en.md', 'plugin/README.md', 'plugin/assets/logo.svg', 'scripts/build-agy-plugin.mjs', 'plugin/hooks.json', 'magpie_plugin/lib/backend.mjs',
     'bin/gempt.mjs', 'plugin/work_split_hook.mjs', 'core/agy-install.mjs', 'core/mcp-server.mjs',
-    'core/host-context.mjs', 'core/wait.mjs', 'core/assets/mcp_app_live.html', 'core/assets/workload.json']) {
+    'core/host-context.mjs', 'core/wait.mjs', 'core/assets/mcp_app_live.html', 'core/assets/workload.json',
+    'core/assets/http-ui/index.html', 'core/assets/http-ui/styles.css', 'core/assets/http-ui/app.js',
+    'plugin/sidecars/gempt_live/sidecar.json', 'plugin/sidecars/gempt_live/main.mjs']) {
     assert.ok(paths.includes(path), path);
   }
   const roots = /^(?:LICENSE(?:\.md)?$|THIRD_PARTY_LICENSES\.txt$|README(?:\.en)?\.md$|install\.(?:sh|ps1)$|package\.json$|(?:bin|core|magpie_plugin|mcp_app|plugin|scripts|templates)\/)/;
@@ -64,29 +67,74 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
   assert.ok(!existsSync(join(REPO_ROOT, 'mcp_app', 'node_modules')));
 });
 
-test('UI assets and API requests resolve relative to the direct and proxied page', async () => {
+test('shared Console adapters preserve relative HTTP paths, authentication and exact MCP arguments', async () => {
+  const { createHttpTransport } = await import('../magpie_plugin/ui/http.js');
+  const { createConsoleTransport } = await import('../mcp_app/console-transport.js');
   const html = readFileSync(join(REPO_ROOT, 'magpie_plugin', 'ui', 'index.html'), 'utf-8');
-  const script = readFileSync(join(REPO_ROOT, 'magpie_plugin', 'ui', 'app.js'), 'utf-8');
-  const style = html.match(/<link rel="stylesheet" href="([^"]+)"/)?.[1];
-  const app = html.match(/<script src="([^"]*app\.js)"/)?.[1];
-  assert.equal(style, './styles.css');
-  assert.equal(app, './app.js');
-  const fetchSource = script.match(/  async function apiFetch\([\s\S]+?\r?\n  }/)?.[0];
-  assert.ok(fetchSource);
+  assert.match(html, /<link rel="stylesheet" href="\.\/styles\.css">/);
+  assert.doesNotMatch(html, /<script/);
+  const query = { q: 'a/b', offset: 0, limit: 25 };
+  const settings = { native_swarm: false, swarm_shell_model: 'gemini-3.8-flash-low', codex_timeout_sec: 1800 };
   for (const base of ['http://127.0.0.1:3498/', 'https://magpie.invalid/service/gempt/']) {
-    assert.equal(new URL(style, base).href, `${base}styles.css`);
-    assert.equal(new URL(app, base).href, `${base}app.js`);
-    const apiFetch = runInNewContext(`${fetchSource}\napiFetch`, {
-      apiKey: 'test-key',
-      fetch(path, options) {
-        assert.equal(path, './api/requests?q=a%2Fb');
-        assert.equal(new URL(path, base).href, `${base}api/requests?q=a%2Fb`);
-        assert.equal(options.headers['x-gempt-key'], 'test-key');
-        return { status: 200 };
-      },
+    let request;
+    const transport = createHttpTransport('test-key', async (path, options) => {
+      request = [new URL(path, base).href, options];
+      return new Response(JSON.stringify({ ok: true, items: [] }));
     });
-    assert.equal((await apiFetch('/api/requests?q=a%2Fb')).status, 200);
+    assert.equal((await transport.listActivity('requests', query)).items.length, 0);
+    assert.equal(request[0], `${base}api/requests?q=a%2Fb&offset=0&limit=25`);
+    assert.equal(request[1].headers['x-gempt-key'], 'test-key');
+    await transport.saveSettings(settings);
+    assert.equal(request[0], `${base}api/settings`);
+    assert.deepEqual(JSON.parse(request[1].body), settings);
+    await transport.runAction('interrupt_run', { run_id: 'a'.repeat(32) });
+    assert.equal(request[0], `${base}api/runs/${'a'.repeat(32)}/interrupt`);
   }
+
+  const calls = [];
+  const embedded = createConsoleTransport(async (name, args) => { calls.push([name, args]); });
+  await embedded.getState();
+  await embedded.getRatio('24h');
+  await embedded.saveSettings(settings);
+  await embedded.listActivity('sessions', query);
+  await embedded.getActivity('sessions', 'exec-fixture');
+  assert.deepEqual(calls, [
+    ['gempt_app_console_state', {}],
+    ['gempt_app_token_ratio', { range: '24h' }],
+    ['gempt_app_console_settings', settings],
+    ['gempt_app_console_activity', { kind: 'sessions', query }],
+    ['gempt_app_console_activity', { kind: 'sessions', id: 'exec-fixture' }],
+  ]);
+});
+
+test('built AGY resource uses the full shared Console markup and scoped styles', () => {
+  const html = readFileSync(join(REPO_ROOT, 'magpie_plugin/ui/index.html'), 'utf-8').replaceAll('\r\n', '\n');
+  const css = readFileSync(join(REPO_ROOT, 'magpie_plugin/ui/styles.css'), 'utf-8').replaceAll('\r\n', '\n');
+  const resource = readFileSync(join(REPO_ROOT, 'core/assets/mcp_app_live.html'), 'utf-8');
+  const fragment = html.split('<!-- CONSOLE START -->')[1].split('<!-- CONSOLE END -->')[0].trim();
+  assert.ok(resource.includes(fragment.replace('class="console-host"', 'class="console-host" hidden')));
+  assert.ok(resource.includes(css));
+  assert.match(css, /@scope \(\.console-host\)/);
+  assert.match(css, /--gp-bg: var\(--bg\)/);
+  assert.match(resource, /--color-background-primary/);
+  assert.match(css, /@container \(max-width: 450px\)/);
+  assert.match(resource, /default-src 'none'/);
+  assert.doesNotMatch(resource, /<script\b[^>]+src=|<link\b[^>]+rel="stylesheet"/);
+  assert.deepEqual([...resource.matchAll(/id="tab-(live|overview|requests|sessions)"/g)].map((match) => match[1]),
+    ['live', 'overview', 'requests', 'sessions']);
+  assert.equal((resource.match(/id="refresh-btn"/g) || []).length, 1);
+  assert.equal((resource.match(/<dialog\b/g) || []).length, 1);
+  assert.equal((resource.match(/id="toast"/g) || []).length, 1);
+});
+
+test('shared Console preferences survive blocked storage in an opaque iframe', async (t) => {
+  const { consolePreference } = await import('../magpie_plugin/ui/app.js');
+  const prior = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, get() { throw new Error('opaque'); } });
+  t.after(() => prior ? Object.defineProperty(globalThis, 'localStorage', prior) : delete globalThis.localStorage);
+  assert.equal(consolePreference('test-opaque'), null);
+  consolePreference('test-opaque', '7d');
+  assert.equal(consolePreference('test-opaque'), '7d');
 });
 
 test('UI token-ratio card offers all ranges, shows observation states and has no dispatch nags', () => {
@@ -151,9 +199,11 @@ test('UI shows tiers only for direct routing and offers exactly two Antigravity 
   };
   const routeModes = [];
   const noop = () => {};
-  const renderState = runInNewContext(`let latestState, currentViewMode, nativePreviewTier;\n${renderSource}\nrenderState`, {
+  const renderTierRoutes = script.match(/  function renderTierRoutes\([\s\S]+?\r?\n  }/)?.[0];
+  assert.ok(renderTierRoutes);
+  const renderState = runInNewContext(`let latestState, currentViewMode, nativePreviewTier, onState, locateWork;\nconst pendingSettings = new Set();\n${renderSource}\n${renderTierRoutes}\nrenderState`, {
     $: (id) => elements[id],
-    document: { querySelectorAll: () => [] },
+    root: { querySelectorAll: () => [] },
     resolveEffectiveViewMode: (state) => state.mode,
     renderSetupBanner: noop,
     renderControls: noop,
@@ -418,7 +468,7 @@ test('package.json Magpie manifest fields and single plugin factory export exist
   assert.equal(pkg.name, 'gempt');
   assert.equal(pkg.type, 'module');
   assert.equal(pkg.exports['.'], './magpie_plugin/index.mjs');
-  for (const item of [pkg.main.slice(2), 'core/assets/*', 'plugin/rules/AGENTS.md', 'install.sh', 'install.ps1', 'README.md']) {
+  for (const item of [pkg.main.slice(2), 'core/assets/**/*', 'plugin/rules/AGENTS.md', 'install.sh', 'install.ps1', 'README.md']) {
     assert.ok(pkg.files.includes(item), `files missing ${item}`);
   }
   assert.ok(existsSync(join(REPO_ROOT, pkg.main)));
@@ -855,6 +905,12 @@ test('page server supports native groups and lossless failover round-trip with a
       const unauth = await fetch(`${origin}${path}`, { headers: opaque });
       assert.equal(unauth.status, 401);
       assert.equal(unauth.headers.get('access-control-allow-origin'), null);
+    }
+    for (const path of ['/http.js', '/app.js']) {
+      const publicModule = await fetch(`${origin}${path}`, { headers: opaque });
+      assert.equal(publicModule.status, 200);
+      assert.equal(publicModule.headers.get('access-control-allow-origin'), 'null');
+      assert.doesNotMatch(await publicModule.text(), /<meta name="gempt-key"/);
     }
     const preflight = await fetch(`${origin}/api/state`, { method: 'OPTIONS', headers: opaque });
     assert.equal(preflight.status, 204);
@@ -2202,6 +2258,177 @@ test('token-ratio reports weighted work and cache-inclusive shares independently
   }
 });
 
+
+test('authenticated Magpie Live shares run snapshots, turn controls, replies and exact activity links', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-live-http-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const configPath = join(dir, 'config.json');
+  const sessionsDir = join(dir, 'sessions');
+  const id = 'f'.repeat(32);
+  const sessionId = 'exec-live-link';
+  const runPath = join(sessionsDir, 'runs', id);
+  const statePath = join(runPath, 'state.json');
+  const timestamp = new Date().toISOString();
+  const actions = [];
+  mkdirSync(runPath, { recursive: true });
+  writeFileSync(join(dir, 'app-server.json'), JSON.stringify({
+    status: 'running', pid: process.pid, ws_url: 'ws://127.0.0.1:1',
+  }));
+  const record = {
+    run_id: id, session_id: sessionId, cwd: dir, title: 'Live HTTP', state: 'waiting_gemini',
+    source: 'magpie_exec', pid: process.pid, codex_thread_id: 'thread-1', turn_id: 'turn-1', created_at: timestamp,
+    started_at: timestamp, pending_tool_call: { tool: 'ask_gemini', call_id: 'question', arguments: { question: 'Proceed?' } },
+    progress: { phase: 'waiting_gemini' },
+  };
+  writeFileSync(statePath, JSON.stringify(record));
+  writeFileSync(join(sessionsDir, sessionId + '.json'), JSON.stringify({
+    session_id: sessionId, title: record.title, cwd: dir, mode: 'exec', turns: [],
+  }));
+  writeFileSync(join(runPath, 'events.jsonl'), JSON.stringify({ method: 'item/agentMessage/delta',
+    params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: 'Live output' } }) + '\n');
+  const service = await startServer({
+    port: 0, sessionsDir, configPath, magpieConfigDir: dir,
+    appServerOptions: {
+      env: { ...process.env, GEMPT_APP_SERVER_STATE: join(dir, 'app-server.json') },
+      connect: async () => ({ close() {}, request: async (method, args) => { actions.push([method, args]); } }),
+    },
+  });
+  t.after(() => service.close());
+  const base = `http://127.0.0.1:${service.port}`;
+  const { text: page } = await rawHttpGet({ port: Number(new URL(base).port), path: '/' });
+  const headers = { 'x-gempt-key': page.match(/name="gempt-key" content="([^"]+)"/)[1] };
+  const read = async (path) => {
+    const response = await fetch(base + path, { headers });
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const write = (operation, body, origin = base) => fetch(`${base}/api/live/${operation}`, {
+    method: 'POST', headers: { ...headers, Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  assert.equal((await fetch(base + '/api/live/runs')).status, 401);
+  assert.equal((await write('steer', { run_id: id, message: 'go' }, 'null')).status, 403);
+  assert.equal((await write('steer', { run_id: id, message: 'go' }, 'https://foreign.test')).status, 403);
+  assert.equal((await fetch(base + '/api/live/stream?run_id=invalid', { headers })).status, 400);
+  assert.equal((await fetch(base + '/api/live/runs?limit=5000', { headers })).status, 400);
+  const list = await read(`/api/live/runs?session_id=${sessionId}`);
+  assert.equal(list.runs[0].run_id, id);
+  assert.equal('stream' in list, false);
+  const stream = await read(`/api/live/stream?run_id=${id}`);
+  assert.equal(stream.full_text, 'Live output');
+  assert.equal(stream.run.pending_tool_call.arguments.question, 'Proceed?');
+  assert.equal((await read(`/api/requests?run_id=${id}&session_id=${sessionId}`)).items[0].run_id, id);
+  assert.equal((await read(`/api/sessions?session_id=${sessionId}`)).items[0].live_run_id, id);
+  assert.equal((await write('steer', { run_id: id, message: 'continue' })).status, 200);
+  assert.equal((await write('interrupt', { run_id: id })).status, 200);
+  assert.deepEqual(actions.map(([method]) => method), ['turn/steer', 'turn/interrupt']);
+  assert.equal(actions[0][1].expectedTurnId, 'turn-1');
+  assert.equal((await write('reply', { run_id: id, call_id: 'question', message: 'yes' })).status, 200);
+  assert.equal(JSON.parse(readFileSync(join(runPath, 'tool_replies', 'question.json'))).answer, 'yes');
+  const legacyId = 'e'.repeat(32);
+  const legacyPath = join(sessionsDir, 'runs', legacyId);
+  mkdirSync(legacyPath, { recursive: true });
+  writeFileSync(join(legacyPath, 'state.json'), JSON.stringify({ ...record, run_id: undefined }));
+  assert.equal((await read('/api/active-runs')).active_runs.some((run) => run.run_id === legacyId), true);
+});
+
+test('Magpie serves split gzip assets with conditional caching and a private HTML key', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-split-http-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const { port, close } = await startServer({ port: 0, configPath: join(dir, 'config.json'),
+    sessionsDir: join(dir, 'sessions'), magpieConfigDir: dir });
+  t.after(close);
+  const base = `http://127.0.0.1:${port}`;
+  const get = (path, headers = {}) => fetch(base + path, { headers });
+  const html = await rawHttpGet({ port, path: '/', headers: { 'accept-encoding': 'gzip' } });
+  assert.equal(html.status, 200);
+  assert.equal(html.headers['cache-control'], 'no-store');
+  assert.equal(html.headers.etag, undefined);
+  assert.equal(html.headers['content-encoding'], 'gzip');
+  const { text: markup } = await rawHttpGet({ port, path: '/' });
+  assert.match(markup, /name="gempt-key"/);
+  assert.match(markup, /<script type="module" src="\.\/app.js"><\/script>/);
+  assert.match(markup, /<link rel="stylesheet" href="\.\/styles.css">/);
+  for (const path of ['/app.js', '/styles.css']) {
+    const zipped = await get(path, { 'accept-encoding': 'br, gzip;q=0.8', origin: 'null' });
+    assert.equal(zipped.headers.get('content-encoding'), 'gzip');
+    assert.match(zipped.headers.get('vary'), /Accept-Encoding/);
+    const plain = await get(path, { 'accept-encoding': 'gzip;q=0' });
+    assert.equal(plain.headers.get('content-encoding'), null);
+    const data = await zipped.text();
+    assert.equal(await plain.text(), data);
+    assert.doesNotMatch(data, /@modelcontextprotocol|Invalid Zod|@cfworker/);
+    const etag = zipped.headers.get('etag');
+    assert.ok(etag);
+    assert.equal((await get(path, { 'if-none-match': etag })).status, 304);
+  }
+});
+
+test('boot prewarms token ratio and overview, coalesces refreshes and reflects ledger writes', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-prewarm-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const sessionsDir = join(dir, 'sessions');
+  mkdirSync(sessionsDir);
+  const postMessage = Worker.prototype.postMessage;
+  const posted = [];
+  t.mock.method(Worker.prototype, 'postMessage', function (message, ...rest) {
+    if (message.args?.[0] === sessionsDir || message.args?.[1]?.sessionsDir === sessionsDir) posted.push(message.args);
+    return postMessage.call(this, message, ...rest);
+  });
+  const { port, close } = await startServer({ port: 0, configPath: join(dir, 'config.json'), sessionsDir, magpieConfigDir: dir });
+  t.after(close);
+  await eventually(() => posted.some(([scope]) => scope === sessionsDir)
+    && posted.some(([, options]) => options?.range === '24h'));
+
+  const { readOverviewActivity } = await import('../magpie_plugin/lib/activity.mjs');
+  const first = readOverviewActivity(sessionsDir, dir);
+  assert.strictEqual(first, readOverviewActivity(sessionsDir, dir));
+  assert.equal((await first).activityTotals.requests, 0);
+  writeFileSync(join(sessionsDir, 'consult-fresh.json'), JSON.stringify({
+    mode: 'consult', updated_at: new Date().toISOString(), turns: [{ goal: 'fresh', reply: 'yes' }],
+  }));
+  const { text: page } = await rawHttpGet({ port, path: '/' });
+  const headers = { 'x-gempt-key': page.match(/name="gempt-key" content="([^"]+)"/)[1] };
+  const [overview, summary] = await Promise.all([rawHttpGet({ port, path: '/api/overview', headers }),
+    rawHttpGet({ port, path: '/api/summary', headers })]);
+  assert.equal(JSON.parse(overview.text).activity_totals.requests, 1);
+  assert.equal(JSON.parse(summary.text).magpie.reachable, null);
+});
+
+test('summary and overview avoid a stalled gateway, and the separate probe coalesces and caches failures', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-summary-http-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const configPath = join(dir, 'config.json');
+  let probes = 0;
+  const gateway = http.createServer(() => { probes++; });
+  await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve));
+  t.after(() => { gateway.closeAllConnections(); return new Promise((resolve) => gateway.close(resolve)); });
+  writeFileSync(configPath, JSON.stringify({ magpie: { base_url: `http://127.0.0.1:${gateway.address().port}` },
+    routing_policy: { work_split: 'gpt_first' } }));
+  const svc = await startServer({ port: 0, configPath, sessionsDir: join(dir, 'sessions'), magpieConfigDir: dir });
+  t.after(() => svc.close());
+  const base = `http://127.0.0.1:${svc.port}`;
+  const { text: page } = await rawHttpGet({ port: Number(new URL(base).port), path: '/' });
+  const headers = { 'x-gempt-key': page.match(/name="gempt-key" content="([^"]+)"/)[1] };
+  const read = (path) => fetch(base + '/api/' + path, { headers }).then((res) => res.json());
+  const summary = await read('summary');
+  assert.equal(summary.routing.gpt_share, 80);
+  assert.equal(summary.magpie.reachable, null);
+  assert.equal('token_ratio' in await read('overview'), false);
+  assert.deepEqual(Object.keys(await read('active-runs')).sort(), ['active_runs', 'app_server']);
+  assert.equal(probes, 0);
+  const pending = Promise.all([read('magpie-status'), read('magpie-status')]);
+  await eventually(() => probes === 1);
+  assert.equal((await read('summary')).magpie.reachable, null);
+  const [first, second] = await pending;
+  assert.equal(first.reachable, false);
+  assert.equal(first.error, 'Timeout after 600ms');
+  assert.deepEqual(first, second);
+  assert.deepEqual(await read('magpie-status'), first);
+  assert.equal(probes, 1);
+  assert.equal((await read('summary')).magpie.reachable, false);
+  assert.equal((await read('token-ratio?range=7d')).range, '7d');
+});
+
 test('token-ratio and /api/state apply five timestamp windows and roll today over at local midnight', async (t) => {
   const { RATIO_RANGES, readTokenRatio, resolveBudget } = await import('../magpie_plugin/lib/token-ratio.mjs');
   const dir = mkdtempSync(join(tmpdir(), 'gempt-ratio-ranges-'));
@@ -2300,7 +2527,7 @@ test('mcpTools false disables duplicate Magpie GemPT tool registration', async (
 
 test('Magpie marketplace check shape and inspect+share guard hold', async () => {
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '0.4.1');
+  assert.equal(pkg.version, '0.5.0');
   assert.ok(pkg.keywords.includes('magpie-plugin'));
   assert.ok(pkg.files.includes('THIRD_PARTY_LICENSES.txt'));
   assert.ok(pkg.magpie?.summary?.en && pkg.magpie?.summary?.zh);
@@ -2634,20 +2861,21 @@ test('app-server manager runs periodic health probes for Linux children and clos
   assert.equal(failedRestart.status, 500);
   assert.match(failedRestart.error, /重启超时/);
 
-  // 3. Non-lock-holder restart waits for delayed exit + replacement and returns the NEW PID.
+  // 3. The Console observer verifies the child and waits for the owner to replace it.
   const oldPid = ownerMgr.getStatus().pid;
   const delayedFollower = createAppServerManager({
+    observeOnly: true,
     configPath,
     sessionsDir,
     env: { ...process.env, GEMPT_APP_SERVER_STATE: statePath },
     port: 0,
-    spawnProcess: spawnLinuxChild,
+    spawnProcess: () => assert.fail('Console observer must leave app-server ownership with Magpie.'),
     connect: async (target) => {
       if (!fakePids.has(target.pid)) throw new Error('gone');
       return { close() {}, request: async () => ({}) };
     },
     isPidAlive: (pid) => pid === process.pid || fakePids.has(pid),
-    verifyProcess: async () => true,
+    verifyProcess: async (pid, marker) => pid === oldPid && marker.endsWith('.token'),
     terminateProcess: (target) => {
       setTimeout(() => {
         fakePids.delete(target.pid);
@@ -2667,6 +2895,8 @@ test('app-server manager runs periodic health probes for Linux children and clos
   assert.equal(restarted.app_server.running, true);
   assert.equal(restarted.app_server.healthy, true);
   assert.notEqual(restarted.app_server.pid, oldPid);
+  await delayedFollower.stop();
+  assert.equal(ownerMgr.getStatus().pid, restarted.app_server.pid);
 });
 
 test('activity endpoints unify run reconciliation, cache ledger with write invalidation, and align session_id with core/state', async (t) => {

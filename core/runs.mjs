@@ -6,14 +6,15 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { connectAppServer, readAppServerState, textInput, UNAVAILABLE } from '../magpie_plugin/lib/app-server-client.mjs';
 import { normalizeTitle, readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
+import { getMcpEffort } from './config.mjs';
+import { resolveExecTimeoutSec, validateExecTimeoutSec } from '../magpie_plugin/lib/routing.mjs';
 import { resolveNodeExecutable } from './node-executable.mjs';
 import { readHostContext } from './host-context.mjs';
 import { atomicJson, resolvePath, validateSessionId, withLock, withinPath } from './state.mjs';
 import { ensureShareWorktree } from './worktrees.mjs';
 
 export const ACTIVE_STATES = new Set(['queued', 'running', 'waiting_gemini']);
-export const EXEC_TIMEOUT_MIN_SEC = 30;
-export const EXEC_TIMEOUT_MAX_SEC = 7200;
+export { EXEC_TIMEOUT_MIN_SEC, EXEC_TIMEOUT_MAX_SEC, validateExecTimeoutSec } from '../magpie_plugin/lib/routing.mjs';
 export const UNCONFIRMED_HOLD_MS = 30 * 60 * 1000;
 const STARTUP_GRACE_MS = 60_000;
 const TERMINAL_INTERRUPT_ERR = /not found|no active|already (?:completed|finished|interrupted|stopped|ended)|unknown turn|invalid turn/i;
@@ -23,14 +24,6 @@ const waitPath = fileURLToPath(new URL('./wait.mjs', import.meta.url));
 const now = () => Date.now() / 1000;
 const readRetry = new Int32Array(new SharedArrayBuffer(4));
 const runError = (message, status, cause) => Object.assign(new Error(message, { cause }), { status });
-
-export function validateExecTimeoutSec(value) {
-  if (value === undefined) return undefined;
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < EXEC_TIMEOUT_MIN_SEC || value > EXEC_TIMEOUT_MAX_SEC) {
-    throw runError(`Invalid timeout_sec: expected a finite number between ${EXEC_TIMEOUT_MIN_SEC} and ${EXEC_TIMEOUT_MAX_SEC}.`, 400);
-  }
-  return value;
-}
 
 export function isRecentUnconfirmedRun(record, nowMs = Date.now(), modifiedAtMs = null) {
   if (!record?.remote_turn_unconfirmed || ACTIVE_STATES.has(record.state)) return false;
@@ -66,12 +59,23 @@ export function saveRun(file, record) {
   }
 }
 
-export function readRun(runId, sessionsDir) {
+const stateCache = new Map();
+const runDirectories = new Map();
+
+function fileVersion(stat) {
+  return stat && `${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+}
+
+export function readRun(runId, sessionsDir, { stat, readonly = false, allowLegacyId = false } = {}) {
   const path = join(runDirectory(runId, sessionsDir), 'state.json');
-  let record;
+  stat ??= statSync(path, { throwIfNoEntry: false });
+  const version = fileVersion(stat);
+  const cached = stateCache.get(path);
+  let data = version && cached?.version === version ? cached.data : undefined;
   for (let attempt = 0; ; attempt++) {
+    if (data) break;
     try {
-      record = JSON.parse(readFileSync(path, 'utf8'));
+      data = JSON.parse(readFileSync(path, 'utf8'));
       break;
     } catch (error) {
       if (error.code === 'ENOENT') throw runError(`Run '${runId}' not found.`, 404, error);
@@ -79,8 +83,16 @@ export function readRun(runId, sessionsDir) {
       Atomics.wait(readRetry, 0, 0, 20);
     }
   }
-  if (record?.run_id !== runId || typeof record.state !== 'string') throw new Error('Run state does not match the requested ID.');
-  reconcileRunState(record, () => statSync(path, { throwIfNoEntry: false })?.mtimeMs);
+  const storedId = data?.run_id || (allowLegacyId ? runId : undefined);
+  if (storedId !== runId || typeof data?.state !== 'string') throw new Error('Run state does not match the requested ID.');
+  if (version && cached?.version !== version) {
+    stateCache.delete(path);
+    if (stateCache.size >= 1024) stateCache.delete(stateCache.keys().next().value);
+    stateCache.set(path, { version, data });
+  }
+  // Reconcile time and worker liveness even when the file has not changed.
+  const record = readonly ? { ...data } : structuredClone(data);
+  reconcileRunState(record, () => stat?.mtimeMs);
   record.title = normalizeTitle(record.title, record.goal, record.source_cwd || record.cwd);
   return record;
 }
@@ -285,15 +297,37 @@ export function replyToolCall(runId, callId, answer, { success = true, sessionsD
 
 export function stateEntries(sessionsDir) {
   const parent = join(resolveSessionsDir(sessionsDir), 'runs');
-  let dirs;
-  try { dirs = readdirSync(parent, { withFileTypes: true }); } catch (error) {
-    if (error.code === 'ENOENT') return [];
-    throw error;
+  const parentStat = statSync(parent, { throwIfNoEntry: false });
+  if (!parentStat?.isDirectory()) {
+    runDirectories.delete(parent);
+    return [];
   }
-  return dirs.filter((dir) => dir.isDirectory() && /^[a-f0-9]{32}$/.test(dir.name)).flatMap(({ name }) => {
-    const stat = statSync(join(parent, name, 'state.json'), { throwIfNoEntry: false });
-    return stat?.isFile() ? [{ id: name, mtime: stat.mtimeMs }] : [];
-  }).sort((left, right) => right.mtime - left.mtime);
+  const version = `${fileVersion(parentStat)}:${parentStat.nlink}`;
+  const checkedAt = performance.now();
+  let index = runDirectories.get(parent);
+  // Some filesystems coalesce rapid directory updates. The link count tracks
+  // subdirectory additions on Unix, and the timed rescan covers other cases.
+  if (index?.version !== version || checkedAt - index.checkedAt >= 1000) {
+    const ids = readdirSync(parent, { withFileTypes: true })
+      .filter((dir) => dir.isDirectory() && /^[a-f0-9]{32}$/.test(dir.name))
+      .map((dir) => dir.name);
+    index = { version, checkedAt, ids, signature: null, entries: [] };
+    if (!runDirectories.has(parent) && runDirectories.size >= 32) {
+      runDirectories.delete(runDirectories.keys().next().value);
+    }
+    runDirectories.set(parent, index);
+  }
+  // Workers publish state atomically inside each run directory. The parent
+  // signature only tracks additions/removals, so stat the known state files.
+  const files = index.ids.map((id) => statSync(join(parent, id, 'state.json'), { throwIfNoEntry: false }));
+  const signature = files.map(fileVersion).join('|');
+  if (signature !== index.signature) {
+    index.signature = signature;
+    index.entries = index.ids.flatMap((id, i) => files[i]?.isFile()
+      ? [{ id, mtime: files[i].mtimeMs, stat: files[i] }] : [])
+      .sort((left, right) => right.mtime - left.mtime);
+  }
+  return index.entries;
 }
 
 export function runWithinRoot(record, root) {
@@ -307,10 +341,10 @@ export function listActiveRoster({ limit = 20, root, hostConversationId, session
   const foldSession = (id) => process.platform === 'win32' ? id?.toLowerCase() : id;
   const sessionKey = foldSession(sessionId);
   const nowMs = Date.now();
-  for (const { id, mtime } of stateEntries(sessionsDir)) {
+  for (const { id, mtime, stat } of stateEntries(sessionsDir)) {
     if (roster.length >= limit) break;
     let record;
-    try { record = readRun(id, sessionsDir); } catch { continue; }
+    try { record = readRun(id, sessionsDir, { stat, readonly: true }); } catch { continue; }
     const active = includeUnconfirmed ? isRunOccupying(record, nowMs, mtime) : ACTIVE_STATES.has(record.state);
     if (!active || !runWithinRoot(record, workspace)
         || (hostConversationId && record.host_conversation_id !== hostConversationId)
@@ -395,14 +429,14 @@ export async function dispatchRun(args, {
       }
       hostContext = readHostContext(config, sourceCwd);
       hostId = args.host_conversation_id || prior?.host_conversation_id || hostContext.conversation_id || null;
-      const configuredTimeout = Number(readJsonSafe(config)?.codex?.timeout_sec) || 0;
-      const deadlineBudget = timeoutSec ?? Math.max(3600, configuredTimeout);
+      const cfg = readJsonSafe(config);
+      const executionTimeout = resolveExecTimeoutSec({ codex: cfg?.codex, timeoutSec, effort: getMcpEffort(cfg?.routing_policy) });
       record = {
         source: 'magpie_exec', run_id: id, cwd, state: 'queued', created_at: new Date().toISOString(),
         worktree_path: worktreePath, source_cwd: worktreePath ? sourceCwd : null, goal: args.goal,
         title: normalizeTitle(args.title, args.goal, sourceCwd), tier: args.tier, agent,
         host_conversation_id: hostId, session_id: sessionId, config_path: config, progress: null,
-        verification: args.verification, deadline: now() + 900 + deadlineBudget,
+        verification: args.verification, execution_timeout_sec: executionTimeout, deadline: now() + executionTimeout,
       };
       saveRun(file, record);
     }, { attempts: 80, delayMs: 25 });
@@ -434,5 +468,5 @@ export async function dispatchRun(args, {
   const result = await waitForRun(id, { sessionsDir: sessions, timeoutSec: Math.max(0, deadline - performance.now()) / 1000 });
   if (legacyNative || ACTIVE_STATES.has(result.state) || result.state === 'interrupted') return result;
   if (!result.result) throw new Error(`${id}: ${result.error || result.state}`);
-  return { ...result.result, run_id: id, state: 'finished' };
+  return { ...result.result, run_id: id, state: 'finished', execution_timeout_sec: result.execution_timeout_sec };
 }

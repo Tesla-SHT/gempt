@@ -12,11 +12,13 @@
     "approval_policy": "never",
     "model_provider": "",
     "extra_args": [],
-    "timeout_sec": 600
+    "timeout_sec": 3600
   },
   "routing_policy": {
     "work_split": "balanced",
     "swarm_split": "inherit",
+    "native_swarm": true,
+    "swarm_shell_model": "gemini-4-hydrogen-low",
     "default_tier": "sonnet",
     "failover_mode": "subscription_only",
     "auto_effort": false,

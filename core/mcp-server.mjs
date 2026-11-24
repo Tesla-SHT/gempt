@@ -2,8 +2,7 @@ import { createInterface } from 'node:readline';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
-import { resolveBudget } from '../magpie_plugin/lib/token-ratio.mjs';
-import { createExecutionTools } from '../magpie_plugin/lib/tools.mjs';
+import { GEMPT_VERSION } from './config.mjs';
 import { readHostContext } from './host-context.mjs';
 import { APP_RESOURCE, APP_TOOLS, APP_URI, callAppTool, readAppResource } from './mcp-app.mjs';
 import { ACTIVE_STATES, buildWaitCommand, compactReceiptText, dispatchRun, interruptRun, readRun, replyToolCall, runWithinRoot, steerRun, validateExecTimeoutSec } from './runs.mjs';
@@ -15,9 +14,6 @@ const object = (value) => value !== null && typeof value === 'object' && !Array.
 const short = (value, limit) => Array.from(String(value || '')).slice(0, limit).join('');
 const bytes = (value) => Buffer.byteLength(JSON.stringify(value));
 const textResult = (data, extras) => ({ content: [{ type: 'text', text: JSON.stringify(data) }], ...extras });
-const VERSION = readJsonSafe(new URL('../package.json', import.meta.url))?.version
-  || readJsonSafe(new URL('../../plugin.json', import.meta.url))?.version || '0.4.1';
-
 function compact(payload) {
   const data = { ...payload };
   for (const key of ['recent', 'active']) {
@@ -48,13 +44,8 @@ function compactStatus(live, record, options) {
     else if (record.result?.text) item.msg = short(record.result.text, 140);
     return compact(item);
   }
-  const policy = readJsonSafe(options.configPath)?.routing_policy || {};
-  const profile = String(policy.work_split || 'balanced');
-  const ratio = resolveBudget(profile, {
-    configPath: options.configPath, sessionsDir: options.sessionsDir, env: options.env,
-  });
   const summary = (run, limit) => ({ id: run.run_id, st: run.state, t: short(run.title, limit) });
-  return compact({ split: profile, target: ratio.target_gpt_share, gpt: ratio.actual_gpt_share,
+  return compact({ split: live.routing.profile, target: live.routing.gpt_share,
     active: live.runs.filter((run) => ACTIVE_STATES.has(run.state)).slice(0, 4).map((run) => summary(run, 24)),
     recent: live.runs.filter((run) => !ACTIVE_STATES.has(run.state)).slice(0, 3).map((run) => summary(run, 20)) });
 }
@@ -99,6 +90,7 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
     const context = readHostContext(options.configPath, cwd);
     const hostId = args.host_conversation_id || context.conversation_id;
     const family = args.gemini_family || context.gemini_family;
+    const { createExecutionTools } = await import('../magpie_plugin/lib/tools.mjs');
     const consult = createExecutionTools(options).consult;
     if (!cwd && args.file_paths != null) throw new Error('cwd is required when providing file_paths.');
     const execute = () => consult.execute({ goal, tier: args.tier, cwd, file_paths: args.file_paths,
@@ -151,7 +143,7 @@ async function dispatch(request, env) {
       case 'initialize':
         return response({ protocolVersion: params?.protocolVersion || '2024-11-05',
           capabilities: { tools: { listChanged: false }, resources: { listChanged: false } },
-          serverInfo: { name: 'gempt', version: VERSION } });
+          serverInfo: { name: 'gempt', version: GEMPT_VERSION } });
       case 'ping': return response({});
       case 'tools/list': return response({ tools: TOOLS });
       case 'resources/list': return response({ resources: [APP_RESOURCE] });

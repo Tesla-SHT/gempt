@@ -317,6 +317,7 @@ export function probeMagpie(baseUrl = DEFAULT_MAGPIE_URL, apiKey = '', timeoutMs
     const finish = (result) => {
       if (settled) return;
       settled = true;
+      clearTimeout(deadline);
       resolveProbe(result);
     };
 
@@ -403,9 +404,9 @@ export function probeMagpie(baseUrl = DEFAULT_MAGPIE_URL, apiKey = '', timeoutMs
       },
     );
 
-    req.setTimeout(timeoutMs, () => {
+    const deadline = setTimeout(() => {
       req.destroy(new Error(`Timeout after ${timeoutMs}ms`));
-    });
+    }, timeoutMs);
     req.on('error', (err) => {
       finish(emptyProbeResult(cleanedUrl, err.message));
     });

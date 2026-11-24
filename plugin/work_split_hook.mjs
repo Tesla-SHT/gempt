@@ -3,9 +3,9 @@ import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, 
 import { basename, dirname, extname, join } from 'node:path';
 
 const runtime = existsSync(new URL('./runtime/core/host-context.mjs', import.meta.url)) ? './runtime/' : '../';
-const [{ WORKLOAD }, { readHostContext, updateHostContext }, { atomicJson, resolvePath, withLock }, backend] = await Promise.all([
+const [{ WORKLOAD }, { readHostContext, updateHostContext }, { atomicJson, resolvePath, withLock }, backend, { getNativeSwarmPolicy }] = await Promise.all([
   import(`${runtime}core/assets.mjs`), import(`${runtime}core/host-context.mjs`),
-  import(`${runtime}core/state.mjs`), import(`${runtime}magpie_plugin/lib/backend.mjs`),
+  import(`${runtime}core/state.mjs`), import(`${runtime}magpie_plugin/lib/backend.mjs`), import(`${runtime}core/config.mjs`),
 ]);
 const { explicitTitle, readJsonSafe, resolveConfigPath, resolveSessionsDir } = backend;
 const configPath = resolveConfigPath();
@@ -19,6 +19,7 @@ const exemptParts = [
   '/.zcode/skills/', '/agent-skills/', '/.config/gempt/',
 ];
 const override = /自己改|自己查|自己做|不用\s*gpt|别用\s*gpt|别派\s*gpt|不要\s*gpt|别转\s*gpt|gemini\s*(?:自己|直接)?(?:做|改|查|处理)|\b(?:no\s+gpt|skip\s+gempt|bypass\s+gempt|don'?t\s+use\s+gpt)\b/i;
+const swarmOverride = /(?:不用|别用|不要|跳过)\s*swarm|\b(?:direct\s+gpt_run|skip\s+swarm|no\s+swarm)\b/i;
 const waitCommand = /\bgempt-wait\b|\bgempt\s+status\b[^\n]*--wait\b/i;
 const readCommand = /(?:^|[;&|\r\n]\s*)(?:(?:sudo|command|time)\s+)?(?:Get-Content|Select-String|Get-ChildItem|gc|sls|gci|cat|head|tail|rg|ripgrep|grep|findstr|find|ls|dir|tree|sed|awk|wc|git\s+(?:diff|show|log|grep|status)|type)(?:\.exe)?(?=\s|$)/i;
 const milestones = [120, 200, 280];
@@ -41,9 +42,9 @@ function readRoutingPolicy() {
     const rawSwarm = typeof policy?.swarm_split === 'string' ? policy.swarm_split : 'inherit';
     const swarm = rawSwarm === 'inherit' || Object.hasOwn(WORKLOAD.profiles, rawSwarm)
       ? rawSwarm : 'inherit';
-    return { work_split: work, swarm_split: swarm };
+    return { work_split: work, swarm_split: swarm, ...getNativeSwarmPolicy(policy) };
   } catch {
-    return { work_split: 'balanced', swarm_split: 'inherit' };
+    return { work_split: 'balanced', swarm_split: 'inherit', ...getNativeSwarmPolicy() };
   }
 }
 
@@ -73,13 +74,16 @@ function payloadSwarmSignal(payload) {
   const toolName = text(payload.toolCall?.name);
   if (swarmTools.has(toolName)) return toolName !== 'swarm' || payload.toolCall?.args?.action !== 'models';
   if (toolName === 'invoke_subagent' && text(payload.toolCall?.args?.TypeName) !== 'gempt-worker') return true;
-  if (toolName === 'call_mcp_tool' && payload.toolCall?.args?.ServerName === 'gempt_gempt') {
-    const parentId = text(payload.toolCall?.args?.Arguments?.host_conversation_id);
-    if (parentId && conversation && parentId !== conversation) return true;
-    const mcpRole = text(payload.toolCall?.args?.Arguments?.role).toLowerCase();
-    if (mcpRole && mcpRole !== 'solo') return true;
-  }
   return false;
+}
+
+function workerSignal(payload) {
+  const parent = text(payload.parentConversationId) || text(payload.parent_conversation_id);
+  const role = [payload.swarmRole, payload.swarm_role, payload.agentRole, payload.agent_role, payload.role, process.env.GEMPT_SWARM_ROLE]
+    .map((value) => text(value).toLowerCase()).find(Boolean);
+  return payload.isSubagent === true || payload.is_subagent === true || Boolean(text(payload.subagentType) || text(payload.subagent_type))
+    || Boolean(parent && parent !== payload.conversationId) || ['worker', 'verifier', 'narrator', 'subagent', 'member'].includes(role)
+    || (!role && envSwarmSignal()) || hostSubagentSignal(payload.conversationId);
 }
 
 function hostSubagentSignal(conversation) {
@@ -127,7 +131,7 @@ function healthy() {
     return false;
   }
   const pid = Math.trunc(Number(state?.pid));
-  if (state?.status !== 'running' || !state.ws_url || !(pid > 0)) return false;
+  if (state?.status !== 'running' || state.healthy === false || !state.ws_url || !(pid > 0)) return false;
   try { process.kill(pid, 0); } catch (error) { if (error.code !== 'EPERM') return false; }
   const runs = join(resolveSessionsDir(), 'runs');
   let files;
@@ -210,26 +214,33 @@ async function handle(payload) {
   await updateHostContext(conversationId, workspacePaths, { geminiFamily: family, configPath });
   const routing = readRoutingPolicy();
   const detectedSwarm = payloadSwarmSignal(payload) || hostSubagentSignal(conversationId);
+  let isWorker = workerSignal(payload);
   let storedSwarm = false;
   if (text(conversationId)) {
     const existing = readJsonSafe(stateFilePath(conversationId));
     storedSwarm = Boolean(existing?.is_swarm);
-    if (detectedSwarm && !storedSwarm) {
+    if ((detectedSwarm && !storedSwarm) || (isWorker && !existing?.is_worker)) {
       await updateState(conversationId, (state) => {
-        if (!state.is_swarm) {
-          state.is_swarm = true;
-          state.updated_at = now();
-        }
+        state.is_swarm ||= detectedSwarm;
+        state.is_worker ||= isWorker;
+        state.updated_at = now();
       });
-      storedSwarm = true;
     }
+    isWorker ||= Boolean(existing?.is_worker);
   }
-  const isSwarm = envSwarmSignal() || detectedSwarm || storedSwarm;
-  const coordinatingSwarm = isSwarm && routing.swarm_split === 'inherit' && routing.work_split !== 'gemini';
-  const ordinary = isSwarm && routing.swarm_split !== 'inherit' ? routing.swarm_split
-    : coordinatingSwarm ? 'gemini_first' : routing.work_split;
+  const isSwarm = envSwarmSignal() || detectedSwarm || storedSwarm || isWorker;
+  const ordinary = isSwarm && routing.swarm_split !== 'inherit' ? routing.swarm_split : routing.work_split;
   const pct = WORKLOAD.profiles[ordinary]?.gpt_share ?? WORKLOAD.profiles.balanced.gpt_share;
   const userInput = String(payload.lastUserInput || '');
+  const bypass = override.test(userInput);
+  const nativeSwarm = routing.native_swarm && routing.work_split !== 'gemini' && !isWorker
+    && !bypass && !swarmOverride.test(userInput) && healthy();
+  const workerCommand = 'gempt run --cwd "$PWD" --workspace inherit --host '
+    + (text(conversationId) || '<conversationId>') + ' --title <name> --goal -';
+  const swarmDispatch = `Use swarm(action="title") and spawn an AGY native Swarm worker with `
+    + `swarm(action="add", model="${routing.swarm_shell_model}", workspace="share" for edits or "inherit" for inspection). `
+    + 'Record each worker task in plan.json per swarm_pane. In the worker brief, give the command '
+    + `\`${workerCommand}\` (add --access inspect for read-only work), then execute its wait_command.`;
   const key = userInput.trim() ? createHash('sha1').update(userInput.trim()).digest('hex').slice(0, 16) : '';
   if (Object.hasOwn(payload, 'toolCall') || hookEventName === 'PreToolUse') {
     const allow = { decision: 'allow' };
@@ -245,6 +256,9 @@ async function handle(payload) {
     }
     if (name === 'call_mcp_tool') {
       if (input.ServerName !== 'gempt_gempt') return allow;
+      if (input.ToolName === 'gpt_run' && nativeSwarm) {
+        return { decision: 'deny', reason: swarmDispatch };
+      }
       if (['gpt_run', 'gpt_ask'].includes(input.ToolName)) {
         await updateState(conversationId, (state) => setCount(state, key, 0));
         const parentId = text(input.Arguments?.host_conversation_id);
@@ -254,14 +268,15 @@ async function handle(payload) {
       }
       return allow;
     }
-    if (['gemini', 'gemini_first'].includes(ordinary) || override.test(userInput) || !healthy()) return allow;
+    if (['gemini', 'gemini_first'].includes(ordinary) || bypass || !healthy()) return allow;
+    if (isWorker && name === 'run_command' && /\bgempt\s+run\b/i.test(String(input.CommandLine || ''))) return allow;
     const target = ['Path', 'TargetFile', 'AbsolutePath', 'SearchPath', 'DirectoryPath'].map((key) => text(input[key])).find(Boolean) || '';
     const cwd = text(payload.cwd) || text(workspacePaths?.[0]) || (extname(target) ? dirname(target) : target) || '.';
     if (['edit_file', 'write_file'].includes(name)) {
       if (!sourceWrite(target, input)) return allow;
       return { decision: 'deny', reason: `[GemPT ${pct}% Write Gate] Source edit (${basename(target)}) routed to Codex. `
-        + `Call call_mcp_tool(ServerName="gempt_gempt", ToolName="gpt_run", Arguments={"goal": "Edit ${target}: <change & verify>", "cwd": "${cwd}", "access": "change"}) `
-        + 'then run the returned `gempt-wait <id>` via run_command(WaitMsBeforeAsync=500). (User can say "自己改" to bypass.)' };
+        + (nativeSwarm ? swarmDispatch : `Call call_mcp_tool(ServerName="gempt_gempt", ToolName="gpt_run", Arguments={"goal": "Edit ${target}: <change & verify>", "cwd": "${cwd}", "access": "change"}) `
+        + 'then run the returned `gempt-wait <id>` via run_command(WaitMsBeforeAsync=500). (User can say "自己改" to bypass.)') };
     }
     if (ordinary === 'balanced') return allow;
     const command = String(input.CommandLine || '').trim();
@@ -273,15 +288,16 @@ async function handle(payload) {
     if (count <= limit) return allow;
     const extra = ordinary === 'gpt_first' ? ' For coding-only workspaces, prefer Codex CLI directly.' : '';
     return { decision: 'deny', reason: `[GemPT ${pct}% Explore Stop-Loss] ${count} non-exempt workspace reads/searches this turn (limit ${limit}). `
-      + `Dispatch deep inspection to Codex: call_mcp_tool(ServerName="gempt_gempt", ToolName="gpt_run", Arguments={"goal": "<what to inspect>", "cwd": "${cwd}", "access": "inspect"}) `
-      + `then run returned \`gempt-wait <id>\` via run_command(WaitMsBeforeAsync=500).${extra} (Say "自己查" to bypass.)` };
+      + (nativeSwarm ? swarmDispatch : `Dispatch deep inspection to Codex: call_mcp_tool(ServerName="gempt_gempt", ToolName="gpt_run", Arguments={"goal": "<what to inspect>", "cwd": "${cwd}", "access": "inspect"}) `
+      + `then run returned \`gempt-wait <id>\` via run_command(WaitMsBeforeAsync=500).${extra} (Say "自己查" to bypass.)`) };
   }
   if (hookEventName === 'SessionStart') {
-    if (pct <= 0) return {};
+    if (pct <= 0 && !nativeSwarm) return {};
     return { injectSteps: [step(`GemPT v2 active: ${ordinary} (${pct}% GPT${family ? `, family=${family}` : ''}${isSwarm ? ', swarm' : ''}).\n`
-      + 'Tools (ServerName="gempt_gempt"): gpt_run(goal,cwd,access="change"|"inspect",workspace="inherit"|"share",session_id?) | '
+      + (nativeSwarm ? swarmDispatch + '\nKeep quick gpt_ask (including tier="chore") and gpt_ctl direct.'
+        : 'Tools (ServerName="gempt_gempt"): gpt_run(goal,cwd,access="change"|"inspect",workspace="inherit"|"share",session_id?) | '
       + 'gpt_ask(goal,file_paths?,cwd?,tier?,session_id?) | gpt_ctl(action="status"|"steer"|"interrupt"|"reply",run_id?,message?,call_id?).\n'
-      + "Run gpt_run's returned `gempt-wait <id>` via run_command(WaitMsBeforeAsync=500); never poll status.")] };
+      + "Run gpt_run's returned `gempt-wait <id>` via run_command(WaitMsBeforeAsync=500); never poll status."))] };
   }
   const tokens = Math.floor(contextTokens(payload.transcriptPath) / 1000);
   const steps = await updateState(conversationId, (state) => {
@@ -302,9 +318,10 @@ async function handle(payload) {
       setCount(state, key, 0);
       state.last_entry_key = entry;
       state.last_entry_at = now();
-      if (coordinatingSwarm && !override.test(userInput)) {
-        result.push(step(`[GemPT ${pct}%] Swarm Coordinator: coordinate, review, and merge freely. Start GPT workers with model="gemini-4-hydrogen-low"; their brief runs \`gempt run --cwd "$PWD" --workspace inherit\` and the returned \`gempt-wait\` command. Launch Gemini/Claude workers natively.`));
-      } else if (Object.hasOwn(banners, ordinary) && !override.test(userInput) && healthy()) {
+      if (nativeSwarm) {
+        result.push(step(`[GemPT ${pct}%] Swarm Coordinator: dispatch coding and execution work via native Swarm. ${swarmDispatch} `
+          + 'Keep quick gpt_ask (including tier="chore") and gpt_ctl direct.'));
+      } else if (Object.hasOwn(banners, ordinary) && !bypass && healthy()) {
         result.push(step(`[GemPT ${pct}%] ${banners[ordinary]}`));
       }
     }

@@ -75,6 +75,7 @@ async function settings(options) {
 async function main([command, ...args]) {
   if (!command || command === '--help' || command === '-h') {
     console.log(`Usage: gempt <${[...Object.keys(commands), 'wait'].join('|')}> [options]`);
+    console.log('Run: --goal - reads stdin. --timeout SECONDS accepts 30–7200 (default 3600).');
     return;
   }
   if (command === 'wait') return runWait(args);
@@ -102,13 +103,12 @@ async function main([command, ...args]) {
         background: waitSec === 0, sandbox: access === 'inspect' ? 'read-only' : undefined, mcp: true,
         expected_report: 'Report concisely: changed files, verification commands/results, and any remaining blockers. Omit verbose raw logs.',
       }, { configPath, waitSec });
-      const { run_id, session_id, state, worktree_path = null, cwd, tier = null } = run;
-      const receipt = { run_id, session_id, state, worktree_path, cwd, tier };
+      const { run_id, session_id, state, worktree_path = null, cwd, tier = null, execution_timeout_sec } = run;
+      const receipt = { run_id, session_id, state, worktree_path, cwd, tier, execution_timeout_sec };
       if (ACTIVE_STATES.has(state) || state === 'interrupted') {
         const wait_command = buildWaitCommand(run_id);
-        print({ ...receipt, wait_command, text: state === 'waiting_gemini'
-          ? `Run ${run_id} is waiting for ask_gemini reply (use gempt reply-tool).`
-          : `Run ${run_id} started. Execute \`${wait_command}\` via run_command(WaitMsBeforeAsync=500) for zero-poll wakeup.` });
+        print({ ...receipt, wait_command,
+          ...(state === 'waiting_gemini' ? { pending_tool_call: run.pending_tool_call } : {}) });
         return Number(state === 'interrupted');
       }
       const { model, reasoning_effort, verification, usage, text } = run;

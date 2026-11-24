@@ -12,44 +12,31 @@
  */
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { dirname, extname, join, resolve, sep } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { RATIO_RANGES } from './token-ratio.mjs';
-import {
-  createNativeGroups,
-  getDispatchActivity,
-  initSubscriptionConfig,
-  isActivityId,
-  listDispatchActivity,
-  readJsonSafe,
-  readState,
-  resolveConfigPath,
-  setDefaultTier,
-  updateSettings,
-} from './backend.mjs';
-
+import { promisify } from 'node:util';
+import { gzip } from 'node:zlib';
+import { readJsonSafe, resolveConfigPath, warmPageTelemetry } from './backend.mjs';
 import { createAppServerManager } from './app-server-manager.mjs';
-import { installAgy } from '../../core/agy-install.mjs';
+import { dispatchPageApi } from './page-api.mjs';
+import { readPageAsset } from './page-assets.mjs';
 
 export const DEFAULT_PORT = 3498;
 const MAX_POST_BYTES = 8192;
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
-const UI_ROOT = resolve(HERE, '..', 'ui');
-const UI_PREFIX = UI_ROOT.endsWith(sep) ? UI_ROOT : UI_ROOT + sep;
-const INDEX_FILE = resolve(UI_ROOT, 'index.html');
 const THIS_FILE = fileURLToPath(import.meta.url);
-const CASE_INSENSITIVE_FS = process.platform === 'win32' || process.platform === 'darwin';
+const compress = promisify(gzip);
+const compressedAssets = new WeakMap();
 
-const MIME = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.json': 'application/json; charset=utf-8',
-};
+function acceptsGzip(value = '') {
+  return value.split(',').some((part) => {
+    const [encoding, ...parameters] = part.trim().toLowerCase().split(';');
+    const quality = parameters.find((parameter) => /^\s*q\s*=/.test(parameter));
+    return encoding.trim() === 'gzip' && (!quality || Number(quality.split('=')[1]) > 0);
+  });
+}
 
 const PKG = (() => {
   try {
@@ -59,16 +46,12 @@ const PKG = (() => {
   }
 })();
 
-const BUILD_ID = `${PKG.version || '0.4.1'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
+const BUILD_ID = `${PKG.version || '0.5.0'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
 const pidAlive = (pid) => {
   if (!Number.isSafeInteger(pid) || pid < 1) return false;
   try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }
 };
 const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
-const isIndexFile = (file) => (CASE_INSENSITIVE_FS
-  ? file.toLowerCase() === INDEX_FILE.toLowerCase()
-  : file === INDEX_FILE);
-
 function readJsonBody(req) {
   return new Promise((resolveBody, rejectBody) => {
     const chunks = [];
@@ -176,6 +159,9 @@ export async function startServer({
 
   let actualPort = 0;
   let appServer;
+  const pageOptions = () => ({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, agyBinDir,
+    magpieCliPath, execEnabled, mcpToolsEnabled, appServer, probeTimeoutMs, env: appServerOptions?.env,
+    connect: appServerOptions?.connect });
   let OWN = new Set();
   let HOSTS = new Set();
 
@@ -194,24 +180,46 @@ export async function startServer({
     const o = normalizedOrigin(req);
     return o === undefined || o === 'null' || OWN.has(o);
   };
-  const corsHeaders = (req) => {
+  const corsHeaders = (req, publicModule = false) => {
     const o = req.headers.origin;
     const norm = normalizedOrigin(req);
     const h = { vary: 'Origin' };
-    if (norm === 'null' ? req.method === 'OPTIONS' || keyOK(req) : (norm !== undefined && OWN.has(norm))) {
+    if (norm === 'null' ? publicModule || req.method === 'OPTIONS' || keyOK(req) : (norm !== undefined && OWN.has(norm))) {
       h['access-control-allow-origin'] = o;
     }
     return h;
   };
-  const send = (req, res, status, body, type = 'application/json; charset=utf-8', withCors = true) => {
-    const data = typeof body === 'string' || body instanceof Uint8Array ? body : JSON.stringify(body);
-    res.writeHead(status, {
+  const send = async (req, res, status, body, type = 'application/json; charset=utf-8', withCors = true, asset) => {
+    let data = typeof body === 'string' || body instanceof Uint8Array ? body : JSON.stringify(body);
+    const headers = {
       'content-type': type,
-      'cache-control': 'no-store',
-      ...(withCors ? corsHeaders(req) : {}),
+      'cache-control': asset ? 'public, max-age=0, must-revalidate' : 'no-store',
+      ...(withCors ? corsHeaders(req, withCors === 'module') : {}),
       'x-content-type-options': 'nosniff',
-    });
-    res.end(data);
+    };
+    headers.vary = [headers.vary, 'Accept-Encoding'].filter(Boolean).join(', ');
+    if (asset) {
+      headers.etag = asset.etag;
+      if (req.headers['if-none-match']?.split(/,\s*/).some((tag) => tag === '*' || tag.replace(/^W\//, '') === asset.etag.slice(2))) {
+        res.writeHead(304, headers);
+        return res.end();
+      }
+    }
+    if (Buffer.byteLength(data) >= 1024 && acceptsGzip(req.headers['accept-encoding'])) {
+      if (asset && !compressedAssets.has(asset)) {
+        compressedAssets.set(asset, compress(data).catch(() => {
+          compressedAssets.delete(asset);
+          return null;
+        }));
+      }
+      const compressed = await (asset ? compressedAssets.get(asset) : compress(data).catch(() => null));
+      if (compressed) {
+        data = compressed;
+        headers['content-encoding'] = 'gzip';
+      }
+    }
+    res.writeHead(status, headers);
+    res.end(req.method === 'HEAD' ? undefined : data);
   };
   const keyOK = (req) => {
     const got = Buffer.from(String(req.headers['x-gempt-key'] || ''));
@@ -239,21 +247,6 @@ export async function startServer({
     try {
       const url = new URL(req.url || '/', `http://127.0.0.1:${actualPort || DEFAULT_PORT}`);
       const pathname = url.pathname;
-      // Validate the raw segment before URL normalization can collapse dot paths.
-      const activity = /^\/api\/(requests|sessions)(?:\/(.*))?$/.exec((req.url || '/').split('?', 1)[0]);
-      if (activity && req.method === 'GET') {
-        if (!keyOK(req)) return send(req, res, 401, { error: 'unauthorized: send the x-gempt-key header' });
-        const [, kind, encodedId] = activity;
-        if (encodedId === undefined) {
-          const result = await listDispatchActivity(kind, url.searchParams, sessionsDir, magpieConfigDir, configPath);
-          return send(req, res, 200, result, typeof result === 'string' ? 'text/csv; charset=utf-8' : undefined);
-        }
-        let id;
-        try { id = decodeURIComponent(encodedId); } catch { /* Invalid percent encoding. */ }
-        if (!id || !isActivityId(kind, id)) return send(req, res, 400, { error: 'invalid activity id' });
-        const result = await getDispatchActivity(kind, id, sessionsDir, magpieConfigDir, configPath);
-        return result ? send(req, res, 200, result) : send(req, res, 404, { error: 'not found' });
-      }
       if (pathname === '/api/ping') {
         return send(req, res, 200, {
           ok: true,
@@ -264,90 +257,22 @@ export async function startServer({
         }, undefined, false);
       }
 
-      if (pathname.startsWith('/api/')) {
-        if (!keyOK(req)) {
-          return send(req, res, 401, { error: 'unauthorized: send the x-gempt-key header' });
-        }
-        if (req.method === 'POST' && pathname === '/api/install-agy') {
-          if (normalizedOrigin(req) === 'null') return send(req, res, 403, { error: 'invalid origin' });
-          return send(req, res, 200, await installAgy({ target: antigravityPluginDir, binDir: agyBinDir }));
-        }
-        if (req.method === 'POST' && pathname === '/api/app-server/restart') {
-          if (normalizedOrigin(req) === 'null') return send(req, res, 403, { error: 'invalid origin' });
-          if (!appServer) return send(req, res, 503, { error: 'shared Codex app-server management is disabled' });
-          const body = await readJsonBody(req);
-          const result = await appServer.restart({ force: body?.force === true });
-          return send(req, res, result.status || (result.ok ? 200 : 500), result);
-        }
-        const interrupt = /^\/api\/runs\/(.*?)\/interrupt$/.exec((req.url || '/').split('?', 1)[0]);
-        if (req.method === 'POST' && interrupt) {
-          if (normalizedOrigin(req) === 'null') return send(req, res, 403, { error: 'invalid origin' });
-          const id = interrupt[1];
-          if (id.length !== 32 || !/^[a-f0-9]+$/.test(id)) return send(req, res, 400, { error: 'invalid run_id' });
-          if (!appServer) return send(req, res, 503, { error: 'shared Codex app-server management is disabled' });
-          return send(req, res, 200, await appServer.interruptRun(id, sessionsDir));
-        }
-        if (req.method === 'GET' && pathname === '/api/state') {
-          const ratioRange = url.searchParams.get('ratio_range') ?? '24h';
-          if (!RATIO_RANGES.includes(ratioRange)) {
-            return send(req, res, 400, { error: 'invalid ratio_range' });
-          }
-          if (url.searchParams.get('probe') === '1' && appServer) {
-            await appServer.ensureRunning({ probe: true });
-          }
-          const state = await readState({
-            configPath,
-            sessionsDir,
-            magpieConfigDir,
-            antigravityPluginDir,
-            execEnabled,
-            mcpToolsEnabled,
-            appServer,
-            ratioRange,
-            probeTimeoutMs,
-          });
-          return send(req, res, 200, state);
-        }
-        if (req.method === 'POST' && pathname === '/api/init') {
-          const result = await initSubscriptionConfig({ configPath, probeTimeoutMs });
-          return send(req, res, result.status, result);
-        }
-        if (req.method === 'POST' && pathname === '/api/native-groups') {
-          const result = await createNativeGroups({
-            configPath,
-            magpieConfigDir,
-            magpieCliPath,
-            probeTimeoutMs,
-          });
-          return send(req, res, result.status, result);
-        }
-        if (req.method === 'POST' && pathname === '/api/tier') {
-          const body = await readJsonBody(req);
-          const result = setDefaultTier(body?.tier, { configPath });
-          return send(req, res, result.status, result);
-        }
-        if (req.method === 'POST' && pathname === '/api/settings') {
-          const result = await updateSettings(await readJsonBody(req), { configPath, probeTimeoutMs });
-          return send(req, res, result.status, result);
-        }
-        return send(req, res, 404, { error: 'not found' });
+      const rawPath = (req.url || '/').split('?', 1)[0];
+      if (pathname.startsWith('/api/') || /^\/api\/(requests|sessions)(?:\/|$)/.test(rawPath)) {
+        if (!keyOK(req)) return send(req, res, 401, { error: 'unauthorized: send the x-gempt-key header' });
+        const result = await dispatchPageApi({
+          method: req.method, url, rawPath, readBody: () => readJsonBody(req),
+          opaqueOrigin: normalizedOrigin(req) === 'null',
+        }, pageOptions());
+        return send(req, res, result.status, result.body, result.type);
       }
 
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         return send(req, res, 405, { error: 'method not allowed' }, undefined, false);
       }
 
-      const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
-      const file = resolve(UI_ROOT, rel);
-      if (!file.startsWith(UI_PREFIX)) {
-        return send(req, res, 403, { error: 'forbidden' }, undefined, false);
-      }
-      const data = await readFile(file).catch(() => null);
-      if (!data) {
-        return send(req, res, 404, 'not found', 'text/plain; charset=utf-8', false);
-      }
-      const type = MIME[extname(file).toLowerCase()] || 'application/octet-stream';
-      if (isIndexFile(file)) {
+      const index = pathname === '/' || pathname.toLowerCase() === '/index.html';
+      if (index) {
         const mode = String(req.headers['sec-fetch-mode'] || '').trim().toLowerCase();
         if (mode && mode !== 'navigate' && mode !== 'nested-navigate') {
           return send(req, res, 403, { error: 'cross-origin page read not allowed' }, undefined, false);
@@ -356,10 +281,16 @@ export async function startServer({
         if (origin !== undefined && !OWN.has(origin)) {
           return send(req, res, 403, { error: 'cross-origin page read not allowed' }, undefined, false);
         }
-        const html = data.toString('utf-8').replace('<head>', `<head>\n  <meta name="gempt-key" content="${KEY}">`);
-        return send(req, res, 200, html, type, false);
+        const asset = await readPageAsset('/index.html');
+        const html = asset.data.toString('utf8')
+          .replace('<head>', `<head>\n  <meta name="gempt-key" content="${KEY}">`);
+        return await send(req, res, 200, html, asset.type, false);
       }
-      return send(req, res, 200, data, type, false);
+      const asset = await readPageAsset(pathname);
+      if (!asset) return send(req, res, 404, 'not found', 'text/plain; charset=utf-8', false);
+      // Public modules also load in opaque Magpie frames.
+      return await send(req, res, 200, asset.data, asset.type,
+        asset.type.startsWith('text/javascript') ? 'module' : false, asset);
     } catch (err) {
       if (res.headersSent) {
         try { res.end(); } catch { /* ignore */ }
@@ -442,6 +373,7 @@ export async function startServer({
       appServer = createAppServerManager({ configPath, sessionsDir, ...appServerOptions });
       void appServer.ensureRunning();
     }
+    if (listening) warmPageTelemetry(pageOptions());
     return {
       port: actualPort,
       get listening() { return server.listening; },
@@ -490,6 +422,7 @@ export async function startServer({
         cleanStaleIdentity(identityFile(p));
         try {
           if (await bindOnce(p)) {
+            warmPageTelemetry(pageOptions());
             console.log(`[gempt-magpie-plugin] took over port ${p} (build ${BUILD_ID})`);
             return;
           }

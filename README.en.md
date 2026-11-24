@@ -1,4 +1,4 @@
-# GemPT v0.4.1
+# GemPT v0.5.0
 
 [中文文档](./README.md) · [Antigravity Plugin README](./plugin/README.md) · [Third-Party Licenses](./THIRD_PARTY_LICENSES.txt)
 
@@ -18,11 +18,11 @@ Runtime code uses only Node.js built-in modules (`>= 20.11.0`). GemPT Live ships
 
 ### 1. Install the Magpie Plugin
 
-Search for **GemPT** directly in the Magpie Plugin Marketplace (published at `v0.4.1` via `github:yizhang-dream/gempt`), or install from the CLI:
+Search for **GemPT** directly in the Magpie Plugin Marketplace (published at `v0.5.0` via `github:yizhang-dream/gempt`), or install from the CLI:
 
 ```bash
 # Recommended: install from the published GitHub release tag (available now)
-magpie plugin add github:yizhang-dream/gempt#v0.4.1
+magpie plugin add github:yizhang-dream/gempt#v0.5.0
 ```
 
 > **Note:** `gempt` is not yet published on the npm registry; do not run bare `magpie plugin add gempt` yet (it returns 404).
@@ -33,10 +33,10 @@ Open **Plugins → GemPT** in Magpie and click **Enable Subscription Config** (o
 
 ```bash
 # Recommended: one-command install from the GitHub release tag (available now)
-npx --yes github:yizhang-dream/gempt#v0.4.1 install-agy
+npx --yes github:yizhang-dream/gempt#v0.5.0 install-agy
 ```
 
-> **Note:** Since `gempt` is not yet published on the npm registry, use the GitHub tag above or install from a local checkout (bare `npx --yes gempt@0.4.1 install-agy` is not yet active).
+> **Note:** Since `gempt` is not yet published on the npm registry, use the GitHub tag above or install from a local checkout (bare `npx --yes gempt@0.5.0 install-agy` is not yet active).
 
 From a local checkout:
 - **Linux / macOS**: `bash install.sh`
@@ -64,7 +64,7 @@ Then verify in Antigravity:
 | --- | --- | --- |
 | `gpt_run` | `gempt_run` | Async Codex execution. Use `access="inspect"` (read-only) or `access="change"` (edits/tests). For parallel edits on the same Git repo, pass `access="change"` + `workspace="share"` (checked out from committed `HEAD`; disallowed with `access="inspect"`). |
 | `gpt_ask` | `gempt_ask` | Synchronous consultation with optional `cwd`, `file_paths`, and `session_id`. Use `tier="chore"` for utility tasks such as summarization. |
-| `gpt_ctl` | `gempt_ctl` | `status`, `steer`, `interrupt`, or `reply` to `ask_gemini`. Call `gpt_ctl({})` in Antigravity to open **GemPT Live**. |
+| `gpt_ctl` | `gempt_ctl` | `status`, `steer`, `interrupt`, or `reply` to `ask_gemini`. Open [GemPT Live](sidecar://gempt/gempt_live/) in Antigravity to switch between Live, Overview (including settings), Requests, and Sessions. |
 
 For new MCP threads, GemPT uses the current Gemini family. Pass `gemini_family` when you know it. Receipts report `paired:<family>` for a pairing or `mcp` when an unknown family uses the default model. Explicit `tier` values remain supported for legacy scripts.
 

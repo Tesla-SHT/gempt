@@ -106,6 +106,7 @@ function instanceSignature(rec) {
 
 export function createAppServerManager({
   configPath, sessionsDir, env = process.env, port = Number(env.GEMPT_APP_SERVER_PORT || 0),
+  observeOnly = false,
   spawnProcess = spawn, connect = connectAppServer, startupMs = 8000,
   backoffMs = [250, 500, 1000, 2000, 4000, 8000],
   healthIntervalMs = 30_000,
@@ -465,7 +466,7 @@ export function createAppServerManager({
       clearTimeout(restart);
       restart = undefined;
     }
-    if (!starting) {
+    if (!observeOnly && !starting) {
       starting = start().catch((err) => {
         error = err.message;
         terminate(child);
@@ -495,7 +496,16 @@ export function createAppServerManager({
     const prevSig = instanceSignature(prev);
     const prevPid = prev?.status === 'running' ? prev.pid : null;
     const external = !ownsLock && prev?.status === 'running' && alive(prev.pid);
-    const verified = external && (!prev.process_marker || await verifyProcess(prev.pid, prev.process_marker));
+    const lockOwner = () => {
+      try { return readFileSync(lockFile, 'utf8'); } catch { return ''; }
+    };
+    const ownerBefore = observeOnly ? lockOwner() : '';
+    const marker = prev?.process_marker;
+    const verified = external && (marker ? await verifyProcess(prev.pid, marker) : !observeOnly);
+    if (observeOnly && (!verified || !alive(Number(ownerBefore.split(' ')[0])) || ownerBefore !== lockOwner()
+      || prevSig !== instanceSignature(readJsonSafe(stateFile)))) {
+      return { ok: false, status: 409, error: 'No verified Codex app-server with a live manager to restart.' };
+    }
     const active = force === true ? [] : readActiveRuns(sessionsDir);
     if (active.length) {
       return {
@@ -543,7 +553,7 @@ export function createAppServerManager({
       if (!oldExited && prevPid) {
         if (!alive(prevPid)) {
           oldExited = true;
-        } else if (external && !forcedKillSent && prevPid !== process.pid
+        } else if (!observeOnly && external && !forcedKillSent && prevPid !== process.pid
             && Date.now() >= forceKillAt && process.platform !== 'win32') {
           forcedKillSent = true;
           try { process.kill(prevPid, 'SIGKILL'); } catch { /* ignore */ }

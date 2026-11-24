@@ -1,9 +1,11 @@
-import { isRunOccupying, reconcileRunState } from '../../core/runs.mjs';
+import { isRunOccupying, readRun, reconcileRunState, stateEntries } from '../../core/runs.mjs';
 import { isValidSessionId } from '../../core/state.mjs';
 import {
   closeSync, existsSync, fstatSync, lstatSync, openSync, readSync, readdirSync, statSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { isMainThread, workerData } from 'node:worker_threads';
+import { createBackgroundWorker, serveBackgroundWorker } from './background-worker.mjs';
 import { correlateGatewayUsage } from './activity-gateway.mjs';
 import { readActivityTimeline } from './activity-timeline.mjs';
 import { buildRequestAnalytics, buildSessionAnalytics } from './activity-analytics.mjs';
@@ -157,6 +159,24 @@ function reconcileActivityRun(data, modifiedMs) {
   return reconcileRunState(record, () => modifiedMs);
 }
 
+export function listConsultSessions(sessionsDir, { limit, matches }) {
+  const sessions = [];
+  for (const entry of sortedMtimeEntries(resolveSessionsDir(sessionsDir), (name) => name.endsWith('.json'))) {
+    const id = entry.name.slice(0, -5);
+    if (!safeSessionId(id)) continue;
+    const record = readJsonSafe(entry.full);
+    if (inferSessionMode(id, record) !== 'consult' || !matches(record)) continue;
+    sessions.push({
+      session_id: id, mode: 'consult', host_conversation_id: record.host_conversation_id ?? null,
+      title: normalizeTitle(record.title, sessionGoal(record), record.cwd),
+      cwd: record.cwd || null, model: record.model || '', tier: record.tier || '',
+      updated_at: record.updated_at || null,
+    });
+    if (sessions.length >= limit) break;
+  }
+  return sessions;
+}
+
 export function readRecentActivity(sessionsDir, limit = 6) {
   const recentSessions = [];
   for (const entry of sortedMtimeEntries(sessionsDir, (n) => n.endsWith('.json'))) {
@@ -192,6 +212,7 @@ export function readRecentActivity(sessionsDir, limit = 6) {
       const reconciled = reconcileActivityRun(data, modifiedMs);
       recentRuns.push({
         run_id: String(reconciled.run_id || dirEntry.name),
+        session_id: reconciled.session_id ?? null,
         state: String(reconciled.state || 'unknown'),
         cwd_name: workspaceName(reconciled.cwd),
         title: normalizeTitle(reconciled.title, reconciled.goal, reconciled.cwd),
@@ -204,26 +225,34 @@ export function readRecentActivity(sessionsDir, limit = 6) {
     }
   }
 
+  if (recentSessions.length) {
+    const sessionIds = new Set(recentSessions.map(({ session_id }) => session_id));
+    for (const { id, stat } of stateEntries(sessionsDir)) {
+      if (!sessionIds.size) break;
+      let run;
+      try { run = readRun(id, sessionsDir, { stat, readonly: true }); } catch { continue; }
+      if (sessionIds.delete(run.session_id)) {
+        recentSessions.find(({ session_id }) => session_id === run.session_id).has_live_run = true;
+      }
+    }
+  }
   return { recentSessions, recentRuns };
 }
 
 export function readActiveRuns(sessionsDir) {
-  const dir = join(resolveSessionsDir(sessionsDir), 'runs');
   const nowMs = Date.now();
   const result = [];
-  for (const item of activityEntries(dir)) {
-    if (!item.isDirectory() || !ACTIVITY_RUN_ID.test(item.name)) continue;
-    const file = readActivityFile(join(dir, item.name, 'state.json'));
-    if (!file) continue;
-    const { data, modifiedMs } = file;
-    if (!data || (data.run_id && data.run_id !== item.name)) continue;
-    const reconciled = reconcileActivityRun(data, modifiedMs);
+  for (const { id, mtime: modifiedMs, stat } of stateEntries(sessionsDir)) {
+    let reconciled;
+    try { reconciled = readRun(id, sessionsDir, { stat, readonly: true, allowLegacyId: true }); } catch { continue; }
     if (!isRunOccupying(reconciled, nowMs, modifiedMs)) continue;
     result.push({
-      run_id: item.name,
+      run_id: id,
       state: reconciled.state,
       session_id: reconciled.session_id ?? null,
       cwd: reconciled.cwd,
+      created_at: reconciled.created_at ?? null,
+      started_at: reconciled.started_at ?? null,
       title: normalizeTitle(reconciled.title, reconciled.goal, reconciled.cwd),
       codex_thread_id: reconciled.codex_thread_id ?? null,
       turn_id: reconciled.turn_id ?? null,
@@ -690,6 +719,33 @@ export function readDispatchActivity(sessionsDir) {
   return built.data;
 }
 
+const overviewWorker = createBackgroundWorker(new URL(import.meta.url), 'gempt-overview');
+const overviewReads = new Map();
+const overviewSnapshots = new WeakMap();
+
+function snapshotOverviewActivity(dir, magpieConfigDir) {
+  const ledger = readDispatchActivity(dir);
+  if (!overviewSnapshots.has(ledger)) {
+    const { recentSessions, recentRuns } = readRecentActivity(dir, 6);
+    overviewSnapshots.set(ledger, {
+      activityTotals: ledger.totals, recentSessions, recentRuns, activeRuns: readActiveRuns(dir),
+    });
+  }
+  return { ...overviewSnapshots.get(ledger), recentGroupCalls: readExternalGroupUsage(magpieConfigDir, 6) };
+}
+
+export function readOverviewActivity(sessionsDir, magpieConfigDir) {
+  const dir = resolveSessionsDir(sessionsDir);
+  const magpieDir = resolveMagpieConfigDir(magpieConfigDir);
+  const key = JSON.stringify([dir, magpieDir]);
+  if (!overviewReads.has(key)) {
+    overviewReads.set(key, overviewWorker(dir, magpieDir).finally(() => overviewReads.delete(key)));
+  }
+  return overviewReads.get(key);
+}
+
+if (!isMainThread && workerData === 'gempt-overview') serveBackgroundWorker(snapshotOverviewActivity);
+
 async function enrichDispatchActivity(sessionsDir, magpieConfigDir, configPath) {
   const dir = resolveSessionsDir(sessionsDir);
   const resolvedMagpieDir = resolveMagpieConfigDir(magpieConfigDir);
@@ -729,7 +785,8 @@ function requestListItem(row) {
 
 function sessionListItem(row) {
   const { requests, runs, ...item } = row;
-  return { ...item, title: item.title.slice(0, 320) };
+  return { ...item, live_run_id: requests.findLast((request) => request.run_id)?.run_id ?? null,
+    title: item.title.slice(0, 320) };
 }
 
 function activityRange(params) {
@@ -823,7 +880,10 @@ export async function listDispatchActivity(kind, params, sessionsDir, magpieConf
   const findText = (row) => [row.id, row.session_id, row.run_id, row.title, row.goal, row.prompt, row.reply, row.error, row.model,
     row.tier, row.agent, row.cwd, row.requested_model, row.sent_model, row.provider, row.account]
     .some((value) => value?.toLowerCase().includes(query));
-  const searchable = query ? records.filter((row) => findText(row) || row.requests?.some(findText)) : records;
+  const linked = records.filter((row) => (!params.get('session_id') || row.session_id === params.get('session_id'))
+    && (!params.get('run_id') || (isRequests ? row.run_id === params.get('run_id')
+      : row.requests.some((request) => request.run_id === params.get('run_id')))));
+  const searchable = query ? linked.filter((row) => findText(row) || row.requests?.some(findText)) : linked;
   const filters = Object.entries(fields);
   const filtered = searchable.filter((row) => filters.every(([key, field]) => matches(row, key, field)));
   if (isRequests && params.get('format') === 'csv') return activityCsv(filtered);

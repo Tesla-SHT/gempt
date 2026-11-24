@@ -1,10 +1,7 @@
-/*
- * GemPT Magpie Page Plugin UI controller.
- * Applies Magpie theme/tokens from boot query parameters, authenticates API
- * calls with the injected <meta name="gempt-key"> secret and controls Antigravity
- * MCP orchestration and native Magpie routing groups for other clients.
- */
-(() => {
+// Shared Console controller. Host adapters provide transport and host integration.
+export function mountConsole(root, transport, {
+  queryViewMode = '', onState, navigate, showToast, copyText,
+} = {}) {
   const POLL_MS = 15000;
   const LIVE_POLL_MS = 2800;
   const MODE_STORAGE_KEY = 'gempt_view_mode';
@@ -17,13 +14,11 @@
     '7d': '近 7 天实际 Token 占比',
   };
   const SUPPORTS_HAS = typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('selector(:has(*))');
-  const $ = (id) => document.getElementById(id);
-  const params = new URLSearchParams(location.search);
-  const queryViewMode = (() => {
-    const m = String(params.get('mode') || '').trim().toLowerCase();
-    return m === 'mcp' || m === 'native' ? m : '';
-  })();
-  const apiKey = document.querySelector('meta[name="gempt-key"]')?.getAttribute('content') || '';
+  const $ = (id) => root.querySelector(`#${id}`);
+  const embedded = transport.isEmbeddedInAgy;
+  const scrollTarget = root;
+  let visible = false;
+  const pendingSettings = new Set();
 
   const EFFORT_LABELS = {
     none: '思考：关',
@@ -87,31 +82,26 @@
   let currentEffortChoice = 'high';
   let currentViewMode = queryViewMode || readStoredMode();
   let ratioRange = readStoredRatioRange();
-  let toastTimer = null;
+  let ratioFetch;
+  let runStateFetch;
+  let locateWork = false;
 
   function readStoredMode() {
-    try {
-      const saved = window.localStorage?.getItem(MODE_STORAGE_KEY);
-      return saved === 'native' || saved === 'mcp' ? saved : '';
-    } catch {
-      return '';
-    }
+    const saved = consolePreference(MODE_STORAGE_KEY);
+    return saved === 'native' || saved === 'mcp' ? saved : '';
   }
 
   function readStoredRatioRange() {
-    try {
-      const saved = window.localStorage?.getItem(RATIO_RANGE_STORAGE_KEY);
-      if (Object.hasOwn(RATIO_RANGE_TITLES, saved)) return saved;
-    } catch {}
-    return '24h';
+    const saved = consolePreference(RATIO_RANGE_STORAGE_KEY);
+    return Object.hasOwn(RATIO_RANGE_TITLES, saved) ? saved : '24h';
   }
 
   function selectRatioRange(range) {
     if (!Object.hasOwn(RATIO_RANGE_TITLES, range) || range === ratioRange) return;
     ratioRange = range;
-    try { window.localStorage?.setItem(RATIO_RANGE_STORAGE_KEY, range); } catch {}
+    consolePreference(RATIO_RANGE_STORAGE_KEY, range);
     updateRatioRangeControls();
-    void refreshState();
+    void refreshRatio();
   }
 
   function updateRatioRangeControls() {
@@ -121,85 +111,21 @@
   }
 
   function writeStoredMode(mode) {
-    try {
-      window.localStorage?.setItem(MODE_STORAGE_KEY, mode);
-    } catch {
-      // Ignore storage failures inside restricted sandboxes.
-    }
+    consolePreference(MODE_STORAGE_KEY, mode);
   }
-
-  function applyHostTheme() {
-    const theme = params.get('theme');
-    if (theme === 'dark' || theme === 'light') {
-      document.documentElement.dataset.theme = theme;
-    }
-    const rawTokens = params.get('tokens');
-    if (!rawTokens) return;
-    try {
-      const json = decodeURIComponent(escape(atob(rawTokens)));
-      const parsed = JSON.parse(json);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        for (const [k, v] of Object.entries(parsed)) {
-          if (!/^--[a-z0-9-]+$/i.test(k)) continue;
-          const val = String(v ?? '').trim();
-          if (!val || val.length > 200 || /[;{}]|url\(/i.test(val)) continue;
-          document.documentElement.style.setProperty(k, val);
-        }
-      }
-    } catch {
-      // Fall back to default Magpie CSS tokens.
-    }
-  }
-
-  applyHostTheme();
 
   function syncHasFallbackClasses() {
     if (SUPPORTS_HAS) return;
-    for (const row of document.querySelectorAll('.tier-row')) {
+    for (const row of root.querySelectorAll('.tier-row')) {
       const radio = row.querySelector('.tier-radio');
       row.classList.toggle('is-checked', Boolean(radio?.checked));
       row.classList.toggle('is-disabled', Boolean(radio?.disabled));
     }
-    for (const opt of document.querySelectorAll('.seg-option')) {
+    for (const opt of root.querySelectorAll('.seg-option')) {
       const radio = opt.querySelector('.seg-radio');
       opt.classList.toggle('is-checked', Boolean(radio?.checked));
       opt.classList.toggle('is-disabled', Boolean(radio?.disabled));
     }
-  }
-
-  let reloadingForAuth = false;
-  async function apiFetch(path, options = {}) {
-    const headers = {
-      ...(options.headers || {}),
-      'x-gempt-key': apiKey,
-    };
-    const res = await fetch(path.startsWith('/api/') ? `.${path}` : path, { ...options, headers });
-    if (res.status === 401 && !reloadingForAuth) {
-      try {
-        const last = Number(sessionStorage.getItem('gempt-auth-reload') || 0);
-        if (Date.now() - last > 3000) {
-          reloadingForAuth = true;
-          sessionStorage.setItem('gempt-auth-reload', String(Date.now()));
-          location.reload();
-        }
-      } catch {
-        reloadingForAuth = true;
-        location.reload();
-      }
-    }
-    return res;
-  }
-
-  function showToast(message, kind = 'info') {
-    const el = $('toast');
-    if (!el) return;
-    el.textContent = message;
-    el.dataset.kind = kind;
-    el.hidden = false;
-    if (toastTimer) clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => {
-      el.hidden = true;
-    }, 2600);
   }
 
   function titleCaseTier(id) {
@@ -360,6 +286,7 @@
     swarm.disabled = !state.configured;
     const validSwarm = state.swarm_split === 'inherit' || Object.hasOwn(profiles, state.swarm_split);
     swarm.value = validSwarm ? state.swarm_split : 'inherit';
+    renderExecutionSettings(state);
     renderPairings(state);
     const ordinary = profiles[state.work_split];
     const team = profiles[swarm.value] || ordinary;
@@ -368,7 +295,6 @@
     if (ordinary?.gpt_share !== 0 && state.tools?.exec_enabled === false) {
       workDetail.textContent += ' Magpie 的 gempt_run 当前允许只读调查。要允许写入，请在 GemPT 插件选项开启 exec。';
     }
-    renderTokenRatio(state.token_ratio);
     $('swarm-detail').textContent = team?.gpt_share === 0
       ? team.detail
       : (team?.label || '') + ' · 协调者拆单和解说，成员按各自职责派单，核验者独立检查。';
@@ -476,6 +402,30 @@
     }
   }
 
+  function renderExecutionSettings(state) {
+    for (const radio of root.querySelectorAll('[name="native_swarm"]')) {
+      radio.checked = radio.value === String(state.native_swarm !== false);
+      radio.disabled = !state.configured || pendingSettings.has(radio.name);
+    }
+    const model = $('swarm-shell-model');
+    const models = state.swarm_shell_models || [];
+    if (Array.from(model.options, (option) => option.value).join() !== models.join()) {
+      model.replaceChildren(...models.map((name) => new Option(name, name)));
+    }
+    model.value = state.swarm_shell_model;
+    model.disabled = !state.configured || pendingSettings.has(model.name);
+    const timeout = $('codex-timeout');
+    if (document.activeElement !== timeout) timeout.value = state.codex_timeout_sec ?? 3600;
+    const disabled = !state.configured || pendingSettings.has(timeout.name);
+    timeout.disabled = disabled;
+    for (const control of root.querySelectorAll('[data-timeout], [data-timeout-save]')) {
+      control.disabled = disabled;
+      if (control.dataset.timeout) {
+        control.setAttribute('aria-pressed', String(Number(control.dataset.timeout) === state.codex_timeout_sec));
+      }
+    }
+  }
+
   function renderControls(state, viewMode) {
     renderWorkSplit(state, viewMode);
     const mcpBar = $('mcp-controls-bar');
@@ -485,7 +435,7 @@
 
     const configured = Boolean(state.configured);
     currentDefaultSandbox = state.default_sandbox || 'workspace-write';
-    for (const radio of document.querySelectorAll('input[name="default_sandbox"]')) {
+    for (const radio of root.querySelectorAll('input[name="default_sandbox"]')) {
       radio.checked = radio.value === currentDefaultSandbox;
       radio.disabled = !configured;
     }
@@ -498,7 +448,7 @@
     }
 
     currentEffortChoice = state.auto_effort ? 'auto' : state.mcp_effort || 'medium';
-    for (const radio of document.querySelectorAll('input[name="active_effort"]')) {
+    for (const radio of root.querySelectorAll('input[name="active_effort"]')) {
       radio.checked = radio.value === currentEffortChoice;
       radio.disabled = !configured;
     }
@@ -507,6 +457,11 @@
       effHint.textContent = EFFORT_HINTS[currentEffortChoice] || formatEffortLabel(currentEffortChoice);
     }
 
+    renderGatewayControls(state);
+  }
+
+  function renderGatewayControls(state) {
+    const configured = Boolean(state.configured);
     const failoverGroup = $('failover-control-group');
     const apiEnabled = Boolean(state.features?.api_fallback);
     currentFailoverMode = state.failover_mode || 'subscription_only';
@@ -515,7 +470,7 @@
       failoverGroup.hidden = !apiEnabled;
       if (apiEnabled) {
         const apiAvailable = Boolean(state.api_fallback?.available) || currentFailoverMode === 'api_fallback';
-        for (const radio of document.querySelectorAll('input[name="failover_mode"]')) {
+        for (const radio of root.querySelectorAll('input[name="failover_mode"]')) {
           radio.checked = radio.value === currentFailoverMode;
           if (!configured) {
             radio.disabled = true;
@@ -725,6 +680,7 @@
         : (run.state === 'failed' || run.verification === 'failed' ? 'err' : 'neutral'),
       text: `执行 · ${titleCaseTier(run.tier || 'exec')} · ${run.title || run.cwd_name || run.run_id.slice(0, 8)}`,
       meta: formatRunMeta(run),
+      runId: run.run_id, sessionId: run.session_id,
     }));
     const sessions = (state.recent_sessions || []).map((sess) => {
       const agentTag = sess.agent ? ` · ${sess.agent}` : '';
@@ -732,6 +688,7 @@
         tone: 'ok',
         text: `${sess.mode === 'exec' ? '执行' : '咨询'} · ${titleCaseTier(sess.tier || 'sonnet')}${agentTag} · ${sess.title || sess.cwd_name || 'GPT 任务'}`,
         meta: `${Math.max(1, Math.floor((sess.turns || 0) / 2))} 轮`,
+        sessionId: sess.session_id, hasLive: sess.has_live_run,
       };
     });
     const groupCalls = (state.recent_group_calls || []).map((call) => {
@@ -769,9 +726,12 @@
       dot.className = 'recent-dot';
       dot.dataset.tone = item.tone;
       dot.setAttribute('aria-hidden', 'true');
-      const text = document.createElement('span');
-      text.className = 'recent-text';
-      text.textContent = item.text;
+      const linked = item.runId || item.hasLive;
+      const text = node(linked ? 'button' : 'span', 'recent-text', item.text);
+      if (linked) {
+        text.type = 'button';
+        text.onclick = () => navigate('live', { id: item.runId, sessionId: item.sessionId, focus: true });
+      }
       left.append(dot, text);
 
       const meta = document.createElement('span');
@@ -786,11 +746,13 @@
   function renderState(state) {
     if (!state) return;
     latestState = state;
+    onState?.(state);
+    if (locateWork) currentViewMode = 'mcp';
     nativePreviewTier ||= state.default_tier || 'sonnet';
     const viewMode = resolveEffectiveViewMode(state);
     currentViewMode = viewMode;
 
-    for (const radio of document.querySelectorAll('input[name="view_mode"]')) {
+    for (const radio of root.querySelectorAll('input[name="view_mode"]')) {
       radio.checked = radio.value === viewMode;
     }
 
@@ -798,25 +760,7 @@
     renderControls(state, viewMode);
     renderReadiness(state);
 
-    const tiersSection = $('tiers-section');
-    tiersSection.hidden = viewMode !== 'native';
-    const nativeById = new Map((state.native_groups?.tiers || []).map((t) => [t.id, t]));
-    if (viewMode === 'native') {
-      for (const row of tiersSection.querySelectorAll('.tier-row')) {
-        const tierId = row.dataset.tier;
-        const nativeInfo = nativeById.get(tierId);
-        const radio = row.querySelector('.tier-radio');
-        const pillEl = row.querySelector('[data-field="target_pill"]');
-        const subEl = row.querySelector('[data-field="chain_summary"]');
-        const effortEl = row.querySelector('[data-field="effort_tag"]');
-        if (radio) radio.checked = tierId === nativePreviewTier;
-        if (pillEl) pillEl.textContent = nativeInfo?.group_id || `group/gempt-${tierId}`;
-        if (subEl) subEl.textContent = formatNativeSummary(nativeInfo);
-        if (effortEl) effortEl.textContent = nativeInfo?.installed ? '已就绪' : '未创建';
-      }
-    }
-
-    renderActiveRoute(state, nativeById.get(nativePreviewTier), viewMode);
+    renderTierRoutes(state, viewMode);
 
     const choreModel = $('chore-model');
     const choreSub = $('chore-sub');
@@ -837,13 +781,63 @@
     if (stripAgy) stripAgy.hidden = viewMode !== 'mcp' || !hasAgy;
 
     renderActivity(state);
+    if (locateWork && visible && activeTab === 'overview') {
+      locateWork = false;
+      const work = $('work-controls');
+      work.scrollIntoView({ block: 'start' });
+      work.focus({ preventScroll: true });
+    }
+    for (const field of root.querySelectorAll('[name]')) {
+      if (pendingSettings.has(field.name)) field.disabled = true;
+    }
     syncHasFallbackClasses();
     markUiReady();
   }
 
+  function renderTierRoutes(state, viewMode) {
+    const tiersSection = $('tiers-section');
+    tiersSection.hidden = viewMode !== 'native';
+    const nativeById = new Map((state.native_groups?.tiers || []).map((t) => [t.id, t]));
+    if (viewMode === 'native') {
+      for (const row of tiersSection.querySelectorAll('.tier-row')) {
+        const tierId = row.dataset.tier;
+        const nativeInfo = nativeById.get(tierId);
+        const radio = row.querySelector('.tier-radio');
+        const pillEl = row.querySelector('[data-field="target_pill"]');
+        const subEl = row.querySelector('[data-field="chain_summary"]');
+        const effortEl = row.querySelector('[data-field="effort_tag"]');
+        if (radio) radio.checked = tierId === nativePreviewTier;
+        if (pillEl) pillEl.textContent = nativeInfo?.group_id || `group/gempt-${tierId}`;
+        if (subEl) subEl.textContent = formatNativeSummary(nativeInfo);
+        if (effortEl) effortEl.textContent = nativeInfo?.installed ? '已就绪' : '未创建';
+      }
+    }
+
+    renderActiveRoute(state, nativeById.get(nativePreviewTier), viewMode);
+  }
+
+  let gatewayStatus;
+
+  function patchGatewayStatus({ overview, ...magpie }) {
+    gatewayStatus = { ...overview, magpie };
+    if (!latestState || latestState.magpie.url !== magpie.url) return;
+    latestState = { ...latestState, ...gatewayStatus };
+    if (!visible || activeTab !== 'overview') return;
+    renderSetupBanner(latestState, currentViewMode);
+    renderPairings(latestState);
+    renderGatewayControls(latestState);
+    renderReadiness(latestState);
+    renderTierRoutes(latestState, currentViewMode);
+    for (const field of root.querySelectorAll('[name]')) {
+      if (pendingSettings.has(field.name)) field.disabled = true;
+    }
+    syncHasFallbackClasses();
+    renderSyncStatus();
+  }
+
   function markUiReady() {
-    if (document.documentElement.classList.contains('gp-ready')) return;
-    requestAnimationFrame(() => requestAnimationFrame(() => document.documentElement.classList.add('gp-ready')));
+    if (root.classList.contains('gp-ready')) return;
+    requestAnimationFrame(() => requestAnimationFrame(() => root.classList.add('gp-ready')));
   }
 
   function renderSyncStatus() {
@@ -852,11 +846,11 @@
     const magpie = latestState?.magpie;
     const offline = magpie?.reachable === false;
     let message = '';
-    if (stateRefreshError) {
+    if (!view && stateRefreshError) {
       message = stateSyncedAt
         ? `概览数据已过期 · 上次同步 ${dateTime.format(stateSyncedAt)} · ${stateRefreshError}`
         : `加载概览失败 · ${stateRefreshError}`;
-    } else if (offline) {
+    } else if (!view && offline) {
       message = 'Magpie 离线 · 请检查本地 Magpie 是否已启动';
       if (stateSyncedAt) message += ` · 上次同步 ${dateTime.format(stateSyncedAt)}`;
     } else if (activity?.refreshError) {
@@ -871,51 +865,29 @@
       announcement.textContent = message;
       $('sync-message').textContent = message;
     }
-    if (!message && document.activeElement === $('sync-retry')) $('refresh-btn').focus();
+    if (!message && document.activeElement === $('sync-retry')) document.getElementById('refresh-btn').focus();
     banner.hidden = !message;
-    const status = $('magpie-status');
-    const statusText = $('magpie-status-text');
-    if (stateRefreshError || offline) {
-      status.dataset.state = 'offline';
-      status.title = stateRefreshError || magpie.error || 'Magpie 暂不可达';
-      statusText.textContent = stateRefreshError ? (stateSyncedAt ? '同步失败' : '连接失败') : '未连接';
-    } else if (magpie) {
-      const ready = latestState.subscription?.connected || latestState.native_groups?.complete;
-      status.dataset.state = ready ? 'online' : 'warn';
-      status.title = magpie.url || '';
-      statusText.textContent = ready ? '已连接' : '待登录 Codex 订阅';
-    }
   }
 
-  async function refreshState({ manual = false, live = false } = {}) {
-    if (live && stateFetch) return;
+  async function refreshState({ replace = false } = {}) {
+    if (!visible || activeTab !== 'overview' || (stateFetch && !replace)) return;
     stateFetch?.abort();
     const abort = stateFetch = new AbortController();
-    const refreshBtn = $('refresh-btn');
-    if (manual && refreshBtn) refreshBtn.classList.add('is-spinning');
+    const previousGatewayStatus = gatewayStatus;
     try {
       const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(POLL_MS)]);
-      const res = await apiFetch(`/api/state?ratio_range=${ratioRange}${manual ? '&probe=1' : ''}`, { signal });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
+      let data = await transport.getState({ signal });
       if (abort.signal.aborted) return;
-      if (typeof data?.magpie?.reachable !== 'boolean') throw new Error('状态响应格式无效');
-      if (live && latestState && !stateRefreshError && latestState.magpie?.reachable === data.magpie.reachable) {
-        latestState = { ...latestState, app_server: data.app_server, active_runs: data.active_runs };
-      } else {
-        renderState(data);
+      if (!data?.magpie) throw new Error('状态响应格式无效');
+      if (gatewayStatus?.magpie.url === data.magpie.url
+          && (gatewayStatus !== previousGatewayStatus || data.magpie.reachable === null)) {
+        data = { ...data, ...gatewayStatus };
       }
+      renderState(data);
       renderLiveOverview(data);
       if (data.magpie.reachable) stateSyncedAt = Date.now();
       stateRefreshError = '';
       renderSyncStatus();
-      // The slow state refresh also discovers runs when an activity list is idle.
-      const view = activityViews[activeTab];
-      if (view && !view.open && !view.listFetch && !view.items.some(isActiveRun)
-          && data.active_runs?.length) {
-        void refreshActivityView(view);
-      }
-      if (manual && data.magpie.reachable) showToast('状态已更新');
     } catch (err) {
       if (!abort.signal.aborted) {
         stateRefreshError = err.name === 'TimeoutError' ? '连接超时' : err.message;
@@ -925,9 +897,41 @@
       if (stateFetch === abort) {
         stateFetch = null;
         markUiReady();
-        refreshBtn?.classList.remove('is-spinning');
         syncLivePoll();
       }
+    }
+  }
+
+  async function refreshRatio() {
+    if (!visible || activeTab !== 'overview') return;
+    ratioFetch?.abort();
+    const abort = ratioFetch = new AbortController();
+    try {
+      const ratio = await transport.getRatio(ratioRange, { signal: abort.signal });
+      if (!abort.signal.aborted) renderTokenRatio(ratio);
+    } catch {
+      if (!abort.signal.aborted) {
+        $('token-ratio-card').hidden = false;
+        $('token-ratio-title').textContent = RATIO_RANGE_TITLES[ratioRange];
+        $('token-ratio-badge').textContent = '读取失败';
+      }
+    } finally {
+      if (ratioFetch === abort) ratioFetch = null;
+    }
+  }
+
+  async function refreshRunState() {
+    if (!visible || activeTab !== 'overview' || runStateFetch) return;
+    const abort = runStateFetch = new AbortController();
+    try {
+      const data = await transport.getRunState({ signal: abort.signal });
+      if (abort.signal.aborted) return;
+      if (latestState) latestState = { ...latestState, ...data };
+      renderLiveOverview(data);
+    } catch (error) {
+      if (!abort.signal.aborted) $('active-run-list').title = error.message;
+    } finally {
+      if (runStateFetch === abort) runStateFetch = null;
     }
   }
 
@@ -935,11 +939,7 @@
     const btn = $('init-sub-btn');
     if (btn) btn.disabled = true;
     try {
-      const res = await apiFetch('/api/init', { method: 'POST' });
-      const payload = await res.json().catch(() => ({}));
-      if (!res.ok || !payload.ok) {
-        throw new Error(payload.error || `HTTP ${res.status}`);
-      }
+      await transport.runAction('init');
       showToast('已启用全客户端共享配置');
     } catch (err) {
       showToast(`启用失败: ${err.message}`, 'error');
@@ -953,11 +953,7 @@
     const btn = $('create-native-btn');
     if (btn) btn.disabled = true;
     try {
-      const res = await apiFetch('/api/native-groups', { method: 'POST' });
-      const payload = await res.json().catch(() => ({}));
-      if (!res.ok || !payload.ok) {
-        throw new Error(payload.error || `HTTP ${res.status}`);
-      }
+      const payload = await transport.runAction('native_groups');
       const createdCount = Array.isArray(payload.created) ? payload.created.length : 0;
       const skippedCount = Array.isArray(payload.skipped) ? payload.skipped.length : 0;
       if (createdCount > 0 && skippedCount > 0) {
@@ -975,61 +971,42 @@
     }
   }
 
-  async function updateSetting(groupName, payloadBody, previousValue, successText) {
-    const radios = [...document.querySelectorAll(`[name="${groupName}"]`)];
-    for (const r of radios) r.disabled = true;
+  async function updateSetting(groupName, payload, previousValue, successText) {
+    if (pendingSettings.has(groupName)) return;
+    const controls = [...root.querySelectorAll(`[name="${groupName}"]`)];
+    pendingSettings.add(groupName);
+    for (const control of controls) control.disabled = true;
+    if (groupName === 'codex_timeout_sec') renderExecutionSettings(latestState);
     syncHasFallbackClasses();
-
     try {
-      const res = await apiFetch('/api/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payloadBody),
-      });
-      const payload = await res.json().catch(() => ({}));
-      if (!res.ok || !payload.ok) {
-        throw new Error(payload.error || `HTTP ${res.status}`);
+      const state = await transport.saveSettings(payload);
+      if (state?.magpie && visible && activeTab === 'overview') {
+        renderState(state);
+        renderLiveOverview(state);
+      } else {
+        await refreshState({ replace: true });
       }
+      if (groupName === 'work_split') void refreshRatio();
       showToast(successText);
     } catch (err) {
-      for (const r of radios) {
-        if (r.tagName === 'SELECT') r.value = previousValue;
-        else r.checked = r.value === previousValue;
+      for (const control of controls) {
+        if (control.type === 'radio') control.checked = control.value === String(previousValue);
+        else control.value = previousValue;
       }
-      syncHasFallbackClasses();
       showToast(`设置失败: ${err.message}`, 'error');
     } finally {
-      const allow = Boolean(latestState?.configured);
-      for (const r of radios) r.disabled = !allow;
+      pendingSettings.delete(groupName);
+      for (const control of controls) control.disabled = !latestState?.configured;
       syncHasFallbackClasses();
       await refreshState();
+      if (groupName === 'codex_timeout_sec') renderExecutionSettings(latestState);
     }
   }
 
-  async function copyText(text, customMessage = '') {
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-        showToast(customMessage || `已复制 ${text.trim()}`);
-        return;
-      }
-    } catch {
-      // Fall through to legacy textarea copy fallback.
-    }
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.setAttribute('readonly', '');
-    ta.style.cssText = 'position:fixed;opacity:0;pointer-events:none';
-    document.body.appendChild(ta);
-    ta.select();
-    try {
-      document.execCommand('copy');
-      showToast(customMessage || `已复制 ${text.trim()}`);
-    } catch {
-      showToast('复制失败，请手动输入或复制', 'error');
-    } finally {
-      ta.remove();
-    }
+  function saveTimeout(seconds) {
+    if (!latestState?.configured || typeof seconds !== 'number' || seconds < 30 || seconds > 7200 || !Number.isFinite(seconds)) return;
+    $('codex-timeout').value = seconds;
+    void updateSetting('codex_timeout_sec', { codex_timeout_sec: seconds }, latestState.codex_timeout_sec, 'Codex 执行超时预算已保存');
   }
 
   function copyMcpConfig() {
@@ -1069,7 +1046,6 @@
   const phases = { ...statuses, connecting: '连接 Codex', completed: '已完成' };
   const activeRunStates = new Set(['queued', 'running', 'waiting_gemini']);
   const interrupts = new Set();
-  const overviewRunTimes = new Map();
   const checks = { passed: '已通过', failed: '失败', unverified: '未验证', not_requested: '未要求' };
   const exactNumber = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 3 });
   const compactNumber = new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 });
@@ -1813,9 +1789,7 @@
   }
 
   async function findRunRequest(runId, signal) {
-    const res = await apiFetch(`/api/requests?${new URLSearchParams({ q: runId })}`, { signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const { items } = await res.json();
+    const { items } = await transport.listActivity('requests', { run_id: runId }, { signal });
     return items.find((request) => request.run_id === runId);
   }
 
@@ -1834,9 +1808,7 @@
       interrupts.add(id);
       control.disabled = true;
       try {
-        const res = await apiFetch(`/api/runs/${encodeURIComponent(id)}/interrupt`, { method: 'POST' });
-        const payload = await res.json().catch(() => ({}));
-        if (!res.ok || !payload.ok) throw new Error(payload.error || `HTTP ${res.status}`);
+        await transport.runAction('interrupt_run', { run_id: id });
         showToast(run.remote_turn_unconfirmed ? '已发送中断确认请求' : '已发送中止请求');
       } catch (err) {
         showToast(`中止失败 · ${err.message}`, 'error');
@@ -1849,26 +1821,9 @@
     return control;
   }
 
-  function runElapsed(run, time) {
-    const start = Date.parse(time);
-    if (Number.isFinite(start)) return duration(Math.max(0, (Date.now() - start) / 1000));
-    if (!overviewRunTimes.has(run.run_id) && activeTab === 'overview') {
-      overviewRunTimes.set(run.run_id, null);
-      // The live state identifies the run. The request ledger supplies its timestamp.
-      void findRunRequest(run.run_id).then((request) => {
-        if (!overviewRunTimes.has(run.run_id) || !request?.timestamp) return;
-        overviewRunTimes.set(run.run_id, request.timestamp);
-        const row = $('active-run-list').querySelector(`[data-run-id="${run.run_id}"]`);
-        const elapsed = row?.querySelector('.run-elapsed');
-        if (elapsed) {
-          elapsed.textContent = runElapsed(run, request.timestamp);
-          elapsed.hidden = !elapsed.textContent;
-        }
-      }).finally(() => {
-        if (overviewRunTimes.get(run.run_id) === null) overviewRunTimes.delete(run.run_id);
-      }).catch(() => {});
-    }
-    return '';
+  function runElapsed(time) {
+    const start = typeof time === 'number' ? time * 1000 : Date.parse(time);
+    return Number.isFinite(start) ? duration(Math.max(0, (Date.now() - start) / 1000)) : '';
   }
 
   function preview(className, value) {
@@ -1899,41 +1854,35 @@
     if (chip) chip.disabled = true;
     if (val) val.textContent = '重启中…';
     try {
-      const res = await apiFetch('/api/app-server/restart', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ force }),
-      });
-      const payload = await res.json().catch(() => ({}));
-      if (res.status === 409 && !force) {
+      await transport.runAction('restart_app_server', { force });
+      showToast('共享 Codex app-server 已重启');
+      await refreshState({ manual: false });
+    } catch (err) {
+      if (err.status === 409 && err.data?.active_runs && !force) {
         restartConfirmPending = true;
         if (val) val.textContent = '再点强制重启';
-        showToast(payload.error || '当前有运行中任务，再点一次将强制重启 Codex 服务', 'error');
+        showToast(err.message || '当前有运行中任务，再点一次将强制重启 Codex 服务', 'error');
         restartConfirmTimer = setTimeout(() => {
           clearRestartConfirm();
           if (latestState) renderLiveOverview(latestState);
         }, 5000);
         return;
       }
-      if (!res.ok || !payload.ok) {
-        throw new Error(payload.error || `HTTP ${res.status}`);
-      }
-      showToast('共享 Codex app-server 已重启');
-      await refreshState({ manual: false });
-    } catch (err) {
       showToast(`重启失败: ${err.message}`, 'error');
       await refreshState({ manual: false });
     } finally {
       restartInFlight = false;
-      if (chip) chip.disabled = false;
+      if (chip) chip.disabled = embedded && !latestState?.app_server?.pid;
     }
   }
 
   function renderLiveOverview(state) {
     const server = state.app_server;
+    const unavailable = embedded && !server?.pid;
+    $('chip-app-server').disabled = unavailable || restartInFlight;
     $('chip-app-server').dataset.tone = server?.error ? 'warn' : server?.running ? 'ok' : 'neutral';
     if (!restartInFlight && !restartConfirmPending) {
-      $('chip-app-server-val').textContent = server?.error ? '异常 · 点此重启' : server?.running ? '运行中 · 重启' : '未运行 · 启动';
+      $('chip-app-server-val').textContent = unavailable ? '未运行 · 在 Magpie 启动' : server?.error ? '异常 · 点此重启' : server?.running ? '运行中 · 重启' : '未运行 · 启动';
     }
     const error = $('app-server-error');
     error.textContent = server?.error || '';
@@ -1945,9 +1894,6 @@
     const focused = list.contains(document.activeElement) ? document.activeElement : null;
     const focusedRunId = focused?.closest('[data-run-id]')?.dataset.runId;
     let restoreFocus;
-    for (const id of overviewRunTimes.keys()) {
-      if (!runs.some((run) => run.run_id === id)) overviewRunTimes.delete(id);
-    }
     list.replaceChildren(...runs.map((run) => {
       const row = node('li', 'active-run');
       row.dataset.runId = run.run_id;
@@ -1962,7 +1908,7 @@
       if (phaseLabel && phaseLabel !== (statuses[status] || status)) {
         head.append(node('span', 'run-phase', phaseLabel));
       }
-      const elapsed = node('span', 'run-elapsed', runElapsed(run, overviewRunTimes.get(run.run_id)));
+      const elapsed = node('span', 'run-elapsed', runElapsed(run.started_at || run.created_at));
       elapsed.hidden = !elapsed.textContent;
       head.append(elapsed);
       info.append(head);
@@ -1977,7 +1923,7 @@
       const actions = node('div', 'active-run-actions');
       const detail = button('查看详情');
       detail.dataset.runAction = 'detail';
-      detail.onclick = () => navigateActivityTab('requests', false, `run-${run.run_id}`);
+      detail.onclick = () => navigate('live', { id: run.run_id, sessionId: run.session_id, focus: true });
       const interrupt = interruptButton(run, run.remote_turn_unconfirmed ? '中止确认' : '中止');
       actions.append(detail, interrupt);
       row.append(info, actions);
@@ -2056,8 +2002,9 @@
   }
 
   function sessionRow(view, session) {
-    const row = button('', 'activity-session-row');
-    row.dataset.activityId = session.id;
+    const row = node('div', 'activity-session-entry');
+    const summary = button('', 'activity-session-row');
+    summary.dataset.activityId = session.id;
     const icon = node('span', 'activity-session-icon', session.mode === 'exec' ? '>_' : '≡');
     icon.setAttribute('aria-hidden', 'true');
     const who = node('span', 'activity-session-who');
@@ -2077,11 +2024,17 @@
     }
     const arrow = node('span', 'activity-session-go', '›');
     arrow.setAttribute('aria-hidden', 'true');
-    row.append(icon, who, node('span', 'activity-badge', modes[session.mode]));
-    if (isActiveRun(session) || session.state === 'interrupted') row.append(statusBadge(session));
-    row.append(tokens,
+    summary.append(icon, who, node('span', 'activity-badge', modes[session.mode]));
+    if (isActiveRun(session) || session.state === 'interrupted') summary.append(statusBadge(session));
+    summary.append(tokens,
       node('span', 'activity-session-turns', `${number(session.turn_count)} 轮`), arrow);
-    row.onclick = () => navigateActivityTab(view.kind, false, session.id);
+    summary.onclick = () => navigateActivityTab(view.kind, false, session.id);
+    row.append(summary);
+    if (session.live_run_id) {
+      const live = button('实时流 ›');
+      live.onclick = () => navigate('live', { id: session.live_run_id, sessionId: session.session_id, focus: true });
+      row.append(live);
+    }
     return row;
   }
 
@@ -2143,6 +2096,10 @@
   function detailLink(tab, id, label) {
     const link = node('a', 'activity-link', label);
     link.href = `#${tab}/${encodeURIComponent(id)}`;
+    link.onclick = (event) => {
+      event.preventDefault();
+      navigate(tab, { id, focus: true });
+    };
     return link;
   }
 
@@ -2255,7 +2212,8 @@
     add('文件夹', r.cwd, true);
     detailLine(info, '会话 ID', r.session_id, true, !heading && r.session_id
       ? detailLink('sessions', r.session_id, '查看所属会话 ›') : null);
-    add('运行 ID', r.run_id, true);
+    detailLine(info, '运行 ID', r.run_id, true, r.run_id
+      ? detailLink('live', r.run_id, '查看实时流 ›') : null);
     add('Codex 线程 ID', r.codex_thread_id, true);
     add('验证', checks[r.verification.status] || r.verification.status);
     box.append(info);
@@ -2278,7 +2236,9 @@
   function renderSessionDetail(session) {
     const box = node('section', 'activity-detail-box');
     const info = node('dl', 'activity-detail-info');
-    detailLine(info, '会话 ID', session.session_id, true);
+    const latestRun = session.turns.findLast((turn) => turn.run_id);
+    detailLine(info, '会话 ID', session.session_id, true, latestRun
+      ? detailLink('live', latestRun.run_id, '查看实时流 ›') : null);
     detailLine(info, '文件夹', session.cwd, true);
     detailLine(info, '模式', modes[session.mode]);
     detailLine(info, '时间', session.created_at && session.created_at !== session.updated_at
@@ -2349,39 +2309,35 @@
     const row = [...view.results.querySelectorAll('[data-activity-id]')]
       .find((row) => row.dataset.activityId === open.id);
     (row || $(`tab-${view.kind}`)).focus({ preventScroll: true });
-    window.scrollTo(0, open.scroll);
+    scrollTarget.scrollTo(0, open.scroll);
   }
 
   async function loadActivityDetail(view, refresh = false) {
+    if (!visible || activeTab !== view.kind) return;
     const open = view.open;
     open.abort?.abort();
     const abort = open.abort = new AbortController();
     const body = view.detail.querySelector('.activity-detail-body');
     body.setAttribute('aria-busy', 'true');
     try {
-      const fetchDetail = (id) => apiFetch(`/api/${view.kind}/${encodeURIComponent(id)}`, { signal: abort.signal });
-      let res = await fetchDetail(open.id);
-      if (res.status === 404 && open.runId) {
-        // A run can move into its session's numbered turn when it finishes.
+      const fetchDetail = (id) => transport.getActivity(view.kind, id, { signal: abort.signal });
+      let data;
+      try {
+        data = await fetchDetail(open.id);
+      } catch (error) {
+        if (error.status !== 404 || !open.runId || abort.signal.aborted) throw error;
+        // A finished run can move into its session's numbered turn.
         const request = await findRunRequest(open.runId, abort.signal);
-        if (request && request.id !== open.id) {
-          open.id = request.id;
-          const current = activityLocation();
-          if (current.tab === view.kind && current.id === open.linkId) {
-            history.replaceState(null, '', `#${view.kind}/${encodeURIComponent(open.id)}`);
-            open.linkId = open.id;
-          }
-          res = await fetchDetail(open.id);
-        }
+        if (!request || request.id === open.id) throw error;
+        open.id = request.id;
+
+        data = await fetchDetail(open.id);
       }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
       if (abort.signal.aborted) return;
       const session = view.kind === 'sessions';
       const run = session ? data.turns.findLast(isActiveRun) || data : data;
       open.syncedAt = Date.now();
       open.refreshError = '';
-      open.active = isActiveRun(run);
       if (!session && data.run_id) open.runId = data.run_id;
       const rendered = JSON.stringify(data);
       if (open.rendered === rendered && !body.querySelector('button:disabled')) return;
@@ -2426,7 +2382,7 @@
   function openActivityDetail(view, id) {
     view.open?.abort?.abort();
     const runId = /^run-([a-f0-9]{32})$/.exec(id)?.[1];
-    view.open = { id, linkId: id, runId, scroll: window.scrollY };
+    view.open = { id, linkId: id, runId, scroll: root.scrollTop };
     const back = button(view.kind === 'requests' ? '‹ 请求' : '‹ 会话', 'activity-link activity-back');
     back.onclick = () => navigateActivityTab(view.kind);
     const body = node('div', 'activity-detail-body');
@@ -2434,7 +2390,7 @@
     view.detail.replaceChildren(back, body);
     view.list.hidden = true;
     view.detail.hidden = false;
-    window.scrollTo(0, 0);
+    scrollTarget.scrollTo(0, 0);
     back.focus({ preventScroll: true });
     void loadActivityDetail(view);
   }
@@ -2450,6 +2406,7 @@
   }
 
   async function loadActivityList(view, offset = 0, append = false, refresh = false) {
+    if (!visible || activeTab !== view.kind) return;
     view.listFetch?.abort();
     const abort = view.listFetch = new AbortController();
     const limit = refresh && view.kind === 'sessions' ? Math.max(activityPageSize, view.items.length) : activityPageSize;
@@ -2461,11 +2418,10 @@
     view.results.setAttribute('aria-busy', 'true');
     if (!view.loaded) view.results.replaceChildren(node('div', 'activity-empty', '正在读取记录…'));
     try {
-      const fetchPage = async () => {
-        const res = await apiFetch(`/api/${view.kind}?${query}`, { signal: abort.signal });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.json();
-      };
+      const fetchPage = () => transport.listActivity(view.kind, {
+        ...Object.fromEntries(query),
+        offset: Number(query.get('offset')), limit: Number(query.get('limit')),
+      }, { signal: abort.signal });
       const data = await fetchPage();
       // Preserve the expanded session list when refreshing live rows.
       while (data.items.length < Math.min(limit, data.total - offset) && !abort.signal.aborted) {
@@ -2549,93 +2505,79 @@
   }
 
   function refreshActivityView(view) {
-    if (!view) return;
+    if (!visible || !view || activeTab !== view.kind) return;
     return view.open ? loadActivityDetail(view, true)
       : loadActivityList(view, view.kind === 'requests' ? view.offset : 0, false, true);
   }
 
   function syncLivePoll() {
-    const view = activityViews[activeTab];
-    const active = view?.open ? view.open.active : view ? view.items.some(isActiveRun) : latestState?.active_runs?.length;
+    const active = visible && activeTab === 'overview' && latestState?.active_runs?.length;
     if (!active || document.visibilityState !== 'visible') {
       clearTimeout(liveTimer);
       liveTimer = null;
     } else if (liveTimer === null) {
       liveTimer = setTimeout(async () => {
         liveTimer = null;
-        if (document.visibilityState !== 'visible') return;
-        const current = activityViews[activeTab];
-        if (!current) await refreshState({ live: true });
-        else if (!current.listFetch && !current.open?.abort) await refreshActivityView(current);
+        if (activeTab === 'overview' && document.visibilityState === 'visible') await refreshRunState();
         syncLivePoll();
       }, LIVE_POLL_MS);
     }
   }
 
-  function activityLocation() {
-    const [tab, encodedId, rest] = location.hash.slice(1).split('/');
-    if (!activityTabs.includes(tab)) return { tab: 'overview' };
-    let id;
-    if (activityViews[tab] && encodedId && rest === undefined) {
-      try { id = decodeURIComponent(encodedId); } catch { /* Invalid URL fragment. */ }
-    }
-    return { tab, id };
-  }
-
-  function selectActivityLocation(focus = false) {
-    const { tab, id } = activityLocation();
+  function setTab(tab, { id, work = false } = {}) {
     const previous = activeTab;
-    if (tab !== previous) {
-      if (activityViews[previous]) closeActivityDetail(activityViews[previous], false);
-      window.scrollTo(0, 0);
-    }
+    const wasVisible = visible;
+    visible = tab !== 'live';
     activeTab = tab;
-    for (const name of activityTabs) {
-      const selected = name === tab;
-      $(name).hidden = !selected;
-      $(`tab-${name}`).tabIndex = selected ? 0 : -1;
-      $(`tab-${name}`).setAttribute('aria-selected', String(selected));
+    if (tab !== previous) {
+      if (previous === 'overview') {
+        stateFetch?.abort();
+        stateFetch = null;
+        ratioFetch?.abort();
+        runStateFetch?.abort();
+      }
+      if (activityViews[previous]) {
+        activityViews[previous].listFetch?.abort();
+        closeActivityDetail(activityViews[previous], false);
+      }
+      scrollTarget.scrollTo(0, 0);
     }
-    if (focus) $(`tab-${tab}`).focus();
+    for (const name of activityTabs) $(name).hidden = name !== tab;
+    if (!visible) {
+      syncLivePoll();
+      return;
+    }
     const view = activityViews[tab];
     if (view && id) {
       if (view.open?.linkId !== id) openActivityDetail(view, id);
     } else if (view) {
-      closeActivityDetail(view, !focus && tab === previous);
-      void refreshActivityView(view);
+      const hadDetail = Boolean(view.open);
+      closeActivityDetail(view, tab === previous);
+      if (!view.loaded || hadDetail) void refreshActivityView(view);
+    } else {
+      locateWork = work;
+      if (work && latestState) renderState(latestState);
+      if (!latestState || !wasVisible || previous !== tab) {
+        void refreshState();
+        void refreshRatio();
+      }
     }
-    else if (latestState) renderLiveOverview(latestState);
+    markUiReady();
     renderSyncStatus();
     syncLivePoll();
   }
 
   function navigateActivityTab(tab, focus = false, id) {
-    const hash = `#${tab}${id ? `/${encodeURIComponent(id)}` : ''}`;
-    if (location.hash !== hash) history.pushState(null, '', hash);
-    selectActivityLocation(focus);
+    navigate(tab, { id, focus });
   }
 
-  for (const tab of activityTabs) {
-    const control = $(`tab-${tab}`);
-    control.onclick = () => navigateActivityTab(tab);
-    control.onkeydown = (event) => {
-      const index = activityTabs.indexOf(tab);
-      const direction = { ArrowRight: 1, ArrowLeft: -1 }[event.key];
-      const next = direction ? activityTabs[(index + direction + activityTabs.length) % activityTabs.length]
-        : event.key === 'Home' ? activityTabs[0] : event.key === 'End' ? activityTabs.at(-1) : '';
-      if (!next) return;
-      event.preventDefault();
-      navigateActivityTab(next, true);
-    };
-  }
-  for (const link of document.querySelectorAll('[data-activity-tab]')) {
+  for (const link of root.querySelectorAll('[data-activity-tab]')) {
     link.onclick = (event) => {
       event.preventDefault();
       navigateActivityTab(link.dataset.activityTab, true);
     };
   }
-  window.addEventListener('hashchange', () => selectActivityLocation());
-  document.addEventListener('keydown', (event) => {
+  root.addEventListener('keydown', (event) => {
     const view = activityViews[activeTab];
     if (event.key === 'Escape' && view?.open) navigateActivityTab(view.kind);
   });
@@ -2644,7 +2586,7 @@
     activityRefreshTimer = null;
     if (activityRefreshMs > 0) {
       activityRefreshTimer = setInterval(() => {
-        if (document.visibilityState !== 'visible') return;
+        if (!visible || document.visibilityState !== 'visible') return;
         const view = activityViews[activeTab];
         if (view && !view.listFetch && !view.open?.abort) void refreshActivityView(view);
       }, activityRefreshMs);
@@ -2675,15 +2617,11 @@
       return control;
     });
     view.list.querySelector('[data-range-controls]').replaceChildren(...rangeControls);
-    const refreshBtn = view.list.querySelector('[data-activity-refresh]');
-    if (refreshBtn) {
-      refreshBtn.onclick = () => { void refreshActivityView(view); };
-    }
     const autoSelect = view.list.querySelector('[data-auto-refresh]');
     if (autoSelect) {
       autoSelect.onchange = () => {
         activityRefreshMs = Math.max(0, Number(autoSelect.value) || 0);
-        for (const other of document.querySelectorAll('[data-auto-refresh]')) other.value = String(activityRefreshMs);
+        for (const other of root.querySelectorAll('[data-auto-refresh]')) other.value = String(activityRefreshMs);
         syncActivityAutoRefresh();
       };
     }
@@ -2724,24 +2662,21 @@
       };
     }
   }
-  const exportCsv = document.querySelector('[data-export-csv]');
+  const exportCsv = root.querySelector('[data-export-csv]');
   exportCsv.onclick = async () => {
     exportCsv.disabled = true;
     try {
-      const query = activityQuery(activityViews.requests);
-      query.set('format', 'csv');
-      const response = await apiFetch(`/api/requests?${query}`);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      downloadActivity('gempt-requests.csv', await response.blob());
+      const query = Object.fromEntries(activityQuery(activityViews.requests));
+      const { csv } = await transport.listActivity('requests', { ...query, format: 'csv' });
+      downloadActivity('gempt-requests.csv', new Blob([csv], { type: 'text/csv;charset=utf-8' }));
     } catch (error) {
       showToast(`导出失败（${error.message}）`, 'error');
     } finally {
       exportCsv.disabled = false;
     }
   };
-  selectActivityLocation();
 
-  document.addEventListener('change', (ev) => {
+  root.addEventListener('change', (ev) => {
     const target = ev.target;
     if (!(target instanceof HTMLInputElement || target instanceof HTMLSelectElement)) return;
     if (target.name === 'view_mode') {
@@ -2753,6 +2688,9 @@
       renderState(latestState);
     } else if (target.name === 'work_split' || target.name === 'swarm_split') {
       updateSetting(target.name, { [target.name]: target.value }, latestState[target.name], '工作分工已保存，下次派单生效');
+    } else if (target.name === 'native_swarm' || target.name === 'swarm_shell_model') {
+      const value = target.name === 'native_swarm' ? target.value === 'true' : target.value;
+      void updateSetting(target.name, { [target.name]: value }, latestState[target.name], 'Swarm 派单设置已保存');
     } else if (target.dataset.family) {
       const family = target.dataset.family;
       updateSetting(target.name, { pairing: { family, model: target.value } }, latestState.pairings[family], '配对已保存，下个新任务生效');
@@ -2774,16 +2712,30 @@
     }
   });
 
-  document.addEventListener('click', (ev) => {
+  const timeoutInput = $('codex-timeout');
+  timeoutInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.isComposing && timeoutInput.reportValidity()) {
+      saveTimeout(timeoutInput.valueAsNumber);
+    }
+  });
+
+  root.addEventListener('click', (ev) => {
     const btn = ev.target instanceof Element ? ev.target.closest('button') : null;
     if (!btn) return;
+    if (btn.hasAttribute('data-timeout-save')) {
+      if (timeoutInput.reportValidity()) saveTimeout(timeoutInput.valueAsNumber);
+      return;
+    }
+    if (btn.dataset.timeout) {
+      saveTimeout(Number(btn.dataset.timeout));
+      return;
+    }
     if (btn.dataset.ratioRange) {
       selectRatioRange(btn.dataset.ratioRange);
       return;
     }
-    if (btn.id === 'refresh-btn' || btn.id === 'sync-retry') {
-      refreshState({ manual: btn.id === 'refresh-btn' });
-      void refreshActivityView(activityViews[activeTab]);
+    if (btn.id === 'sync-retry') {
+      void refresh();
       return;
     }
     if (btn.id === 'init-sub-btn') {
@@ -2818,17 +2770,31 @@
     }
   });
 
+  async function refresh() {
+    if (!visible) return;
+    if (activeTab === 'overview') await Promise.all([refreshState(), refreshRatio()]);
+    else await refreshActivityView(activityViews[activeTab]);
+  }
+
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-      refreshState();
-      void refreshActivityView(activityViews[activeTab]);
-    }
+    if (visible && document.visibilityState === 'visible') void refresh();
     syncLivePoll();
   });
-
   updateRatioRangeControls();
-  refreshState();
   setInterval(() => {
-    if (document.visibilityState === 'visible' && !stateFetch) refreshState();
+    if (visible && activeTab === 'overview' && document.visibilityState === 'visible') void refresh();
   }, POLL_MS);
-})();
+  return { setTab, refresh, patchGatewayStatus };
+}
+
+const preferences = new Map();
+
+export function consolePreference(key, value) {
+  if (value !== undefined) {
+    preferences.set(key, value);
+    try { globalThis.localStorage?.setItem(key, value); } catch { /* Opaque iframe. */ }
+    return value;
+  }
+  if (preferences.has(key)) return preferences.get(key);
+  try { return globalThis.localStorage?.getItem(key) ?? null; } catch { return null; }
+}

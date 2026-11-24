@@ -3,8 +3,11 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { isAstraModel } from '../magpie_plugin/lib/routing.mjs';
 import { WORKLOAD } from './assets.mjs';
+import { RUNTIME_ROOT, resolvePluginRoot } from './bundle-paths.mjs';
 import { withLockSync } from './state.mjs';
 
+export const GEMPT_VERSION = readJsonSafe(join(RUNTIME_ROOT, 'package.json'))?.version
+  || readJsonSafe(join(resolvePluginRoot(), 'plugin.json'))?.version || '0.5.0';
 export const TIER_ORDER = ['sonnet', 'opus', 'fable'];
 export const TIER_ALIASES = { lite: 'sonnet', mid: 'opus', max: 'fable' };
 export const VALID_SANDBOXES = ['read-only', 'workspace-write', 'danger-full-access'];
@@ -82,6 +85,14 @@ export function isCodexModelId(modelId) {
 export function getMcpEffort(policy) {
   const effort = String(policy?.mcp_effort || '').trim().toLowerCase();
   return VALID_EFFORTS.includes(effort) && effort !== 'ultra' ? effort : DEFAULT_MCP_EFFORT;
+}
+
+export function getNativeSwarmPolicy(policy) {
+  return {
+    native_swarm: typeof policy?.native_swarm === 'boolean' ? policy.native_swarm : WORKLOAD.native_swarm,
+    swarm_shell_model: WORKLOAD.swarm_shell_models.includes(policy?.swarm_shell_model)
+      ? policy.swarm_shell_model : WORKLOAD.swarm_shell_model,
+  };
 }
 
 export function getPairing(policy, family) {

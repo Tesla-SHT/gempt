@@ -6,14 +6,14 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, delimiter, dirname, join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
+import { RUNTIME_ROOT, resolvePluginRoot } from './bundle-paths.mjs';
 import { APP_RESOURCE, APP_TOOLS, APP_URI } from './mcp-app.mjs';
 import { resolveNodeExecutable } from './node-executable.mjs';
 import { atomicJson, resolvePath, withLock, withinPath } from './state.mjs';
 
 export { resolveNodeExecutable };
 export const DEFAULT_AGY_TARGET = join(homedir(), '.gemini', 'config', 'plugins', 'gempt');
-const ROOT = fileURLToPath(new URL('../', import.meta.url));
 const WINDOWS = process.platform === 'win32';
 const quotePosix = (value) => `'${value.replaceAll("'", "'\\''")}'`;
 const quoteWindows = (value) => `"${value}"`;
@@ -30,14 +30,16 @@ export function buildPortableMcpConfig() {
 }
 
 export function stagePluginBundle(staged, { target, source, nodeBin, portable = false } = {}) {
-  const projectSource = source && existsSync(join(source, 'plugin', 'plugin.json')) ? source : ROOT;
-  const plugin = source === projectSource || !source ? join(projectSource, 'plugin') : source;
+  let projectSource = RUNTIME_ROOT;
+  if (source && existsSync(join(source, 'plugin', 'plugin.json'))) projectSource = source;
+  else if (source && existsSync(join(source, 'runtime', 'core', 'mcp-server.mjs'))) projectSource = join(source, 'runtime');
+  const plugin = source && source !== projectSource ? source : resolvePluginRoot(projectSource);
   const runtime = join(staged, 'runtime');
   mkdirSync(staged, { recursive: true });
   for (const name of ['plugin.json', 'mcp_config.json', 'hooks.json', 'work_split_hook.mjs']) {
     copyFileSync(join(plugin, name), join(staged, name));
   }
-  for (const name of ['rules', 'agents', 'skills', 'assets']) {
+  for (const name of ['rules', 'agents', 'skills', 'assets', 'sidecars']) {
     if (existsSync(join(plugin, name))) copyTree(join(plugin, name), join(staged, name));
   }
   copyTree(existsSync(join(plugin, 'templates')) ? join(plugin, 'templates') : join(projectSource, 'templates'),
@@ -48,6 +50,14 @@ export function stagePluginBundle(staged, { target, source, nodeBin, portable = 
   }
   copyTree(join(projectSource, 'core'), join(runtime, 'core'));
   copyTree(join(projectSource, 'magpie_plugin', 'lib'), join(runtime, 'magpie_plugin', 'lib'));
+  const runtimeUI = join(runtime, 'magpie_plugin', 'ui');
+  mkdirSync(runtimeUI, { recursive: true });
+  copyFileSync(join(projectSource, 'magpie_plugin', 'ui', 'http.js'), join(runtimeUI, 'http.js'));
+  const sidecarFile = join(staged, 'sidecars', 'gempt_live', 'sidecar.json');
+  if (existsSync(sidecarFile)) {
+    const sidecar = JSON.parse(readFileSync(sidecarFile, 'utf8'));
+    atomicJson(sidecarFile, { ...sidecar, command: portable ? 'node' : nodeBin });
+  }
   if (existsSync(join(projectSource, 'bin'))) copyTree(join(projectSource, 'bin'), join(runtime, 'bin'));
   let pkgVersion;
   try { pkgVersion = JSON.parse(readFileSync(join(plugin, 'plugin.json'), 'utf8')).version; } catch {}
@@ -108,10 +118,17 @@ export async function validatePluginBundle(staged, nodeBin, env = process.env, {
   }
   for (const file of ['README.md', 'LICENSE', 'THIRD_PARTY_LICENSES.txt', 'assets/logo.svg',
     'hooks.json', 'mcp_config.json', 'rules/AGENTS.md', 'agents/gempt-worker.md',
-    'skills/gempt/SKILL.md', 'runtime/bin/gempt.mjs', 'runtime/core/assets/workload.json', 'runtime/core/assets/mcp_app_live.html']) {
+    'skills/gempt/SKILL.md', 'runtime/bin/gempt.mjs', 'runtime/core/assets/workload.json', 'runtime/core/assets/mcp_app_live.html',
+    'sidecars/gempt_live/sidecar.json', 'sidecars/gempt_live/main.mjs',
+    ...['index.html', 'styles.css', 'app.js'].map((file) => `runtime/core/assets/http-ui/${file}`)]) {
     if (!statSync(join(staged, file), { throwIfNoEntry: false })?.isFile() || !statSync(join(staged, file)).size) {
       throw new Error(`Missing or empty Antigravity plugin asset: ${file}`);
     }
+  }
+  const sidecar = JSON.parse(readFileSync(join(staged, 'sidecars', 'gempt_live', 'sidecar.json'), 'utf8'));
+  if (!sidecar.has_web_ui || sidecar.command !== (portable ? 'node' : nodeBin) || sidecar.args?.[0] !== 'main.mjs'
+      || !sidecar.ui_config?.views?.some(({ path, entrypoint }) => path === '/' && entrypoint === 'SIDECAR_UI_ENTRYPOINT_AUX_PANE')) {
+    throw new Error('Invalid GemPT Live sidecar manifest.');
   }
   if (portable) {
     const mcp = JSON.parse(readFileSync(join(staged, 'mcp_config.json'), 'utf8'));
@@ -124,12 +141,22 @@ export async function validatePluginBundle(staged, nodeBin, env = process.env, {
     }
   }
   const validationWorkspace = mkdtempSync(join(dirname(staged), '.gempt-validate-'));
-  const childEnv = { ...env, GEMPT_CONFIG: join(validationWorkspace, 'validation-config.json') };
+  const childEnv = {
+    ...env,
+    GEMPT_CONFIG: join(validationWorkspace, 'validation-config.json'),
+    GEMPT_SESSIONS_DIR: join(validationWorkspace, 'sessions'),
+    GEMPT_AGY_BRAIN_DIR: join(validationWorkspace, 'brain'),
+    GEMPT_APP_SERVER_STATE: join(validationWorkspace, 'app-server.json'),
+    MAGPIE_CONFIG_DIR: join(validationWorkspace, 'magpie'),
+    MAGPIE_ADDR: 'http://127.0.0.1:0',
+  };
   delete childEnv.GEMPT_APP_HTML;
+  const consoleTool = 'gempt_app_console_state';
   const requests = [
     { id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' } },
     { id: 2, method: 'tools/list' },
     { id: 3, method: 'resources/read', params: { uri: APP_URI } },
+    { id: 4, method: 'tools/call', params: { name: consoleTool, arguments: {} } },
   ].map((request) => ({ jsonrpc: '2.0', ...request }));
   try {
     const [packets, [hook]] = await Promise.all([
@@ -142,10 +169,24 @@ export async function validatePluginBundle(staged, nodeBin, env = process.env, {
     const tools = results.get(2)?.tools;
     const expected = ['gpt_run', 'gpt_ask', 'gpt_ctl', ...Object.keys(APP_TOOLS)].sort();
     if (JSON.stringify(tools?.map(({ name }) => name).sort()) !== JSON.stringify(expected)) {
-      throw new Error('Staged MCP server did not advertise the seven GemPT tools.');
+      throw new Error(`Staged MCP server did not advertise the expected set of ${expected.length} GemPT tools.`);
+    }
+    const entrypointTools = tools.filter(({ _meta }) => _meta?.['com.google.antigravity/ui']?.entrypoints?.length);
+    if (entrypointTools.length || tools.find(({ name }) => name === 'gpt_ctl')?._meta.ui?.resourceUri !== APP_URI) {
+      throw new Error('Staged MCP server must preserve the GemPT resource and leave Antigravity entrypoints to the sidecar.');
     }
     const resource = results.get(3)?.contents?.[0];
     if (resource?.mimeType !== APP_RESOURCE.mimeType || !resource.text) throw new Error('Staged MCP server could not read GemPT Live.');
+    const consoleResponse = packets.find(({ id }) => id === 4);
+    const consoleState = consoleResponse?.result;
+    if (consoleResponse?.error || !consoleState || consoleState.isError) {
+      const detail = consoleResponse?.error?.message || consoleState?.content?.[0]?.text || 'missing tool result';
+      throw new Error(`Staged MCP server ${consoleTool} failed: ${detail}`);
+    }
+    const rulesText = consoleState.structuredContent?.rulesText;
+    if (typeof rulesText !== 'string' || !rulesText.trim()) {
+      throw new Error(`Staged MCP server ${consoleTool} returned empty rules text.`);
+    }
     if (!hook?.injectSteps?.[0]?.systemMessage?.systemMessage) throw new Error('Staged SessionStart hook did not inject a system message.');
   } finally {
     try { rmSync(validationWorkspace, { recursive: true, force: true }); } catch {}
@@ -379,7 +420,7 @@ export async function installAgy({ target = DEFAULT_AGY_TARGET, source, force = 
   target = resolvePath(target);
   source = source && resolvePath(source);
   const nodeBin = resolveNodeExecutable({ env });
-  if ([ROOT, resolvePath(nodeBin), source].filter(Boolean).some((path) => withinPath(path, target))) {
+  if ([RUNTIME_ROOT, resolvePath(nodeBin), source].filter(Boolean).some((path) => withinPath(path, target))) {
     throw new Error(`Target ${target} contains the running GemPT package, source, or Node executable.`);
   }
   const parent = dirname(target);

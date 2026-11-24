@@ -2,6 +2,33 @@
  * Deterministic, auditable effort routing, timeout floors, and escalation hints.
  */
 
+export const DEFAULT_EXEC_TIMEOUT_SEC = 3600;
+export const EXEC_TIMEOUT_MIN_SEC = 30;
+export const EXEC_TIMEOUT_MAX_SEC = 7200;
+
+export function validateExecTimeoutSec(value) {
+  if (value === undefined) return undefined;
+  if (!Number.isFinite(value) || value < EXEC_TIMEOUT_MIN_SEC || value > EXEC_TIMEOUT_MAX_SEC) {
+    throw Object.assign(new Error(
+      `Invalid timeout_sec: expected a finite number between ${EXEC_TIMEOUT_MIN_SEC} and ${EXEC_TIMEOUT_MAX_SEC}.`,
+    ), { status: 400 });
+  }
+  return value;
+}
+
+export function configuredExecTimeoutSec(codex) {
+  const value = Number(codex?.timeout_sec);
+  if (value === 600 && codex?.timeout_sec_customized !== true) return DEFAULT_EXEC_TIMEOUT_SEC;
+  return value >= EXEC_TIMEOUT_MIN_SEC && value <= EXEC_TIMEOUT_MAX_SEC ? value : DEFAULT_EXEC_TIMEOUT_SEC;
+}
+
+export function resolveExecTimeoutSec({ codex, timeoutSec, effort } = {}) {
+  const explicit = validateExecTimeoutSec(timeoutSec);
+  if (explicit !== undefined) return explicit;
+  const configured = configuredExecTimeoutSec(codex);
+  return codex?.timeout_sec_customized === true ? configured : Math.max(configured, effortTimeoutFloor(effort));
+}
+
 export const AUTO_EFFORT_CANDIDATES = Object.freeze(['low', 'medium', 'high', 'xhigh']);
 
 export const EFFORT_EXEC_TIMEOUT_SEC = Object.freeze({
@@ -88,7 +115,7 @@ export function isAstraModel(modelId) {
 export function effortTimeoutFloor(effort, { mode = 'exec' } = {}) {
   const key = String(effort || 'medium').trim().toLowerCase();
   const table = mode === 'consult' ? EFFORT_CONSULT_TIMEOUT_SEC : EFFORT_EXEC_TIMEOUT_SEC;
-  const fallback = mode === 'consult' ? 180 : 600;
+  const fallback = mode === 'consult' ? 180 : table.medium;
   return table[key] ?? fallback;
 }
 

@@ -3,6 +3,8 @@
  */
 import { closeSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
+import { isMainThread, workerData } from 'node:worker_threads';
+import { createBackgroundWorker, serveBackgroundWorker } from './background-worker.mjs';
 import { extname, join, resolve } from 'node:path';
 import { WORKLOAD } from '../../core/assets.mjs';
 import { readJsonSafe, resolveSessionsDir } from '../../core/config.mjs';
@@ -27,6 +29,20 @@ const GEMPT_COMMAND = /(?:^|[;&|]\s*)(?:&\s+)?(?:"[^"\r\n]*[/\\]|'[^'\r\n]*[/\\]
 const MEDIA_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.ico', '.svg', '.mp4', '.mov', '.webm', '.wav', '.mp3', '.pdf']);
 
 const _memCache = new Map();
+const files = new Map();
+
+function readCachedFile(path, stat, parse, variant = '') {
+  const signature = `${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}:${variant}`;
+  const saved = files.get(path);
+  if (saved?.signature === signature) return saved.value;
+  const value = parse();
+  if (value !== null) {
+    files.delete(path);
+    if (files.size >= 256) files.delete(files.keys().next().value);
+    files.set(path, { signature, value });
+  }
+  return value;
+}
 
 function isUnderTmp(p) {
   if (!p) return false;
@@ -127,28 +143,15 @@ function isGemptToolCall(name, args) {
     || (name === 'run_command' && GEMPT_COMMAND.test(String(args.CommandLine || '').trim()));
 }
 
-function scanTranscriptFile(filePath, cutoffMs, nowMs) {
+function readTranscriptFile(filePath) {
   let text;
-  try {
-    text = readFileSync(filePath, 'utf-8');
-  } catch {
-    return null;
-  }
-  const fileGem = emptyBucket();
-  const fileGpt = emptyBucket();
-  let workCalls = 0;
-  let swarmCalls = 0;
-  let visionCalls = 0;
-  let gemptActive = false;
+  try { text = readFileSync(filePath, 'utf-8'); } catch { return null; }
+  const rows = [];
   let swarmParent;
   for (const line of text.split(/\r?\n/)) {
     if (!line.includes('PLANNER_RESPONSE') && !(swarmParent === undefined && line.includes('SYSTEM_MESSAGE'))) continue;
     let obj;
-    try {
-      obj = JSON.parse(line);
-    } catch {
-      continue;
-    }
+    try { obj = JSON.parse(line); } catch { continue; }
     if (!obj || typeof obj !== 'object') continue;
     if (swarmParent === undefined) {
       if (obj.type === 'SYSTEM_MESSAGE') {
@@ -161,22 +164,37 @@ function scanTranscriptFile(filePath, cutoffMs, nowMs) {
     }
     if (obj.type !== 'PLANNER_RESPONSE') continue;
     const ts = parseTimestampMs(obj.created_at);
-    if (ts === null || ts < cutoffMs || ts > nowMs) continue;
+    if (ts === null) continue;
+    let mask = 0;
     for (const tc of (Array.isArray(obj.tool_calls) ? obj.tool_calls : [])) {
       const name = String(tc?.name || tc?.tool_name || '').trim();
       const args = tc?.args || tc?.arguments || {};
-      gemptActive ||= isGemptToolCall(name, args);
+      if (isGemptToolCall(name, args)) mask |= 1;
       const cat = classifyToolCall(name, args);
-      if (cat === 'swarm') swarmCalls += 1;
-      else if (cat === 'vision') visionCalls += 1;
-      else if (cat === 'work') workCalls += 1;
+      if (cat === 'work') mask |= 2;
+      else if (cat === 'swarm' || cat === 'vision') mask |= 4;
     }
-    const cls = classifyModel(obj.model || '');
-    const bucket = cls === 'gpt' ? fileGpt : fileGem;
-    addTokens(bucket, obj.input_tokens, obj.output_tokens, obj.cache_read_tokens);
+    rows.push([ts, mask, classifyModel(obj.model || '') === 'gpt', obj.input_tokens, obj.output_tokens, obj.cache_read_tokens]);
   }
-  const excluded = workCalls === 0 && (swarmCalls > 0 || visionCalls > 0);
-  return { gemini: fileGem, gpt: fileGpt, gemptActive, excluded, swarmParent };
+  return { rows, swarmParent };
+}
+
+function scanTranscriptFile(filePath, stat, cutoffMs, nowMs) {
+  // Small transcripts can be overwritten within one filesystem clock tick.
+  // Reading them directly is cheap and avoids reusing an ambiguous signature.
+  const file = stat.size < 4096n ? readTranscriptFile(filePath)
+    : readCachedFile(filePath, stat, () => readTranscriptFile(filePath));
+  if (!file) return null;
+  const gemini = emptyBucket();
+  const gpt = emptyBucket();
+  let flags = 0;
+  for (const [ts, mask, isGpt, input, output, cache] of file.rows) {
+    if (ts < cutoffMs || ts > nowMs) continue;
+    flags |= mask;
+    addTokens(isGpt ? gpt : gemini, input, output, cache);
+  }
+  return { gemini, gpt, swarmParent: file.swarmParent, gemptActive: Boolean(flags & 1),
+    excluded: !(flags & 2) && Boolean(flags & 4) };
 }
 
 function listDirectories(dir) {
@@ -193,10 +211,10 @@ function recentRunConversations(sessionsDir, cutoffMs, nowMs) {
   const conversations = new Set();
   for (const entry of listDirectories(runsDir)) {
     const path = join(runsDir, entry.name, 'state.json');
-    let mtimeMs;
+    let stat;
     try {
-      mtimeMs = statSync(path).mtimeMs;
-      if (mtimeMs < cutoffMs) continue;
+      stat = statSync(path);
+      if (stat.mtimeMs < cutoffMs) continue;
     } catch {
       continue;
     }
@@ -204,7 +222,7 @@ function recentRunConversations(sessionsDir, cutoffMs, nowMs) {
     if (typeof run?.host_conversation_id !== 'string' || !run.host_conversation_id) continue;
     const timestamps = [run.created_at, run.started_at, run.finished_at, run.updated_at, run.progress?.updated_at]
       .map(parseTimestampMs).filter((time) => time !== null);
-    if ((timestamps.length ? timestamps : [Math.trunc(mtimeMs)]).some((time) => time >= cutoffMs && time <= nowMs)) {
+    if ((timestamps.length ? timestamps : [Math.trunc(stat.mtimeMs)]).some((time) => time >= cutoffMs && time <= nowMs)) {
       conversations.add(run.host_conversation_id);
     }
   }
@@ -238,13 +256,13 @@ function scanAgyBrain(brainDir, sessionsDir, cutoffMs, nowMs, gemini, gpt) {
     const transcript = join(brainDir, entry.name, '.system_generated', 'logs', 'transcript.jsonl');
     let st;
     try {
-      st = statSync(transcript);
+      st = statSync(transcript, { bigint: true });
     } catch {
       continue;
     }
-    if (st.mtimeMs < cutoffMs) continue;
+    if (Number(st.mtimeMs) < cutoffMs) continue;
     filesScanned += 1;
-    const usage = scanTranscriptFile(transcript, cutoffMs, nowMs);
+    const usage = scanTranscriptFile(transcript, st, cutoffMs, nowMs);
     if (!usage) continue;
     if (usage.gemptActive) activeHosts.add(entry.name);
     if (usage.swarmParent && usage.swarmParent !== entry.name) {
@@ -268,44 +286,21 @@ function scanAgyBrain(brainDir, sessionsDir, cutoffMs, nowMs, gemini, gpt) {
   };
 }
 
-function scanMagpieUsage(magpieDir, cutoffMs, nowMs, gemini, gpt, other, maxTailBytes = MAX_USAGE_TAIL_BYTES) {
-  if (!magpieDir) return { matched: 0, truncated: false };
-  const usageFile = join(magpieDir, 'usage.jsonl');
-  let size = 0;
-  try {
-    size = statSync(usageFile).size;
-  } catch {
-    return { matched: 0, truncated: false };
-  }
-  if (size <= 0) return { matched: 0, truncated: false };
-  const tailLimit = Number.isFinite(maxTailBytes) && maxTailBytes > 0 ? Math.trunc(maxTailBytes) : MAX_USAGE_TAIL_BYTES;
-  const start = Math.max(0, size - tailLimit);
+function readUsageRows(usageFile, size, start) {
   const truncated = start > 0;
-  let matched = 0;
-
+  const rows = [];
   const processLine = (buf) => {
     const raw = buf.toString('utf-8').trim();
     if (!raw) return;
     let obj;
-    try {
-      obj = JSON.parse(raw);
-    } catch {
-      return;
-    }
+    try { obj = JSON.parse(raw); } catch { return; }
     if (!obj || typeof obj !== 'object') return;
     const ts = parseTimestampMs(obj.t ?? obj.created_at ?? obj.timestamp);
-    if (ts === null || ts < cutoffMs || ts > nowMs) return;
-    const model = String(obj.served || obj.model || obj.req || '');
-    const provider = String(obj.provider || '');
-    const cls = classifyModel(model, provider);
-    const bucket = cls === 'gpt' ? gpt : (cls === 'gemini' ? gemini : other);
-    addTokens(
-      bucket,
-      obj.in !== undefined ? obj.in : obj.input_tokens,
+    if (ts === null) return;
+    const cls = classifyModel(obj.served || obj.model || obj.req, obj.provider);
+    rows.push([ts, cls, obj.in !== undefined ? obj.in : obj.input_tokens,
       obj.out !== undefined ? obj.out : obj.output_tokens,
-      obj.cache_read !== undefined ? obj.cache_read : obj.cache_read_tokens,
-    );
-    matched += 1;
+      obj.cache_read !== undefined ? obj.cache_read : obj.cache_read_tokens]);
   };
 
   let fd;
@@ -341,13 +336,34 @@ function scanMagpieUsage(magpieDir, cutoffMs, nowMs, gemini, gpt, other, maxTail
       processLine(carry);
     }
   } catch {
-    return { matched: 0, truncated };
+    return null;
   } finally {
     if (fd !== undefined) {
       try { closeSync(fd); } catch { /* ignore */ }
     }
   }
-  return { matched, truncated };
+  return rows;
+}
+
+function scanMagpieUsage(magpieDir, cutoffMs, nowMs, gemini, gpt, other, maxTailBytes) {
+  const empty = { matched: 0, truncated: false };
+  if (!magpieDir) return empty;
+  const usageFile = join(magpieDir, 'usage.jsonl');
+  let stat;
+  try { stat = statSync(usageFile, { bigint: true }); } catch { return empty; }
+  const size = Number(stat.size);
+  if (!size) return empty;
+  const tailLimit = Number.isFinite(maxTailBytes) && maxTailBytes > 0 ? Math.trunc(maxTailBytes) : MAX_USAGE_TAIL_BYTES;
+  const start = Math.max(0, size - tailLimit);
+  const rows = readCachedFile(usageFile, stat, () => readUsageRows(usageFile, size, start), start);
+  let matched = 0;
+  const buckets = { gemini, gpt, other };
+  for (const [ts, cls, input, output, cache] of rows || []) {
+    if (ts < cutoffMs || ts > nowMs) continue;
+    addTokens(buckets[cls], input, output, cache);
+    matched++;
+  }
+  return { matched, truncated: start > 0 };
 }
 
 export function readTokenRatio({
@@ -360,9 +376,10 @@ export function readTokenRatio({
   maxUsageTailBytes = MAX_USAGE_TAIL_BYTES,
   cacheTtlMs = DEFAULT_CACHE_TTL_MS,
   nowMs,
+  requestTime,
   env = process.env,
 } = {}) {
-  const now = Number.isFinite(nowMs) ? Number(nowMs) : Date.now();
+  const now = Number.isFinite(nowMs) ? nowMs : (requestTime ?? Date.now());
   const customHours = Number(windowHours);
   const selectedRange = RATIO_RANGES.includes(range) ? range
     : Number.isFinite(customHours) && customHours > 0 ? 'custom' : '24h';
@@ -462,3 +479,13 @@ export function resolveBudget(profile, options = {}) {
     window_hours: snapshot.window_hours,
   };
 }
+
+
+// The idle worker retains its per-file and window caches between requests.
+const budgetWorker = createBackgroundWorker(new URL(import.meta.url), 'gempt-token-ratio');
+
+export function resolveBudgetAsync(profile, options) {
+  return budgetWorker(profile, { ...options, requestTime: Date.now() });
+}
+
+if (!isMainThread && workerData === 'gempt-token-ratio') serveBackgroundWorker(resolveBudget);

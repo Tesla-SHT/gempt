@@ -1,4 +1,4 @@
-# GemPT v0.4.1
+# GemPT v0.5.0
 
 [English Quick Start & Docs](./README.en.md) · [Antigravity Plugin README](./plugin/README.md) · [Third-Party Licenses](./THIRD_PARTY_LICENSES.txt)
 
@@ -10,7 +10,7 @@ GemPT 让 Gemini 通过本机 [Magpie](https://github.com/yetone/magpie) 咨询 
 | --- | --- | --- |
 | **Node.js** | `>= 20.11.0` | 运行 MCP server、hooks、CLI 与安装器 |
 | **Magpie** | `>= 0.1.1340` | 本地网关（默认 `http://127.0.0.1:3425`），从 [yetone/magpie](https://github.com/yetone/magpie) / [usemagpie.ai](https://usemagpie.ai) 安装并登录 ChatGPT/Codex 订阅 |
-| **Magpie 侧 GemPT 插件** | `0.4.1` | 提供 `Plugins → GemPT` 面板，并托管共享 Codex `app-server`（Windows 跨 Magpie 热重载独立存活，支持面板一键重启）；**仅单独安装 Codex CLI 无法替代** |
+| **Magpie 侧 GemPT 插件** | `0.5.0` | 提供 `Plugins → GemPT` 面板，并托管共享 Codex `app-server`（Windows 跨 Magpie 热重载独立存活，支持面板一键重启）；**仅单独安装 Codex CLI 无法替代** |
 | **Codex CLI** | `@openai/codex`（已实测 `0.164.0`） | 仅 `gpt_run` 仓库执行需要；通过 `npm install -g @openai/codex` 安装（纯 `gpt_ask` 咨询可不装） |
 | **Git** | 任意现代版本 | 仅并发隔离 `workspace="share"` 需要 |
 
@@ -22,11 +22,11 @@ GemPT 让 Gemini 通过本机 [Magpie](https://github.com/yetone/magpie) 咨询 
 
 ### 2. 安装 Magpie 侧插件
 
-直接在 Magpie 插件市场中搜索 **GemPT** 安装（官方市场已收录 `v0.4.1`，走 GitHub 通道 `github:yizhang-dream/gempt`），或在终端运行：
+直接在 Magpie 插件市场中搜索 **GemPT** 安装（官方市场已收录 `v0.5.0`，走 GitHub 通道 `github:yizhang-dream/gempt`），或在终端运行：
 
 ```bash
 # 推荐：从 GitHub tag 安装（当前立即可用）
-magpie plugin add github:yizhang-dream/gempt#v0.4.1
+magpie plugin add github:yizhang-dream/gempt#v0.5.0
 ```
 
 > 注：`gempt` 尚未发布到 npm registry，请勿直接运行裸包名命令 `magpie plugin add gempt`（当前会返回 404）。
@@ -39,10 +39,10 @@ magpie plugin add github:yizhang-dream/gempt#v0.4.1
 
 ```bash
 # 推荐：通过 GitHub tag 一键安装（当前立即可用）
-npx --yes github:yizhang-dream/gempt#v0.4.1 install-agy
+npx --yes github:yizhang-dream/gempt#v0.5.0 install-agy
 ```
 
-> 注：`gempt` 尚未发布到 npm registry，请使用上述 GitHub tag 渠道或从本地源码安装（裸 npm 命令 `npx --yes gempt@0.4.1 install-agy` 尚未生效）。
+> 注：`gempt` 尚未发布到 npm registry，请使用上述 GitHub tag 渠道或从本地源码安装（裸 npm 命令 `npx --yes gempt@0.5.0 install-agy` 尚未生效）。
 
 从本地源码安装时：
 - **Linux / macOS**：`bash install.sh`（支持 `--target <目录>`）
@@ -76,7 +76,7 @@ gempt init --non-interactive
 | --- | --- | --- |
 | `gpt_run` | `gempt_run` | 异步 Codex 仓库任务。传 `goal`、`cwd`，用 `access="inspect"` 只读调查或 `access="change"` 改代码。多路并发改同一 Git 仓库时传 `access="change"` + `workspace="share"`（基于已提交 `HEAD` 建独立 worktree；只读 `inspect` 禁止使用 `share`）。 |
 | `gpt_ask` | `gempt_ask` | 同步咨询。传 `goal`，可选 `cwd`、`file_paths` 与 `session_id`。整理日志或摘要时传 `tier="chore"`。 |
-| `gpt_ctl` | `gempt_ctl` | 状态查询、转向、中止或回复 `ask_gemini`（`action="status"|"steer"|"interrupt"|"reply"`）。在 Antigravity 调用 `gpt_ctl({})` 打开 **GemPT Live** 侧栏。 |
+| `gpt_ctl` | `gempt_ctl` | 状态查询、转向、中止或回复 `ask_gemini`（`action="status"|"steer"|"interrupt"|"reply"`）。在 Antigravity 打开 [GemPT Live](sidecar://gempt/gempt_live/) 侧栏，可切换至概览（含设置）、请求或会话。 |
 
 `gpt_run` 返回 `run_id`、`session_id` 和 `wait_command`。请优先原样通过 `run_command(WaitMsBeforeAsync=500)` 后台执行返回的 `wait_command` 等待系统唤醒（终端手动等待可用 `gempt-wait <run_id>`、`gempt-wait id1,id2` 或 `gempt-wait --all id1,id2`）。续聊传 `session_id`；失败返工省略 `session_id` 开新线程。
 

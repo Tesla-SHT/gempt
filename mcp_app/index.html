@@ -4,21 +4,44 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
-  <title>GemPT 任务</title>
-  <style><!-- CSS --></style>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+  <meta name="color-scheme" content="light dark">
+  <title>GemPT</title>
+  <link rel="icon" href="data:,">
+  <style><!-- CSS -->
+<!-- CONSOLE CSS --></style>
 </head>
 <body>
-  <main class="shell" data-view="list">
+  <header class="app-topbar">
+    <span class="app-brand" aria-label="GemPT">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M5 17.5L10.5 6.5L14 13L18 8.5L15.5 17.5H5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+        <circle cx="18" cy="6" r="1.6" fill="currentColor"/>
+      </svg>
+      <span>GemPT</span>
+    </span>
+    <nav class="app-tabs" role="tablist" aria-label="GemPT 视图">
+      <button id="tab-live" type="button" role="tab" aria-selected="true" aria-controls="live-panel">实时流</button>
+      <button id="tab-overview" type="button" role="tab" aria-selected="false" aria-controls="overview" tabindex="-1">概览</button>
+      <button id="tab-requests" type="button" role="tab" aria-selected="false" aria-controls="requests" tabindex="-1">请求</button>
+      <button id="tab-sessions" type="button" role="tab" aria-selected="false" aria-controls="sessions" tabindex="-1">会话</button>
+    </nav>
+    <div class="app-tools">
+      <span id="magpie-status" class="connection-dot" role="status" data-state="checking" title="正在检查 Magpie 连接" aria-label="正在检查 Magpie 连接"></span>
+      <button id="routing-badge" class="routing-badge" type="button" title="查看工作分工" aria-label="查看工作分工" disabled>分工</button>
+      <button id="refresh-btn" class="icon-btn" type="button" title="刷新当前页" aria-label="刷新当前页" data-icon="refresh"></button>
+    </div>
+  </header>
+  <main id="live-panel" class="shell" role="tabpanel" aria-labelledby="tab-live" data-view="list">
     <section id="view-list" class="view" aria-labelledby="list-heading">
       <header class="topbar">
         <h1 id="list-heading" class="list-heading">任务</h1>
         <div class="top-actions">
+          <button id="clear-live-session" class="btn-ghost" type="button" hidden>全部任务</button>
           <div class="scope-switch" role="group" aria-label="任务范围">
             <button id="scope-session" type="button" aria-pressed="true">当前会话</button>
             <button id="scope-all" type="button" aria-pressed="false">全部</button>
           </div>
-          <button id="refresh-list" class="icon-btn" type="button" title="刷新列表" aria-label="刷新列表" data-icon="refresh" disabled></button>
         </div>
       </header>
       <p id="list-error" class="notice" role="status" hidden></p>
@@ -48,10 +71,10 @@
           <span id="dot" class="status-glyph" aria-hidden="true"></span>
           <h2 id="detail-title" class="detail-title" tabindex="-1">任务详情</h2>
           <span id="detail-status" class="detail-status"></span>
+          <span id="detail-worktree" class="run-kind" hidden>独立 worktree</span>
           <span id="unconfirmed-badge" class="unconfirmed-badge" hidden>远端终态未确认</span>
           <div class="top-actions">
             <button id="info-toggle" class="icon-btn" type="button" aria-expanded="false" aria-controls="meta-drawer" title="任务信息" aria-label="任务信息" data-icon="info"></button>
-            <button id="refresh" class="icon-btn" type="button" title="刷新详情" aria-label="刷新详情" data-icon="refresh"></button>
           </div>
         </div>
       </header>
@@ -62,6 +85,10 @@
       <div id="turn-panel" class="turn-panel" hidden>
         <section id="meta-drawer" class="meta-drawer" hidden>
           <div class="reading-column">
+            <div class="detail-links">
+              <button id="open-run-requests" class="btn-ghost" type="button">查看请求 ›</button>
+              <button id="open-run-session" class="btn-ghost" type="button">查看会话 ›</button>
+            </div>
             <div class="meta-grid">
               <span>模型 <strong id="model"></strong></span>
               <span>耗时 <strong id="elapsed"></strong></span>
@@ -98,10 +125,15 @@
           <div class="reading-column">
             <ol id="stream" class="stream"></ol>
             <section id="ask" class="ask-card" aria-labelledby="ask-title" hidden>
-              <div class="ask-head"><span data-icon="chat"></span><strong id="ask-title">等待主对话回复</strong></div>
+              <div class="ask-head"><span data-icon="chat"></span><strong id="ask-title">等待回复</strong></div>
               <p id="ask-question" class="ask-q"></p>
               <p id="ask-context" class="ask-ctx" hidden></p>
               <ul id="ask-media" class="file-chips" hidden></ul>
+              <div id="reply-form" class="ask-reply" hidden>
+                <input id="reply-message" class="steer-input" type="text" aria-label="回复提问" placeholder="回复提问…" required>
+                <button id="send-reply" class="btn-primary" type="button">发送回复</button>
+              </div>
+              <p id="reply-status" class="ask-hint" role="status" hidden></p>
               <div class="ask-actions">
                 <button id="attach-context" class="btn-ghost" type="button" hidden>附带上下文到主对话</button>
                 <button id="remind-host" class="btn-ghost" type="button" hidden>在主对话中提醒处理</button>
@@ -123,13 +155,17 @@
       </div>
     </section>
   </main>
+  <!-- CONSOLE MARKUP -->
+  <dialog id="console-copy-dialog" aria-labelledby="console-copy-label">
+    <header><strong id="console-copy-label">手动复制</strong><button id="console-copy-close" class="icon-btn" type="button" aria-label="关闭" data-icon="close"></button></header>
+    <textarea id="console-copy-text" aria-label="待复制内容" readonly></textarea>
+  </dialog>
   <aside id="toast" class="toast" aria-label="操作反馈" hidden>
     <p id="toast-message" role="status"></p>
     <div class="toast-actions">
       <button id="toast-copy" class="btn-ghost" type="button" hidden>复制路径</button>
       <button id="toast-dismiss" class="icon-btn" type="button" aria-label="关闭提示" title="关闭提示" data-icon="close"></button>
     </div>
-    <input id="toast-path" class="mono" aria-label="可复制的路径" readonly hidden>
   </aside>
   <script>/* SCRIPT */</script>
 </body>

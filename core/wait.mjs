@@ -5,7 +5,7 @@ import { parseArgs } from 'node:util';
 import { ACTIVE_STATES, compactReceiptText, readRun, waitForRuns } from './runs.mjs';
 
 function compactRecord(record) {
-  const { before, after, goal, progress, result, ...receipt } = record;
+  const { before, after, goal, progress, result, config_path, source, pid, ...receipt } = record;
   if (after?.status?.trim() && after.status.trim() !== before?.status?.trim()) {
     const files = after.status.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     receipt.changed_files = files.slice(0, 20);

@@ -1,14 +1,14 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { resolveBudget } from './token-ratio.mjs';
+import { resolveBudgetAsync } from './token-ratio.mjs';
 import { WORKLOAD } from '../../core/assets.mjs';
+import { RUNTIME_ROOT, resolvePluginRoot } from '../../core/bundle-paths.mjs';
 import { resolveNodeExecutable } from '../../core/node-executable.mjs';
 import {
   DEFAULT_TIERS, DEFAULT_UTILITY, FEATURES, TIER_ORDER, VALID_FAILOVER_MODES, VALID_SANDBOXES,
-  buildTierView, editDefaultSandbox, editEffortSettings, editPairing, editWorkSplit, expandUser, getMcpEffort, getPairing,
+  buildTierView, editDefaultSandbox, editEffortSettings, editPairing, editWorkSplit, expandUser, getMcpEffort, getNativeSwarmPolicy, getPairing,
   hasApiSnapshot, isCodexModelId, normalizeDefaultTier, readJsonSafe, readPluginExecOption, readPluginMcpToolsOption,
   resolveConfigPath, resolveMagpieConfigDir, resolveSessionsDir, validateEffortSettings, withConfigTransaction,
 } from '../../core/config.mjs';
@@ -17,7 +17,8 @@ import {
   pickSubscriptionPlan, pickTierPlan, probeMagpie, readMagpieNativeGroups, resolveExcludedTokens,
   resolveMagpieApiKey, syncHarnessGroups,
 } from '../../core/magpie.mjs';
-import { readActiveRuns, readDispatchActivity, readExternalGroupUsage, readRecentActivity } from './activity.mjs';
+import { configuredExecTimeoutSec, validateExecTimeoutSec } from './routing.mjs';
+import { readActiveRuns, readDispatchActivity, readExternalGroupUsage, readOverviewActivity, readRecentActivity } from './activity.mjs';
 
 export {
   DEFAULT_MAGPIE_URL, DEFAULT_TIERS, DEFAULT_UTILITY, EFFORT_RANK, FEATURES, TIER_ALIASES,
@@ -35,8 +36,6 @@ export {
   explicitTitle, getDispatchActivity, isActivityId, listDispatchActivity, normalizeTitle,
   readActiveRuns, readExternalGroupUsage, readRecentActivity, sessionGoal, workspaceName,
 } from './activity.mjs';
-
-const REPO_ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 
 export { WORKLOAD };
 
@@ -125,12 +124,12 @@ export function detectClients({ magpieConfigDir, antigravityPluginDir } = {}) {
 }
 
 export function buildRulesSnippet() {
-  return readFileSync(join(REPO_ROOT, 'plugin', 'rules', 'AGENTS.md'), 'utf8');
+  return readFileSync(join(resolvePluginRoot(), 'rules', 'AGENTS.md'), 'utf8');
 }
 
 const SAFE_MCP_ENV_KEYS = new Set(['PYTHONPATH', 'PYTHONUTF8', 'PYTHONIOENCODING', 'LANG', 'LC_ALL', 'GEMPT_CONFIG']);
 
-export function buildMcpSnippet({ antigravityPluginDir, repoRoot = REPO_ROOT, preferInstalled = true } = {}) {
+export function buildMcpSnippet({ antigravityPluginDir, repoRoot = RUNTIME_ROOT, preferInstalled = true } = {}) {
   const agyDir = antigravityPluginDir
     ? resolve(expandUser(antigravityPluginDir))
     : resolve(join(homedir(), '.gemini', 'config', 'plugins', 'gempt'));
@@ -157,27 +156,62 @@ export function buildMcpSnippet({ antigravityPluginDir, repoRoot = REPO_ROOT, pr
   };
 }
 
-export async function readState({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, execEnabled, mcpToolsEnabled, appServer, ratioRange = '24h', probeTimeoutMs = 2000 } = {}) {
-  const resolvedConfigPath = resolveConfigPath(configPath);
-  const resolvedSessionsDir = resolveSessionsDir(sessionsDir);
-  const resolvedMagpieDir = resolveMagpieConfigDir(magpieConfigDir);
-  const rawCfg = readJsonSafe(resolvedConfigPath);
-  const configured = Boolean(rawCfg);
+const probeCache = new Map();
+const PROBE_TTL_MS = 15_000;
 
-  const policy = rawCfg?.routing_policy || {};
-  const defaultTier = normalizeDefaultTier(policy.default_tier) || 'sonnet';
-  const baseUrl = String(rawCfg?.magpie?.base_url || defaultGatewayFromEnv()).replace(/\/+$/, '');
-  const apiKey = rawCfg ? resolveMagpieApiKey(rawCfg) : '';
-  const excludedTokens = resolveExcludedTokens(rawCfg);
-  const magpie = await probeMagpie(baseUrl, apiKey, probeTimeoutMs, excludedTokens);
+function gateway(configPath) {
+  const path = resolveConfigPath(configPath);
+  const config = readJsonSafe(path);
+  const url = String(config?.magpie?.base_url || defaultGatewayFromEnv()).replace(/\/+$/, '');
+  return { path, config, url };
+}
+
+function gatewayIdentity(config, url) {
+  const key = config ? resolveMagpieApiKey(config) : '';
+  const excluded = resolveExcludedTokens(config);
+  return { key, excluded, id: JSON.stringify([url, key, excluded]) };
+}
+
+function cachedProbe(path, url) {
+  const entry = probeCache.get(path);
+  return entry?.url === url ? entry.result : undefined;
+}
+
+export function readRoutingSummary({ configPath } = {}) {
+  const { path, config, url } = gateway(configPath);
+  const policy = config?.routing_policy;
+  const profile = Object.hasOwn(WORKLOAD.profiles, policy?.work_split) ? policy.work_split : 'balanced';
+  const result = cachedProbe(path, url);
+  return {
+    routing: { profile, gpt_share: WORKLOAD.profiles[profile].gpt_share,
+      native_swarm: getNativeSwarmPolicy(policy).native_swarm },
+    magpie: { reachable: result?.reachable ?? null, url, error: result?.error || '' },
+  };
+}
+
+export async function readMagpieStatus({ configPath, force = false, probeTimeoutMs = 600 } = {}) {
+  const { path, config, url } = gateway(configPath);
+  const { key, excluded, id } = gatewayIdentity(config, url);
+  let entry = probeCache.get(path);
+  if (entry?.id !== id) entry = undefined;
+  if (entry?.pending) return entry.pending;
+  if (!force && entry?.result && Date.now() - entry.checkedAt < PROBE_TTL_MS) return entry.result;
+  if (!entry) {
+    if (!probeCache.has(path) && probeCache.size >= 32) probeCache.delete(probeCache.keys().next().value);
+    probeCache.set(path, entry = { id, url });
+  }
+  entry.pending = probeMagpie(url, key, Math.min(probeTimeoutMs, 600), excluded).then((result) => {
+    entry.result = result;
+    entry.checkedAt = Date.now();
+    return result;
+  }).finally(() => { entry.pending = null; });
+  return entry.pending;
+}
+
+function overviewGatewayFields(magpie, rawCfg, resolvedMagpieDir) {
   const recommended = pickSubscriptionPlan(magpie);
-  const defaultModel = pickDefaultSubscriptionModel(magpie) || WORKLOAD.pairings.neon;
-  const pairings = Object.fromEntries(Object.keys(WORKLOAD.pairings).map((family) => [family, getPairing(policy, family)]));
   const nativePlan = pickNativeGroupPlan(magpie);
   const liveNativeGroups = readMagpieNativeGroups(resolvedMagpieDir);
-  const clients = detectClients({ magpieConfigDir: resolvedMagpieDir, antigravityPluginDir });
-  const mcpSnippet = buildMcpSnippet({ antigravityPluginDir });
-  const recentGroupCalls = readExternalGroupUsage(resolvedMagpieDir, 6);
 
   const liveNativeSet = new Set([
     ...(magpie.native_groups || []),
@@ -214,6 +248,90 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     missingReason = 'Magpie 中尚未检测到 Codex 订阅模型。';
   }
 
+  return {
+    mcp_default_model: pickDefaultSubscriptionModel(magpie) || WORKLOAD.pairings.neon,
+    subscription: {
+      connected: Boolean(magpie.codex_ready),
+      codex_count: (magpie.codex_models || []).length,
+      recommended,
+    },
+    native_groups: {
+      ready_count: readyCount,
+      complete: readyCount === NATIVE_GROUP_SPECS.length,
+      can_create: Boolean(nativePlan),
+      missing_reason: missingReason,
+      tiers: nativeTiers,
+    },
+    api_fallback: {
+      available: (magpie.openai_models || []).length > 0 || hasApiSnapshot(rawCfg),
+      openai_count: (magpie.openai_models || []).length,
+      has_snapshot: hasApiSnapshot(rawCfg),
+    },
+  };
+}
+
+export async function readPageMagpieStatus(options = {}) {
+  const magpie = await readMagpieStatus(options);
+  const { config } = gateway(options.configPath);
+  return { ...magpie, overview: overviewGatewayFields(magpie, config, resolveMagpieConfigDir(options.magpieConfigDir)) };
+}
+
+export function readRatio({ range = '24h', configPath, sessionsDir, magpieConfigDir, env } = {}) {
+  const { path, config } = gateway(configPath);
+  return resolveBudgetAsync(config?.routing_policy?.work_split ?? 'balanced', {
+    range, configPath: path, sessionsDir, magpieConfigDir,
+    env: {
+      GEMPT_AGY_BRAIN_DIR: env?.GEMPT_AGY_BRAIN_DIR ?? process.env.GEMPT_AGY_BRAIN_DIR,
+      GEMPT_CONFIG: env?.GEMPT_CONFIG ?? process.env.GEMPT_CONFIG,
+      GEMPT_SESSIONS_DIR: env?.GEMPT_SESSIONS_DIR ?? process.env.GEMPT_SESSIONS_DIR,
+      MAGPIE_CONFIG_DIR: env?.MAGPIE_CONFIG_DIR ?? process.env.MAGPIE_CONFIG_DIR,
+    },
+  });
+}
+
+export function readRunState({ appServer, sessionsDir, activeRuns } = {}) {
+  return {
+    app_server: appServer?.getStatus() ?? { running: false, ws_url: null, pid: null, gateway_url: null, error: null },
+    active_runs: activeRuns ?? readActiveRuns(resolveSessionsDir(sessionsDir)),
+  };
+}
+
+export function warmPageTelemetry(options = {}) {
+  setImmediate(() => {
+    void Promise.allSettled([
+      Promise.resolve().then(() => readRatio(options)),
+      Promise.resolve().then(() => readOverviewActivity(options.sessionsDir, options.magpieConfigDir)),
+    ]);
+  }).unref();
+}
+
+export function readOverview(options = {}) {
+  return readState({ ...options, overview: true });
+}
+
+export async function readState({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, execEnabled, mcpToolsEnabled, appServer, ratioRange = '24h', probeTimeoutMs = 2000, overview = false } = {}) {
+  const resolvedConfigPath = resolveConfigPath(configPath);
+  const resolvedSessionsDir = resolveSessionsDir(sessionsDir);
+  const resolvedMagpieDir = resolveMagpieConfigDir(magpieConfigDir);
+  const rawCfg = readJsonSafe(resolvedConfigPath);
+  const configured = Boolean(rawCfg);
+
+  const policy = rawCfg?.routing_policy || {};
+  const defaultTier = normalizeDefaultTier(policy.default_tier) || 'sonnet';
+  const baseUrl = String(rawCfg?.magpie?.base_url || defaultGatewayFromEnv()).replace(/\/+$/, '');
+  let magpie;
+  if (overview) {
+    magpie = cachedProbe(resolvedConfigPath, baseUrl) ?? { reachable: null, url: baseUrl };
+  } else {
+    const { key, excluded } = gatewayIdentity(rawCfg, baseUrl);
+    magpie = await probeMagpie(baseUrl, key, probeTimeoutMs, excluded);
+  }
+  const { subscription, ...gatewayFields } = overviewGatewayFields(magpie, rawCfg, resolvedMagpieDir);
+  const recommended = subscription.recommended;
+  const pairings = Object.fromEntries(Object.keys(WORKLOAD.pairings).map((family) => [family, getPairing(policy, family)]));
+  const clients = detectClients({ magpieConfigDir: resolvedMagpieDir, antigravityPluginDir });
+  const mcpSnippet = buildMcpSnippet({ antigravityPluginDir });
+
   const tiersObj = rawCfg?.tiers || {};
   const tiers = TIER_ORDER.map((id) => buildTierView(
     id,
@@ -232,10 +350,12 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     use_for_magpie_compact: utilRaw.use_for_magpie_compact !== undefined ? Boolean(utilRaw.use_for_magpie_compact) : true,
   };
 
-  const { recentSessions, recentRuns } = readRecentActivity(resolvedSessionsDir, 6);
-  const { totals: activityTotals } = readDispatchActivity(resolvedSessionsDir);
+  const { recentSessions, recentRuns, activityTotals, activeRuns, recentGroupCalls } = overview
+    ? await readOverviewActivity(resolvedSessionsDir, resolvedMagpieDir)
+    : { ...readRecentActivity(resolvedSessionsDir, 6), recentGroupCalls: readExternalGroupUsage(resolvedMagpieDir, 6),
+        activityTotals: readDispatchActivity(resolvedSessionsDir).totals, activeRuns: readActiveRuns(resolvedSessionsDir) };
   const workSplit = policy.work_split ?? 'balanced';
-  const tokenRatio = resolveBudget(workSplit, {
+  const tokenRatio = overview ? null : await readRatio({
     range: ratioRange,
     configPath: resolvedConfigPath,
     sessionsDir: resolvedSessionsDir,
@@ -243,35 +363,26 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
   });
 
   return {
-    app_server: appServer?.getStatus() ?? { running: false, ws_url: null, pid: null, gateway_url: null, error: null },
-    active_runs: readActiveRuns(resolvedSessionsDir),
+    ...readRunState({ appServer, activeRuns }),
     features: { ...FEATURES },
     configured,
     config_path: resolvedConfigPath,
     work_split: workSplit,
     swarm_split: policy.swarm_split ?? 'inherit',
+    ...getNativeSwarmPolicy(policy),
+    swarm_shell_models: WORKLOAD.swarm_shell_models,
+    codex_timeout_sec: configuredExecTimeoutSec(rawCfg?.codex),
     work_profiles: WORKLOAD.profiles,
-    token_ratio: tokenRatio,
+    ...(overview ? {} : { token_ratio: tokenRatio }),
     pairings,
-    mcp_default_model: defaultModel,
     mcp_effort: getMcpEffort(policy),
     default_tier: defaultTier,
     failover_mode: String(policy.failover_mode || 'subscription_only'),
     auto_effort: Boolean(rawCfg?.routing_policy?.auto_effort),
     default_sandbox: String(rawCfg?.codex?.default_sandbox || 'workspace-write'),
-    subscription: {
-      connected: Boolean(magpie.codex_ready),
-      codex_count: (magpie.codex_models || []).length,
-      recommended,
-    },
+    subscription,
+    ...gatewayFields,
     clients,
-    native_groups: {
-      ready_count: readyCount,
-      complete: readyCount === NATIVE_GROUP_SPECS.length,
-      can_create: Boolean(nativePlan),
-      missing_reason: missingReason,
-      tiers: nativeTiers,
-    },
     mcp_snippet: mcpSnippet,
     rules_snippet: buildRulesSnippet(),
     tools: {
@@ -280,11 +391,6 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
       endpoint: `${baseUrl}/mcp/magpie/tools/gempt`,
     },
     recent_group_calls: recentGroupCalls,
-    api_fallback: {
-      available: (magpie.openai_models || []).length > 0 || hasApiSnapshot(rawCfg),
-      openai_count: (magpie.openai_models || []).length,
-      has_snapshot: hasApiSnapshot(rawCfg),
-    },
     magpie,
     tiers,
     utility,
@@ -357,11 +463,13 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
       approval_policy: String(existingCodex.approval_policy || 'never'),
       model_provider: String(existingCodex.model_provider || ''),
       extra_args: Array.isArray(existingCodex.extra_args) ? existingCodex.extra_args : [],
-      timeout_sec: Number.isFinite(Number(existingCodex.timeout_sec)) ? Number(existingCodex.timeout_sec) : 600,
+      timeout_sec: configuredExecTimeoutSec(existingCodex),
+      ...(existingCodex.timeout_sec_customized === true ? { timeout_sec_customized: true } : {}),
     },
     routing_policy: {
       work_split: existingPolicy.work_split ?? 'balanced',
       swarm_split: existingPolicy.swarm_split ?? 'inherit',
+      ...getNativeSwarmPolicy(existingPolicy),
       pairings: existingPolicy.pairings ?? {},
       default_tier: defaultTier,
       failover_mode: failover,
@@ -423,6 +531,16 @@ export function setFailoverMode(mode, options) {
 
 export async function updateSettings(settings, { configPath, probeTimeoutMs = 2000, candidate, probe } = {}) {
   const edits = {
+    codex_timeout_sec: (loaded, value) => {
+      try {
+        if (validateExecTimeoutSec(value) === undefined) throw new Error('Missing codex_timeout_sec.');
+      } catch (error) {
+        return { ok: false, status: 400, error: error.message };
+      }
+      return { next: { ...loaded.data, codex: { ...loaded.data.codex, timeout_sec: value, timeout_sec_customized: true } } };
+    },
+    native_swarm: (loaded, value) => editSwarmSetting(loaded, 'native_swarm', value, typeof value === 'boolean'),
+    swarm_shell_model: (loaded, value) => editSwarmSetting(loaded, 'swarm_shell_model', value, WORKLOAD.swarm_shell_models.includes(value)),
     default_sandbox: editDefaultSandbox,
     pairing: (loaded, value) => {
       if (!value || typeof value !== 'object' || Array.isArray(value) ||
@@ -482,6 +600,9 @@ export async function updateSettings(settings, { configPath, probeTimeoutMs = 20
       draft.data = result.next;
       Object.assign(response, result.response);
     }
+    if (Number(draft.data.codex?.timeout_sec) === 600 && draft.data.codex?.timeout_sec_customized !== true) {
+      draft.data = { ...draft.data, codex: { ...draft.data.codex, timeout_sec: configuredExecTimeoutSec(draft.data.codex) } };
+    }
     if (candidate) return { ok: true, config: draft.data };
     return { next: draft.data, response: hasMode || hasEffort || keys.includes('default_sandbox') ? response : undefined };
   };
@@ -495,6 +616,11 @@ export async function updateSettings(settings, { configPath, probeTimeoutMs = 20
     probe = await probeMagpie(url, key, probeTimeoutMs, excluded);
     probeKey = result.probeKey;
   }
+}
+
+function editSwarmSetting({ data }, key, value, valid) {
+  if (!valid) return { ok: false, status: 400, error: `Invalid ${key}.` };
+  return { next: { ...data, routing_policy: { ...data.routing_policy, [key]: value } } };
 }
 
 function planFailover(current, normalized, probe) {

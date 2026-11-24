@@ -1,7 +1,7 @@
 {
   "name": "gempt",
   "displayName": "GemPT — Gemini × GPT Orchestrator",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Pair Antigravity Gemini with GPT/Codex through MCP and control runs in GemPT Live. Includes /gempt and /gempt-chore. Other agents can select Magpie's group/gempt-{sonnet,opus,fable} directly.",
   "author": {
     "name": "yizhang-dream",
