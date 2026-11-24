@@ -2,6 +2,32 @@ import { tr } from '../magpie_plugin/ui/i18n.js';
 import { createHttpTransport } from "../magpie_plugin/ui/http.js";
 import { mountLive } from "./live-ui.js";
 
+function createTimeoutSignal(ms, parentSignal) {
+  if (typeof AbortSignal?.timeout === "function" && (!parentSignal || typeof AbortSignal?.any === "function")) {
+    const t = AbortSignal.timeout(ms);
+    return { signal: parentSignal ? AbortSignal.any([parentSignal, t]) : t, cleanup() {} };
+  }
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(parentSignal.reason);
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      controller.abort(parentSignal.reason);
+      return { signal: controller.signal, cleanup() {} };
+    }
+    parentSignal.addEventListener("abort", onAbort, { once: true });
+  }
+  const timer = setTimeout(() => {
+    controller.abort(Object.assign(new Error("The operation timed out."), { name: "TimeoutError" }));
+  }, ms);
+  return {
+    signal: controller.signal,
+    cleanup() {
+      clearTimeout(timer);
+      parentSignal?.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
 function mountSidecar() {
   const bridge = window.sidecar;
   const params = new URLSearchParams(location.search);
@@ -20,18 +46,22 @@ function mountSidecar() {
     },
   };
   const transport = createHttpTransport(null, async (path, { signal, body }) => {
-    const timeout = AbortSignal.timeout(15_000);
     if (opaque && !token) throw new Error(tr("侧栏缺少鉴权令牌，请重新打开侧栏。"));
-    // The SDK accepts its query token and parses JSON from a plain-text body.
-    // An opaque frame cannot send the token header through a CORS preflight.
-    return fetchPage(opaque ? `./api?${new URLSearchParams({ token })}` : "./api", {
-      method: "POST", signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-      headers: opaque ? { "Content-Type": "text/plain" } : {
-        "Content-Type": "application/json", ...(!bridge?.fetch && token ? { "X-Sidecar-Token": token } : {}),
-      },
-      body: JSON.stringify({ path, body: body === undefined ? undefined : JSON.parse(body), conversationId,
-        workspaceUris: path.startsWith("./api/live/") ? workspaceUris : undefined }),
-    });
+    const { signal: reqSignal, cleanup } = createTimeoutSignal(15_000, signal);
+    try {
+      // The SDK accepts its query token and parses JSON from a plain-text body.
+      // An opaque frame cannot send the token header through a CORS preflight.
+      return await fetchPage(opaque ? `./api?${new URLSearchParams({ token })}` : "./api", {
+        method: "POST", signal: reqSignal,
+        headers: opaque ? { "Content-Type": "text/plain" } : {
+          "Content-Type": "application/json", ...(!bridge?.fetch && token ? { "X-Sidecar-Token": token } : {}),
+        },
+        body: JSON.stringify({ path, body: body === undefined ? undefined : JSON.parse(body), conversationId,
+          workspaceUris: path.startsWith("./api/live/") ? workspaceUris : undefined }),
+      });
+    } finally {
+      cleanup();
+    }
   });
   mountLive({ transport, sidecar });
 }

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { basename, delimiter, dirname, join, resolve } from 'node:path';
@@ -24,14 +24,37 @@ function executable(candidates) {
   });
 }
 
-export function findCodexCli(configuredPath = '', env = process.env) {
+function nvmNodeBinDirs(home) {
+  const root = join(home, '.nvm', 'versions', 'node');
+  try {
+    return readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort((a, b) => b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' }))
+      .map((name) => join(root, name, 'bin'));
+  } catch {
+    return [];
+  }
+}
+
+export function findCodexCli(configuredPath = '', env = process.env, { platform = process.platform, home = homedir() } = {}) {
   const dirs = String(env.PATH || env.Path || '').split(delimiter).filter(Boolean);
   const candidates = [configuredPath, env.CODEX_CLI_PATH, env.CODEX_BIN].filter(Boolean).flatMap((entry) => {
     const path = expandUser(entry);
     return [path, ...(basename(path) === path ? dirs.map((dir) => join(dir, path)) : [])];
   });
-  const names = process.platform === 'win32' ? ['codex.exe', 'codex.cmd', 'codex.ps1', 'codex'] : ['codex'];
-  dirs.push(join(homedir(), '.local', 'bin'));
+  const names = platform === 'win32' ? ['codex.exe', 'codex.cmd', 'codex.ps1', 'codex'] : ['codex'];
+  dirs.push(join(home, '.local', 'bin'));
+  if (platform !== 'win32') {
+    dirs.push(
+      '/opt/homebrew/bin',
+      '/usr/local/bin',
+      join(home, '.volta', 'bin'),
+      join(home, '.npm-global', 'bin'),
+      join(home, '.fnm', 'current', 'bin'),
+      ...nvmNodeBinDirs(home),
+    );
+  }
   if (env.APPDATA) dirs.push(join(env.APPDATA, 'npm'));
   const found = executable([...candidates, ...dirs.flatMap((dir) => names.map((name) => join(dir, name)))]);
   return found ? resolve(found) : '';

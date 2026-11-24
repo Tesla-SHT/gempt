@@ -519,7 +519,7 @@ export function findMagpieCli(configuredPath = '') {
       if (process.env[variable]) dirs.push(join(process.env[variable], 'magpie'));
     }
   } else {
-    dirs.push(join(homedir(), '.local', 'bin'), join(homedir(), '.local', 'opt', 'magpie'), '/usr/local/bin');
+    dirs.push(join(homedir(), '.local', 'bin'), join(homedir(), '.local', 'opt', 'magpie'), '/opt/homebrew/bin', '/usr/local/bin');
     if (process.platform === 'darwin') {
       dirs.push('/Applications/Magpie.app/Contents/MacOS', '/Applications/magpie.app/Contents/MacOS');
     }

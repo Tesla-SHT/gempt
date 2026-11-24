@@ -1,9 +1,8 @@
-import { APP_TOOLS, LIVE_META } from './mcp-app.mjs';
 import { WORKLOAD } from './assets.mjs';
 
-function tool(name, description, properties, required, meta) {
+function tool(name, description, properties, required) {
   return { name, description, inputSchema: { type: 'object', properties, additionalProperties: false,
-    ...(required ? { required } : {}) }, ...(meta ? { _meta: meta } : {}) };
+    ...(required ? { required } : {}) } };
 }
 
 export const TOOLS = [
@@ -46,6 +45,5 @@ export const TOOLS = [
       call_id: { type: 'string', description: 'Pending ask_gemini call_id (reply only).' },
       host_conversation_id: { type: 'string', description: 'Optional Antigravity conversation ID for status.' },
       scope: { type: 'string', enum: ['session', 'all'], default: 'session', description: 'Run listing scope for status / GemPT.' },
-    }, undefined, LIVE_META),
-  ...Object.values(APP_TOOLS),
+    }),
 ];

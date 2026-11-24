@@ -6,7 +6,6 @@ import {
 } from 'node:fs';
 import { basename, delimiter, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { APP_RESOURCE, APP_TOOLS, APP_URI } from './mcp-app.mjs';
 import { agyInstallPaths, RUNTIME_ROOT, resolvePluginRoot } from './bundle-paths.mjs';
 import { resolveNodeExecutable } from './node-executable.mjs';
 import { atomicJson, resolvePath, withLock, withinPath } from './state.mjs';
@@ -116,12 +115,15 @@ export async function validatePluginBundle(staged, nodeBin, env = process.env, {
   }
   for (const file of ['README.md', 'LICENSE', 'THIRD_PARTY_LICENSES.txt', 'assets/logo.svg',
     'hooks.json', 'mcp_config.json', 'rules/AGENTS.md', 'agents/gempt-worker.md',
-    'skills/gempt/SKILL.md', 'runtime/bin/gempt.mjs', 'runtime/core/assets/workload.json', 'runtime/core/assets/mcp_app_live.html',
+    'skills/gempt/SKILL.md', 'runtime/bin/gempt.mjs', 'runtime/core/assets/workload.json',
     'sidecars/gempt_live/sidecar.json', 'sidecars/gempt_live/main.mjs',
     ...['index.html', 'styles.css', 'app.js'].map((file) => `runtime/core/assets/http-ui/${file}`)]) {
     if (!statSync(join(staged, file), { throwIfNoEntry: false })?.isFile() || !statSync(join(staged, file)).size) {
       throw new Error(`Missing or empty Antigravity plugin asset: ${file}`);
     }
+  }
+  if (!readFileSync(join(staged, 'rules', 'AGENTS.md'), 'utf8').trim()) {
+    throw new Error('Empty Antigravity plugin rules text: rules/AGENTS.md');
   }
   const sidecar = JSON.parse(readFileSync(join(staged, 'sidecars', 'gempt_live', 'sidecar.json'), 'utf8'));
   if (!sidecar.has_web_ui || sidecar.command !== (portable ? 'node' : nodeBin) || sidecar.args?.[0] !== 'main.mjs'
@@ -148,13 +150,11 @@ export async function validatePluginBundle(staged, nodeBin, env = process.env, {
     MAGPIE_CONFIG_DIR: join(validationWorkspace, 'magpie'),
     MAGPIE_ADDR: 'http://127.0.0.1:0',
   };
-  delete childEnv.GEMPT_APP_HTML;
-  const consoleTool = 'gempt_app_console_state';
   const requests = [
     { id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' } },
     { id: 2, method: 'tools/list' },
-    { id: 3, method: 'resources/read', params: { uri: APP_URI } },
-    { id: 4, method: 'tools/call', params: { name: consoleTool, arguments: {} } },
+    { id: 3, method: 'resources/list' },
+    { id: 4, method: 'tools/call', params: { name: 'gpt_ctl', arguments: { action: 'status' } } },
   ].map((request) => ({ jsonrpc: '2.0', ...request }));
   try {
     const [packets, [hook]] = await Promise.all([
@@ -164,26 +164,28 @@ export async function validatePluginBundle(staged, nodeBin, env = process.env, {
     ]);
     const results = new Map(packets.map(({ id, result }) => [id, result]));
     if (results.get(1)?.serverInfo?.name !== 'gempt') throw new Error('Staged MCP server did not identify itself as gempt.');
+    if (results.get(1)?.capabilities?.resources) throw new Error('Staged MCP server must not advertise legacy MCP App resources.');
     const tools = results.get(2)?.tools;
-    const expected = ['gpt_run', 'gpt_ask', 'gpt_ctl', ...Object.keys(APP_TOOLS)].sort();
+    const expected = ['gpt_ask', 'gpt_ctl', 'gpt_run'];
     if (JSON.stringify(tools?.map(({ name }) => name).sort()) !== JSON.stringify(expected)) {
       throw new Error(`Staged MCP server did not advertise the expected set of ${expected.length} GemPT tools.`);
     }
-    const entrypointTools = tools.filter(({ _meta }) => _meta?.['com.google.antigravity/ui']?.entrypoints?.length);
-    if (entrypointTools.length || tools.find(({ name }) => name === 'gpt_ctl')?._meta.ui?.resourceUri !== APP_URI) {
-      throw new Error('Staged MCP server must preserve the GemPT resource and leave Antigravity entrypoints to the sidecar.');
+    if (tools.some(({ _meta }) => _meta?.ui || _meta?.['com.google.antigravity/ui'])) {
+      throw new Error('Staged MCP server tools must not carry legacy MCP App UI metadata.');
     }
-    const resource = results.get(3)?.contents?.[0];
-    if (resource?.mimeType !== APP_RESOURCE.mimeType || !resource.text) throw new Error('Staged MCP server could not read GemPT.');
-    const consoleResponse = packets.find(({ id }) => id === 4);
-    const consoleState = consoleResponse?.result;
-    if (consoleResponse?.error || !consoleState || consoleState.isError) {
-      const detail = consoleResponse?.error?.message || consoleState?.content?.[0]?.text || 'missing tool result';
-      throw new Error(`Staged MCP server ${consoleTool} failed: ${detail}`);
+    const resources = results.get(3)?.resources;
+    if (!Array.isArray(resources) || resources.length !== 0) {
+      throw new Error('Staged MCP server must not advertise legacy MCP App resources.');
     }
-    const rulesText = consoleState.structuredContent?.rulesText;
-    if (typeof rulesText !== 'string' || !rulesText.trim()) {
-      throw new Error(`Staged MCP server ${consoleTool} returned empty rules text.`);
+    const statusResponse = packets.find(({ id }) => id === 4);
+    const statusResult = statusResponse?.result;
+    if (statusResponse?.error || !statusResult || statusResult.isError) {
+      const detail = statusResponse?.error?.message || statusResult?.content?.[0]?.text || 'missing tool result';
+      throw new Error(`Staged MCP server gpt_ctl status failed: ${detail}`);
+    }
+    const statusPayload = JSON.parse(statusResult.content?.[0]?.text || '');
+    if (!statusPayload || typeof statusPayload !== 'object' || Array.isArray(statusPayload)) {
+      throw new Error('Staged MCP server gpt_ctl status returned invalid payload.');
     }
     if (!hook?.injectSteps?.[0]?.systemMessage?.systemMessage) throw new Error('Staged SessionStart hook did not inject a system message.');
   } finally {

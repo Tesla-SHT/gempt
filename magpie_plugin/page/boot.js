@@ -41,8 +41,19 @@
     if (retryEl) retryEl.textContent = copy.retry;
   }
 
+  const withTimeout = (promise, ms = 1500) => {
+    if (!promise || typeof promise.then !== 'function') return Promise.resolve(promise);
+    let timer;
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('bridge timeout')), ms);
+      }),
+    ]).finally(() => clearTimeout(timer));
+  };
+
   try {
-    const current = await window.magpie?.ready;
+    const current = await withTimeout(window.magpie?.ready);
     if (current) {
       theme = current.dark ? 'dark' : 'light';
       lang = String(current.lang || lang).toLowerCase().startsWith('zh') ? 'zh' : 'en';
@@ -53,7 +64,7 @@
   }
 
   try {
-    const options = await window.magpie?.options?.get?.();
+    const options = await withTimeout(window.magpie?.options?.get?.());
     const val = Number(options?.port);
     if (Number.isInteger(val) && val > 0 && val < 65536) port = val;
   } catch {

@@ -10,10 +10,10 @@ import { dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { serveAppServerSocket } from './app-server-fixture.mjs';
-import { handleTool } from '../core/mcp-server.mjs';
 import { updateHostContext } from '../core/host-context.mjs';
 import { runDirectory, saveRun } from '../core/runs.mjs';
 import { resolvePath } from '../core/state.mjs';
+import { updateSettings } from '../magpie_plugin/lib/backend.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
 
 const output = process.env.GEMPT_VERIFY_DIR || '/tmp/gempt-v060-verify';
@@ -29,13 +29,6 @@ const sessionId = 'exec-console-verification';
 const runPath = runDirectory(runId, sessionsDir);
 const stamp = (minutes = 0) => new Date(Date.now() - minutes * 60_000).toISOString();
 const model = 'codex/gpt-6.2-sol';
-const themeTokens = {
-  dark: ['#17181b', '#202126', '#282a30', '#ebedf3', '#adb3bf', '#8c94a3', '#353842', '#2a2c33'],
-  light: ['#fdfdff', '#ffffff', '#f1f3f7', '#202633', '#555e70', '#626d80', '#cdd3df', '#e7eaf0'],
-};
-const tokenKeys = ['background-primary', 'background-secondary', 'background-tertiary', 'text-primary',
-  'text-secondary', 'text-tertiary', 'border-primary', 'border-secondary'];
-const calls = [];
 const requests = [];
 let consoleServer, chrome, ws, sidecarChild, sidecarOrigin;
 let gatewayDelay = 0;
@@ -51,40 +44,11 @@ let blockedSidecarScript = false;
 const controlPackets = [];
 const controlSockets = new Set();
 const codexToken = 'browser-codex-fixture';
-const appHtml = readFileSync(new URL('../core/assets/mcp_app_live.html', import.meta.url));
 const priorRunId = 'd'.repeat(32);
 const appPath = join(root, 'app-server.json');
 const env = { ...process.env, GEMPT_CONFIG: configPath, GEMPT_SESSIONS_DIR: sessionsDir,
   MAGPIE_CONFIG_DIR: magpieConfigDir, GEMPT_APP_SERVER_STATE: appPath, GEMPT_AGY_BRAIN_DIR: brainDir };
 process.env.GEMPT_AGY_BRAIN_DIR = brainDir;
-
-function hostHtml(theme) {
-  const variables = Object.fromEntries(tokenKeys.map((key, i) => ['--color-' + key, themeTokens[theme][i]]));
-  const context = { theme, styles: { variables }, displayMode: 'inline' };
-  return `<!doctype html><html><head><link rel="icon" href="data:,"></head><body style="margin:0;background:${variables['--color-background-primary']}">
-  <iframe id="app" src="/app" sandbox="allow-scripts allow-downloads" style="position:fixed;inset:0;border:0;width:100%;height:100%"></iframe>
-  <script>
-  const frame = document.getElementById('app');
-  addEventListener('message', async (event) => {
-    if (event.source !== frame.contentWindow || event.origin !== 'null') return;
-    const { id, method, params } = event.data;
-    if (method === 'ui/notifications/initialized') {
-      const toolResult = await fetch('/tool', { method: 'POST', body: JSON.stringify({ name:'gpt_ctl', arguments:{} }) }).then(r => r.json());
-      if (toolResult.isError || !Array.isArray(toolResult.structuredContent?.runs)) throw new Error('gpt_ctl failed to open GemPT');
-      frame.contentWindow.postMessage({ jsonrpc:'2.0', method:'ui/notifications/tool-result', params:toolResult }, '*');
-    }
-    if (id == null) return;
-    let result = {};
-    if (method === 'ui/initialize') result = {
-      protocolVersion: params.protocolVersion, hostInfo:{name:'AGY fixture',version:'1'},
-      hostCapabilities:{ serverTools:{}, message:{text:{}}, updateModelContext:{text:{}} },
-      hostContext:${JSON.stringify(context)}
-    };
-    if (method === 'tools/call') result = await fetch('/tool', { method:'POST', body:JSON.stringify(params) }).then(r => r.json());
-    frame.contentWindow.postMessage({ jsonrpc:'2.0', id, result }, '*');
-  });
-  </script></body></html>`;
-}
 
 const backend = createServer(async (req, res) => {
   const incoming = new URL(req.url, 'http://' + req.headers.host);
@@ -124,21 +88,6 @@ const backend = createServer(async (req, res) => {
     if (gatewayDelay) await sleep(gatewayDelay);
     return res.end(JSON.stringify({ data: [model, 'codex/gpt-6.2-astra', 'gemini/gemini-4-neon-high', 'openai/gpt-5.4'].map(id => ({ id })) }));
   }
-  if (req.url === '/app') {
-    res.setHeader('Content-Type', 'text/html');
-    return res.end(appHtml);
-  }
-  if (req.url === '/tool') {
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    const { name, arguments: args } = JSON.parse(Buffer.concat(chunks).toString());
-    calls.push({ name, args });
-    try {
-      return res.end(JSON.stringify(await handleTool(name, args, env, { configPath, sessionsDir, magpieConfigDir })));
-    } catch (error) {
-      return res.end(JSON.stringify({ isError: true, content: [{ type: 'text', text: error.message }] }));
-    }
-  }
   if (incoming.pathname === '/native-host' && sidecarOrigin) {
     const bare = incoming.searchParams.has('bare');
     const opaque = incoming.searchParams.has('opaque');
@@ -166,10 +115,6 @@ const backend = createServer(async (req, res) => {
         ${noWorkspace ? '' : `setWorkspace([${JSON.stringify(pathToFileURL(cwd).href)}]);`}
       };
       </script>`);
-  }
-  if (incoming.pathname === '/') {
-    res.setHeader('Content-Type', 'text/html');
-    return res.end(hostHtml(incoming.searchParams.get('theme') || 'dark'));
   }
   res.writeHead(404).end('Not found');
 });
@@ -267,8 +212,8 @@ try {
   const { result: { tools } } = JSON.parse(execFileSync(process.execPath, [serverEntry], {
     input: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) + '\n', encoding: 'utf8', env,
   }));
-  assert.deepEqual(tools.filter(({ _meta }) => _meta?.['com.google.antigravity/ui']?.entrypoints?.length), []);
-  assert.equal(tools.find(({ name }) => name === 'gpt_ctl')._meta.ui.resourceUri, 'ui://gempt/live.html');
+  assert.deepEqual(tools.map(({ name }) => name).sort(), ['gpt_ask', 'gpt_ctl', 'gpt_run']);
+  assert.deepEqual(tools.filter(({ _meta }) => _meta?.ui || _meta?.['com.google.antigravity/ui']), []);
   backend.listen(0, '127.0.0.1');
   await once(backend, 'listening');
   const url = 'http://127.0.0.1:' + backend.address().port;
@@ -355,10 +300,8 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
     await cdp('Page.navigate', { url: target });
     contextId = await until(async () => {
       const { frameTree } = await cdp('Page.getFrameTree');
-      const native = new URL(target).pathname === '/native-host';
-      const frame = embedded ? frameTree.childFrames?.find(({ frame }) => native
-        ? frame.url.startsWith(url + sidecarPrefix)
-        : frame.url === url + '/app')?.frame : frameTree.frame;
+      const frame = embedded ? frameTree.childFrames?.find(({ frame }) =>
+        frame.url.startsWith(url + sidecarPrefix))?.frame : frameTree.frame;
       return frame && contexts.get(frame.id);
     }, target);
   }
@@ -386,128 +329,7 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
     assert.deepEqual([png.readUInt32BE(16), png.readUInt32BE(20)], dimensions);
     writeFileSync(join(output, name + '.png'), png);
   }
-  const activityCount = () => calls.filter(({ name }) => name === 'gempt_app_console_activity').length;
   const click = (id) => evaluate(`$(${JSON.stringify(id)}).click();`);
-  const selected = (selector) => evaluate(`return document.querySelector(${JSON.stringify(selector)})?.value;`);
-  async function overview(theme, width, screenshot) {
-    const before = activityCount();
-    await open(`${url}/?theme=${theme}`, width, 900, true);
-    await until(() => evaluate(`return document.querySelector('.session-card[data-run-id="${runId}"]')?.dataset.runId;`), 'Live on launch');
-    assert.equal(await evaluate("return $('tab-live').getAttribute('aria-selected');"), 'true');
-    await click('tab-overview');
-    await until(() => evaluate(`return !$('view-console')?.hidden && !$('token-ratio-card')?.hidden
-      && $('magpie-status')?.dataset.state === 'online' && !!$('active-run-list')?.children.length;`), 'shared Overview state');
-    assert.equal(await evaluate('try { void localStorage; return false; } catch { return true; }'), true);
-    assert.equal(await evaluate("return getComputedStyle($('view-console')).getPropertyValue('--gp-bg').trim();"), themeTokens[theme][0]);
-    assert.equal(await selected('[name="native_swarm"]:checked'), 'true');
-    assert.equal(await selected('#swarm-shell-model'), 'gemini-4-hydrogen-low');
-    assert.equal(await evaluate("return document.querySelector('[name=\"failover_mode\"]') === null;"), true);
-    assert.deepEqual(await evaluate(`return [...document.querySelector('[name="pair-hydrogen"]').options]
-      .filter(option => option.value !== 'default').map(option => [option.value, option.text]);`),
-      [model, 'codex/gpt-6.2-astra', 'gemini/gemini-4-neon-high', 'openai/gpt-5.4'].map(id => [id, id]));
-    assert.equal(await selected('#codex-timeout'), '3600');
-    assert.match(await evaluate("return $('routing-badge').textContent;"), /^80% · Swarm$/);
-    assert.ok(Number.parseFloat(await evaluate("return $('token-ratio-gpt-bar').style.width;")) > 0);
-    assert.equal(activityCount(), before);
-    await assertGeometry(screenshot);
-    if (width < 500) {
-      await click('routing-badge');
-      assert.equal(await evaluate("return document.activeElement.id;"), 'work-controls');
-    }
-    if (screenshot) await shot(screenshot);
-  }
-
-  await overview('dark', 1280, 'agy-console-dark-wide');
-  const overviewCalls = calls.filter(({ name }) => name === 'gempt_app_console_state').length;
-  const activeCalls = calls.filter(({ name }) => name === 'gempt_app_active_runs').length;
-  await sleep(3000);
-  assert.equal(activityCount(), 0, 'Overview refresh must never call activity');
-  assert.equal(calls.filter(({ name }) => name === 'gempt_app_console_state').length, overviewCalls);
-  assert.ok(calls.filter(({ name }) => name === 'gempt_app_active_runs').length > activeCalls);
-  await click('tab-sessions');
-  await until(() => evaluate("return document.querySelector('#sessions [data-activity-id]')?.dataset.activityId;"), 'session ledger');
-  await shot('agy-console-sessions-dark');
-  await evaluate(`const filter = document.querySelector('#sessions [data-filter="mode"]');
-    filter.value = 'consult'; filter.dispatchEvent(new Event('change', { bubbles: true }));`);
-  await until(() => calls.some(({ name, args }) => name === 'gempt_app_console_activity'
-    && args.kind === 'sessions' && args.query?.mode === 'consult'), 'session mode filter');
-  await until(() => evaluate("return document.querySelector('#sessions [data-activity-id]')?.dataset.activityId.startsWith('consult-');"), 'consult-only sessions');
-  await evaluate("document.querySelector('#sessions [data-activity-id]').click();");
-  await until(() => evaluate("return !!document.querySelector('#sessions-detail .activity-detail-head');"), 'session detail');
-  await click('tab-requests');
-  await until(() => evaluate("return !!document.querySelector('#requests tbody [data-activity-id]');"), 'request ledger');
-  await evaluate(`const search = document.querySelector('#requests .activity-search');
-    search.value = '模型配对'; search.dispatchEvent(new Event('input', { bubbles: true }));`);
-  await until(() => evaluate("return document.querySelectorAll('#requests tbody [data-activity-id]').length === 1;"), 'request search');
-  await evaluate("document.querySelector('[data-export-csv]').click();");
-  await until(() => {
-    try { return readFileSync(join(downloads, 'gempt-requests.csv'), 'utf8').includes('模型配对'); } catch { return false; }
-  }, 'authentic CSV download in MCP App');
-  await click('tab-overview');
-  const activityAfterClose = activityCount();
-  await sleep(3100);
-  assert.equal(activityCount(), activityAfterClose);
-  await click('tab-live');
-  await until(() => evaluate(`return !$('live-panel').hidden && !!document.querySelector('.session-card[data-run-id="${runId}"]');`), 'return to Live');
-
-  await overview('dark', 460, 'agy-console-dark-narrow');
-  await evaluate(`Object.defineProperty(navigator, 'clipboard', { value: undefined });
-    document.execCommand = () => false; $('copy-mcp-btn').click();`);
-  await until(() => evaluate("return $('console-copy-dialog').open && $('console-copy-text').value.includes('mcpServers');"), 'manual clipboard fallback');
-  await click('console-copy-close');
-  await evaluate("document.querySelector('[data-ratio-range=\"7d\"]').click();");
-  await until(() => evaluate("return $('token-ratio-title').textContent.includes('7 天');"), 'token ratio preset');
-  await evaluate("$('advanced-settings').open = true; document.querySelector('[data-timeout=\"1800\"]').click();");
-  await until(() => evaluate("return document.querySelector('[data-timeout=\"1800\"]').getAttribute('aria-pressed') === 'true';"), 'saved timeout preset');
-  await evaluate("const field = $('codex-timeout'); field.value = '2400'; field.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));");
-  await until(() => JSON.parse(readFileSync(configPath)).codex.timeout_sec === 2400, 'manual timeout saved in opaque iframe');
-  await click('dispatch-direct');
-  await until(() => evaluate("return $('routing-badge').textContent === '80% · 直调';"), 'Swarm toggle');
-  await evaluate(`const model = $('swarm-shell-model'); model.value = 'gemini-3.8-flash-low';
-    model.dispatchEvent(new Event('change',{bubbles:true}));`);
-  await until(() => {
-    const policy = JSON.parse(readFileSync(configPath)).routing_policy;
-    return policy.native_swarm === false && policy.swarm_shell_model === 'gemini-3.8-flash-low';
-  }, 'persisted AGY Swarm settings');
-  await until(() => evaluate("return !$('swarm-shell-model').disabled;"), 'model update completed');
-  assert.equal(JSON.parse(readFileSync(configPath)).codex.timeout_sec, 2400);
-  // Restore fixture defaults through the auth-independent application tool.
-  const saved = await handleTool('gempt_app_console_settings', { native_swarm: true,
-    swarm_shell_model: 'gemini-4-hydrogen-low', codex_timeout_sec: 3600 }, env, { configPath, sessionsDir, magpieConfigDir });
-  assert.equal(saved.structuredContent.codex_timeout_sec, 3600);
-  await overview('light', 1280, 'agy-console-light-wide');
-  await overview('light', 390, 'agy-console-light-narrow');
-  await overview('dark', 1440, 'agy-console-dark-1440');
-
-  const beforeLive = activityCount();
-  const beforeLaunch = calls.length;
-  await open(url + '/?theme=dark', 1280, 820, true);
-  await until(() => evaluate(`return document.querySelector('.session-card[data-run-id="${runId}"]')?.dataset.runId;`), 'Live run');
-  await until(() => calls.slice(beforeLaunch).some(({ name }) => name === 'gempt_app_magpie_status'), 'first gateway probe');
-  assert.deepEqual([...new Set(calls.slice(beforeLaunch).map(({ name }) => name))].sort(),
-    ['gempt_app_magpie_status', 'gempt_app_runs', 'gempt_app_summary', 'gpt_ctl']);
-  assert.equal(await evaluate("return $('tab-live').getAttribute('aria-selected');"), 'true');
-  assert.equal(await evaluate("return document.querySelectorAll('.app-topbar [role=tab]').length;"), 4);
-  await evaluate(`document.querySelector('.session-card[data-run-id="${runId}"]').click();`);
-  await until(() => evaluate("return !$('ask')?.hidden && !$('reply-form')?.hidden && $('ask-question')?.textContent.includes('旧会话');"), 'direct reply');
-  assert.equal(await evaluate("return $('detail-worktree').hidden;"), false);
-  assert.equal(await evaluate("return $('routing-badge').textContent;"), '80% · Swarm');
-  await shot('agy-live-dark');
-  await evaluate("$('reply-message').value = '可以，保留原始备份。'; $('reply-message').dispatchEvent(new Event('input')); $('send-reply').click();");
-  await until(() => evaluate("return $('reply-status')?.textContent === '已发送回复。';"), 'direct reply submitted');
-  assert.equal(JSON.parse(readFileSync(join(runPath, 'tool_replies', 'ask_1.json'))).answer, '可以，保留原始备份。');
-  await sleep(2800);
-  assert.equal(activityCount(), beforeLive);
-  await open(url + '/?theme=light', 460, 820, true);
-  await until(() => evaluate(`return document.querySelector('.session-card[data-run-id="${runId}"]')?.dataset.runId;`), 'light Live run');
-  await evaluate(`document.querySelector('.session-card[data-run-id="${runId}"]').click();`);
-  await until(() => evaluate("return !$('ask')?.hidden && !$('reply-form')?.hidden;"), 'light Live reply card');
-  await shot('agy-live-light-narrow');
-  await click('info-toggle');
-  await click('open-run-session');
-  await until(() => evaluate("return !!document.querySelector('#sessions-detail .activity-detail-head');"), 'AGY Live to Session');
-  await evaluate(`document.querySelector('#sessions-detail a[href="#live/${priorRunId}"]').click();`);
-  await until(() => evaluate("return $('detail-title').textContent === '较早轮次';"), 'AGY Session to the exact older run');
 
   gatewayDelay = 400;
   await open(standaloneUrl, 1280, 900, false);
@@ -549,7 +371,7 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
   await until(() => evaluate("return !!document.querySelector('#sessions [data-activity-id]');"), 'Magpie session ledger');
   await evaluate(`document.querySelector('#sessions [data-activity-id="${sessionId}"]').parentElement.querySelector('.activity-link').click();`);
   await until(() => evaluate("return !$('live-panel').hidden && !$('detail-bar').hidden;"), 'Magpie session list to Live');
-  rmSync(join(runPath, 'tool_replies', 'ask_1.json'));
+  rmSync(join(runPath, 'tool_replies', 'ask_1.json'), { force: true });
   await open(standaloneUrl + '#live/' + runId, 360, 820, false);
   await until(() => evaluate("return !$('ask').hidden;"), 'Magpie hash restores Live detail');
   assert.equal(await evaluate("return getComputedStyle($('toast')).bottom;"), '65px');
@@ -594,7 +416,7 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
         input: [{ type: 'text', text: 'Continue with the gateway check.' }] } },
       { method: 'turn/interrupt', params: { threadId: 'console-codex-thread', turnId: 'verification-turn' } },
     ]);
-    rmSync(join(runPath, 'tool_replies', 'ask_1.json'));
+    rmSync(join(runPath, 'tool_replies', 'ask_1.json'), { force: true });
     await evaluate("$('reply-message').value = '可以通过侧栏继续。'; $('reply-message').dispatchEvent(new Event('input')); $('send-reply').click();");
     await until(() => evaluate("return $('reply-status').textContent === '已发送回复。';"), 'native authenticated reply');
     assert.equal(JSON.parse(readFileSync(join(runPath, 'tool_replies', 'ask_1.json'))).answer, '可以通过侧栏继续。');
@@ -699,9 +521,9 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
     await assertTopbar('English native Live light');
     await shot('sidecar-en-live-light');
     // Restore the fixture before the remaining lifecycle and authentication checks.
-    const restored = await handleTool('gempt_app_console_settings', { ui: { language: 'zh' },
-      magpie: { api_key: '', api_key_env: '' }, codex: { extra_args: [] } }, env, { configPath, sessionsDir, magpieConfigDir });
-    assert.equal(restored.structuredContent.ui.language, 'zh');
+    const restored = await updateSettings({ ui: { language: 'zh' },
+      magpie: { api_key: '', api_key_env: '' }, codex: { extra_args: [] } }, { configPath });
+    assert.equal(restored.ok, true);
 
     await open(url + '/native-host?bare', 460, 820, true);
     await until(() => evaluate("return $('detail-title').textContent === '核对双端控制台与迁移';"), 'native slashless entry and deep-linked run');
@@ -750,7 +572,7 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
   assert.deepEqual(notFound, [], 'Chrome received no 404 responses');
   assert.deepEqual(errors, [], 'Chrome console and uncaught errors');
   assert.deepEqual(external, [], 'No external asset or network requests');
-  console.log('Chrome OK · Magpie HTTP, MCP App and native Sidecar · prefixed, slashless, index, opaque, gateway-authenticated and late-workspace startup · four tabs, details, token ratio, settings and controls · 0 HTTP 404s, 0 console errors');
+  console.log('Chrome OK · Magpie HTTP and native Sidecar · prefixed, slashless, index, opaque, gateway-authenticated and late-workspace startup · four tabs, details, token ratio, settings and controls · 0 HTTP 404s, 0 console errors');
   for (const status of [401, 404, 500]) {
     sidecarFailure = status;
     await open(url + '/native-host?no-workspace', 460, 820, true);

@@ -886,13 +886,39 @@ export function mountConsole(root, transport, {
     banner.hidden = !message;
   }
 
+  function createTimeoutSignal(ms, parentSignal) {
+    if (typeof AbortSignal?.timeout === 'function' && (!parentSignal || typeof AbortSignal?.any === 'function')) {
+      const t = AbortSignal.timeout(ms);
+      return { signal: parentSignal ? AbortSignal.any([parentSignal, t]) : t, cleanup() {} };
+    }
+    const controller = new AbortController();
+    const onAbort = () => controller.abort(parentSignal.reason);
+    if (parentSignal) {
+      if (parentSignal.aborted) {
+        controller.abort(parentSignal.reason);
+        return { signal: controller.signal, cleanup() {} };
+      }
+      parentSignal.addEventListener('abort', onAbort, { once: true });
+    }
+    const timer = setTimeout(() => {
+      controller.abort(Object.assign(new Error('The operation timed out.'), { name: 'TimeoutError' }));
+    }, ms);
+    return {
+      signal: controller.signal,
+      cleanup() {
+        clearTimeout(timer);
+        parentSignal?.removeEventListener('abort', onAbort);
+      },
+    };
+  }
+
   async function refreshState({ replace = false } = {}) {
     if (!visible || activeTab !== 'overview' || (stateFetch && !replace)) return;
     stateFetch?.abort();
     const abort = stateFetch = new AbortController();
     const previousGatewayStatus = gatewayStatus;
+    const { signal, cleanup } = createTimeoutSignal(POLL_MS, abort.signal);
     try {
-      const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(POLL_MS)]);
       let data = await transport.getState({ signal });
       if (abort.signal.aborted) return;
       if (!data?.magpie) throw new Error(tr('状态响应格式无效'));
@@ -911,6 +937,7 @@ export function mountConsole(root, transport, {
         renderSyncStatus();
       }
     } finally {
+      cleanup();
       if (stateFetch === abort) {
         stateFetch = null;
         markUiReady();

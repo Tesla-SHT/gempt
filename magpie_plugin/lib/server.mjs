@@ -46,7 +46,7 @@ const PKG = (() => {
   }
 })();
 
-const BUILD_ID = `${PKG.version || '0.7.0'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
+const BUILD_ID = `${PKG.version || '0.7.1'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
 const pidAlive = (pid) => {
   if (!Number.isSafeInteger(pid) || pid < 1) return false;
   try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }
@@ -167,8 +167,8 @@ export async function startServer({
 
   const own = (p) => {
     actualPort = p;
-    OWN = new Set([`http://127.0.0.1:${p}`, `http://localhost:${p}`]);
-    HOSTS = new Set([`127.0.0.1:${p}`, `localhost:${p}`]);
+    OWN = new Set([`http://127.0.0.1:${p}`, `http://localhost:${p}`, `http://[::1]:${p}`]);
+    HOSTS = new Set([`127.0.0.1:${p}`, `localhost:${p}`, `[::1]:${p}`]);
   };
 
   const normalizedOrigin = (req) => {
@@ -189,13 +189,14 @@ export async function startServer({
     }
     return h;
   };
-  const send = async (req, res, status, body, type = 'application/json; charset=utf-8', withCors = true, asset) => {
+  const send = async (req, res, status, body, type = 'application/json; charset=utf-8', withCors = true, asset, extraHeaders) => {
     let data = typeof body === 'string' || body instanceof Uint8Array ? body : JSON.stringify(body);
     const headers = {
       'content-type': type,
       'cache-control': asset ? 'public, max-age=0, must-revalidate' : 'no-store',
       ...(withCors ? corsHeaders(req, withCors === 'module') : {}),
       'x-content-type-options': 'nosniff',
+      ...extraHeaders,
     };
     headers.vary = [headers.vary, 'Accept-Encoding'].filter(Boolean).join(', ');
     if (asset) {
@@ -278,13 +279,16 @@ export async function startServer({
           return send(req, res, 403, { error: 'cross-origin page read not allowed' }, undefined, false);
         }
         const origin = normalizedOrigin(req);
-        if (origin !== undefined && !OWN.has(origin)) {
+        if (origin !== undefined && origin !== 'null' && !OWN.has(origin)) {
           return send(req, res, 403, { error: 'cross-origin page read not allowed' }, undefined, false);
         }
         const asset = await readPageAsset('/index.html');
         const html = asset.data.toString('utf8')
           .replace('<head>', `<head>\n  <meta name="gempt-key" content="${KEY}">`);
-        return await send(req, res, 200, html, asset.type, false);
+        const ownOrigins = [...OWN].join(' ');
+        return await send(req, res, 200, html, asset.type, false, undefined, {
+          'content-security-policy': `default-src 'none'; script-src 'self' ${ownOrigins}; connect-src 'self' ${ownOrigins}; style-src 'self' ${ownOrigins} 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'`,
+        });
       }
       const asset = await readPageAsset(pathname);
       if (!asset) return send(req, res, 404, 'not found', 'text/plain; charset=utf-8', false);

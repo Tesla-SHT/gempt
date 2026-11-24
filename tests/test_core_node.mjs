@@ -18,7 +18,7 @@ import { promisify } from 'node:util';
 import { installAgy, resolveNodeExecutable, stagePluginBundle, syncInPlace, validatePluginBundle } from '../core/agy-install.mjs';
 import { assertSafeOutDir } from '../scripts/build-agy-plugin.mjs';
 import { contextPath, readHostContext, updateHostContext } from '../core/host-context.mjs';
-import { APP_RESOURCE, APP_URI, callAppTool, readAppResource } from '../core/mcp-app.mjs';
+import { runLiveOperation } from '../core/live-service.mjs';
 import { handleTool, TOOLS } from '../core/mcp-server.mjs';
 import { buildWaitCommand, dispatchRun, interruptRun, isRecentUnconfirmedRun, listActiveRoster, readRun,
   reconcileRunState, replyToolCall, runDirectory, saveRun, steerRun, waitForRun, waitForRuns } from '../core/runs.mjs';
@@ -26,7 +26,9 @@ import { DEFAULT_LOCK_STALE_MS, isValidSessionId, lockStaleMsForBudget, validate
 import { linkTarget, listArguments, streamRenderKey, timelineMessages } from '../mcp_app/live-state.js';
 import { assertShareWorktree, ensureShareWorktree, pruneShareWorktrees,
   removeShareWorktree, worktreesRoot } from '../core/worktrees.mjs';
-import { readState, updateSettings } from '../magpie_plugin/lib/backend.mjs';
+import { createAppServerManager } from '../magpie_plugin/lib/app-server-manager.mjs';
+import { probeGatewaySettings, readOverview, readRoutingSummary, readState, resetSettings, updateSettings } from '../magpie_plugin/lib/backend.mjs';
+import { dispatchPageApi } from '../magpie_plugin/lib/page-api.mjs';
 import { resolveExecTimeoutSec } from '../magpie_plugin/lib/routing.mjs';
 import { runAppServer } from '../magpie_plugin/lib/app-server-run.mjs';
 
@@ -35,17 +37,18 @@ const hookPath = fileURLToPath(new URL('../plugin/work_split_hook.mjs', import.m
 const cliPath = fileURLToPath(new URL('../bin/gempt.mjs', import.meta.url));
 
 test('Live builds the split pane and preserves host scope, safe link routes and exact transcript text', () => {
-  const bundle = readFileSync(new URL('../core/assets/mcp_app_live.html', import.meta.url), 'utf8');
-  const source = readFileSync(new URL('../mcp_app/index.html', import.meta.url), 'utf8').trimEnd().replace(/\r\n/g, '\n');
+  const html = readFileSync(new URL('../core/assets/http-ui/index.html', import.meta.url), 'utf8');
+  const css = readFileSync(new URL('../core/assets/http-ui/styles.css', import.meta.url), 'utf8');
+  const js = readFileSync(new URL('../core/assets/http-ui/app.js', import.meta.url), 'utf8');
   const styles = readFileSync(new URL('../mcp_app/styles.css', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
-  assert.ok(bundle.includes(source.split('<!-- CSS -->')[0]));
-  assert.ok(bundle.includes(styles));
-  assert.match(bundle, /@media \(min-width: 900px\)[\s\S]+?grid-template-columns: 290px minmax\(0, 1fr\)/);
-  assert.match(bundle, /max-width: 760px; margin: 0 auto/);
-  assert.match(bundle, /id="scope-all"[^>]+>全部<\/button>/);
-  assert.match(bundle, /createTHead\(/);
-  assert.match(bundle, /com\.google\.antigravity\/toggle-aux-pane/);
-  assert.match(bundle, /ui\/open-link/);
+  assert.doesNotMatch(html, /<meta\s+http-equiv=["']Content-Security-Policy["']/i);
+  assert.match(html, /<link rel="stylesheet" href="\.\/styles\.css">/);
+  assert.match(html, /<script defer src="\.\/app\.js"><\/script>/);
+  assert.ok(css.includes(styles));
+  assert.match(css, /@media \(min-width: 900px\)[\s\S]+?grid-template-columns: 290px minmax\(0, 1fr\)/);
+  assert.match(css, /max-width: 760px; margin: 0 auto/);
+  assert.match(html, /id="scope-all"[^>]+>全部<\/button>/);
+  assert.match(js, /createTHead\(/);
 
   assert.deepEqual(listArguments('session', null), { scope: 'session', limit: 50 });
   assert.deepEqual(listArguments('session', 'selected'), { scope: 'session', limit: 50, host_conversation_id: 'selected' });
@@ -197,6 +200,17 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   t.after(() => languageServer.close());
   const env = { ...f.env, ANTIGRAVITY_CSRF_TOKEN: 'fixture', ANTIGRAVITY_LS_ADDRESS: `127.0.0.1:${languageServer.address().port}` };
   assert.equal(resolveNodeExecutable({ execPath: join(f.root, 'magpie-bun'), env: { PATH: dirname(process.execPath) } }), process.execPath);
+  const macHome = join(f.root, 'mac-home');
+  const nvmOld = join(macHome, '.nvm', 'versions', 'node', 'v18.19.0', 'bin');
+  const nvmNew = join(macHome, '.nvm', 'versions', 'node', 'v22.2.0', 'bin');
+  mkdirSync(nvmOld, { recursive: true });
+  mkdirSync(nvmNew, { recursive: true });
+  writeFileSync(join(nvmOld, 'node'), '#!/bin/sh\n', { mode: 0o755 });
+  writeFileSync(join(nvmNew, 'node'), '#!/bin/sh\n', { mode: 0o755 });
+  assert.equal(resolveNodeExecutable({ execPath: join(f.root, 'magpie-bun'), env: { PATH: '' }, platform: 'darwin', home: macHome }), join(nvmNew, 'node'));
+  const { findCodexCli } = await import('../magpie_plugin/lib/app-server-manager.mjs');
+  writeFileSync(join(nvmNew, 'codex'), '#!/bin/sh\n', { mode: 0o755 });
+  assert.equal(findCodexCli('', { PATH: '' }, { platform: 'darwin', home: macHome }), join(nvmNew, 'codex'));
   const installed = await installAgy({ target, binDir, env });
   assert.equal(installed.installed, true);
   assert.ok(!existsSync(legacyLock));
@@ -215,7 +229,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const bridge = join(target, 'work_split_hook.py');
   assert.equal(readFileSync(bridge, 'utf8').trimEnd().split('\n').length, 7);
   assert.ok(!existsSync(join(target, 'runtime', 'gempt')));
-  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.7.0' });
+  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.7.1' });
   const bundledSkills = new URL('../plugin/skills/', import.meta.url);
   assert.deepEqual(readdirSync(bundledSkills).sort(), ['gempt', 'gempt-chore']);
   assert.deepEqual(readdirSync(join(target, 'skills')).sort(), ['gempt', 'gempt-chore']);
@@ -235,21 +249,21 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const initialized = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' },
   }) });
-  assert.equal(initialized.result.serverInfo.version, '0.7.0');
-  const response = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
-    jsonrpc: '2.0', id: 1, method: 'resources/read', params: { uri: APP_URI },
+  assert.equal(initialized.result.serverInfo.version, '0.7.1');
+  assert.equal(initialized.result.capabilities.resources, undefined);
+  const listedResources = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
+    jsonrpc: '2.0', id: 1, method: 'resources/list',
   }) });
-  assert.match(response.result.contents[0].text, /GemPT/);
-  const consoleState = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
+  assert.deepEqual(listedResources.result.resources, []);
+  const ctlStatus = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'tools/call',
-    params: { name: 'gempt_app_console_state', arguments: {} },
+    params: { name: 'gpt_ctl', arguments: { action: 'status' } },
   }) });
-  assert.equal(consoleState.error, undefined);
-  assert.notEqual(consoleState.result?.isError, true, consoleState.result?.content?.[0]?.text);
+  assert.equal(ctlStatus.error, undefined);
+  assert.notEqual(ctlStatus.result?.isError, true, ctlStatus.result?.content?.[0]?.text);
+  assert.equal(typeof JSON.parse(ctlStatus.result.content[0].text), 'object');
   const rulesText = readFileSync(join(target, 'rules', 'AGENTS.md'), 'utf8');
   assert.ok(rulesText.trim());
-  assert.equal(consoleState.result.structuredContent.rulesText, rulesText);
-  assert.equal(consoleState.result.structuredContent.rules_snippet, rulesText);
   const hooks = JSON.parse(readFileSync(join(target, 'hooks.json'), 'utf8'));
   const matcher = hooks['gempt-work-split'].PreToolUse[0].matcher.split('|');
   for (const name of ['swarm', 'post_message', 'read_board', 'swarm_wait', 'define_subagent', 'send_message']) {
@@ -387,7 +401,7 @@ test('portable Antigravity bundle validates and a shim failure reports a partial
   await validatePluginBundle(bundleDir, resolveNodeExecutable(), f.env, { portable: true });
   writeFileSync(join(bundleDir, 'rules', 'AGENTS.md'), ' \n');
   await assert.rejects(validatePluginBundle(bundleDir, resolveNodeExecutable(), f.env, { portable: true }),
-    /gempt_app_console_state.*empty rules text/);
+    /Empty Antigravity plugin rules text/);
   const manifest = JSON.parse(readFileSync(join(bundleDir, 'plugin.json'), 'utf8'));
   assert.equal(manifest.logo, 'assets/logo.svg');
   assert.equal(typeof manifest.author?.name, 'string');
@@ -1012,27 +1026,22 @@ test('wait batch returns the first ready run or waits for all and keeps waiting_
   assert.equal(JSON.parse(failed.stdout).runs[first].state, 'waiting_gemini');
 });
 
-test('Live resource and run list bind to the active conversation and workspace', async (t) => {
+test('Live run list binds to the active conversation and workspace', async (t) => {
   const f = fixture(t);
-  assert.match(readAppResource().contents[0].text, /<title>GemPT<\/title>/);
-  assert.equal(readAppResource().contents[0].uri, APP_URI);
-  const pane = join(f.root, 'blank.html');
-  writeFileSync(pane, '\n ');
-  assert.throws(() => readAppResource({ env: { GEMPT_APP_HTML: pane } }), /non-empty/);
   const first = '1'.repeat(32);
   await updateHostContext('current', [f.cwd], f);
   state(f, first, { host_conversation_id: 'current' });
   state(f, '2'.repeat(32), { host_conversation_id: 'another' });
   state(f, '3'.repeat(32), { host_conversation_id: 'current', cwd: f.root });
   const opts = { ...f, root: f.cwd };
-  const { structuredContent: scoped } = await callAppTool('gempt_app_runs', {}, opts);
+  const scoped = await runLiveOperation('runs', {}, opts);
   assert.equal(scoped.bound_conversation_id, 'current');
   assert.equal(scoped.bound_workspace_name, 'repo');
   assert.equal(scoped.session_count, 1);
   assert.deepEqual(scoped.runs.map(({ run_id }) => run_id), [first]);
-  assert.equal((await callAppTool('gempt_app_runs', { scope: 'all' }, opts)).structuredContent.runs.length, 2);
-  assert.equal((await callAppTool('gempt_app_runs', { host_conversation_id: 'another' }, opts)).structuredContent.session_count, 1);
-  await assert.rejects(callAppTool('gempt_app_stream', { run_id: '3'.repeat(32) }, opts), /outside host workspace/);
+  assert.equal((await runLiveOperation('runs', { scope: 'all' }, opts)).runs.length, 2);
+  assert.equal((await runLiveOperation('runs', { host_conversation_id: 'another' }, opts)).session_count, 1);
+  await assert.rejects(runLiveOperation('stream', { run_id: '3'.repeat(32) }, opts), /outside host workspace/);
 });
 
 test('Live run list defaults to an empty unbound session and can list all workspace runs', async (t) => {
@@ -1042,17 +1051,17 @@ test('Live run list defaults to an empty unbound session and can list all worksp
   state(f, first, { host_conversation_id: 'previous' });
   state(f, second, { host_conversation_id: 'another', state: 'finished' });
   const opts = { ...f, root: f.cwd };
-  const { structuredContent: scoped } = await callAppTool('gempt_app_runs', {}, opts);
+  const scoped = await runLiveOperation('runs', {}, opts);
   assert.equal(scoped.scope, 'session');
   assert.equal(scoped.unbound_session, true);
   assert.deepEqual(scoped.runs, []);
-  assert.equal(scoped.app_server.version, '0.7.0');
+  assert.equal(scoped.app_server.version, '0.7.1');
 
-  const { structuredContent: all } = await callAppTool('gempt_app_runs', { scope: 'all' }, opts);
+  const all = await runLiveOperation('runs', { scope: 'all' }, opts);
   assert.equal(all.scope, 'all');
   assert.equal(all.unbound_session, false);
   assert.deepEqual(all.runs.map(({ run_id }) => run_id).sort(), [first, second]);
-  assert.equal(all.app_server.version, '0.7.0');
+  assert.equal(all.app_server.version, '0.7.1');
 });
 
 test('Live binds normalized workspaces and never selects another run for a filtered explicit ID', async (t) => {
@@ -1083,23 +1092,28 @@ test('Live binds normalized workspaces and never selects another run for a filte
   state(f, previous, { host_conversation_id: 'previous' });
   for (let i = 3; i <= 23; i++) state(f, i.toString(16).padStart(32, '0'), { host_conversation_id: 'previous' });
   const opts = { ...f, root: f.cwd };
-  const { structuredContent: excluded } = await handleTool('gpt_ctl', { run_id: previous }, f.env, opts);
+  const excluded = await runLiveOperation('open', { run_id: previous }, opts);
   assert.equal(excluded.active_conversation_id, 'first');
   assert.equal(excluded.requested_run, false);
   assert.equal(excluded.run_id, null);
   assert.equal(excluded.stream, null);
   assert.deepEqual(excluded.runs.map(({ run_id }) => run_id), [current]);
-  const { structuredContent: all } = await callAppTool('gempt_live_view', { scope: 'all', run_id: previous }, opts);
+  const ctlExcluded = await handleTool('gpt_ctl', { run_id: previous }, f.env, opts);
+  assert.equal(ctlExcluded.structuredContent, undefined);
+  assert.equal(JSON.parse(ctlExcluded.content[0].text).id, previous);
+  const all = await runLiveOperation('open', { scope: 'all', run_id: previous }, opts);
   assert.equal(all.run_id, previous);
   assert.equal(all.requested_run, true);
   assert.equal(all.runs.length, 23);
-  const { structuredContent: page } = await callAppTool('gempt_app_runs', { scope: 'all', limit: 3 }, opts);
+  const page = await runLiveOperation('runs', { scope: 'all', limit: 3 }, opts);
   assert.equal(page.next_offset, 3);
-  const { structuredContent: rest } = await callAppTool('gempt_app_runs', { scope: 'all', offset: page.next_offset }, opts);
+  const rest = await runLiveOperation('runs', { scope: 'all', offset: page.next_offset }, opts);
   assert.deepEqual([...page.runs, ...rest.runs].map(({ run_id }) => run_id), all.runs.map(({ run_id }) => run_id));
-  const { structuredContent: bound } = await handleTool('gpt_ctl', { host_conversation_id: 'previous' }, f.env, opts);
+  const bound = await runLiveOperation('open', { host_conversation_id: 'previous' }, opts);
   assert.equal(bound.bound_conversation_id, 'previous');
   assert.equal(bound.active_conversation_id, 'first');
+  const ctlBound = await handleTool('gpt_ctl', { host_conversation_id: 'previous' }, f.env, opts);
+  assert.ok(JSON.parse(ctlBound.content[0].text).active.length >= 1);
 
   for (const [name, fields] of Object.entries({ gpt_run: ['title', 'tier', 'background', 'host_conversation_id'],
     gpt_ask: ['host_conversation_id'], gpt_ctl: ['host_conversation_id'] })) {
@@ -1113,7 +1127,7 @@ test('Live run index sees new directories, worker updates and removed state file
   const f = fixture(t);
   const first = '1'.repeat(32);
   const second = '2'.repeat(32);
-  const runs = async () => (await callAppTool('gempt_app_runs', { scope: 'all' }, f)).structuredContent.runs;
+  const runs = async () => (await runLiveOperation('runs', { scope: 'all' }, f)).runs;
   assert.deepEqual(await runs(), []);
   state(f, first, { state: 'finished', session_id: 'session-a' });
   assert.deepEqual((await runs()).map((run) => run.state), ['finished']);
@@ -1121,8 +1135,8 @@ test('Live run index sees new directories, worker updates and removed state file
   assert.deepEqual((await runs()).map((run) => run.state), ['running']);
   state(f, second, { state: 'finished', session_id: 'session-b' });
   assert.deepEqual(new Set((await runs()).map((run) => run.run_id)), new Set([first, second]));
-  const linked = await callAppTool('gempt_app_runs', { scope: 'all', session_id: 'session-a' }, f);
-  assert.deepEqual(linked.structuredContent.runs.map((run) => run.run_id), [first]);
+  const linked = await runLiveOperation('runs', { scope: 'all', session_id: 'session-a' }, f);
+  assert.deepEqual(linked.runs.map((run) => run.run_id), [first]);
   rmSync(join(runDirectory(first, f.sessionsDir), 'state.json'));
   assert.deepEqual((await runs()).map((run) => run.run_id), [second]);
 });
@@ -1147,10 +1161,12 @@ test('Live journal filters other turns, bounds events, and pages stable Unicode 
   });
   const diff = event('turn/diff/updated', { diff: 'diff only 🧪'.repeat(200_000) });
   writeFileSync(journal, unrelated + command + diff + message + incomplete);
-  const call = async (args) => (await callAppTool('gempt_app_stream', { run_id: id, ...args }, f)).structuredContent;
-  const opened = await handleTool('gpt_ctl', { scope: 'all' }, f.env, f);
-  assert.equal(opened.structuredContent.runs[0].run_id, id);
-  assert.equal(opened.structuredContent.stream, null);
+  const call = async (args) => runLiveOperation('stream', { run_id: id, ...args }, f);
+  const opened = await runLiveOperation('open', { scope: 'all' }, f);
+  assert.equal(opened.runs[0].run_id, id);
+  assert.equal(opened.stream, null);
+  const ctlOpened = await handleTool('gpt_ctl', { scope: 'all' }, f.env, f);
+  assert.equal(JSON.parse(ctlOpened.content[0].text).active[0].id, id);
   const first = await call({ max_events: 1 });
   assert.equal((await call({ max_events: 1 })).text_revision, first.text_revision);
   assert.equal(first.timeline.length, 1);
@@ -1183,7 +1199,7 @@ test('Live journal filters other turns, bounds events, and pages stable Unicode 
   assert.equal((await call({})).full_text, 'rotated');
 });
 
-test('standalone NDJSON MCP keeps the GemPT resource and app-only tools without Antigravity entrypoints', async (t) => {
+test('standalone NDJSON MCP exposes only core tools without legacy MCP App resources or UI metadata', async (t) => {
   const f = fixture(t);
   await appFixture(t, f);
   await updateHostContext('host', [f.cwd], f);
@@ -1208,28 +1224,22 @@ test('standalone NDJSON MCP keeps the GemPT resource and app-only tools without 
   const started = await request('initialize', { protocolVersion: '2026-test' });
   assert.equal(started.result.protocolVersion, '2026-test');
   assert.equal(started.result.serverInfo.name, 'gempt');
-  assert.equal(started.result.serverInfo.version, '0.7.0');
+  assert.equal(started.result.serverInfo.version, '0.7.1');
+  assert.deepEqual(started.result.capabilities, { tools: { listChanged: false } });
   send({ method: 'notifications/initialized' });
   assert.deepEqual((await request('ping')).result, {});
   const { tools } = (await request('tools/list')).result;
-  assert.deepEqual(tools.filter((tool) => !tool._meta?.ui?.visibility).map(({ name }) => name), ['gpt_run', 'gpt_ask', 'gpt_ctl']);
-  assert.deepEqual(tools.slice(3).map(({ name, _meta }) => [name, _meta.ui.visibility]),
-    [...['runs', 'stream', 'interrupt', 'steer', 'reply', 'summary', 'magpie_status', 'active_runs', 'token_ratio', 'console_state', 'console_settings',
-      'console_action', 'console_activity'].map((name) => [`gempt_app_${name}`, ['app']])]);
-  const entrypointTools = tools.filter(({ _meta }) => _meta?.['com.google.antigravity/ui']?.entrypoints?.length);
-  assert.deepEqual(entrypointTools, []);
-  assert.equal(tools.find(({ name }) => name === 'gpt_ctl')._meta.ui.resourceUri, APP_URI);
-  assert.deepEqual((await request('resources/list')).result.resources, [APP_RESOURCE]);
+  assert.deepEqual(tools.map(({ name }) => name), ['gpt_run', 'gpt_ask', 'gpt_ctl']);
+  assert.deepEqual(tools.filter(({ _meta }) => _meta?.ui || _meta?.['com.google.antigravity/ui']), []);
+  assert.deepEqual((await request('resources/list')).result.resources, []);
   assert.equal((await request('resources/read', { uri: 'ui://unknown' })).error.code, -32002);
-  const resource = (await request('resources/read', { uri: APP_URI })).result.contents[0];
-  assert.equal(resource.text, readAppResource().contents[0].text);
+  assert.equal((await request('resources/read', { uri: 'ui://gempt/live.html' })).error.code, -32002);
   const { result } = await request('tools/call', { name: 'gpt_ctl', arguments: {} });
   assert.ok(Buffer.byteLength(result.content[0].text) <= 500);
-  assert.equal(JSON.parse(result.content[0].text).active.length, 1);
-  assert.equal(result.structuredContent.bound_conversation_id, 'host');
-  assert.equal(result.structuredContent.stream, null);
-  assert.equal(result.structuredContent.run_id, null);
-  assert.equal(result.structuredContent.runs[0].run_id, 'd'.repeat(32));
+  const status = JSON.parse(result.content[0].text);
+  assert.equal(status.active.length, 1);
+  assert.equal(status.active[0].id, 'd'.repeat(32));
+  assert.equal(result.structuredContent, undefined);
   const oversized = 'e'.repeat(32);
   state(f, oversized, { state: 'failed', host_conversation_id: 'host', title: '🚦'.repeat(40),
     error: '🚧'.repeat(500) });
@@ -1239,8 +1249,8 @@ test('standalone NDJSON MCP keeps the GemPT resource and app-only tools without 
   const asked = await request('tools/call', { name: 'gpt_ask', arguments: { goal: 'Summarize the fixture.' } });
   assert.equal(asked.result.isError, undefined, asked.result.content[0].text);
   assert.equal(JSON.parse(asked.result.content[0].text).text.includes('Consult answer.'), true);
-  const consults = await request('tools/call', { name: 'gempt_app_runs', arguments: { include_consults: true } });
-  assert.equal(consults.result.structuredContent.consult_sessions[0].session_id,
+  const consults = await runLiveOperation('runs', { include_consults: true }, { ...f, root: f.cwd });
+  assert.equal(consults.consult_sessions[0].session_id,
     JSON.parse(asked.result.content[0].text).session_id);
   const launch = await request('tools/call', { name: 'gpt_run', arguments: { goal: 'Inspect the fixture.', access: 'inspect' } });
   assert.equal(launch.result.isError, false, launch.result.content[0].text);
@@ -1354,10 +1364,10 @@ test('execution clock survives 600s and early ask_gemini pauses before the start
   assert.equal(waiting.deadline - Date.now() / 1000, 25);
   t.mock.timers.tick(60_000);
   assert.equal(readRun(earlyId, f.sessionsDir).state, 'waiting_gemini');
-  const reply = await callAppTool('gempt_app_reply', {
+  const reply = await runLiveOperation('reply', {
     run_id: earlyId, call_id: 'early_ask', message: 'Approved.',
   }, f);
-  assert.equal(reply.structuredContent.ok, true);
+  assert.equal(reply.ok, true);
   t.mock.timers.tick(100);
   const replyPacket = await until(() => packets.find(({ id }) => id === 'early-ask-rpc'));
   assert.equal(replyPacket.result.contentItems[0].text, 'Approved.');
@@ -1387,29 +1397,35 @@ test('Console migrates the legacy timeout and preserves a deliberately saved 600
   assert.equal((await waitForRun(run.run_id, { ...f, timeoutSec: 5 })).execution_timeout_sec, 3600);
   assert.equal((await updateSettings({ native_swarm: false }, f)).ok, true);
   assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).codex.timeout_sec, 3600);
-  const settings = await callAppTool('gempt_app_console_settings', {
+  const api = async (method, path, body) => dispatchPageApi({
+    method, url: new URL(path, 'http://localhost'), rawPath: path.split('?', 1)[0], readBody: () => body,
+  }, { ...options, appServer });
+  const appServer = createAppServerManager({ ...options, observeOnly: true });
+  t.after(() => appServer.stop());
+  const saved = await api('POST', '/api/settings', {
     codex_timeout_sec: 600, native_swarm: true, swarm_shell_model: 'gemini-3.8-flash-low',
-  }, options);
-  assert.equal(settings.structuredContent.codex_timeout_sec, 600);
-  assert.equal(settings.structuredContent.native_swarm, true);
-  assert.equal(settings.structuredContent.swarm_shell_model, 'gemini-3.8-flash-low');
+  });
+  assert.equal(saved.status, 200);
+  const overview = (await api('GET', '/api/overview')).body;
+  assert.equal(overview.codex_timeout_sec, 600);
+  assert.equal(overview.native_swarm, true);
+  assert.equal(overview.swarm_shell_model, 'gemini-3.8-flash-low');
   assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).codex.timeout_sec_customized, true);
   const customized = await dispatchRun({ goal: 'Check saved timeout', cwd: f.cwd, background: true }, f);
   assert.equal(customized.execution_timeout_sec, 600);
   assert.equal((await waitForRun(customized.run_id, { ...f, timeoutSec: 5 })).execution_timeout_sec, 600);
-  await assert.rejects(callAppTool('gempt_app_console_settings', { codex_timeout_sec: 29 }, options), /Invalid/);
-  await assert.rejects(callAppTool('gempt_app_console_action', { action: 'tier', force: true }, options), /Unexpected or missing/);
-  const unsafeRestart = await callAppTool('gempt_app_console_action', { action: 'restart_app_server', force: true }, options);
-  assert.equal(unsafeRestart.isError, true);
-  assert.equal(unsafeRestart.structuredContent.status, 409);
-  const activity = await callAppTool('gempt_app_console_activity', { kind: 'requests', query: { q: 'saved timeout', limit: 1 } }, options);
-  assert.equal(activity.structuredContent.items[0].run_id, customized.run_id);
-  const details = await callAppTool('gempt_app_console_activity', { kind: 'requests', id: activity.structuredContent.items[0].id }, options);
-  assert.equal(details.structuredContent.run_id, customized.run_id);
+  assert.equal((await api('POST', '/api/settings', { codex_timeout_sec: 29 })).status, 400);
+  assert.equal((await api('POST', '/api/tier', { tier: 'invalid' })).status, 400);
+  const unsafeRestart = await api('POST', '/api/app-server/restart', { force: true });
+  assert.equal(unsafeRestart.status, 409);
+  const activity = await api('GET', '/api/requests?q=saved+timeout&limit=1');
+  assert.equal(activity.body.items[0].run_id, customized.run_id);
+  const details = await api('GET', `/api/requests/${encodeURIComponent(activity.body.items[0].id)}`);
+  assert.equal(details.body.run_id, customized.run_id);
   const waiting = 'd'.repeat(32);
   state(f, waiting, { state: 'waiting_gemini', pending_tool_call: { tool: 'ask_gemini', call_id: 'ask_1' } });
-  await assert.rejects(callAppTool('gempt_app_reply', { run_id: waiting, call_id: 'stale', message: 'yes' }, options), /not waiting/);
-  await assert.rejects(callAppTool('gempt_app_reply', { run_id: waiting, call_id: 'ask_1', message: 'yes' },
+  await assert.rejects(runLiveOperation('reply', { run_id: waiting, call_id: 'stale', message: 'yes' }, options), /not waiting/);
+  await assert.rejects(runLiveOperation('reply', { run_id: waiting, call_id: 'ask_1', message: 'yes' },
     { ...options, root: join(f.root, 'other') }), /outside host workspace/);
 });
 
@@ -1684,7 +1700,7 @@ test('Live restricts out-of-workspace files, exposes remote_turn_unconfirmed, an
     state: 'failed', codex_thread_id: 'th-1', turn_id: 'tu-1', remote_turn_unconfirmed: true,
     progress: { phase: 'failed', touched_files: ['ok.txt', '../secret.txt', outside] },
   });
-  const streamed = (await callAppTool('gempt_app_stream', { run_id: id }, { ...f, root: f.cwd })).structuredContent;
+  const streamed = await runLiveOperation('stream', { run_id: id }, { ...f, root: f.cwd });
   assert.equal(streamed.run.remote_turn_unconfirmed, true);
   assert.equal(streamed.run.can_interrupt, true);
   assert.ok(streamed.file_uris['ok.txt']);
@@ -1787,18 +1803,18 @@ test('packaging guards unsafe output paths and rolls back in-place sync on verif
   assert.equal(existsSync(join(target, 'added.txt')), false);
 });
 
-test('MCP console saves nested preferences and supports gateway actions', async (t) => {
+test('Console API saves nested preferences and supports gateway actions', async (t) => {
   const f = fixture(t);
   const gateway = createServer((_req, res) => res.end(JSON.stringify({ data: [{ id: 'vendor/model:small' }] })));
   gateway.listen(0, '127.0.0.1');
   await once(gateway, 'listening');
   t.after(() => gateway.close());
   const url = 'http://127.0.0.1:' + gateway.address().port;
-  const set = (args) => callAppTool('gempt_app_console_settings', args, f);
-  const action = (args) => callAppTool('gempt_app_console_action', args, f);
+  const set = (args) => updateSettings(args, f);
   const secret = 'mcp-fixture-value-z123';
-  assert.equal((await set({ ui: { language: 'zh' } })).structuredContent.configured, false);
-  assert.equal((await action({ action: 'reset_settings' })).structuredContent.keep_gateway, true);
+  assert.equal((await set({ ui: { language: 'zh' } })).ok, true);
+  assert.equal((await readOverview(f)).configured, false);
+  assert.equal(resetSettings({}, f).keep_gateway, true);
   const saved = await set({
     magpie: { base_url: url + '/', api_key: secret, api_key_env: '' },
     swarm_shell_model: 'vendor/shell:stable@v2',
@@ -1808,7 +1824,8 @@ test('MCP console saves nested preferences and supports gateway actions', async 
     codex: { cli_path: '', extra_args: [' --strict-config '] },
     ui: { language: 'en' },
   });
-  const { structuredContent: state } = saved;
+  assert.equal(saved.ok, true);
+  const state = await readOverview(f);
   assert.equal(state.swarm_shell_model, 'vendor/shell:stable@v2');
   assert.equal(state.magpie_base_url, url);
   assert.equal(state.magpie_api_key_hint, '••••z123');
@@ -1819,19 +1836,19 @@ test('MCP console saves nested preferences and supports gateway actions', async 
   assert.deepEqual(state.codex_extra_args, ['--strict-config']);
   assert.equal(state.consult_timeout_sec, 1800);
   assert.equal(state.ui.language, 'en');
-  assert.ok(!JSON.stringify(saved).includes(secret));
-  assert.equal((await callAppTool('gempt_app_summary', {}, f)).structuredContent.ui.language, 'en');
-  await assert.rejects(set({ swarm_shell_model: 'shell bad' }), /Invalid/);
-  await assert.rejects(set({ codex: { extra_args: [1] } }), /Invalid/);
-  await assert.rejects(set({ limits: { consult_timeout_sec: 14 } }), /Invalid/);
-  await assert.rejects(set({ ui: { language: 'de' } }), /Invalid/);
-  assert.equal((await set({ codex: { extra_args: ['bad\nflag'] } })).isError, true);
-  const probe = await action({ action: 'probe_gateway', base_url: url, api_key: 'draft-secret' });
-  assert.equal(probe.structuredContent.reachable, true);
-  assert.deepEqual(probe.structuredContent.models, ['vendor/model:small']);
+  assert.ok(!JSON.stringify(state).includes(secret));
+  assert.equal(readRoutingSummary(f).ui.language, 'en');
+  assert.equal((await set({ swarm_shell_model: 'shell bad' })).ok, false);
+  assert.equal((await set({ codex: { extra_args: [1] } })).ok, false);
+  assert.equal((await set({ limits: { consult_timeout_sec: 14 } })).ok, false);
+  assert.equal((await set({ ui: { language: 'de' } })).ok, false);
+  assert.equal((await set({ codex: { extra_args: ['bad\nflag'] } })).ok, false);
+  const probe = await probeGatewaySettings({ base_url: url, api_key: 'draft-secret' }, f);
+  assert.equal(probe.reachable, true);
+  assert.deepEqual(probe.models, ['vendor/model:small']);
   assert.ok(!JSON.stringify(probe).includes('draft-secret'));
-  await action({ action: 'reset_settings', keep_gateway: true });
+  resetSettings({ keep_gateway: true }, f);
   assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).magpie.api_key, secret);
-  await action({ action: 'reset_settings', keep_gateway: false });
+  resetSettings({ keep_gateway: false }, f);
   assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).magpie.api_key, '');
 });

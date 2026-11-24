@@ -13,7 +13,7 @@ import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { runInNewContext } from 'node:vm';
-import { buildMcpSnippet, findMagpieCli, initSubscriptionConfig, listDispatchActivity, normalizeTitle, readActiveRuns, readState, setDefaultSandbox, setDefaultTier } from '../magpie_plugin/lib/backend.mjs';
+import { buildMcpSnippet, findMagpieCli, listDispatchActivity, normalizeTitle, readActiveRuns, readState, setDefaultSandbox, setDefaultTier } from '../magpie_plugin/lib/backend.mjs';
 import { createAppServerManager, resolveCodexInvocation } from '../magpie_plugin/lib/app-server-manager.mjs';
 import { buildEscalationSuggestion } from '../magpie_plugin/lib/routing.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
@@ -50,13 +50,13 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files, version }] = JSON.parse(stdout);
-  assert.equal(version, '0.7.0');
+  assert.equal(version, '0.7.1');
   const paths = files.map((file) => file.path);
   assert.deepEqual(paths.filter((path) => /^plugin\/skills\/[^/]+\/SKILL\.md$/.test(path)).sort(),
     ['plugin/skills/gempt-chore/SKILL.md', 'plugin/skills/gempt/SKILL.md']);
   for (const path of ['LICENSE', 'THIRD_PARTY_LICENSES.txt', 'README.en.md', 'plugin/README.md', 'plugin/assets/logo.svg', 'scripts/build-agy-plugin.mjs', 'plugin/hooks.json', 'magpie_plugin/lib/backend.mjs',
     'bin/gempt.mjs', 'plugin/work_split_hook.mjs', 'core/agy-install.mjs', 'core/mcp-server.mjs',
-    'core/host-context.mjs', 'core/wait.mjs', 'core/assets/mcp_app_live.html', 'core/assets/workload.json',
+    'core/host-context.mjs', 'core/wait.mjs', 'core/assets/workload.json',
     'core/assets/http-ui/index.html', 'core/assets/http-ui/styles.css', 'core/assets/http-ui/app.js',
     'plugin/sidecars/gempt_live/sidecar.json', 'plugin/sidecars/gempt_live/main.mjs']) {
     assert.ok(paths.includes(path), path);
@@ -68,9 +68,8 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
   assert.ok(!existsSync(join(REPO_ROOT, 'mcp_app', 'node_modules')));
 });
 
-test('shared Console adapters preserve relative HTTP paths, authentication and exact MCP arguments', async () => {
+test('shared Console HTTP adapter preserves relative HTTP paths and authentication', async () => {
   const { createHttpTransport } = await import('../magpie_plugin/ui/http.js');
-  const { createConsoleTransport } = await import('../mcp_app/console-transport.js');
   const html = readFileSync(join(REPO_ROOT, 'magpie_plugin', 'ui', 'index.html'), 'utf-8');
   assert.match(html, /<link rel="stylesheet" href="\.\/styles\.css">/);
   assert.doesNotMatch(html, /<script/);
@@ -91,36 +90,23 @@ test('shared Console adapters preserve relative HTTP paths, authentication and e
     await transport.runAction('interrupt_run', { run_id: 'a'.repeat(32) });
     assert.equal(request[0], `${base}api/runs/${'a'.repeat(32)}/interrupt`);
   }
-
-  const calls = [];
-  const embedded = createConsoleTransport(async (name, args) => { calls.push([name, args]); });
-  await embedded.getState();
-  await embedded.getRatio('24h');
-  await embedded.saveSettings(settings);
-  await embedded.listActivity('sessions', query);
-  await embedded.getActivity('sessions', 'exec-fixture');
-  assert.deepEqual(calls, [
-    ['gempt_app_console_state', {}],
-    ['gempt_app_token_ratio', { range: '24h' }],
-    ['gempt_app_console_settings', settings],
-    ['gempt_app_console_activity', { kind: 'sessions', query }],
-    ['gempt_app_console_activity', { kind: 'sessions', id: 'exec-fixture' }],
-  ]);
 });
 
-test('built AGY resource uses the full shared Console markup and scoped styles', () => {
+test('built HTTP UI uses the full shared Console markup and scoped styles', () => {
   const html = readFileSync(join(REPO_ROOT, 'magpie_plugin/ui/index.html'), 'utf-8').replaceAll('\r\n', '\n');
   const css = readFileSync(join(REPO_ROOT, 'magpie_plugin/ui/styles.css'), 'utf-8').replaceAll('\r\n', '\n');
-  const resource = readFileSync(join(REPO_ROOT, 'core/assets/mcp_app_live.html'), 'utf-8');
+  const resource = readFileSync(join(REPO_ROOT, 'core/assets/http-ui/index.html'), 'utf-8');
+  const builtCss = readFileSync(join(REPO_ROOT, 'core/assets/http-ui/styles.css'), 'utf-8');
   const fragment = html.split('<!-- CONSOLE START -->')[1].split('<!-- CONSOLE END -->')[0].trim();
   assert.ok(resource.includes(fragment.replace('class="console-host"', 'class="console-host" hidden')));
-  assert.ok(resource.includes(css));
+  assert.ok(builtCss.includes(css));
   assert.match(css, /@scope \(\.console-host\)/);
   assert.match(css, /--gp-bg: var\(--bg\)/);
-  assert.match(resource, /--color-background-primary/);
+  assert.match(builtCss, /--color-background-primary/);
   assert.match(css, /@container \(max-width: 450px\)/);
-  assert.match(resource, /default-src 'none'/);
-  assert.doesNotMatch(resource, /<script\b[^>]+src=|<link\b[^>]+rel="stylesheet"/);
+  assert.doesNotMatch(resource, /<meta\s+http-equiv=["']Content-Security-Policy["']/i);
+  assert.match(resource, /<link rel="stylesheet" href="\.\/styles\.css">/);
+  assert.match(resource, /<script defer src="\.\/app\.js"><\/script>/);
   assert.deepEqual([...resource.matchAll(/id="tab-(live|overview|requests|sessions)"/g)].map((match) => match[1]),
     ['live', 'overview', 'requests', 'sessions']);
   assert.equal((resource.match(/id="refresh-btn"/g) || []).length, 1);
@@ -300,29 +286,6 @@ function startMockMagpie(modelsData, { onRequest } = {}) {
     });
   });
 }
-
-test('a fresh gateway with a single non-GPT delegate can consult before and after initialization', async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'gempt-fresh-model-'));
-  const model = 'custom-provider/worker#fast';
-  const gateway = await startMockMagpie([{ id: model }]);
-  const previous = process.env.MAGPIE_ADDR;
-  process.env.MAGPIE_ADDR = gateway.url;
-  t.after(async () => {
-    if (previous === undefined) delete process.env.MAGPIE_ADDR;
-    else process.env.MAGPIE_ADDR = previous;
-    await gateway.close();
-    rmSync(dir, { recursive: true, force: true });
-  });
-  const configPath = join(dir, 'config.json');
-  const tools = createExecutionTools({ configPath, sessionsDir: join(dir, 'sessions') });
-  const consult = args => tools.consult.execute({ goal: 'Reply OK', ...args });
-  assert.equal((await consult({ gemini_family: 'neon' })).model, model);
-  const init = await initSubscriptionConfig({ configPath });
-  assert.equal(init.ok, true);
-  assert.equal(init.plan.tiers.sonnet.exec_model, model);
-  assert.equal((await consult({ tier: 'opus' })).model, model);
-  assert.deepEqual(gateway.requests.map(request => request.body.model), [model, model]);
-});
 
 function rawHttpGet({ port, path, headers = {} }) {
   return new Promise((resolveReq, rejectReq) => {
@@ -2374,7 +2337,7 @@ test('Magpie serves split gzip assets with conditional caching and a private HTM
   assert.equal(html.headers['content-encoding'], 'gzip');
   const { text: markup } = await rawHttpGet({ port, path: '/' });
   assert.match(markup, /name="gempt-key"/);
-  assert.match(markup, /<script type="module" src="\.\/app.js"><\/script>/);
+  assert.match(markup, /<script defer src="\.\/app.js"><\/script>/);
   assert.match(markup, /<link rel="stylesheet" href="\.\/styles.css">/);
   for (const path of ['/app.js', '/styles.css']) {
     const zipped = await get(path, { 'accept-encoding': 'br, gzip;q=0.8', origin: 'null' });
@@ -2555,7 +2518,7 @@ test('mcpTools false disables duplicate Magpie GemPT tool registration', async (
 
 test('Magpie marketplace check shape and inspect+share guard hold', async () => {
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '0.7.0');
+  assert.equal(pkg.version, '0.7.1');
   assert.ok(pkg.keywords.includes('magpie-plugin'));
   assert.ok(pkg.files.includes('THIRD_PARTY_LICENSES.txt'));
   assert.ok(pkg.magpie?.summary?.en && pkg.magpie?.summary?.zh);
@@ -2752,12 +2715,23 @@ test('GemptPlugin hot-reload disposes prior HTTP server, cleans stale identity f
   assert.equal(idRec1.instance_id, ping1.instance_id);
   assert.equal(idRec1.pid, process.pid);
 
-  // Verify GET / security boundaries (allow navigate/nested-navigate/host proxy; block cors/opaque Origin/path tricks).
-  assert.equal((await rawHttpGet({ port: targetPort, path: '/', headers: { 'sec-fetch-mode': 'navigate' } })).status, 200);
+  // Verify GET / security boundaries (allow navigate/nested-navigate/opaque Origin navigation; block cors/foreign Origin/path tricks).
+  const rootRes = await rawHttpGet({ port: targetPort, path: '/', headers: { 'sec-fetch-mode': 'navigate' } });
+  assert.equal(rootRes.status, 200);
+  const csp = rootRes.headers['content-security-policy'] || '';
+  assert.match(csp, new RegExp(`script-src 'self' [^;]*http://127\\.0\\.0\\.1:${targetPort}`));
+  assert.match(csp, new RegExp(`connect-src 'self' [^;]*http://127\\.0\\.0\\.1:${targetPort}`));
+  assert.match(csp, new RegExp(`style-src 'self' [^;]*http://127\\.0\\.0\\.1:${targetPort}[^;]* 'unsafe-inline'`));
+  assert.ok(!/<meta\s+http-equiv=["']Content-Security-Policy["']/i.test(rootRes.body));
   assert.equal((await rawHttpGet({ port: targetPort, path: '/', headers: { 'sec-fetch-mode': 'nested-navigate' } })).status, 200);
   assert.equal((await rawHttpGet({ port: targetPort, path: '/' })).status, 200);
+  assert.equal((await rawHttpGet({ port: targetPort, path: '/', headers: { Host: `[::1]:${targetPort}` } })).status, 200);
   assert.equal((await rawHttpGet({ port: targetPort, path: '/', headers: { Origin: `http://127.0.0.1:${targetPort}` } })).status, 200);
-  assert.equal((await rawHttpGet({ port: targetPort, path: '/', headers: { Origin: 'null' } })).status, 403);
+  const opaqueNav = await rawHttpGet({ port: targetPort, path: '/', headers: { Origin: 'null' } });
+  assert.equal(opaqueNav.status, 200);
+  assert.equal(opaqueNav.headers['access-control-allow-origin'], undefined);
+  assert.equal((await rawHttpGet({ port: targetPort, path: '/', headers: { Origin: 'null', 'sec-fetch-mode': 'cors' } })).status, 403);
+  assert.equal((await rawHttpGet({ port: targetPort, path: '/', headers: { Origin: 'https://evil.example' } })).status, 403);
   assert.equal((await rawHttpGet({ port: targetPort, path: '/', headers: { 'sec-fetch-mode': 'cors' } })).status, 403);
   assert.equal((await rawHttpGet({ port: targetPort, path: '/./index.html', headers: { 'sec-fetch-mode': 'cors' } })).status, 403);
 

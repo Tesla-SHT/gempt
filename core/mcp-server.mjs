@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
 import { GEMPT_VERSION } from './config.mjs';
 import { readHostContext } from './host-context.mjs';
-import { APP_RESOURCE, APP_TOOLS, APP_URI, callAppTool, readAppResource } from './mcp-app.mjs';
+import { runLiveOperation } from './live-service.mjs';
 import { ACTIVE_STATES, buildWaitCommand, compactReceiptText, dispatchRun, interruptRun, readRun, replyToolCall, runWithinRoot, steerRun, validateExecTimeoutSec } from './runs.mjs';
 import { lockStaleMsForBudget, resolvePath, validateSessionId, withLock } from './state.mjs';
 import { TOOLS } from './tool-schemas.mjs';
@@ -68,8 +68,8 @@ async function control(args, options) {
     ...(args.host_conversation_id ? { host_conversation_id: args.host_conversation_id } : {}),
     ...(['session', 'all'].includes(args.scope) ? { scope: args.scope } : {}),
   };
-  const { structuredContent } = await callAppTool('gempt_live_view', liveArgs, options);
-  return textResult(compactStatus(structuredContent, record, options), { structuredContent });
+  const live = await runLiveOperation('open', liveArgs, options);
+  return textResult(compactStatus(live, record, options));
 }
 
 export async function handleTool(name, args, env = process.env, overrides = {}, callCtx) {
@@ -78,7 +78,6 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
     root: env.GEMPT_WORKSPACE_ROOT?.trim() ? resolvePath(env.GEMPT_WORKSPACE_ROOT.trim()) : null, env,
     magpieConfigDir: env.MAGPIE_CONFIG_DIR, ...overrides,
   };
-  if (Object.hasOwn(APP_TOOLS, name)) return callAppTool(name, args, options);
   if (name === 'gpt_ctl') return control(args, options);
   if (!['gpt_run', 'gpt_ask'].includes(name)) throw new Error(`Unknown tool: ${name}`);
   const goal = String(args.goal || '').trim();
@@ -142,14 +141,13 @@ async function dispatch(request, env) {
     switch (method) {
       case 'initialize':
         return response({ protocolVersion: params?.protocolVersion || '2024-11-05',
-          capabilities: { tools: { listChanged: false }, resources: { listChanged: false } },
+          capabilities: { tools: { listChanged: false } },
           serverInfo: { name: 'gempt', version: GEMPT_VERSION } });
       case 'ping': return response({});
       case 'tools/list': return response({ tools: TOOLS });
-      case 'resources/list': return response({ resources: [APP_RESOURCE] });
+      case 'resources/list': return response({ resources: [] });
       case 'resources/read':
-        if (params?.uri !== APP_URI) return errorResponse(id, -32002, 'Resource not found', { uri: params?.uri });
-        return response(readAppResource({ env }));
+        return errorResponse(id, -32002, 'Resource not found', { uri: params?.uri });
       case 'tools/call': {
         const name = String(params?.name || '');
         const args = params?.arguments ?? {};

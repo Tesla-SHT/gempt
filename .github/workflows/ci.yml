@@ -45,11 +45,13 @@ jobs:
               if (!text.includes(pattern)) throw new Error(`${file} missing expected version marker: ${pattern}`);
             }
             const licenses = fs.readFileSync("THIRD_PARTY_LICENSES.txt", "utf8");
-            for (const dep of ["@modelcontextprotocol/ext-apps", "@modelcontextprotocol/client", "@modelcontextprotocol/core", "zod", "pkce-challenge"]) {
+            for (const dep of ["entities", "marked"]) {
               if (!licenses.includes(dep)) throw new Error(`THIRD_PARTY_LICENSES.txt missing ${dep}`);
             }
-            const liveHtml = fs.readFileSync("core/assets/mcp_app_live.html", "utf8");
-            if (liveHtml.length < 1000) throw new Error("Prebuilt GemPT Live HTML is missing or unexpectedly small");
+            for (const asset of ["core/assets/http-ui/index.html", "core/assets/http-ui/styles.css", "core/assets/http-ui/app.js"]) {
+              const content = fs.readFileSync(asset, "utf8");
+              if (content.length < 1000) throw new Error(`Prebuilt GemPT HTTP UI asset ${asset} is missing or unexpectedly small`);
+            }
             console.log(`Version ${ver} and third-party license checks passed.`);
           '
 
