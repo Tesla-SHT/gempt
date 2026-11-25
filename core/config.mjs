@@ -8,7 +8,7 @@ import { RUNTIME_ROOT, resolvePluginRoot } from './bundle-paths.mjs';
 import { withLockSync } from './state.mjs';
 
 export const GEMPT_VERSION = readJsonSafe(join(RUNTIME_ROOT, 'package.json'))?.version
-  || readJsonSafe(join(resolvePluginRoot(), 'plugin.json'))?.version || '0.8.0';
+  || readJsonSafe(join(resolvePluginRoot(), 'plugin.json'))?.version || '0.8.1';
 export const TIER_ORDER = ['sonnet', 'opus', 'fable'];
 export const TIER_ALIASES = { lite: 'sonnet', mid: 'opus', max: 'fable' };
 export const VALID_SANDBOXES = ['read-only', 'workspace-write', 'danger-full-access'];
