@@ -29,3 +29,19 @@ export function serveAppServerSocket(req, socket, onPacket) {
     }
   });
 }
+
+// Mirrors the installed v2 app-server schema: only start can supply dynamicTools.
+export function threadFixture() {
+  const threads = new Map();
+  return (method, params) => {
+    if (method === 'thread/fork') {
+      if (!threads.has(params.threadId)) throw new Error('Parent thread not found');
+      if (params.dynamicTools) throw new Error('Unexpected fork field dynamicTools');
+    }
+    const id = method === 'thread/resume' ? params.threadId : `thread-${threads.size + 1}`;
+    threads.set(id, params.dynamicTools ?? threads.get(params.threadId));
+    const sandbox = { 'read-only': 'readOnly', 'workspace-write': 'workspaceWrite', 'danger-full-access': 'dangerFullAccess' };
+    return { thread: { id }, cwd: params.cwd, model: params.model, modelProvider: params.modelProvider,
+      sandbox: { type: sandbox[params.sandbox] } };
+  };
+}

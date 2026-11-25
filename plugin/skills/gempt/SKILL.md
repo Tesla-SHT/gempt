@@ -78,6 +78,11 @@ GemPT v0.8.1 使用 Node.js（`>= 22.13.0`）。Antigravity 的 `gempt_gempt` MC
 - 用 `gpt_swarm(action="title"|"plan"|"add"|"status"|"model"|"kill", cli?, ...)` 规划与拉起多 CLI 工位（不消耗 AGY 原生外壳 token），并行写入用 `workspace="share"` 自动创建 worktree。
 - 用 `gpt_board(action="post"|"read"|"wait"|"roster")` 在共享 SQLite 消息板上协同与自动唤醒；通过 `run_command(WaitMsBeforeAsync=500)` 执行返回的 `gempt-wait --board <swarm_id>` 零轮询等待。
 - 可通过 `cli` 参数或控制台 `execution.default_cli` 选择 `auto`（按模型亲和匹配已安装 CLI）或任意 11 种受支持 CLI。
+- **提示词缓存纪律（对齐原生 Swarm）**：
+  - **热上下文分叉**：新工位需继承某成员已读代码与推理时传 `fork="<member>"`（同 CLI/模型下 Codex 走原生 `thread/fork`、Claude 走 `--resume --fork-session`，其余场景自动回退板贴摘要）。
+  - **同批同模型与共享前缀**：同批 `n` 副本或 `tasks` 分片默认沿用同一配对模型、把公共上下文写进共享 `brief`（引擎会自动把静态协议与共享 `brief` 前置、把工位身份与个人切片后置）；仅配额耗尽或用户指定时用 `action="model"` 原地切换。
+  - **克制唤醒与引用**：`@name` 是唤醒门铃而非 CC（点对点交接勿顺手 `@coordinator`），旧帖一律用 `#seq` 引用勿复制粘贴；多领域并行时用 `action="channel"` 分区保持 `main` 安静。
+  - **`gpt_ask` 文件前缀复用**：同一批 `file_paths` 会前置到 `Goal` 之前（Responses 路径附带确定性 `prompt_cache_key`），多次审阅同一组文件时保持 `file_paths` 集合稳定可提高前缀命中率。
 
 当需要与 AGY 原生 Gemini / Claude Swarm 工位混编时，可在控制台显式开启 `routing_policy.native_swarm: true`：Coordinator 用 `swarm(action="title")` / `swarm(action="add", model=routing_policy.swarm_shell_model)` 创建工位，工位内通过 `gempt run --cwd "$PWD" --workspace inherit --host <coordinator_id> --title <name> --goal -` 执行任务并运行 `wait_command`。默认执行预算为 3600 秒，等待 `ask_gemini` 回复期间暂停计时。
 

@@ -104,15 +104,15 @@ async function updateState(conversation, operation) {
     return await withLock(`${file}.node.lock`, () => {
       const stored = readJsonSafe(file);
       const state = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
-      const previous = state.updated_at;
+      const previous = JSON.stringify(state);
       const result = operation(state);
-      if (state.updated_at !== previous) {
+      if (JSON.stringify(state) !== previous) {
         try { atomicJson(file, state); } catch {}
       }
       return result;
     });
   } catch {
-    return operation({});
+    return operation(readJsonSafe(file) || {});
   }
 }
 
@@ -297,15 +297,19 @@ async function handle(payload) {
       + (nativeSwarm ? swarmDispatch : `Dispatch deep inspection via gpt_swarm(action="add", access="inspect") or gpt_run(cwd="${cwd}", access="inspect") `
       + `then run the returned \`gempt-wait\` command via run_command(WaitMsBeforeAsync=500).${extra} (Say "自己查" to bypass.)`) };
   }
+  const routingKey = JSON.stringify([ordinary, pct, isSwarm, nativeSwarm, nativeSwarm && routing.swarm_shell_model]);
+  const rememberRouting = (state) => {
+    if (state.routing_key === routingKey) return false;
+    state.routing_key = routingKey;
+    state.updated_at = now();
+    return true;
+  };
   if (hookEventName === 'SessionStart') {
     if (pct <= 0 && !nativeSwarm) return {};
+    if (!await updateState(conversationId, rememberRouting)) return {};
     return { injectSteps: [step(`GemPT v2 active: ${ordinary} (${pct}% GPT${family ? `, family=${family}` : ''}${isSwarm ? ', swarm' : ''}).\n`
-      + (nativeSwarm ? swarmDispatch + '\nKeep quick gpt_ask (including tier="chore") and gpt_ctl direct.'
-        : 'Default mode: shell-free GemPT Swarm (`gpt_swarm` + `gpt_board` + `gempt-wait --board`). Tools (ServerName="gempt_gempt"): '
-      + 'gpt_swarm(action="title"|"plan"|"add"|"status"|"model"|"kill", cli?, ...) | gpt_board(action="post"|"read"|"wait"|"roster") | '
-      + 'gpt_run(goal,cwd,access="change"|"inspect",workspace="inherit"|"share",cli?,session_id?) | '
-      + 'gpt_ask(goal,file_paths?,cwd?,tier?,session_id?) | gpt_ctl(action="status"|"steer"|"interrupt"|"reply",run_id?,message?,call_id?).\n'
-      + 'Execute the returned `gempt-wait` command via run_command(WaitMsBeforeAsync=500); never poll status.'))] };
+      + (nativeSwarm ? `Delegate via native Swarm (model=${routing.swarm_shell_model}).`
+        : 'Use gpt_swarm and gpt_board for workers, gpt_run for single tasks, and the returned gempt-wait command.'))] };
   }
   const tokens = Math.floor(contextTokens(payload.transcriptPath) / 1000);
   const steps = await updateState(conversationId, (state) => {
@@ -326,10 +330,17 @@ async function handle(payload) {
       setCount(state, key, 0);
       state.last_entry_key = entry;
       state.last_entry_at = now();
+    }
+    if (state.routing_key !== routingKey && !bypass) {
       if (nativeSwarm) {
+        rememberRouting(state);
         result.push(step(`[GemPT ${pct}%] Swarm Coordinator: dispatch coding and execution work via native Swarm. ${swarmDispatch} `
           + 'Keep quick gpt_ask (including tier="chore") and gpt_ctl direct.'));
-      } else if (Object.hasOwn(banners, ordinary) && !bypass && healthy()) {
+      } else if (ordinary === 'gemini' && state.routing_key) {
+        rememberRouting(state);
+        result.push(step('[GemPT 0%] Handle this work in Gemini.'));
+      } else if (Object.hasOwn(banners, ordinary) && healthy()) {
+        rememberRouting(state);
         result.push(step(`[GemPT ${pct}%] ${banners[ordinary]}`));
       }
     }

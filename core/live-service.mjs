@@ -1,3 +1,4 @@
+import { normalizeUsage, cacheHitRatio } from './token-usage.mjs';
 import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -10,12 +11,6 @@ import { resolvePath, withinPath } from './state.mjs';
 
 const TEXT_BYTES = 96 * 1024;
 const GOAL_BYTES = 16 * 1024;
-const USAGE_FIELDS = {
-  inputTokens: 'input_tokens', outputTokens: 'output_tokens', cachedInputTokens: 'cached_input_tokens',
-  totalTokens: 'total_tokens', reasoningOutputTokens: 'reasoning_tokens',
-};
-
-
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {};
 const array = (value) => Array.isArray(value) ? value : [];
 const text = (value, limit) => typeof value === 'string' ? Array.from(value.slice(0, limit * 2)).slice(0, limit).join('') : '';
@@ -27,11 +22,6 @@ function timestamp(value) {
   if (typeof value !== 'string') return number(value);
   const ms = Date.parse(value);
   return Number.isFinite(ms) ? ms / 1000 : null;
-}
-
-function usage(value) {
-  return Object.fromEntries(Object.values(USAGE_FIELDS).filter((key) =>
-    Number.isInteger(value[key]) && value[key] >= 0 && value[key] <= 2 ** 63).map((key) => [key, value[key]]));
 }
 
 function pageText(value, offset, budget = TEXT_BYTES) {
@@ -106,7 +96,7 @@ function runSummary(record, compact = false) {
     goal: bounded(record.goal, compact ? 512 : GOAL_BYTES), last_message: text(progress.last_message || result.text, 200),
     last_command: text(typeof lastCommand === 'string' ? lastCommand : lastCommand?.command, 160),
     started_at: started, finished_at: finished, elapsed_sec: elapsed,
-    usage: usage(firstObject(result.usage, progress.token_usage, record.usage)),
+    usage: normalizeUsage(firstObject(result.usage, progress.token_usage, record.usage)),
     progress: { phase: text(progress.phase, 64), updated_at: timestamp(progress.updated_at) },
     pending_tool_call: record.pending_tool_call ? pending(record.pending_tool_call, compact) : null,
     error: text(record.error, compact ? 240 : 2000),
@@ -281,8 +271,7 @@ class Journal {
       this.requestIds.delete(params.requestId);
       this.row('ask_gemini', callId).status = 'resolved';
     } else if (method === 'thread/tokenUsage/updated') {
-      const totals = firstObject(params.tokenUsage?.last, params.tokenUsage?.total);
-      Object.assign(this.usage, usage(Object.fromEntries(Object.entries(USAGE_FIELDS).map(([key, field]) => [field, totals[key]]))));
+      this.usage = normalizeUsage(firstObject(raw.runUsage, params.tokenUsage?.total, params.tokenUsage?.last));
     }
   }
 
@@ -456,16 +445,14 @@ function stream(record, args, options) {
     if (check.allowed) uris.push([file, check.uri]);
     else restricted.push([file, check.reason]);
   }
-  const totals = usage(firstObject(result.usage, journal.usage, progress.token_usage, record.usage));
-  const input = totals.input_tokens ?? 0;
-  const cached = totals.cached_input_tokens;
+  const totals = normalizeUsage(firstObject(result.usage, journal.usage, progress.token_usage, record.usage));
   return {
     run: { ...runSummary(record), usage: totals }, timeline: withinBudget(timeline.reverse(), 56 * 1024).reverse(),
     ...journal.textPage(fullText), commands: withinBudget(commands.reverse(), 48 * 1024).reverse(),
     next_goal_offset: pageText(record.goal, 0, GOAL_BYTES).next_text_offset,
     touched_files: touched, file_uris: Object.fromEntries(withinBudget(uris, 24 * 1024)),
     restricted_files: Object.fromEntries(withinBudget(restricted, 8 * 1024)), usage: totals,
-    cache_hit_rate: input > 0 && cached !== undefined ? Math.min(cached, input) / input : null,
+    cache_hit_rate: cacheHitRatio(totals),
   };
 }
 

@@ -1,3 +1,4 @@
+import { normalizeUsage, cacheHitRatio } from '../core/token-usage.mjs';
 import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -180,13 +181,22 @@ import { appendFileSync, readFileSync } from 'node:fs';
 let stdinText = '';
 for await (const chunk of process.stdin) stdinText += chunk;
 const args = process.argv.slice(2);
+if (args.includes('--help')) {
+  console.log('--resume ID' + (process.env.MOCK_NO_FORK ? '' : ' --fork-session'));
+  process.exit(0);
+}
+if (args.includes('--fork-session') && process.env.MOCK_BAD_PARENT) {
+  console.error('No conversation found with session ID');
+  process.exit(1);
+}
 const mcpIdx = args.indexOf('--mcp-config');
 const mcpContent = mcpIdx >= 0 ? JSON.parse(readFileSync(args[mcpIdx + 1], 'utf8')) : null;
 const resumeIdx = args.indexOf('--resume');
-const sessionId = resumeIdx >= 0 ? args[resumeIdx + 1] : 'claude-sess-777';
+const sessionId = args.includes('--fork-session') ? 'new-child-id' : resumeIdx >= 0 ? args[resumeIdx + 1] : 'claude-sess-777';
 appendFileSync(${JSON.stringify(captureFile)}, JSON.stringify({
   args,
   stdinLen: stdinText.length,
+  stdinText,
   anthropicBaseUrl: process.env.ANTHROPIC_BASE_URL,
   anthropicAuthToken: process.env.ANTHROPIC_AUTH_TOKEN,
   swarmId: process.env.GEMPT_SWARM_ID || null,
@@ -204,7 +214,7 @@ console.log(JSON.stringify({
       { type: 'tool_use', id: 'tu_2', name: 'Edit', input: { file_path: 'src/app.js' } },
       { type: 'text', text: resumeIdx >= 0 ? 'Resumed turn complete.' : 'First turn complete.' },
     ],
-    usage: { input_tokens: 120, output_tokens: 45, cache_read_input_tokens: 30 },
+    usage: { input_tokens: 120, output_tokens: 45, cache_read_input_tokens: 30, cache_creation_input_tokens: 10 },
   },
 }));
 console.log(JSON.stringify({
@@ -215,7 +225,7 @@ console.log(JSON.stringify({
   type: 'result',
   session_id: sessionId,
   result: resumeIdx >= 0 ? 'Resumed turn complete.' : 'First turn complete.',
-  usage: { input_tokens: 120, output_tokens: 45, cache_read_input_tokens: 30 },
+  usage: { input_tokens: 120, output_tokens: 45, cache_read_input_tokens: 30, cache_creation_input_tokens: 10 },
   is_error: false,
 }));
 `);
@@ -255,7 +265,9 @@ console.log(JSON.stringify({
   assert.equal(liveStream.run.cli, 'claude');
   assert.ok(liveStream.commands.some((c) => c.command === 'echo claude-ok' && c.exit_code === 0));
   assert.ok(liveStream.touched_files.includes('src/app.js'));
-  assert.equal(liveStream.usage.input_tokens, 120);
+  assert.equal(liveStream.usage.input_tokens, 160);
+  assert.equal(liveStream.usage.cache_write_tokens, 10);
+  assert.equal(liveStream.cache_hit_rate, 30 / 160);
   assert.equal(liveStream.usage.output_tokens, 45);
 
   // Turn 2: resume same session with change access (upgrade -> fresh turn) vs same sandbox resume
@@ -275,6 +287,26 @@ console.log(JSON.stringify({
   assert.match(done2.result.text, /Resumed turn complete/);
 
   const invocations = readFileSync(captureFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const fork = await dispatchRun({ goal: 'Fallback board summary', cwd, sandbox: 'read-only',
+    cli: 'claude', model: done1.result.model }, { configPath, sessionsDir, env, swarmFork: {
+    source: { cli: 'claude', model: done1.result.model, id: done1.runner_session_id }, prompt: 'Lean child assignment',
+  } });
+  assert.equal(fork.fork_mode, 'native');
+  assert.equal(fork.runner_session_id, 'new-child-id');
+  const child = JSON.parse(readFileSync(captureFile, 'utf8').trim().split('\n').at(-1));
+  assert.deepEqual(child.args.slice(child.args.indexOf('--resume'), child.args.indexOf('--resume') + 3),
+    ['--resume', 'claude-sess-777', '--fork-session']);
+  assert.equal(child.stdinText, 'Lean child assignment');
+  for (const flag of ['MOCK_BAD_PARENT', 'MOCK_NO_FORK']) {
+    const result = await dispatchRun({ goal: 'Fallback board summary', cwd, sandbox: 'read-only',
+      cli: 'claude', model: done1.result.model }, { configPath, sessionsDir, env: { ...env, [flag]: '1' }, swarmFork: {
+      source: { cli: 'claude', model: done1.result.model, id: done1.runner_session_id }, prompt: 'Lean child assignment',
+    } });
+    assert.equal(result.fork_mode, 'summary_fallback');
+    const invocation = JSON.parse(readFileSync(captureFile, 'utf8').trim().split('\n').at(-1));
+    assert.match(invocation.stdinText, /Fallback board summary/);
+    assert.ok(!invocation.args.includes('--resume'));
+  }
   assert.equal(invocations.length, 2);
   assert.equal(invocations[0].anthropicBaseUrl, gatewayUrl);
   assert.equal(invocations[0].anthropicAuthToken, 'sk-test-magpie');
@@ -321,6 +353,7 @@ if (sub === 'serve') {
   };
   let aborted = false;
   let steered = false;
+  let lookups = 0;
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1:' + port);
     if (url.pathname === '/global/health') {
@@ -336,6 +369,11 @@ if (sub === 'serve') {
     const chunks = [];
     for await (const c of req) chunks.push(c);
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
+    if (req.method === 'GET' && url.pathname === '/session/oc-srv-1') {
+      log({ action: 'lookup', attempt: ++lookups });
+      res.writeHead(Number(process.env.MOCK_LOOKUP_STATUS) || (lookups === 1 ? 503 : 200));
+      return res.end('{}');
+    }
     if (req.method === 'POST' && url.pathname === '/session') {
       log({ mode: 'serve', action: 'create_session', ocConfig: JSON.parse(process.env.OPENCODE_CONFIG_CONTENT || '{}') });
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -367,7 +405,7 @@ if (sub === 'serve') {
         const deadline = Date.now() + 4000;
         while (!aborted && Date.now() < deadline) await new Promise((r) => setTimeout(r, 40));
       }
-      broadcast({ type: 'message.updated', properties: { sessionID: 'oc-srv-1', info: { tokens: { input_tokens: 88, output_tokens: 33 } } } });
+      broadcast({ type: 'message.updated', properties: { sessionID: 'oc-srv-1', info: { tokens: { input: 88, output: 33, cache: { read: 24, write: 8 } } } } });
       broadcast({ type: 'session.idle', properties: { sessionID: 'oc-srv-1' } });
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ info: { id: 'oc-m1' }, parts: [{ type: 'text', text: steered ? 'Serve streaming reply. Steered!' : 'Serve streaming reply.' }] }));
@@ -414,6 +452,27 @@ if (sub === 'serve') {
   assert.equal(done1.state, 'finished', done1.error || 'opencode serve failed');
   assert.match(done1.result.text, /Serve streaming reply/);
   assert.match(done1.result.text, /Steered!/);
+
+  assert.equal(done1.result.usage.input_tokens, 120);
+  assert.equal(done1.result.usage.cache_write_tokens, 8);
+  assert.equal(done1.result.usage.cache_hit_ratio, .2);
+  const resumed = await dispatchRun({ session_id: done1.session_id, cwd, goal: 'Continue in the same session' },
+    { configPath, sessionsDir, env });
+  assert.equal(resumed.runner_session_id, 'oc-srv-1');
+  const log = readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(log.filter((e) => e.action === 'lookup').map((e) => e.attempt), [1, 2]);
+  assert.equal(log.filter((e) => e.action === 'create_session').length, 1);
+
+  const resumeArgs = { session_id: done1.session_id, cwd, goal: 'Follow up after outage' };
+  await assert.rejects(dispatchRun(resumeArgs, { configPath, sessionsDir, env: { ...env, MOCK_LOOKUP_STATUS: '503' } }),
+    /preserving session oc-srv-1/);
+  const outageLog = readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(outageLog.slice(log.length).filter((e) => e.action === 'lookup').map((e) => e.attempt), [1, 2, 3]);
+  assert.ok(!outageLog.slice(log.length).some((e) => e.action === 'create_session'));
+  await dispatchRun(resumeArgs, { configPath, sessionsDir, env: { ...env, MOCK_LOOKUP_STATUS: '404' } });
+  const repaired = readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse).slice(outageLog.length);
+  assert.ok(repaired.some((e) => e.action === 'create_session'));
+  assert.match(repaired.find((e) => e.action === 'message').text, /Carryover[\s\S]*Serve streaming reply/);
 
   // 2. Serve mode + interrupt/abort
   const r2 = await dispatchRun({
@@ -478,9 +537,16 @@ const summary = {
   sessionsDir: process.env.GEMPT_SESSIONS_DIR || '',
 };
 if (id === 'gemini') {
+  summary.prompt = process.argv[process.argv.indexOf('-p') + 1];
+  summary.resume = process.argv.includes('--resume') && process.argv[process.argv.indexOf('--resume') + 1];
+  if (summary.prompt === 'temporary failure') {
+    console.log(JSON.stringify({ type: 'result', status: 'error', error: { message: 'transient error' } }));
+    process.exit(1);
+  }
   console.log(JSON.stringify({ type: 'init', session_id: 'gem-sess-1' }));
   console.log(JSON.stringify({ type: 'message', role: 'assistant', content: 'GEMINI_OK:' + JSON.stringify(summary) }));
-  console.log(JSON.stringify({ type: 'result', status: 'success', stats: { input_tokens: 10, output_tokens: 5 } }));
+  console.log(JSON.stringify({ type: 'result', status: 'success', stats: { models: { gem: {
+    tokens: { prompt: 10, input: 4, candidates: 5, cached: 6, thoughts: 1, total: 16 } } } } }));
 } else if (id === 'grok' || id === 'copilot') {
   console.log('PLAIN_OK:' + JSON.stringify(summary));
 } else {
@@ -517,7 +583,23 @@ if (id === 'gemini') {
     const payload = JSON.parse(match[1]);
     assert.equal(payload.cli, id);
     assert.equal(payload.openaiBase, `${gatewayUrl}/v1`);
-    if (id === 'gemini') assert.equal(payload.geminiBase, gatewayUrl);
+    if (id === 'gemini') {
+      assert.equal(payload.geminiBase, gatewayUrl);
+      assert.equal(done.result.usage.input_tokens, 10);
+      assert.equal(done.result.usage.cache_hit_ratio, .6);
+      const wake = async (goal) => {
+        const receipt = await dispatchRun({ cli: id, model: done.result.model, goal, cwd,
+          session_id: done.session_id, background: true }, { configPath, sessionsDir, env, swarmWake: true });
+        return waitForRun(receipt.run_id, { sessionsDir, timeoutSec: 15 });
+      };
+      assert.equal((await wake('temporary failure')).state, 'failed');
+      assert.equal(JSON.parse(readFileSync(join(sessionsDir, done.session_id + '.json'))).runner_session_id, 'gem-sess-1');
+      const retry = await wake('fresh board message');
+      assert.equal(retry.state, 'finished', retry.error);
+      const resumed = JSON.parse(retry.result.text.match(/GEMINI_OK:(\{.*\})/)[1]);
+      assert.equal(resumed.prompt, 'fresh board message');
+      assert.equal(resumed.resume, 'gem-sess-1');
+    }
     assert.equal(payload.swarmId, `sw-${id}`);
     assert.equal(payload.agent, `w-${id}`);
     assert.equal(payload.sessionsDir, sessionsDir);
@@ -674,4 +756,28 @@ test('backend exposes runners, execution config, zero-CLI readiness, and default
   assert.equal(apiRes.status, 200);
   assert.equal(apiRes.body.execution.default_cli, 'claude');
   assert.equal(apiRes.body.runners.length, 11);
+});
+
+test('cache input and writes normalize once across owner-specific token counters', () => {
+  const models = { a: { tokens: { prompt: 30, input: 5, cached: 25, candidates: 4, thoughts: 3, total: 40 } },
+    b: { tokens: { input: 7, cached: 3, candidates: 2, thoughts: 1 } }, empty: {} };
+  assert.deepEqual(normalizeUsage({ models }), { input_tokens: 40, cached_input_tokens: 28,
+    output_tokens: 6, reasoning_tokens: 4, total_tokens: 53 });
+  assert.equal(normalizeUsage({ models, input_tokens: 0, output_tokens: 1 }).input_tokens, 0);
+  assert.equal(normalizeUsage({ models, input: 12 }).input_tokens, 40);
+  for (const [raw, written] of [
+    [{ input_tokens: 100, input_tokens_details: { cached_tokens: 40 } }, undefined],
+    [{ prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 40 } }, undefined],
+    [{ inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 5 }, 5],
+    [{ input_tokens: 55, cache_read_input_tokens: 40, cache_creation_input_tokens: 5 }, 5],
+    [{ input: 55, cache: { read: 40, write: 5 } }, 5],
+    [{ promptTokenCount: 100, cachedContentTokenCount: 40 }, undefined],
+    [{ input_tokens: 100, cached: 40 }, undefined],
+  ]) {
+    const usage = normalizeUsage(raw);
+    assert.equal(usage.input_tokens, 100);
+    assert.equal(usage.cache_write_tokens, written);
+    assert.equal(cacheHitRatio(usage), .4);
+    assert.deepEqual(normalizeUsage(usage), usage);
+  }
 });

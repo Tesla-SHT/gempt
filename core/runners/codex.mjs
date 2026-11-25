@@ -55,6 +55,8 @@ export const codexRunner = {
       sandbox: ctx.sandbox,
       approvalPolicy: ctx.approvalPolicy,
       threadId: ctx.threadId,
+      nativeFork: ctx.nativeFork,
+      onForkMode: ctx.onForkMode,
       gatewayUrl: ctx.gatewayUrl,
       timeoutSec: ctx.timeoutSec,
       sandboxUpgraded: ctx.sandboxUpgraded,

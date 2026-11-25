@@ -15,6 +15,7 @@ import { promisify } from 'node:util';
 import { runInNewContext } from 'node:vm';
 import { buildMcpSnippet, findMagpieCli, listDispatchActivity, normalizeTitle, readActiveRuns, readState, setDefaultSandbox, setDefaultTier } from '../magpie_plugin/lib/backend.mjs';
 import { createAppServerManager, resolveCodexInvocation } from '../magpie_plugin/lib/app-server-manager.mjs';
+import { createThreadCacheKeys } from '../magpie_plugin/lib/codex-proxy.mjs';
 import { buildEscalationSuggestion } from '../magpie_plugin/lib/routing.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
 import { createExecutionTools, createGemptTools } from '../magpie_plugin/lib/tools.mjs';
@@ -23,6 +24,126 @@ import { waitForRun } from '../core/runs.mjs';
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
+
+test('thread cache keys expire after inactivity and evict least recently used mappings', () => {
+  let time = 0;
+  const keys = createThreadCacheKeys({ limit: 2, ttl: 10, now: () => time });
+  const add = (threadId) => keys.register({ threadId, parentThreadId: 'root' });
+  add('a');
+  add('b');
+  time = 9;
+  assert.equal(keys.lookup('a').rootThreadId, 'root');
+  add('c');
+  assert.equal(keys.lookup('b'), undefined);
+  time = 11;
+  assert.equal(keys.lookup('a').cacheKey, 'root');
+  time = 21;
+  assert.equal(keys.lookup('a'), undefined);
+});
+
+test('resident Codex proxy authenticates IPC and bearer separately and streams mapped responses', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'gempt-proxy-'));
+  const seen = [];
+  let finishStream;
+  const gateway = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    seen.push({ path: req.url, headers: req.headers, body: Buffer.concat(chunks).toString() });
+    if (req.url.endsWith('?error')) {
+      res.writeHead(429, { 'retry-after': '3' });
+      return res.end('rate limited');
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-request-id': 'from-magpie' });
+    res.write('data: first\n\n');
+    if (req.url.endsWith('?stream')) await new Promise((resolve) => { finishStream = resolve; });
+    if (req.url.endsWith('?broken')) {
+      finishStream = () => res.destroy();
+      return;
+    }
+    res.end('data: last\n\n');
+  });
+  await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve));
+  const configPath = join(root, 'config.json');
+  writeFileSync(configPath, JSON.stringify({ codex: { cli_path: process.execPath },
+    magpie: { base_url: 'http://127.0.0.1:' + gateway.address().port, api_key: 'upstream-test' } }));
+  let bearer;
+  const svc = await startServer({ port: 0, configPath, sessionsDir: join(root, 'sessions'), manageAppServer: true,
+    appServerOptions: { env: { ...process.env, GEMPT_APP_SERVER_STATE: join(root, 'state.json') },
+      connect: async () => ({ close() {} }), terminateProcess() {},
+      spawnProcess(_bin, _args, opts) {
+        bearer = opts.env.GEMPT_APP_SERVER_GATEWAY_TOKEN;
+        return { pid: process.pid };
+      } } });
+  t.after(async () => {
+    finishStream?.();
+    await svc.close();
+    await new Promise((resolve) => gateway.close(resolve));
+    rmSync(root, { recursive: true, force: true });
+  });
+  assert.ok((await svc.appServer.ensureRunning()).running);
+  const base = 'http://127.0.0.1:' + svc.port;
+  const ipc = JSON.parse(readFileSync(join(root, `page-server-${svc.port}.ipc`))).token;
+  const register = (data, token = ipc) => fetch(base + '/api/internal/cache-key', { method: 'POST',
+    headers: { 'x-gempt-ipc-token': token }, body: JSON.stringify(data) });
+  const post = (body, headers = {}, suffix = '', token = bearer) => fetch(base + '/v1/codex-proxy/responses' + suffix,
+    { method: 'POST', body, headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', ...headers },
+      signal: AbortSignal.timeout(5000) });
+  assert.notEqual(bearer, 'upstream-test');
+  assert.equal((await register({}, bearer)).status, 401);
+  assert.equal((await register({})).status, 400);
+  assert.equal((await post('{}', {}, '', ipc)).status, 401);
+  assert.equal(seen.length, 0);
+  for (const registration of [
+    { threadId: 'parent', parentThreadId: 'grandparent' }, { threadId: 'child', parentThreadId: 'parent' },
+    ...[['a', 's', 'm'], ['b', 's', 'm'], ['c', 's', 'x'], ['d', 'z', 'm']].map(([threadId, swarmId, model]) => ({ threadId, swarmId, model })),
+    { threadId: 'fork-b', parentThreadId: 'b' },
+  ]) assert.equal((await register(registration)).status, 200);
+  const fields = { instructions: 'stay', tools: [{ name: 'x' }], input: [{ role: 'user', content: 'child' }] };
+  const child = JSON.stringify({ prompt_cache_key: 'child', ...fields });
+  const live = await post(child, { session_id: 'child' }, '?stream');
+  assert.equal(live.headers.get('x-request-id'), 'from-magpie');
+  assert.equal(live.headers.get('content-type'), 'text/event-stream');
+  const reader = live.body.getReader();
+  assert.equal(Buffer.from((await reader.read()).value).toString(), 'data: first\n\n');
+  finishStream();
+  assert.equal(Buffer.from((await reader.read()).value).toString(), 'data: last\n\n');
+  assert.equal((await reader.read()).done, true);
+  assert.deepEqual(JSON.parse(seen.at(-1).body), { ...fields, prompt_cache_key: 'grandparent' });
+  assert.equal(seen.at(-1).headers.session_id, 'grandparent');
+  assert.equal(seen.at(-1).headers.authorization, 'Bearer upstream-test');
+  assert.equal(seen.at(-1).path, '/v1/responses?stream');
+  const shared = [];
+  for (const id of ['a', 'b', 'fork-b', 'c', 'd']) {
+    const headers = id === 'b' ? {} : { 'session-id': id, 'thread-id': id };
+    await (await post(JSON.stringify({ prompt_cache_key: id }), headers)).text();
+    const key = JSON.parse(seen.at(-1).body).prompt_cache_key;
+    assert.match(key, /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-8[a-f0-9]{3}-[a-f0-9]{12}$/);
+    if (id !== 'b') {
+      assert.equal(seen.at(-1).headers['session-id'], key);
+      assert.equal(seen.at(-1).headers['thread-id'], id);
+    }
+    shared.push(key);
+  }
+  assert.equal(new Set(shared.slice(0, 3)).size, 1);
+  assert.equal(new Set(shared).size, 3);
+  await (await post('{}', { conversation_id: 'child' })).text();
+  assert.deepEqual(JSON.parse(seen.at(-1).body), { prompt_cache_key: 'grandparent' });
+  const solo = '{ "prompt_cache_key" : "solo" }';
+  const failure = await post(solo, { session_id: 'solo' }, '?error');
+  assert.equal(failure.status, 429);
+  assert.equal(failure.headers.get('retry-after'), '3');
+  assert.equal(await failure.text(), 'rate limited');
+  assert.equal(seen.at(-1).body, solo);
+  assert.equal(seen.at(-1).headers.session_id, 'solo');
+  const precise = '{"prompt_cache_key":"child","tools":[{"maximum":9007199254740993}]}';
+  await (await post(precise, { conversation_id: 'unregistered-header' })).text();
+  assert.equal(seen.at(-1).body, precise.replace('"child"', '"grandparent"'));
+  const broken = await post(solo, {}, '?broken');
+  const brokenReader = broken.body.getReader();
+  assert.equal(Buffer.from((await brokenReader.read()).value).toString(), 'data: first\n\n');
+  finishStream();
+  await assert.rejects(brokenReader.read());
+});
 
 test('short titles prefer the explicit value and clean historical goals', () => {
   for (const [title, goal, cwd, expected] of [
@@ -1591,12 +1712,19 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     assert.equal(c1.reasoning_effort, 'xhigh');
     assert.equal(c1.agent, 'zcode');
     assert.match(magpie.requests[0].body.input[0].content, /1: def solve\(\):/);
+    assert.deepEqual(magpie.requests[0].body.input.map((m) => m.role), ['user', 'user']);
+    assert.match(magpie.requests[0].body.input[0].content, /^## Referenced Files[\s\S]*return 42/);
+    assert.doesNotMatch(magpie.requests[0].body.input[0].content, /## Goal/);
+    assert.match(magpie.requests[0].body.input[1].content, /^## Goal\nReview solve function/);
+    assert.match(magpie.requests[0].body.prompt_cache_key, /^[a-f0-9]{64}$/);
     assert.equal(magpie.requests[0].body.reasoning.effort, 'xhigh');
 
     // Consult multi-turn resume & chore routing
     const c2 = await defaultTools.consult.execute({ goal: 'Follow up question', session_id: c1.session_id }, { agent: 'claude' });
     assert.equal(c2.session_id, c1.session_id);
-    assert.equal(magpie.requests[1].body.input.length, 3);
+    assert.equal(magpie.requests[1].body.input.length, 4);
+    assert.deepEqual(magpie.requests[1].body.input.slice(0, 2), magpie.requests[0].body.input);
+    assert.equal(magpie.requests[1].body.prompt_cache_key, magpie.requests[0].body.prompt_cache_key);
     const consultHistory = JSON.parse(readFileSync(join(sessDir, `${c1.session_id}.json`), 'utf8'));
     assert.equal(consultHistory.turn_details[1].agent, 'zcode');
     assert.ok(consultHistory.turn_details[1].response_id);
@@ -1952,7 +2080,8 @@ test('shared app-server manager launches once, authenticates, restarts and serve
     assert.equal(bin, process.execPath);
     assert.deepEqual(args.slice(0, 2), ['app-server', '--listen']);
     assert.ok(args.includes('capability-token'));
-    assert.ok(args.includes('model_providers.gempt_gateway.base_url=' + JSON.stringify(gateway.url + '/v1')));
+    assert.ok(args.some((arg) => /^model_providers\.gempt_gateway\.base_url="http:\/\/127\.0\.0\.1:\d+\/v1\/codex-proxy"$/.test(arg)));
+    assert.ok(args.includes('model_providers.gempt_gateway.supports_websockets=false'));
     assert.equal(opts.windowsHide, true);
     assert.equal(opts.env.NO_PROXY, '127.0.0.1,localhost,::1');
     assert.equal(opts.env.CODEX_SESSION_ID, undefined);
@@ -2499,7 +2628,9 @@ test('transport disconnects yield recovery hint and app-server self-heals on wed
 
   let spawnCount = 0;
   let healthy = true;
-  const fakeSpawn = () => {
+  const fakeSpawn = (_bin, args) => {
+    const { magpie } = JSON.parse(readFileSync(configPath));
+    assert.ok(args.includes('model_providers.gempt_gateway.base_url=' + JSON.stringify(magpie.base_url + '/v1')));
     spawnCount++;
     const child = new EventEmitter();
     child.pid = process.pid;
@@ -3074,4 +3205,51 @@ test('advanced HTTP settings validate, protect credentials, probe drafts and res
   assert.equal((await call('reset-settings', { keep_gateway: false }))[0], 200);
   assert.equal(config().magpie.base_url, 'http://127.0.0.1:3425');
   assert.equal(config().magpie.api_key, '');
+});
+
+test('independent consultations over the same files share a prefix and retry a rejected cache key once', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'gempt-prefix-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  let chatError;
+  const magpie = await startMockMagpie(undefined, { onRequest: (_url, body) => body.prompt_cache_key
+    ? { status: 422, json: { error: 'Unrecognized field: prompt_cache_key' } }
+    : body.messages?.[2]?.role === 'user' ? chatError : null });
+  t.after(() => magpie.close());
+  const configPath = join(root, 'config', 'config.json');
+  mkdirSync(dirname(configPath));
+  writeFileSync(configPath, JSON.stringify({ version: 1, magpie: { base_url: magpie.url },
+    tiers: { sonnet: { consult_model: 'codex/gpt-6.2-sol' } } }));
+  const workspace = join(root, 'workspace');
+  mkdirSync(workspace);
+  for (const name of ['a.txt', 'b.txt']) writeFileSync(join(workspace, name), name);
+  const tools = createExecutionTools({ configPath, sessionsDir: join(root, 'sessions') });
+  for (const [goal, paths] of [['first', ['b.txt', 'a.txt']], ['second', ['a.txt', 'b.txt']]]) {
+    await tools.consult.execute({ goal, cwd: workspace, file_paths: paths, context: goal, expected_output: goal });
+  }
+  const bodies = magpie.requests.map((r) => r.body);
+  assert.equal(bodies.length, 4);
+  assert.ok(bodies[0].prompt_cache_key);
+  assert.equal(bodies[0].prompt_cache_key, bodies[2].prompt_cache_key);
+  assert.deepEqual(bodies[0].input[0], bodies[2].input[0]);
+  assert.match(bodies[0].input[0].content, /a\.txt[\s\S]*b\.txt/);
+  for (const index of [0, 2]) {
+    const { prompt_cache_key, ...rest } = bodies[index];
+    assert.deepEqual(bodies[index + 1], rest);
+  }
+  const chat = { goal: 'chat', cwd: workspace, file_paths: ['b.txt', 'a.txt'], api_mode: 'chat' };
+  for (const status of [400, 422]) {
+    chatError = { status, json: { error: 'Conversation roles must alternate user/assistant.' } };
+    const session = await tools.consult.execute(chat);
+    const [first, retry] = magpie.requests.slice(-2).map((r) => r.body.messages);
+    assert.deepEqual(first.map((m) => m.role), ['system', 'user', 'user']);
+    assert.deepEqual(first[1], bodies[0].input[0]);
+    assert.deepEqual(retry, [first[0], { role: 'user', content: first[1].content + '\n\n' + first[2].content }]);
+    await tools.consult.execute({ goal: 'again', session_id: session.session_id, api_mode: 'chat' });
+    assert.deepEqual(magpie.requests.at(-2).body.messages.slice(0, 3), first);
+    assert.deepEqual(magpie.requests.at(-1).body.messages.slice(2), magpie.requests.at(-2).body.messages.slice(3));
+  }
+  chatError = { status: 400, json: { error: 'Invalid model parameter' } };
+  const before = magpie.requests.length;
+  await assert.rejects(tools.consult.execute(chat), /Invalid model parameter/);
+  assert.equal(magpie.requests.length, before + 1);
 });

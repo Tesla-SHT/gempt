@@ -177,7 +177,7 @@ export const geminiRunner = {
         return;
       }
       if (ev.type === 'result') {
-        if (ev.stats || ev.usage) journal.recordUsage(ev.stats || ev.usage);
+        if (ev.stats || ev.usage) journal.recordUsage({ ...ev.usage, ...ev.stats });
         if (typeof ev.response === 'string' && ev.response.trim()) resultText = ev.response.trim();
         else if (typeof ev.result === 'string' && ev.result.trim()) resultText = ev.result.trim();
         if (ev.status === 'error' || ev.error) {

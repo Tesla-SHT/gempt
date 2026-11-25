@@ -1,3 +1,4 @@
+import { cacheHitRatio, normalizeUsage } from '../../core/token-usage.mjs';
 import { isRunOccupying, readRun, reconcileRunState, stateEntries } from '../../core/runs.mjs';
 import { isValidSessionId } from '../../core/state.mjs';
 import {
@@ -343,23 +344,15 @@ function activityTime(...values) {
 const activityNumber = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 
 function activityUsage(usage) {
-  const input = activityNumber(usage?.input_tokens ?? usage?.prompt_tokens);
-  const output = activityNumber(usage?.output_tokens ?? usage?.completion_tokens);
-  const cached = activityNumber(usage?.cached_input_tokens ?? usage?.input_tokens_details?.cached_tokens
-    ?? usage?.prompt_tokens_details?.cached_tokens);
-  const read = cached ?? activityNumber(usage?.cache_read_input_tokens ?? usage?.cache_read_tokens);
-  const write = activityNumber(usage?.cache_creation_input_tokens ?? usage?.cache_write_tokens);
+  const tokens = normalizeUsage(usage || {});
   return {
-    input_tokens: input,
-    output_tokens: output,
-    cache_read_tokens: read,
-    cache_write_tokens: write,
-    cache_hit_rate: read != null && input != null && input + (cached == null ? read + (write ?? 0) : 0) > 0
-      ? read / (input + (cached == null ? read + (write ?? 0) : 0)) : null,
-    reasoning_tokens: activityNumber(usage?.reasoning_tokens ?? usage?.output_tokens_details?.reasoning_tokens
-      ?? usage?.completion_tokens_details?.reasoning_tokens),
-    total_tokens: activityNumber(usage?.total_tokens) ?? ([input, output, read, write].some((n) => n != null)
-      ? (input ?? 0) + (output ?? 0) + (cached == null ? read ?? 0 : 0) + (write ?? 0) : null),
+    input_tokens: tokens.input_tokens ?? null,
+    output_tokens: tokens.output_tokens ?? null,
+    cache_read_tokens: tokens.cached_input_tokens ?? null,
+    cache_write_tokens: tokens.cache_write_tokens ?? null,
+    cache_hit_rate: cacheHitRatio(tokens),
+    reasoning_tokens: tokens.reasoning_tokens ?? null,
+    total_tokens: tokens.total_tokens ?? null,
   };
 }
 
@@ -434,7 +427,12 @@ function readActivitySession(dir, id) {
       const prior = turns.at(-1);
       if (prior?.role === 'user' && prior.reply === undefined) prior.reply = entry.content;
     } else if (entry.role === 'user') {
-      turns.push({ ...entry, prompt: entry.prompt ?? entry.content });
+      const prior = turns.at(-1);
+      if (mode === 'consult' && prior?.role === 'user' && prior.reply === undefined) {
+        prior.prompt += '\n\n' + entry.content;
+      } else {
+        turns.push({ ...entry, prompt: entry.prompt ?? entry.content });
+      }
     } else if (!entry.role) {
       turns.push(entry);
     }
@@ -615,7 +613,9 @@ function mergeGatewayUsage(request, rows) {
     request.cacheInput = usage.cache_hit_rate > 0 ? usage.cache_read_tokens / usage.cache_hit_rate : usage.input_tokens;
   }
   usage.cache_write_tokens = sumKnown(rows, (row) => row.cache_write_tokens) ?? usage.cache_write_tokens;
-  for (const key of ['input_tokens', 'output_tokens', 'reasoning_tokens']) {
+  usage.input_tokens ??= sumKnown(rows, (row) => row.input_tokens == null ? null
+    : row.input_tokens + (row.input_includes_cache ? 0 : (row.cache_read_tokens ?? 0) + (row.cache_write_tokens ?? 0)));
+  for (const key of ['output_tokens', 'reasoning_tokens']) {
     usage[key] ??= sumKnown(rows, (row) => row[key]);
   }
   usage.total_tokens ??= sumKnown(rows, (row) => row.input_tokens == null && row.output_tokens == null ? null

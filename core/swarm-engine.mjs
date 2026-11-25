@@ -1,4 +1,5 @@
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
+import { isValidSessionId } from './state.mjs';
 import { readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
 import { CLI_CHOICES, getExecutionConfig } from './config.mjs';
 import { readHostContext } from './host-context.mjs';
@@ -47,9 +48,8 @@ function resolveEngineContext(args = {}, options = {}) {
   };
 }
 
-export function buildWorkerInstructions({ swarmId, workerName, brief, seq, registry = [], channels, role, forkContext, shardInstruction, owner = 'coordinator' }) {
-  return [
-    `You are swarm worker \`${workerName}\` in GemPT Swarm \`${swarmId}\` (opening board message #${seq}).`,
+export function buildWorkerInstructions({ swarmId, workerName, brief, seq, registry = [], channels, role, forkContext, nativeParent, shardInstruction, owner = 'coordinator' }) {
+  const protocol = [
     'Shared message board protocol:',
     '- Use `board_post` to report progress, hand off to peers (`@peer-name`), or finish (`@coordinator [done] <concise summary>`).',
     '- Use `board_read` to inspect recent messages or specific `#seq` posts, and `board_roster` to see teammates and states.',
@@ -60,15 +60,22 @@ export function buildWorkerInstructions({ swarmId, workerName, brief, seq, regis
     '- Refer to earlier posts by #seq. Keep posts short, ignore your own posts, and never greet or acknowledge ("ready", "acknowledged").',
     '- When idle call board_wait with the highest seq you actually read. End the turn when parked. mentions_only defaults to true. Set it to false to wake on visible work.',
     '- Use board_swarm to add and manage your own helpers. Ownership is recorded in added_by. Kill your helpers when finished. Killing a parent leaves its helpers running.',
+    '- Never poll the board.',
+  ];
+  return [
+    ...(nativeParent ? [`Everything before this turn is @${nativeParent}'s context. Do not redo its work or answer its old requests.`] : protocol),
+    '',
+    '## Assignment',
+    brief,
     ...(owner === 'coordinator' ? [] : [`- Report your result to @${owner} [done].`]),
     ...(registry.some((r) => !r.archived) || channels?.length ? [
       `The board is split into channels, one per work area. You see #main, ${effectiveChannels(role, channels, workerName).map((c) => c === ALL ? 'all channels' : '#' + c).join(', ') || 'your own posts'}, and any post that names you.`,
       `Post your area's work in #${homeChannelOf(role, channels, registry)} by default. Use #main for results, decisions and asks of other areas. @name reaches anyone across channels. board_read with channel reads another channel. @#channel calls on its members.`,
     ] : []),
     ...(forkContext ? [forkContext] : []),
-    '',
-    '## Assignment',
-    brief,
+    `Worker identity: @${workerName}`,
+    `Swarm: ${swarmId}`,
+    `Opening brief: #${seq}`,
     ...(shardInstruction ? [shardInstruction] : []),
   ].join('\n');
 }
@@ -103,6 +110,7 @@ function compactRosterItem(worker) {
     task_summary: worker.task_summary,
     role: worker.role,
     added_by: worker.added_by,
+    fork_mode: worker.fork_mode,
     channels: effectiveChannels(worker.role, worker.channels, worker.name),
     wake_mode: worker.wake_mode,
     wait_since: worker.wait_since,
@@ -215,8 +223,6 @@ export async function routeBoardDeliveries(swarmId, options = {}) {
         continue;
       }
       const wakeGoal = [
-        `New Swarm board messages for @${worker.name}:`,
-        '',
         formatBoardMessagesForWorker(remainingUnread),
         '',
         'Respond on the board via `board_post` (tag the relevant peer or `@coordinator [done] ...` when finished).',
@@ -244,6 +250,7 @@ export async function routeBoardDeliveries(swarmId, options = {}) {
           swarm_id: swarmId,
           swarm_agent: worker.name,
         }, {
+          swarmWake: true,
           configPath: ctx.configPath,
           sessionsDir: ctx.sessionsDir,
           magpieConfigDir: ctx.magpieConfigDir,
@@ -325,6 +332,7 @@ export async function onWorkerTurnFinished({
 
   const finished = await updateWorker(swarmId, swarmAgent, {
     state: nextState,
+    ...(result?.fork_mode ? { fork_mode: result.fork_mode } : {}),
     ...(result?.cli ? { cli: result.cli } : {}),
     session_id: result?.session_id || sessionId || worker.session_id,
     parked_on: worker.parked_on?.startsWith('board_wait') ? worker.parked_on : null,
@@ -372,9 +380,11 @@ function expandWorkerSpecs(args) {
       const name = validateWorkerName(`${baseName}-${idx + 1}`);
       const cleanSlice = String(slice || '').trim();
       if (!cleanSlice) throw new Error(`Task slice #${idx + 1} must be non-empty.`);
+      const shardInstruction = `Assigned slice (${idx + 1}/${tasks.length}): ${cleanSlice}`;
       return {
         name,
-        fullBrief: `${brief}\n\nAssigned slice (${idx + 1}/${tasks.length}): ${cleanSlice}`,
+        fullBrief: `${brief}\n\n${shardInstruction}`,
+        shardInstruction,
         taskSummary: cleanSlice.slice(0, 120),
       };
     });
@@ -508,17 +518,30 @@ export async function handleSwarmAction(args = {}, options = {}) {
     const owner = parent ? actor : args.added_by || actor;
     const roleOf = (name) => args.role || (ROLE_WORKER_RE.test(name) ? name.split('-')[0] : 'worker');
     let forkContext;
+    let forkSource;
     if (args.fork) {
       const source = args.fork === 'coordinator' ? null : await getWorker(swarmId, args.fork, storage);
       if (!source && args.fork !== 'coordinator') throw new Error(`Cannot fork unknown member '${args.fork}'.`);
+      let session = isValidSessionId(source?.session_id)
+        ? readJsonSafe(join(ctx.sessionsDir, `${source.session_id}.json`)) : null;
+      if (!session && source?.run_id) {
+        try { session = ctx.readRunImpl(source.run_id, ctx.sessionsDir, { readonly: true }); }
+        catch { /* The parent may still be starting or its run may have been pruned. */ }
+      }
+      if (session) {
+        const cli = session.cli || 'codex';
+        const id = cli === 'codex' ? session?.codex_thread_id : cli === 'claude' ? session?.runner_session_id : null;
+        if (id && session.model) forkSource = { cli, model: session.model, id };
+      }
       const recent = await readBoardMessages(swarmId, { ...storage, limit: Infinity });
       const memory = recent.filter((m) => m.from_agent === args.fork || m.meta?.worker === args.fork).slice(-8);
       forkContext = [source?.task_summary || source?.brief, ...memory.map((m) => `#${m.seq} ${truncateText(m.text)}`),
-        `Everything before this turn is @${args.fork}'s memory. Do not redo its work or answer its old requests. Begin with your assignment below.`].filter(Boolean).join('\n');
+        `Everything before this turn is @${args.fork}'s memory. Do not redo its work or answer its old requests. Follow your own assignment.`].filter(Boolean).join('\n');
     }
     const briefs = await addWorkerBriefs(swarmId, specs.map((spec) => ({
       channel: homeChannelOf(roleOf(spec.name), channels, registry),
       worker: { name: spec.name, cli, model, tier, access, workspace, source_cwd: ctx.cwd || null, state: 'working',
+        fork_mode: args.fork ? 'summary_fallback' : null,
         role: roleOf(spec.name), channels, added_by: owner, brief: spec.fullBrief, task_summary: spec.taskSummary, parked_on: null, error: null },
     })), storage);
     const spawned = [];
@@ -526,9 +549,11 @@ export async function handleSwarmAction(args = {}, options = {}) {
     for (const [index, spec] of specs.entries()) {
       const msg = briefs[index];
       lastBriefSeq = msg.seq;
+      const instructions = { swarmId, workerName: spec.name, brief: String(args.brief).trim(), seq: msg.seq, owner,
+        role: roleOf(spec.name), registry, channels, shardInstruction: spec.shardInstruction };
       try {
         const run = await ctx.dispatchRunImpl({
-          goal: buildWorkerInstructions({ swarmId, workerName: spec.name, brief: spec.fullBrief, seq: msg.seq, owner, role: roleOf(spec.name), registry, channels, forkContext, shardInstruction: spec.shardInstruction }),
+          goal: buildWorkerInstructions({ ...instructions, forkContext }),
           cwd: ctx.cwd,
           access,
           workspace,
@@ -546,6 +571,8 @@ export async function handleSwarmAction(args = {}, options = {}) {
           swarm_agent: spec.name,
           expected_report: `Post your final result via board_post mentioning @${owner} with [done] prefix, listing changed files and verification results.`,
         }, {
+          swarmFork: args.fork ? { source: forkSource,
+            prompt: buildWorkerInstructions({ ...instructions, nativeParent: args.fork }) } : undefined,
           configPath: ctx.configPath,
           sessionsDir: ctx.sessionsDir,
           magpieConfigDir: ctx.magpieConfigDir,
@@ -565,7 +592,6 @@ export async function handleSwarmAction(args = {}, options = {}) {
           worktree_path: run.worktree_path || null,
           source_cwd: run.source_cwd || ctx.cwd || null,
           model: run.model || model,
-          last_seq: msg.seq,
         }, { sessionsDir: ctx.sessionsDir });
         spawned.push({ ...compactRosterItem(saved), brief_seq: msg.seq });
       } catch (err) {

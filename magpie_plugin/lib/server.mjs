@@ -19,6 +19,7 @@ import { promisify } from 'node:util';
 import { gzip } from 'node:zlib';
 import { readJsonSafe, resolveConfigPath, warmPageTelemetry } from './backend.mjs';
 import { createAppServerManager } from './app-server-manager.mjs';
+import { createThreadCacheKeys, PROXY_PATH, proxyCodexRequest } from './codex-proxy.mjs';
 import { dispatchPageApi } from './page-api.mjs';
 import { readPageAsset } from './page-assets.mjs';
 
@@ -96,6 +97,9 @@ export async function startServer({
 } = {}) {
   const KEY = randomBytes(24).toString('base64url');
   const IPC_TOKEN = randomBytes(24).toString('base64url');
+  const proxyToken = randomBytes(32).toString('base64url');
+  const threadCacheKeys = createThreadCacheKeys();
+  let proxyTarget;
   const INSTANCE_ID = randomBytes(16).toString('hex');
   const resolvedConfigDir = dirname(resolveConfigPath(configPath));
   const identityFile = (p) => join(resolvedConfigDir, `page-server-${p}.json`);
@@ -280,6 +284,15 @@ export async function startServer({
     try {
       const url = new URL(req.url || '/', `http://127.0.0.1:${actualPort || DEFAULT_PORT}`);
       const pathname = url.pathname;
+      if (pathname.startsWith(PROXY_PATH + '/')) {
+        const got = Buffer.from(req.headers.authorization || '');
+        const want = Buffer.from('Bearer ' + proxyToken);
+        if (got.length !== want.length || !timingSafeEqual(got, want)) {
+          return send(req, res, 401, { error: 'invalid proxy token' }, undefined, false);
+        }
+        if (!proxyTarget) return send(req, res, 503, { error: 'gateway unavailable' }, undefined, false);
+        return await proxyCodexRequest(req, res, url, proxyTarget, threadCacheKeys);
+      }
       if (pathname === '/api/ping') {
         return send(req, res, 200, {
           ok: true,
@@ -290,12 +303,16 @@ export async function startServer({
         }, undefined, false);
       }
 
-      if (pathname === '/api/internal/dispatch') {
+      if (pathname === '/api/internal/dispatch' || pathname === '/api/internal/cache-key') {
         if (req.method !== 'POST') return send(req, res, 405, { error: 'method not allowed' }, undefined, false);
         const remote = String(req.socket?.remoteAddress || '');
         const isLoopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
         if (!isLoopback || !ipcOK(req)) {
           return send(req, res, 401, { error: 'unauthorized: valid loopback x-gempt-ipc-token required' }, undefined, false);
+        }
+        if (pathname === '/api/internal/cache-key') {
+          threadCacheKeys.register(await readJsonBody(req) || {});
+          return send(req, res, 200, { ok: true }, undefined, false);
         }
         const body = await readJsonBody(req, 1024 * 1024);
         if (!body || typeof body !== 'object' || !body.args || typeof body.args !== 'object') {
@@ -429,18 +446,23 @@ export async function startServer({
     takeoverTimer.unref?.();
   });
 
-  const result = (listening, reused) => {
+  const startManager = () => {
     if (manageAppServer ?? target !== 0) {
-      appServer = createAppServerManager({ configPath, sessionsDir, ...appServerOptions });
+      appServer = createAppServerManager({ configPath, sessionsDir, ...appServerOptions,
+        proxyBaseUrl: `http://127.0.0.1:${actualPort}${PROXY_PATH}`, proxyToken,
+        onProxyTarget: (target) => { proxyTarget = target; } });
       void appServer.ensureRunning();
     }
+  };
+  const result = (listening, reused) => {
+    if (listening) startManager();
     if (listening) warmPageTelemetry(pageOptions());
     return {
       port: actualPort,
       get listening() { return server.listening; },
       reused,
       server,
-      appServer,
+      get appServer() { return appServer; },
       async close() {
         closed = true;
         if (takeoverTimer) {
@@ -483,6 +505,7 @@ export async function startServer({
         cleanStaleIdentity(identityFile(p));
         try {
           if (await bindOnce(p)) {
+            startManager();
             warmPageTelemetry(pageOptions());
             console.log(`[gempt-magpie-plugin] took over port ${p} (build ${BUILD_ID})`);
             return;

@@ -75,6 +75,7 @@ function instanceSignature(rec) {
 export function createAppServerManager({
   configPath, sessionsDir, env = process.env, port = Number(env.GEMPT_APP_SERVER_PORT || 0),
   observeOnly = false,
+  proxyBaseUrl, proxyToken, onProxyTarget,
   spawnProcess = spawn, connect = connectAppServer, startupMs = 8000,
   backoffMs = [250, 500, 1000, 2000, 4000, 8000],
   healthIntervalMs = 30_000,
@@ -242,7 +243,9 @@ export function createAppServerManager({
     const url = String(raw.magpie?.base_url || defaultGatewayFromEnv()).replace(/\/+$/, '');
     const key = resolveMagpieApiKey({ magpie: { ...raw.magpie, base_url: url } });
     const extraArgs = codexAppServerExtraArgs(raw.codex?.extra_args);
-    return { raw, url, key, extraArgs, hash: configFingerprint(url, key, raw.codex?.cli_path, extraArgs) };
+    const hash = configFingerprint(proxyBaseUrl ? JSON.stringify([url, proxyBaseUrl, proxyToken]) : url,
+      key, raw.codex?.cli_path, extraArgs);
+    return { raw, url, key, extraArgs, hash };
   }
 
   async function probeConnection(target, timeoutMs = 800) {
@@ -267,7 +270,7 @@ export function createAppServerManager({
     gatewayUrl = url;
     const stale = readJsonSafe(stateFile);
     if (stale?.status === 'running' && alive(stale.pid)) {
-      const configMatches = !stale.config_hash || stale.config_hash === cfgHash;
+      const configMatches = (!proxyBaseUrl && !stale.config_hash) || stale.config_hash === cfgHash;
       const staleHealthy = await probeConnection(stale, 1500);
       if (configMatches && staleHealthy) {
         connection = { ...stale, healthy: true, error: null };
@@ -315,10 +318,14 @@ export function createAppServerManager({
       const [bin, ...prefix] = invocation(cli, env);
       const args = [...prefix, 'app-server', ...extraArgs, '--listen', wsUrl, '--ws-auth', 'capability-token', '--ws-token-file', tokenFile,
         '-c', 'model_providers.gempt_gateway.name="Magpie"',
-        '-c', 'model_providers.gempt_gateway.base_url=' + JSON.stringify(gatewayUrl + '/v1'),
+        '-c', 'model_providers.gempt_gateway.base_url=' + JSON.stringify(proxyBaseUrl || gatewayUrl + '/v1'),
         '-c', 'model_providers.gempt_gateway.wire_api="responses"', '-c', 'model_provider="gempt_gateway"'];
-      if (gatewayKey) {
-        childEnv.GEMPT_APP_SERVER_GATEWAY_TOKEN = gatewayKey;
+      if (proxyBaseUrl) {
+        args.push('-c', 'model_providers.gempt_gateway.supports_websockets=false');
+        onProxyTarget?.({ url, key: gatewayKey });
+      }
+      if (proxyToken || gatewayKey) {
+        childEnv.GEMPT_APP_SERVER_GATEWAY_TOKEN = proxyToken || gatewayKey;
         args.push('-c', 'model_providers.gempt_gateway.env_key="GEMPT_APP_SERVER_GATEWAY_TOKEN"');
       }
       const spawnOpts = { cwd: homedir(), env: childEnv, windowsHide: true, detached: true, stdio: ['ignore', 'ignore', 'pipe'] };
@@ -351,6 +358,7 @@ export function createAppServerManager({
         pid: spawned.pid,
         port: picked,
         gateway_url: gatewayUrl,
+        ...(proxyBaseUrl ? { proxy_port: Number(new URL(proxyBaseUrl).port) } : {}),
         config_hash: cfgHash,
         process_marker: basename(tokenFile),
         instance_id: randomUUID(),
@@ -398,7 +406,7 @@ export function createAppServerManager({
     if (stopped) return getStatus();
     if (ownsLock && connection && alive(connection.pid)) {
       const { hash: wantHash } = currentGatewayConfig();
-      const configChanged = Boolean(connection.config_hash && connection.config_hash !== wantHash);
+      const configChanged = (proxyBaseUrl || connection.config_hash) && connection.config_hash !== wantHash;
       const shouldProbe = probe || (healthIntervalMs > 0 && Date.now() - lastProbeAt > healthIntervalMs);
       let healthy = probeHealthy !== false;
       if (shouldProbe) {

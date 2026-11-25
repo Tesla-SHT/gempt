@@ -80,6 +80,7 @@ CREATE INDEX IF NOT EXISTS idx_swarms_host_conv ON swarms(host_conversation_id);
 const migrations = {
   roster: {
     role: "TEXT DEFAULT 'worker'", added_by: "TEXT DEFAULT 'coordinator'", channels_json: 'TEXT',
+    fork_mode: 'TEXT',
     wake_mode: "TEXT DEFAULT 'mentions'", wait_since: 'INTEGER DEFAULT 0', last_read_seq: 'INTEGER DEFAULT 0',
     last_nudged_seq: 'INTEGER DEFAULT 0', last_park_blocked_seq: 'INTEGER DEFAULT 0', quota_paused_seq: 'INTEGER DEFAULT 0',
   },
@@ -218,6 +219,7 @@ function formatWorker(row) {
     role: row.role || 'worker',
     added_by: row.added_by || 'coordinator',
     channels: safeJsonParse(row.channels_json, null),
+    fork_mode: row.fork_mode ?? null,
     wake_mode: row.wake_mode || 'mentions',
     wait_since: Number(row.wait_since || 0),
     last_read_seq: Number(row.last_read_seq || 0),
@@ -235,6 +237,13 @@ function formatWorker(row) {
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
+}
+
+export function boardPostPreview(message) {
+  if (message.text.length <= 2000) return message;
+  const text = message.text.slice(0, 2000).replace(/[\uD800-\uDBFF]$/, '');
+  return { ...message, text, truncated: true,
+    hint: `Read #${message.seq} with gpt_board(action="read", swarm_id=${JSON.stringify(message.swarm_id)}, seqs=[${message.seq}]).` };
 }
 
 function formatMessage(row) {
@@ -417,7 +426,7 @@ export async function addWorkerBriefs(swarmId, specs, options = {}) {
     const live = conn.all("SELECT name FROM roster WHERE swarm_id = ? AND state != 'killed'", id);
     if (live.length + specs.length > 32) throw new Error('At most 32 live workers are supported.');
     const registry = registryInDb(conn, id);
-    return specs.map(({ worker, channel }) => {
+    const briefs = specs.map(({ worker, channel }) => {
       const name = validateWorkerName(worker.name);
       if (live.some((w) => w.name === name)) throw new Error(`Worker '${name}' already exists.`);
       for (const c of worker.channels || []) {
@@ -431,6 +440,13 @@ export async function addWorkerBriefs(swarmId, specs, options = {}) {
       conn.run('INSERT INTO deliveries VALUES (?, ?, ?, ?)', message.seq, id, name, nowIso());
       return message;
     });
+    if (briefs.length > 1) {
+      const head = briefs.at(-1).seq;
+      const names = briefs.slice(0, -1).map((brief) => brief.meta.worker);
+      conn.run(`UPDATE roster SET last_read_seq = ?, last_seq = ? WHERE swarm_id = ? AND name IN (${names.map(() => '?').join(',')})`,
+        head, head, id, ...names);
+    }
+    return briefs;
   }), options.db);
 }
 

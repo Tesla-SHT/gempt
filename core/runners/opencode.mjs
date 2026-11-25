@@ -141,7 +141,7 @@ async function consumeOpenCodeSse({ baseUrl, sessionId, journal, signal, onIdle,
         }
       }
     } else if (type === 'message.updated' && props?.info) {
-      if (props.info.tokens) journal.recordUsage(props.info.tokens);
+      if (props.info.tokens) journal.recordUsage(props.info.tokens, props.info.id);
     } else if (type === 'session.idle' || (type === 'session.status' && props?.status?.type === 'idle')) {
       onIdle?.();
     } else if (type === 'session.error') {
@@ -198,12 +198,25 @@ async function runViaServe({ cliPath, ctx, journal, childEnv }) {
 
   try {
     let ocSessionId = ctx.runnerSessionId || '';
+    let prompt = ctx.prompt;
     if (ocSessionId) {
-      const check = await fetch(`${baseUrl}/session/${encodeURIComponent(ocSessionId)}`, {
-        signal: AbortSignal.timeout(2000),
-      }).catch(() => null);
-      if (!check?.ok) ocSessionId = '';
-      else await check.body?.cancel();
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const check = await fetch(`${baseUrl}/session/${encodeURIComponent(ocSessionId)}`, {
+          signal: AbortSignal.any([abortController.signal, AbortSignal.timeout(2000)]),
+        }).catch(() => null);
+        await check?.body?.cancel();
+        if (check?.ok) break;
+        if (check?.status === 404) {
+          ocSessionId = '';
+          prompt = ctx.onSessionMissing?.() ?? prompt;
+          break;
+        }
+        abortController.signal.throwIfAborted();
+        if (attempt === 2 || (check && check.status < 500 && ![408, 429].includes(check.status))) {
+          throw new Error(`OpenCode session lookup failed (${check?.status ?? 'network error'}); preserving session ${ocSessionId}.`);
+        }
+        await sleep(100 * (attempt + 1));
+      }
     }
     if (!ocSessionId) {
       const createRes = await fetch(`${baseUrl}/session`, {
@@ -242,7 +255,7 @@ async function runViaServe({ cliPath, ctx, journal, childEnv }) {
     });
 
     const messagePayload = {
-      parts: [{ type: 'text', text: String(ctx.prompt || '') }],
+      parts: [{ type: 'text', text: String(prompt || '') }],
       ...(ctx.model ? { model: { providerID: 'magpie', modelID: ctx.model } } : {}),
     };
     const msgRes = await fetch(`${baseUrl}/session/${encodeURIComponent(ocSessionId)}/message`, {
@@ -260,7 +273,7 @@ async function runViaServe({ cliPath, ctx, journal, childEnv }) {
     const ct = String(msgRes.headers.get('content-type') || '');
     if (ct.includes('application/json')) {
       const data = await msgRes.json().catch(() => null);
-      if (data?.info?.tokens) journal.recordUsage(data.info.tokens);
+      if (data?.info?.tokens) journal.recordUsage(data.info.tokens, data.info.id);
       if (data?.usage) journal.recordUsage(data.usage);
       responseText = extractPartsText(data?.parts) || String(data?.text || '');
       if (responseText && !journal.getText()) {
@@ -358,7 +371,7 @@ async function runViaCliFallback({ cliPath, ctx, journal, childEnv }) {
       if (ev.type === 'text' && typeof ev.part?.text === 'string') {
         journal.completeMessage(ev.part.id || `oc-run-${++msgSeq}`, ev.part.text);
       } else if (ev.type === 'step_finish' && ev.part?.tokens) {
-        journal.recordUsage(ev.part.tokens);
+        journal.recordUsage(ev.part.tokens, ev.part.id);
       } else if (typeof ev.text === 'string' && ev.text) {
         journal.completeMessage(`oc-run-${++msgSeq}`, ev.text);
       } else if (typeof ev.delta === 'string' && ev.delta) {

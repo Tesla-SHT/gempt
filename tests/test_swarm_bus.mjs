@@ -22,7 +22,7 @@ import {
   homeChannelOf, memberView, mentions, mentionsIn, mentionsOf, seesIn, validateChannelName, validateTopic, visibleUnread,
 } from '../core/swarm-channels.mjs';
 import { handleBoardMcpTool } from '../core/board-mcp.mjs';
-import { handleBoardAction, handleSwarmAction, onWorkerTurnFinished } from '../core/swarm-engine.mjs';
+import { buildWorkerInstructions, handleBoardAction, handleSwarmAction, onWorkerTurnFinished } from '../core/swarm-engine.mjs';
 import { runSwarmOperation } from '../core/swarm-service.mjs';
 import { reconcileRunState, saveRun, tryDelegateDispatch } from '../core/runs.mjs';
 import { handleTool, TOOLS } from '../core/mcp-server.mjs';
@@ -410,6 +410,14 @@ test('swarm-engine orchestrates add/sharding/steer/warm-wake/reply/model/kill an
   assert.match(added.wait_command, /--board sw-demo/);
   assert.equal(dispatched.length, 2);
   assert.equal(dispatched[0].args.swarm_agent, 'builder-1');
+  const prefixes = dispatched.map(({ args }) => args.goal.split('Worker identity:')[0]);
+  assert.equal(prefixes[0], prefixes[1]);
+  assert.match(prefixes[0], /## Assignment\nImplement module/);
+  assert.ok(!prefixes[0].includes('Assigned slice'));
+  for (const worker of added.workers) {
+    assert.equal(worker.last_seq, added.head);
+    assert.equal(worker.last_read_seq, added.head);
+  }
 
   // Posting @builder-1 while working steers its active run.
   const steerRes = await handleBoardAction({
@@ -516,6 +524,18 @@ test('waitForBoard and gempt-wait --board wake on coordinator mentions and worke
   const parsed = JSON.parse(captured.trim());
   assert.equal(parsed.swarm_id, 'sw-wait');
   assert.ok(parsed.head >= 2);
+  const text = 'x'.repeat(1999) + '😀' + 'y'.repeat(3000) + ' @coordinator';
+  const post = await postBoardMessage('sw-wait', { from: 'alpha', text }, { sessionsDir });
+  const snapshot = await waitForBoard('sw-wait', { sessionsDir, since: parsed.head, timeoutMs: 1000 });
+  assert.equal(snapshot.messages.length, 1);
+  const [preview] = snapshot.messages;
+  assert.equal(preview.truncated, true);
+  assert.equal(preview.text, 'x'.repeat(1999));
+  assert.ok(preview.hint.includes('#' + post.seq));
+  const read = async (args) => JSON.parse((await handleTool('gpt_board',
+    { swarm_id: 'sw-wait', action: 'read', ...args }, {}, { sessionsDir })).content[0].text).messages;
+  assert.deepEqual((await read({ since: parsed.head }))[0], preview);
+  assert.equal((await read({ seqs: [post.seq] }))[0].text, text);
 });
 
 test('board-mcp stdio server exposes board_post, board_read, board_ask, and board_roster', async (t) => {
@@ -1343,4 +1363,15 @@ test('GIF89a encoder emits a looping animation with a cropped transparent delta'
   assert.deepEqual(frames.map(f => f.rect), [[0, 0, 10, 6], [2, 1, 4, 3]]);
   assert.deepEqual(frames.map(f => f.delay), [12, 25]);
   assert.equal(frames[1].transparent, true);
+});
+
+test('worker identity and opening cursor follow the entire shared protocol and assignment', () => {
+  const options = { swarmId: 'prefix-test', brief: 'Verify the parser', owner: 'lead' };
+  const split = (workerName, seq) => buildWorkerInstructions({ ...options, workerName, seq }).split('Worker identity:');
+  const [alphaPrefix, alphaTail] = split('alpha', 1);
+  const [bravoPrefix, bravoTail] = split('bravo', 2);
+  assert.equal(alphaPrefix, bravoPrefix);
+  assert.match(alphaPrefix, /board_wait[\s\S]*## Assignment\nVerify the parser[\s\S]*@lead/);
+  assert.equal(alphaTail, ' @alpha\nSwarm: prefix-test\nOpening brief: #1');
+  assert.equal(bravoTail, ' @bravo\nSwarm: prefix-test\nOpening brief: #2');
 });

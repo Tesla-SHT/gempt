@@ -1,3 +1,4 @@
+import { cacheHitRatio, normalizeUsage } from '../../core/token-usage.mjs';
 import { appendFileSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import {
@@ -5,12 +6,13 @@ import {
   readAppServerState, SANDBOX_TYPES, SWARM_DEVELOPER_INSTRUCTIONS, textInput,
 } from './app-server-client.mjs';
 import { saveRun, toolReplyPath } from '../../core/runs.mjs';
+import { readJsonSafe, resolveConfigPath } from '../../core/config.mjs';
 
 export class TurnInterrupted extends Error {}
 
 export async function runAppServer({ configPath, env, runFile, sessionId, onIdentity, prompt, cwd, model,
   effort, sandbox, approvalPolicy, threadId, gatewayUrl, timeoutSec, sandboxUpgraded, interruptConfirmMs = 800,
-  sessionsDir, swarmId, swarmAgent }) {
+  sessionsDir, swarmId, swarmAgent, nativeFork, onForkMode }) {
   const isSwarm = Boolean(swarmId && swarmAgent);
   const board = isSwarm ? await import('../../core/board-mcp.mjs') : null;
   const swarmTools = board?.BOARD_TOOLS.filter((tool) => tool.name !== 'board_ask').map((t) => ({ type: 'function', ...t })) || [];
@@ -44,6 +46,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
   const touched = new Set();
   const tools = new Map();
   let usage = {};
+  let usageBaseline;
   let lastWrite = 0;
   let client;
   let acceptTurn = false;
@@ -161,6 +164,20 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
       }
       if (method === 'turn/completed') notifyTerminal(params.turn);
     }
+    if (acceptTurn && related && sameTurn && method === 'thread/tokenUsage/updated') {
+      const last = normalizeUsage(params.tokenUsage.last);
+      const total = normalizeUsage(params.tokenUsage.total);
+      if (Object.keys(total).length) {
+        // Codex totals are thread-wide. Exclude history already charged to a parent or earlier turn.
+        usageBaseline ??= Object.fromEntries(Object.entries(total).map(([key, value]) =>
+          [key, threadId || record.fork_mode === 'native' ? Math.max(0, value - (last[key] ?? 0)) : 0]));
+        usage = Object.fromEntries(Object.entries(total).map(([key, value]) => [key, Math.max(0, value - (usageBaseline[key] ?? 0))]));
+      } else {
+        for (const [key, value] of Object.entries(last)) usage[key] = (usage[key] ?? 0) + value;
+      }
+      usage.cache_hit_ratio = cacheHitRatio(usage);
+      extra.runUsage = usage;
+    }
     appendFileSync(join(directory, 'events.jsonl'), JSON.stringify({ method, params, id, ...extra }) + '\n');
     if (id !== undefined) {
       if (!acceptTurn || !related || !sameTurn || terminal) {
@@ -259,9 +276,6 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
         break;
       }
       case 'thread/tokenUsage/updated': {
-        const last = params.tokenUsage.last;
-        usage = { input_tokens: last.inputTokens, output_tokens: last.outputTokens, cached_input_tokens: last.cachedInputTokens,
-          total_tokens: last.totalTokens, reasoning_tokens: last.reasoningOutputTokens };
         progress.token_usage = usage;
         save();
         break;
@@ -274,21 +288,57 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     client = await connectAppServer(state, onEvent);
     client.onFailure(fail);
     const developerInstructions = isSwarm
-      ? `${DEVELOPER_INSTRUCTIONS}\n${SWARM_DEVELOPER_INSTRUCTIONS} (Swarm: ${swarmId}, Worker: ${swarmAgent}.)`
+      ? `${DEVELOPER_INSTRUCTIONS}\n${SWARM_DEVELOPER_INSTRUCTIONS}`
       : DEVELOPER_INSTRUCTIONS;
     const dynamicTools = isSwarm ? [ASK_GEMINI, ...swarmTools] : [ASK_GEMINI];
     const common = { cwd, model, modelProvider: PROVIDER, sandbox, approvalPolicy, developerInstructions };
-    const thread = threadId
-      ? await client.request('thread/resume', { ...common, threadId, excludeTurns: true }, remaining())
-      : await client.request('thread/start', { ...common, dynamicTools, allowProviderModelFallback: false }, remaining());
-    if (threadId && thread.thread.id !== threadId) throw new Error('Codex returned a different thread on resume.');
     const sandboxTypes = Object.values(SANDBOX_TYPES);
-    const actual = sandboxTypes.indexOf(thread.sandbox?.type);
     const fold = (path) => process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path);
-    if (!thread.cwd || fold(thread.cwd) !== fold(cwd) || actual < 0 || actual > sandboxTypes.indexOf(SANDBOX_TYPES[sandbox])
-        || (sandboxUpgraded && actual !== sandboxTypes.indexOf(SANDBOX_TYPES[sandbox]))
-        || thread.modelProvider !== PROVIDER) {
-      throw new Error('Codex app-server did not confirm the requested workspace, sandbox and Magpie provider.');
+    function confirmedSandbox(thread) {
+      const actual = sandboxTypes.indexOf(thread.sandbox?.type);
+      const requested = sandboxTypes.indexOf(SANDBOX_TYPES[sandbox]);
+      if (!thread.cwd || fold(thread.cwd) !== fold(cwd) || actual < 0 || actual > requested
+          || (sandboxUpgraded && actual !== requested) || thread.modelProvider !== PROVIDER) {
+        throw new Error('Codex app-server did not confirm the requested workspace, sandbox and Magpie provider.');
+      }
+      return actual;
+    }
+    let thread;
+    if (nativeFork) {
+      try {
+        // Dynamic tools are persisted with the parent. ThreadForkParams does not accept dynamicTools.
+        thread = await client.request('thread/fork', { ...common, threadId: nativeFork.id, excludeTurns: true }, remaining());
+        if (!thread?.thread?.id || thread.thread.id === nativeFork.id) throw new Error('Missing child thread identity.');
+        confirmedSandbox(thread);
+        if (thread.model && thread.model !== model) throw new Error('Fork model mismatch.');
+        record.fork_mode = 'native';
+        prompt = nativeFork.prompt;
+      } catch {
+        record.fork_mode = 'summary_fallback';
+        thread = null;
+      }
+    }
+    if (nativeFork) await onForkMode?.(record.fork_mode);
+    if (!thread) {
+      thread = threadId
+        ? await client.request('thread/resume', { ...common, threadId, excludeTurns: true }, remaining())
+        : await client.request('thread/start', { ...common, dynamicTools, allowProviderModelFallback: false }, remaining());
+    }
+    if (threadId && thread.thread.id !== threadId) throw new Error('Codex returned a different thread on resume.');
+    const actual = confirmedSandbox(thread);
+    const parentThreadId = nativeFork && record.fork_mode === 'native' ? nativeFork.id : null;
+    if (state.proxy_port && (parentThreadId || (!threadId && swarmId))) {
+      const port = state.proxy_port;
+      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid Codex proxy port.');
+      const ipc = readJsonSafe(join(dirname(resolveConfigPath(configPath)), `page-server-${port}.ipc`));
+      if (!ipc?.token || ipc.port !== port) throw new Error('Codex proxy registration unavailable.');
+      const response = await fetch(`http://127.0.0.1:${port}/api/internal/cache-key`, {
+        method: 'POST', redirect: 'error', signal: AbortSignal.timeout(Math.min(5000, remaining())),
+        headers: { 'content-type': 'application/json', 'x-gempt-ipc-token': ipc.token },
+        body: JSON.stringify({ threadId: thread.thread.id, parentThreadId, swarmId, model }),
+      });
+      await response.arrayBuffer();
+      if (!response.ok) throw new Error(`Codex proxy registration failed (HTTP ${response.status}).`);
     }
     record.sandbox = Object.keys(SANDBOX_TYPES)[actual];
     record.model = model;
@@ -327,7 +377,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     if (turn.status !== 'completed') throw new Error(turn.error?.message || `Codex turn ${turn.status}.`);
     const text = [...messages.values()].map((value) => value.trim()).filter(Boolean).join('\n\n');
     if (!text) throw new Error('Codex finished without an assistant message.');
-    return { threadId: progress.thread_id, turnId: progress.turn_id, sandbox: Object.keys(SANDBOX_TYPES)[actual],
+    return { forkMode: record.fork_mode, threadId: progress.thread_id, turnId: progress.turn_id, sandbox: Object.keys(SANDBOX_TYPES)[actual],
       text, elapsedSec: (Date.now() - start) / 1000, commands: [...commands.values()], usage };
   } catch (err) {
     clearInterval(poll);

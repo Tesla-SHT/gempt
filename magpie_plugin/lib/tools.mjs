@@ -21,7 +21,7 @@ import { validateSessionId } from '../../core/state.mjs';
 import { TOOLS } from '../../core/tool-schemas.mjs';
 import { CLI_CHOICES, codexAppServerExtraArgs, getMcpEffort, getPairing, hasRuntimeConfig, isPairingModelId } from '../../core/config.mjs';
 import { pickDelegatePlan } from '../../core/magpie.mjs';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, openSync, readSync, realpathSync, rmSync, statSync, closeSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
@@ -271,14 +271,10 @@ function readContextFiles(filePaths, cwd, { maxFileBytes = MAX_CONTEXT_FILE_BYTE
   return { blocks, warnings };
 }
 
-function buildConsultPrompt({ goal, context = '', fileBlocks = [], constraints = '', expectedOutput = '' }) {
+function buildConsultMessages({ goal, context = '', fileBlocks = [], constraints = '', expectedOutput = '' }, firstTurn) {
   const sections = [`## Goal\n${String(goal || '').trim()}`];
   if (String(context || '').trim()) sections.push(`## Context\n${String(context).trim()}`);
   if (String(constraints || '').trim()) sections.push(`## Hard Constraints\n${String(constraints).trim()}`);
-  if (fileBlocks.length) {
-    const rendered = fileBlocks.map((blk) => `### File: ${blk.path}\n\`\`\`text\n${blk.content}\n\`\`\``);
-    sections.push(`## Referenced Files\n${rendered.join('\n\n')}`);
-  }
   if (String(expectedOutput || '').trim()) {
     sections.push(`## Expected Output\n${String(expectedOutput).trim()}`);
   } else {
@@ -286,7 +282,14 @@ function buildConsultPrompt({ goal, context = '', fileBlocks = [], constraints =
       '## Expected Output\n1. Direct conclusion / recommendation\n2. Key reasoning, edge cases, and failure modes\n3. Concrete verification steps or exact next actions',
     );
   }
-  return sections.join('\n\n');
+  const messages = [];
+  if (fileBlocks.length) {
+    const rendered = fileBlocks.map((blk) => `### File: ${blk.path}\n\`\`\`text\n${blk.content}\n\`\`\``);
+    const files = `## Referenced Files\n${rendered.join('\n\n')}`;
+    if (firstTurn) messages.push({ role: 'user', content: files });
+    else sections.unshift(files);
+  }
+  return [...messages, { role: 'user', content: sections.join('\n\n') }];
 }
 
 function buildExecPrompt({
@@ -419,13 +422,20 @@ function extractChatText(data) {
   return '';
 }
 
-async function callResponses({ baseUrl, apiKey, model, messages, reasoningEffort = '', instructions = '', maxOutputTokens = 16384, timeoutMs = 180000 }) {
+async function callResponses({ cacheKey, baseUrl, apiKey, model, messages, reasoningEffort = '', instructions = '', maxOutputTokens = 16384, timeoutMs = 180000 }) {
   const url = `${baseUrl.replace(/\/+$/, '')}/v1/responses`;
   const payload = { model, input: messages, max_output_tokens: maxOutputTokens };
   if (String(instructions || '').trim()) payload.instructions = String(instructions).trim();
   if (reasoningEffort && reasoningEffort !== 'none') payload.reasoning = { effort: reasoningEffort };
 
-  const data = await postGatewayJson(url, { apiKey, payload, timeoutMs });
+  let data;
+  try {
+    data = await postGatewayJson(url, { apiKey, timeoutMs,
+      payload: cacheKey ? { ...payload, prompt_cache_key: cacheKey } : payload });
+  } catch (err) {
+    if (!cacheKey || ![400, 422].includes(err.statusCode) || !/prompt_cache_key/i.test(err.message)) throw err;
+    data = await postGatewayJson(url, { apiKey, payload, timeoutMs });
+  }
   if (data.error) {
     throw new Error(`Model error from ${model}: ${typeof data.error === 'string' ? data.error : JSON.stringify(data.error)}`);
   }
@@ -451,7 +461,19 @@ async function callChat({ baseUrl, apiKey, model, messages, reasoningEffort = ''
   const payload = { model, messages: fullMessages, max_tokens: maxOutputTokens };
   if (reasoningEffort && reasoningEffort !== 'none') payload.reasoning_effort = reasoningEffort;
 
-  const data = await postGatewayJson(url, { apiKey, payload, timeoutMs });
+  let data;
+  try {
+    data = await postGatewayJson(url, { apiKey, payload, timeoutMs });
+  } catch (err) {
+    const roleError = /\b(?:user|roles?|messages?)\b/i.test(err.message)
+      && /\b(?:alternat(?:e|ing|ion)|consecutive|in a row|back.to.back)\b/i.test(err.message);
+    if (!roleError || ![400, 422].includes(err.statusCode) || messages[0]?.role !== 'user' || messages[1]?.role !== 'user') throw err;
+    const end = messages.findIndex((message) => message.role !== 'user');
+    const count = end < 0 ? messages.length : end;
+    const merged = { role: 'user', content: messages.slice(0, count).map((m) => m.content).join('\n\n') };
+    const retry = [...fullMessages.slice(0, fullMessages.length - messages.length), merged, ...messages.slice(count)];
+    data = await postGatewayJson(url, { apiKey, payload: { ...payload, messages: retry }, timeoutMs });
+  }
   if (data.error) {
     throw new Error(`Model error from ${model}: ${typeof data.error === 'string' ? data.error : JSON.stringify(data.error)}`);
   }
@@ -776,6 +798,8 @@ export function createExecutionTools({
   sourceCwd,
   swarmId,
   swarmAgent,
+  swarmFork,
+  swarmWake,
   env = process.env,
   probeTimeoutMs = 2000,
 } = {}) {
@@ -928,25 +952,28 @@ export function createExecutionTools({
         }
 
         const limits = runtime.cfg?.limits || {};
-        const { blocks, warnings } = readContextFiles(fileList, validatedCwd, {
+        const { blocks, warnings } = readContextFiles([...fileList].sort(), validatedCwd, {
           maxFileBytes: Number(limits.max_context_file_bytes) || MAX_CONTEXT_FILE_BYTES,
           maxTotalBytes: Number(limits.max_total_context_bytes) || MAX_TOTAL_CONTEXT_BYTES,
         });
 
-        const prompt = buildConsultPrompt({
+        const priorTurns = Array.isArray(priorSession?.turns) ? priorSession.turns : [];
+        blocks.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+        const newMessages = buildConsultMessages({
           goal,
           context: args?.context || '',
           fileBlocks: blocks,
           constraints: args?.constraints || '',
           expectedOutput: args?.expected_output || '',
-        });
-
-        const priorTurns = Array.isArray(priorSession?.turns) ? priorSession.turns : [];
-        const messages = [...priorTurns, { role: 'user', content: prompt }];
+        }, !priorTurns.length);
+        const messages = [...priorTurns, ...newMessages];
         const configuredTimeout = Number(limits.consult_timeout_sec) || 180;
         const timeoutMs = (limits.consult_timeout_customized === true ? configuredTimeout
           : Math.max(10, configuredTimeout, effortTimeoutFloor(effort, { mode: 'consult' }))) * 1000;
         const caller = apiMode === 'chat' ? callChat : callResponses;
+        const sessionId = priorSession?.session_id || generateSessionId('consult');
+        const keyParts = blocks.length ? [validatedCwd, ...blocks.map((block) => block.path)] : sessionId;
+        const cacheKey = priorSession?.prompt_cache_key || createHash('sha256').update(JSON.stringify(keyParts)).digest('hex');
         const candidates = [resolved.model, ...(resolved.fallbackModels || [])];
         const attemptedModels = [];
         const t0 = Date.now();
@@ -958,6 +985,7 @@ export function createExecutionTools({
           attemptedModels.push(cand);
           try {
             reply = await caller({
+              cacheKey,
               baseUrl: runtime.baseUrl,
               apiKey: runtime.apiKey,
               model: cand,
@@ -985,9 +1013,8 @@ export function createExecutionTools({
         if (!reply) throw lastErr || new Error('All consult candidates failed.');
         const elapsedSec = (Date.now() - t0) / 1000;
 
-        const sessionId = priorSession?.session_id || generateSessionId('consult');
         const agent = callingAgent(callCtx) || priorSession?.agent || '';
-        const turn = Math.floor(messages.length / 2) + 1;
+        const turn = priorTurns.filter((message) => message.role === 'assistant').length + 1;
         const cwd = validatedCwd || priorSession?.cwd || '';
         const title = normalizeTitle(args.title, goal, cwd);
         const hostId = args.host_conversation_id || priorSession?.host_conversation_id || null;
@@ -998,6 +1025,7 @@ export function createExecutionTools({
           paired_model: paired,
           session_id: sessionId,
           mode: 'consult',
+          prompt_cache_key: cacheKey,
           tier: resolved.tier,
           model: reply.servedModel || usedModel,
           reasoning_effort: effort,
@@ -1219,31 +1247,31 @@ export function createExecutionTools({
         });
 
         const priorTurns = Array.isArray(priorSession?.turns) ? priorSession.turns : [];
-        const needsCarryover = Boolean(
-          priorSession && (sandboxUpgraded || (resolvedCli !== 'codex' && (!runner.capabilities.resume || priorSession.cli !== resolvedCli))),
-        );
-        let carryover = '';
-        if (needsCarryover) {
-          const latest = priorTurns.slice(-2).flatMap((entry) => {
-            if (typeof entry?.content === 'string') return [`${entry.role || 'Prior turn'}: ${entry.content.slice(0, 1200)}`];
-            return [entry?.goal, entry?.reply ?? entry?.text].filter((text) => typeof text === 'string').map((text) => text.slice(0, 1200));
+        const sameCli = priorSession && (priorSession.cli || 'codex') === resolvedCli;
+        const resumeId = resolvedCli !== 'codex' && priorSession && Object.hasOwn(priorSession, 'runner_session_id')
+          ? priorSession.runner_session_id : priorSession?.codex_thread_id;
+        const canResumeRunner = Boolean(sameCli && !sandboxUpgraded && runner.capabilities.resume && resumeId);
+        function promptForTurn(resume) {
+          if (resume && swarmWake) return goal;
+          let carryover = '';
+          if (priorSession && !resume) {
+            const latest = priorTurns.slice(-2).flatMap((entry) => {
+              if (typeof entry?.content === 'string') return [`${entry.role || 'Prior turn'}: ${entry.content.slice(0, 1200)}`];
+              return [entry?.goal, entry?.reply ?? entry?.text].filter((text) => typeof text === 'string').map((text) => text.slice(0, 1200));
+            });
+            carryover = [
+              sandboxUpgraded
+                ? 'Carryover from the prior read-only Codex thread (for context):'
+                : 'Carryover from the prior execution thread (for context):',
+              ...latest,
+            ].join('\n');
+          }
+          return buildExecPrompt({
+            goal, context: [carryover, args.context].filter(Boolean).join('\n\n'), fileBlocks: blocks,
+            constraints: args.constraints, verification: args.verification, expectedReport: args.expected_report, isResume: resume,
           });
-          carryover = [
-            sandboxUpgraded
-              ? 'Carryover from the prior read-only Codex thread (for context):'
-              : 'Carryover from the prior execution thread (for context):',
-            ...latest,
-          ].join('\n');
         }
-        const prompt = buildExecPrompt({
-          goal,
-          context: [carryover, args.context].filter(Boolean).join('\n\n'),
-          fileBlocks: blocks,
-          constraints: args?.constraints || '',
-          verification: args?.verification || '',
-          expectedReport: args?.expected_report || '',
-          isResume: Boolean(priorSession) && !needsCarryover,
-        });
+        let prompt = promptForTurn(canResumeRunner);
 
         const timeoutSec = resolveExecTimeoutSec({ codex: runtime.cfg?.codex, timeoutSec: args.timeout_sec, effort });
 
@@ -1266,10 +1294,22 @@ export function createExecutionTools({
           ...(worktreePath ? { worktree_path: worktreePath, source_cwd: sourceCwd, worktree_pruned_at: null, pruned_worktree_path: null } : {}),
           ...(sandboxUpgraded ? { sandbox_upgraded: true } : {}),
         };
-        const canResumeRunner = Boolean(priorSession && !sandboxUpgraded && (priorSession.cli || 'codex') === resolvedCli);
+        const source = swarmFork?.source;
+        const nativeFork = !priorSession && source?.cli === resolvedCli && source.model === targetModel
+          ? { id: source.id, prompt: swarmFork.prompt } : null;
         let res;
         try {
           res = await runner.runTurn({
+            nativeFork,
+            onSessionMissing() {
+              prompt = promptForTurn(false);
+              return prompt;
+            },
+            async onForkMode(mode) {
+              if (!swarmId || !swarmAgent) return;
+              const { updateWorker } = await import('../../core/swarm-bus.mjs');
+              await updateWorker(swarmId, swarmAgent, { fork_mode: mode }, { sessionsDir: resolvedSessionsDir, expectedRun: args.run_id });
+            },
             cliPath: resolvedRunner.path,
             configPath,
             env,
@@ -1281,7 +1321,7 @@ export function createExecutionTools({
             effort,
             sandbox: effectiveSandbox,
             threadId: canResumeRunner ? priorSession?.codex_thread_id : undefined,
-            runnerSessionId: canResumeRunner ? (priorSession?.runner_session_id || priorSession?.codex_thread_id) : undefined,
+            runnerSessionId: canResumeRunner ? resumeId : undefined,
             sandboxUpgraded,
             gatewayUrl: runtime.baseUrl,
             apiKey: runtime.apiKey,
@@ -1293,7 +1333,7 @@ export function createExecutionTools({
             onIdentity(threadId, turnId, observedSandbox, runnerSid) {
               session.cli = resolvedCli;
               session.codex_thread_id = threadId;
-              if (runnerSid) session.runner_session_id = runnerSid;
+              session.runner_session_id = runnerSid || null;
               session.turn_id = turnId;
               session.sandbox = observedSandbox;
               saveSession(resolvedSessionsDir, session);
@@ -1324,7 +1364,7 @@ export function createExecutionTools({
           codex_thread_id: res.threadId,
           ...(res.runnerSessionId ? { runner_session_id: res.runnerSessionId } : {}),
           turn_id: res.turnId,
-          turns: [...priorTurns, { role: 'user', content: prompt }, { role: 'assistant', content: res.text }],
+          turns: [...priorTurns, { role: 'user', content: res.forkMode === 'native' ? nativeFork.prompt : prompt }, { role: 'assistant', content: res.text }],
           turn_details: {
             ...priorSession?.turn_details,
             [turn]: {
@@ -1353,6 +1393,7 @@ export function createExecutionTools({
         });
         return {
           summary,
+          ...(swarmFork ? { fork_mode: res.forkMode || 'summary_fallback' } : {}),
           text: `${summary}\n\n${res.text}`,
           session_id: sessionId,
           cli: resolvedCli,

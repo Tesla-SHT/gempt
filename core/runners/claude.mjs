@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { TurnInterrupted } from '../../magpie_plugin/lib/app-server-run.mjs';
 import {
@@ -108,7 +108,14 @@ export const claudeRunner = {
       '--permission-mode', permissionMode,
     ];
     if (model) args.push('--model', model);
-    if (threadId && !String(threadId).startsWith('claude-')) {
+    let fork = ctx.nativeFork;
+    if (fork) {
+      const help = spawnSync(bin, [...prefix, '--help'], { cwd, env, encoding: 'utf8', windowsHide: true, timeout: 5000 });
+      if (help.status !== 0 || !/--resume\b/.test(help.stdout) || !/--fork-session\b/.test(help.stdout)) fork = null;
+    }
+    if (fork) {
+      args.push('--resume', fork.id, '--fork-session');
+    } else if (threadId && !String(threadId).startsWith('claude-')) {
       args.push('--resume', String(threadId));
     } else if (ctx.runnerSessionId) {
       args.push('--resume', String(ctx.runnerSessionId));
@@ -151,6 +158,8 @@ export const claudeRunner = {
     let stderr = '';
     let resultText = '';
     let resultIsError = false;
+    let assistantStarted = false;
+    let forkRecorded;
     let msgCounter = 0;
     const toolNames = new Map();
 
@@ -166,8 +175,15 @@ export const claudeRunner = {
     const handleEvent = (ev) => {
       if (!ev || typeof ev !== 'object') return;
       if (typeof ev.session_id === 'string' && ev.session_id.trim()) {
-        journal.setIdentity(ev.session_id.trim());
+        const id = ev.session_id.trim();
+        if (fork && id !== fork.id && journal.record.fork_mode !== 'native') {
+          journal.record.fork_mode = 'native';
+          forkRecorded = ctx.onForkMode?.('native');
+          forkRecorded?.catch(() => {});
+        }
+        if (id !== fork?.id) journal.setIdentity(id);
       }
+      if (ev.type === 'assistant' || ev.type === 'stream_event' || ev.type === 'user') assistantStarted = true;
       if (ev.type === 'stream_event' && ev.event?.type === 'content_block_delta') {
         const delta = ev.event.delta;
         if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
@@ -201,7 +217,7 @@ export const claudeRunner = {
         if (joined) {
           journal.completeMessage(ev.message.id || `claude-msg-${++msgCounter}`, joined);
         }
-        if (ev.message.usage) journal.recordUsage(ev.message.usage);
+        if (ev.message.usage) journal.recordUsage(ev.message.usage, ev.message.id);
         return;
       }
       if (ev.type === 'user' && Array.isArray(ev.message?.content)) {
@@ -238,7 +254,7 @@ export const claudeRunner = {
     });
 
     child.stdin.on('error', () => {});
-    child.stdin.end(String(prompt || ''));
+    child.stdin.end(String(fork?.prompt ?? prompt));
 
     const exitResult = await new Promise((resolveExit, rejectExit) => {
       child.once('error', (err) => {
@@ -250,6 +266,7 @@ export const claudeRunner = {
       clearTimeout(timer);
     });
     await rlClosed;
+    await forkRecorded;
 
     if (isRunInterruptRequested(journal.directory)) {
       journal.finish('interrupted', 'Claude turn interrupted.');
@@ -262,10 +279,17 @@ export const claudeRunner = {
     }
     if (exitResult.code !== 0 || resultIsError) {
       const detail = resultText || stderr.trim() || `Claude exited with code ${exitResult.code ?? exitResult.signal}`;
+      if (fork && !assistantStarted && exitResult.code !== null) {
+        journal.record.fork_mode = 'summary_fallback';
+        await ctx.onForkMode?.('summary_fallback');
+        journal.save(true);
+        return this.runTurn({ ...ctx, nativeFork: null });
+      }
       journal.finish('failed', detail);
       throw new Error(detail);
     }
 
+    if (fork && !journal.getRunnerSessionId()) throw new Error('Claude did not return a new forked session ID.');
     const finalText = journal.getText() || resultText;
     if (!finalText) {
       journal.finish('failed', 'Claude finished without an assistant message.');
@@ -277,6 +301,7 @@ export const claudeRunner = {
     journal.finish('completed');
 
     return {
+      forkMode: journal.record.fork_mode,
       threadId: journal.getThreadId(),
       runnerSessionId: journal.getRunnerSessionId(),
       turnId: journal.getTurnId(),

@@ -8,6 +8,7 @@ import { runLiveOperation } from './live-service.mjs';
 import { ACTIVE_STATES, buildWaitCommand, compactReceiptText, dispatchRun, interruptRun, readRun, replyToolCall, runWithinRoot, steerRun, validateExecTimeoutSec } from './runs.mjs';
 import { lockStaleMsForBudget, resolvePath, validateSessionId, withLock } from './state.mjs';
 import { handleBoardAction, handleSwarmAction } from './swarm-engine.mjs';
+import { boardPostPreview } from './swarm-bus.mjs';
 import { TOOLS } from './tool-schemas.mjs';
 export { TOOLS };
 
@@ -87,10 +88,13 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
     }));
   }
   if (name === 'gpt_board') {
-    return textResult(await handleBoardAction(args, {
+    const board = await handleBoardAction(args, {
       ...options,
       agent: typeof callCtx?.agent === 'string' ? callCtx.agent : undefined,
-    }));
+    });
+    if (board.messages && !args.seqs?.length) board.messages = board.messages.map(boardPostPreview);
+    if (board.message) board.message = boardPostPreview(board.message);
+    return textResult(board);
   }
   if (!['gpt_run', 'gpt_ask'].includes(name)) throw new Error(`Unknown tool: ${name}`);
   const goal = String(args.goal || '').trim();

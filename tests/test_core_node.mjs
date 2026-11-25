@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { serveAppServerSocket } from './app-server-fixture.mjs';
+import { serveAppServerSocket, threadFixture } from './app-server-fixture.mjs';
 import { once } from 'node:events';
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync,
   realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
@@ -19,6 +19,8 @@ import { installAgy, resolveNodeExecutable, stagePluginBundle, syncInPlace, vali
 import { buildTierView, setEffortSettings } from '../core/config.mjs';
 import { assertSafeOutDir } from '../scripts/build-agy-plugin.mjs';
 import { contextPath, readHostContext, updateHostContext } from '../core/host-context.mjs';
+import { handleSwarmAction, handleBoardAction } from '../core/swarm-engine.mjs';
+import { getWorker } from '../core/swarm-bus.mjs';
 import { runLiveOperation } from '../core/live-service.mjs';
 import { handleTool, TOOLS } from '../core/mcp-server.mjs';
 import { buildWaitCommand, dispatchRun, interruptRun, isRecentUnconfirmedRun, listActiveRoster, readRun,
@@ -108,12 +110,18 @@ test('Node hook emits entry banners and one user-only alert per context mileston
     writeFileSync(f.configPath, JSON.stringify({ routing_policy: { work_split: profile } }));
     const payload = { conversationId: profile, workspacePaths: [f.cwd], modelName: 'gemini-4-neon-high' };
     const start = invoke({ ...payload, hookEventName: 'SessionStart' });
+    assert.deepEqual(invoke({ ...payload, hookEventName: 'SessionStart' }), {});
+    if (share) assert.ok(start.injectSteps[0].systemMessage.systemMessage.length < 256);
     if (share) assert.match(start.injectSteps[0].systemMessage.systemMessage, new RegExp(`${share}% GPT, family=neon`));
     else assert.deepEqual(start, {});
     const turn = { ...payload, hookEventName: 'PreInvocation', initialNumSteps: 31, lastUserInput: 'Review this' };
     const entry = invoke({ ...turn, invocationNum: 0 });
-    if (share) assert.ok(entry.injectSteps[0].systemMessage.systemMessage.startsWith(`[GemPT ${share}%] `));
-    else assert.deepEqual(entry, {});
+    assert.deepEqual(entry, {});
+    assert.deepEqual(invoke({ ...turn, invocationNum: 0, lastUserInput: 'A different turn' }), {});
+    if (share === 35) {
+      writeFileSync(f.configPath, JSON.stringify({ routing_policy: { work_split: 'gpt' } }));
+      assert.match(invoke({ ...turn, invocationNum: 2 }).injectSteps[0].systemMessage.systemMessage, /60%/);
+    }
     assert.deepEqual(invoke({ ...turn, invocationNum: 1 }), {});
   }
   assert.equal(readHostContext(f.configPath).conversation_id, 'gpt_first');
@@ -570,10 +578,20 @@ async function appFixture(t, f, controls = {}) {
   const packets = [];
   const turns = new Map();
   const sockets = new Set();
-  let threadCount = 0;
+  const openThread = threadFixture();
   let turnCount = 0;
   const server = createServer((req, res) => {
     res.setHeader('content-type', 'application/json');
+    if (controls.registrations && req.url === '/api/internal/cache-key') {
+      assert.equal(req.headers['x-gempt-ipc-token'], 'registration-token');
+      let data = '';
+      req.on('data', (chunk) => { data += chunk; });
+      req.on('end', () => {
+        controls.registrations.push(JSON.parse(data));
+        res.end('{}');
+      });
+      return;
+    }
     if (req.url === '/v1/models') res.end(JSON.stringify({ data: [{ id: 'codex/gpt-6.2-sol' }] }));
     else if (req.url === '/v1/responses') res.end(JSON.stringify({ model: 'codex/gpt-6.2-sol', output_text: 'Consult answer.' }));
     else { res.statusCode = 404; res.end('{}'); }
@@ -591,11 +609,13 @@ async function appFixture(t, f, controls = {}) {
       const { method, id, params } = packet;
       if (method === 'initialized') return;
       let result = {};
-      if (method === 'thread/start' || method === 'thread/resume') {
-        const sandbox = { 'read-only': 'readOnly', 'workspace-write': 'workspaceWrite', 'danger-full-access': 'dangerFullAccess' };
-        result = { thread: { id: params.threadId || `thread-${++threadCount}` }, cwd: params.cwd,
-          modelProvider: params.modelProvider, sandbox: { type: sandbox[params.sandbox] } };
+      if (['thread/start', 'thread/resume', 'thread/fork'].includes(method)) {
+        if (method === 'thread/fork' && controls.rejectFork) {
+          return send({ id, error: { code: -32601, message: 'Unknown method thread/fork' } });
+        }
+        result = openThread(method, params);
       } else if (method === 'turn/start') {
+        if (controls.registrations) assert.ok(controls.registrations.some((r) => r.threadId === params.threadId));
         const turnId = activeTurn = `turn-${++turnCount}`;
         const threadId = params.threadId;
         const event = (method, params) => send({ method, params: { threadId, turnId, ...params } });
@@ -611,6 +631,7 @@ async function appFixture(t, f, controls = {}) {
           return;
         }
         event('turn/started', { turn: { id: turnId, status: 'inProgress' } });
+        for (const tokenUsage of controls.usage || []) event('thread/tokenUsage/updated', { tokenUsage });
         if (params.input[0].text.includes('Disconnect the turn socket')) {
           socket.end();
           return;
@@ -643,7 +664,11 @@ async function appFixture(t, f, controls = {}) {
     codex: { default_sandbox: 'workspace-write' }, routing_policy: { default_tier: 'sonnet', failover_mode: 'subscription_only' },
     tiers: { sonnet: { consult_model: 'codex/gpt-6.2-sol', exec_model: 'codex/gpt-6.2-sol', reasoning_effort: 'medium' } } }));
   f.env.GEMPT_APP_SERVER_STATE = join(f.root, 'app-server.json');
+  const port = server.address().port;
+  if (controls.registrations) writeFileSync(join(dirname(f.configPath), `page-server-${port}.ipc`),
+    JSON.stringify({ port, token: 'registration-token' }));
   writeFileSync(f.env.GEMPT_APP_SERVER_STATE, JSON.stringify({ status: 'running', ws_url: `ws://${address}`,
+    ...(controls.registrations ? { proxy_port: port } : {}),
     auth_header: 'Authorization', auth_token: 'test-token', gateway_url: gateway }));
   return packets;
 }
@@ -1795,7 +1820,7 @@ test('Coordinator detects Swarm tools without a host flag and inherits the coord
   assert.match(message, /gempt run --cwd "\$PWD" --workspace inherit.*wait_command/);
   assert.deepEqual(entry(1), {});
   policy('gemini');
-  assert.deepEqual(entry(2), {});
+  assert.match(entry(2).injectSteps[0].systemMessage.systemMessage, /0%/);
   policy('gemini', 'gpt_first', { native_swarm: true });
   assert.match(entry(3).injectSteps[0].systemMessage.systemMessage, /\[GemPT 80%\]/);
   assert.match(tool('edit_file', { Path: path }).reason, /Write Gate/);
@@ -1876,4 +1901,70 @@ test('Console API saves nested preferences and supports gateway actions', async 
   assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).magpie.api_key, secret);
   resetSettings({ keep_gateway: false }, f);
   assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).magpie.api_key, '');
+});
+
+test('Codex swarm fork, fallback and warm wake use the right identities, prefixes and turn-local cache usage', async (t) => {
+  const f = fixture(t);
+  const breakdown = (inputTokens) => ({ inputTokens, outputTokens: 0, cachedInputTokens: inputTokens / 2, totalTokens: inputTokens });
+  const controls = { registrations: [], usage: [
+    { total: breakdown(120), last: breakdown(20) },
+    { total: breakdown(150), last: breakdown(30) },
+  ] };
+  const packets = await appFixture(t, f, controls);
+  const swarm_id = 'fork-test';
+  const add = async (name, fork) => {
+    const { workers: [worker] } = await handleSwarmAction({ action: 'add', swarm_id, name, cwd: f.cwd,
+      brief: name === 'alpha' ? 'Original private assignment' : 'Shared assignment', cli: 'codex', fork }, f);
+    const run = await waitForRun(worker.run_id, { ...f, timeoutSec: 10 });
+    assert.equal(run.state, 'finished', run.error);
+    await until(async () => (await getWorker(swarm_id, name, f)).state === 'waiting');
+    return run;
+  };
+  const lastPrompt = () => packets.filter((p) => p.method === 'turn/start').at(-1).params.input[0].text;
+  const parent = await add('alpha');
+  assert.equal(parent.result.usage.input_tokens, 150);
+  const child = await add('bravo', 'alpha');
+  assert.equal(packets.find((p) => p.method === 'thread/fork').params.threadId, parent.codex_thread_id);
+  assert.notEqual(child.codex_thread_id, parent.codex_thread_id);
+  assert.equal(child.fork_mode, 'native');
+  assert.equal((await getWorker(swarm_id, 'bravo', f)).fork_mode, 'native');
+  assert.match(lastPrompt(), /@alpha's context[\s\S]*Shared assignment[\s\S]*Worker identity: @bravo/);
+  assert.doesNotMatch(lastPrompt(), /Original private assignment|Required Report/);
+  assert.equal(child.result.usage.input_tokens, 50);
+  assert.equal(child.result.usage.cache_hit_ratio, .5);
+  const wake = await handleBoardAction({ action: 'post', swarm_id, text: '@bravo check the final diff' }, f);
+  const resumed = await waitForRun(wake.deliveries[0].run_id, { ...f, timeoutSec: 10 });
+  assert.equal(resumed.codex_thread_id, child.codex_thread_id);
+  assert.match(lastPrompt(), /^\[Board #\d+ from @coordinator[\s\S]*board_post/);
+  assert.doesNotMatch(lastPrompt(), /## Goal|Required Report/);
+  controls.rejectFork = true;
+  const fallback = await add('charlie', 'alpha');
+  assert.deepEqual(controls.registrations.map(({ threadId, parentThreadId, swarmId, model }) =>
+    [threadId, parentThreadId, swarmId, model]), [
+    [parent.codex_thread_id, null, swarm_id, parent.model],
+    [child.codex_thread_id, parent.codex_thread_id, swarm_id, child.model],
+    [fallback.codex_thread_id, null, swarm_id, fallback.model],
+  ]);
+  assert.equal(fallback.fork_mode, 'summary_fallback');
+  assert.match(lastPrompt(), /Original private assignment/);
+  assert.doesNotMatch(lastPrompt(), /@alpha's context/);
+  const instructions = packets.filter((p) => /^thread\/(start|resume|fork)$/.test(p.method)).map((p) => p.params.developerInstructions);
+  assert.equal(new Set(instructions).size, 1);
+  assert.doesNotMatch(instructions[0], /fork-test|alpha|bravo/);
+});
+
+test('switching a swarm worker from Claude to Codex carries its last result into a fresh thread', async (t) => {
+  const f = fixture(t);
+  const packets = await appFixture(t, f);
+  mkdirSync(f.sessionsDir, { recursive: true });
+  const session_id = 'exec-previous-claude';
+  writeFileSync(join(f.sessionsDir, session_id + '.json'), JSON.stringify({
+    session_id, mode: 'exec', cli: 'claude', cwd: f.cwd, sandbox: 'workspace-write', codex_thread_id: 'claude-native',
+    turns: [{ role: 'user', content: 'Trace startup' }, { role: 'assistant', content: 'The issue is in initialization' }],
+  }));
+  const run = await dispatchRun({ cli: 'codex', model: 'codex/gpt-6.2-sol', cwd: f.cwd, session_id,
+    swarm_id: 'switch-test', swarm_agent: 'alpha', goal: '[Board #11 from @coordinator] Continue' }, f);
+  assert.equal(run.state, 'finished');
+  assert.ok(packets.some((p) => p.method === 'thread/start'));
+  assert.match(packets.find((p) => p.method === 'turn/start').params.input[0].text, /Carryover[\s\S]*The issue is in initialization/);
 });

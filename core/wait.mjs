@@ -4,7 +4,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { ACTIVE_STATES, compactReceiptText, readRun, waitForRuns } from './runs.mjs';
-import { detectSystemAttention, getBoardHead, listChannels, listRoster, mentionMatchesAgent, openSwarmDb, readBoardMessages } from './swarm-bus.mjs';
+import { boardPostPreview, detectSystemAttention, getBoardHead, listChannels, listRoster, mentionMatchesAgent, openSwarmDb, readBoardMessages } from './swarm-bus.mjs';
 
 import { ALL, activeAt, countsUnread, mentionsIn } from './swarm-channels.mjs';
 
@@ -97,7 +97,7 @@ export async function waitForBoard(swarmId, {
         return {
           swarm_id: swarmId,
           head: previousHead,
-          messages: allMessages ? messages : (matching.length ? matching : messages),
+          messages: (allMessages || !matching.length ? messages : matching).map(boardPostPreview),
           roster: compactRoster(roster), system_attention,
         };
       }

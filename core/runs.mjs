@@ -406,7 +406,7 @@ export function listActiveRoster({ limit = 20, root, hostConversationId, session
 
 export async function dispatchRun(args, {
   env = process.env, configPath = args.config_path, sessionsDir, magpieConfigDir, agent,
-  probeTimeoutMs, waitSec = args.wait_sec, legacyNative = false,
+  probeTimeoutMs, waitSec = args.wait_sec, legacyNative = false, swarmFork, swarmWake,
 } = {}) {
   if (typeof args.goal !== 'string' || !args.goal.trim()) throw new Error('goal is required and must be a non-empty string.');
   const workspace = args.workspace || 'inherit';
@@ -484,6 +484,7 @@ export async function dispatchRun(args, {
         verification: args.verification, execution_timeout_sec: executionTimeout, deadline: now() + executionTimeout,
         ...(args.swarm_id ? { swarm_id: String(args.swarm_id) } : {}),
         ...(args.swarm_agent ? { swarm_agent: String(args.swarm_agent) } : {}),
+        ...(swarmFork ? { fork_mode: 'summary_fallback' } : {}),
         ...(args.cli ? { cli: String(args.cli) } : {}),
         ...(args.model ? { model: String(args.model) } : {}),
       };
@@ -494,7 +495,7 @@ export async function dispatchRun(args, {
     throw error;
   }
   const host = { configPath: config, sessionsDir: sessions, magpieConfigDir, options: { exec: true },
-    probeTimeoutMs, allowSandboxUpgrade: !legacyNative, worktreePath, sourceCwd,
+    probeTimeoutMs, swarmFork, swarmWake, allowSandboxUpgrade: !legacyNative, worktreePath, sourceCwd,
     ...(args.swarm_id ? { swarmId: String(args.swarm_id) } : {}),
     ...(args.swarm_agent ? { swarmAgent: String(args.swarm_agent) } : {}) };
   const request = { ...args, cwd, session_id: args.session_id ? sessionId : undefined,

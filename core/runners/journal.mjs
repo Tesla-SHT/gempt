@@ -1,3 +1,4 @@
+import { cacheHitRatio, normalizeUsage } from '../token-usage.mjs';
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -216,26 +217,21 @@ export function createRunJournal({
     save(true);
   };
 
-  const recordUsage = (raw) => {
+  const messageUsage = new Map();
+  const recordUsage = (raw, messageId) => {
     if (!raw || typeof raw !== 'object') return;
-    const input = Number(raw.input_tokens ?? raw.inputTokens ?? raw.prompt_tokens ?? raw.promptTokenCount);
-    const output = Number(raw.output_tokens ?? raw.outputTokens ?? raw.completion_tokens ?? raw.candidatesTokenCount);
-    const cached = Number(
-      raw.cached_input_tokens ?? raw.cache_read_input_tokens ?? raw.cachedInputTokens ?? raw.cachedContentTokenCount,
-    );
-    const reasoning = Number(raw.reasoning_tokens ?? raw.reasoningOutputTokens ?? raw.thoughtsTokenCount);
-    const total = Number(raw.total_tokens ?? raw.totalTokens ?? raw.totalTokenCount);
-    const normalized = {
-      ...(Number.isFinite(input) && input >= 0 ? { input_tokens: Math.trunc(input) } : {}),
-      ...(Number.isFinite(output) && output >= 0 ? { output_tokens: Math.trunc(output) } : {}),
-      ...(Number.isFinite(cached) && cached >= 0 ? { cached_input_tokens: Math.trunc(cached) } : {}),
-      ...(Number.isFinite(reasoning) && reasoning >= 0 ? { reasoning_tokens: Math.trunc(reasoning) } : {}),
-      ...(Number.isFinite(total) && total >= 0
-        ? { total_tokens: Math.trunc(total) }
-        : (Number.isFinite(input) && Number.isFinite(output) ? { total_tokens: Math.trunc(input + output) } : {})),
-    };
+    const normalized = normalizeUsage(raw);
     if (!Object.keys(normalized).length) return;
-    usage = { ...usage, ...normalized };
+    if (messageId) {
+      messageUsage.set(messageId, normalized);
+      usage = {};
+      for (const tokens of messageUsage.values()) {
+        for (const [key, count] of Object.entries(tokens)) usage[key] = (usage[key] ?? 0) + count;
+      }
+    } else {
+      usage = { ...usage, ...normalized };
+    }
+    usage.cache_hit_ratio = cacheHitRatio(usage);
     progress.token_usage = usage;
     emit('thread/tokenUsage/updated', {
       tokenUsage: {
@@ -243,6 +239,7 @@ export function createRunJournal({
           inputTokens: usage.input_tokens,
           outputTokens: usage.output_tokens,
           cachedInputTokens: usage.cached_input_tokens,
+          cacheWriteInputTokens: usage.cache_write_tokens,
           totalTokens: usage.total_tokens,
           reasoningOutputTokens: usage.reasoning_tokens,
         },
