@@ -4,7 +4,7 @@ import { resolvePath } from '../core/state.mjs';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { createHash } from 'node:crypto';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { execFile } from 'node:child_process';
 import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -67,12 +67,13 @@ test('resident Codex proxy authenticates IPC and bearer separately and streams m
   writeFileSync(configPath, JSON.stringify({ codex: { cli_path: process.execPath },
     magpie: { base_url: 'http://127.0.0.1:' + gateway.address().port, api_key: 'upstream-test' } }));
   let bearer;
+  const appChild = Object.assign(new EventEmitter(), { pid: process.pid, stderr: new EventEmitter() });
   const svc = await startServer({ port: 0, configPath, sessionsDir: join(root, 'sessions'), manageAppServer: true,
     appServerOptions: { env: { ...process.env, GEMPT_APP_SERVER_STATE: join(root, 'state.json') },
       connect: async () => ({ close() {} }), terminateProcess() {},
       spawnProcess(_bin, _args, opts) {
         bearer = opts.env.GEMPT_APP_SERVER_GATEWAY_TOKEN;
-        return { pid: process.pid };
+        return appChild;
       } } });
   t.after(async () => {
     finishStream?.();
@@ -143,7 +144,121 @@ test('resident Codex proxy authenticates IPC and bearer separately and streams m
   assert.equal(Buffer.from((await brokenReader.read()).value).toString(), 'data: first\n\n');
   finishStream();
   await assert.rejects(brokenReader.read());
+  appChild.stderr.emit('data', 'credentials: ' + bearer + ' upstream-test');
+  appChild.emit('exit', 1);
+  assert.equal(svc.appServer.getStatus().error, 'Codex app-server exited (1): credentials: [redacted] [redacted]');
+  assert.equal(JSON.parse(readFileSync(join(root, 'state.json'))).error, svc.appServer.getStatus().error);
 });
+
+for (const active of [false, true]) {
+  const scenario = active ? 'preserves an active run across a gateway key change' : 'adopts a healthy matching instance';
+  test('same-port proxy reload ' + scenario, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'gempt-reload-'));
+    const configPath = join(dir, 'config.json');
+    const sessionsDir = join(dir, 'sessions');
+    const statePath = join(dir, 'app-server.json');
+    const seen = [];
+    const upstream = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* Drain the proxy request. */ }
+      seen.push({ path: req.url, authorization: req.headers.authorization });
+      res.end('upstream ready');
+    });
+    let page;
+    let host;
+    t.after(async () => {
+      await host?.terminate();
+      await page?.close();
+      await new Promise((done) => upstream.close(done));
+      rmSync(dir, { recursive: true, force: true });
+    });
+    await new Promise((ready) => upstream.listen(0, '127.0.0.1', ready));
+    const configure = (key) => writeFileSync(configPath, JSON.stringify({ codex: { cli_path: process.execPath },
+      magpie: { base_url: 'http://127.0.0.1:' + upstream.address().port, api_key: key } }));
+    configure('initial-key');
+    if (active) {
+      const run_id = 'a'.repeat(32);
+      const runDir = join(sessionsDir, 'runs', run_id);
+      mkdirSync(runDir, { recursive: true });
+      writeFileSync(join(runDir, 'state.json'), JSON.stringify({ run_id, state: 'running', pid: process.pid, cwd: dir }));
+    }
+    // Exiting a separate host exercises the manager's reload hook. Explicit close() is a service shutdown.
+    const hostSource = `
+      import { parentPort, workerData } from 'node:worker_threads';
+      import { startServer } from ${JSON.stringify(new URL('../magpie_plugin/lib/server.mjs', import.meta.url).href)};
+      const { active, configPath, sessionsDir, statePath } = workerData;
+      let childConfig;
+      const page = await startServer({ port: 0, configPath, sessionsDir, manageAppServer: true,
+        appServerOptions: { env: { ...process.env, GEMPT_APP_SERVER_STATE: statePath },
+          connect: async () => ({ close() {} }),
+          spawnProcess(bin, args, opts) {
+            const prefix = 'model_providers.gempt_gateway.base_url=';
+            childConfig = { token: opts.env.GEMPT_APP_SERVER_GATEWAY_TOKEN,
+              base: JSON.parse(args.find(arg => arg.startsWith(prefix)).slice(prefix.length)) };
+            return { pid: process.pid, detachedOutOfJob: !active };
+          }, terminateProcess() { throw new Error('unexpected termination'); } } });
+      const status = await page.appServer.ensureRunning();
+      parentPort.postMessage({ ...childConfig, port: page.port, status });
+      process.exit(0);
+    `;
+    host = new Worker(new URL('data:text/javascript,' + encodeURIComponent(hostSource)), {
+      workerData: { active, configPath, sessionsDir, statePath },
+    });
+    const [[initial], [exitCode]] = await Promise.all([once(host, 'message'), once(host, 'exit')]);
+    assert.equal(exitCode, 0);
+    assert.equal(initial.status.running, true);
+    assert.equal(initial.base, 'http://127.0.0.1:' + initial.port + '/v1/codex-proxy');
+    const token = initial.token;
+    assert.match(token, /^[A-Za-z0-9_-]{32,128}$/);
+    assert.equal(readFileSync(join(dir, 'codex-proxy.token'), 'utf8').trim(), token);
+    const state = () => JSON.parse(readFileSync(statePath));
+    const before = state();
+    assert.equal(before.pid, initial.status.pid);
+    assert.ok(before.config_hash);
+    assert.equal(JSON.stringify(before).includes(token), false);
+    const gatewayKey = active ? 'rotated-key' : 'initial-key';
+    configure(gatewayKey);
+    const post = (bearer) => fetch(initial.base + '/responses', { method: 'POST', body: '{}',
+      headers: bearer ? { authorization: 'Bearer ' + bearer } : {}, signal: AbortSignal.timeout(5000) });
+    const opts = { port: initial.port, configPath, sessionsDir };
+    // A host serving only HTTP must know the upstream before any manager callback.
+    page = await startServer({ ...opts, manageAppServer: false });
+    assert.equal((await post(token)).status, 200);
+    await page.close();
+    let spawns = 0;
+    let probes = 0;
+    page = await startServer({ ...opts, manageAppServer: true, appServerOptions: {
+      env: { ...process.env, GEMPT_APP_SERVER_STATE: statePath }, healthIntervalMs: 0,
+      connect: async (target) => { assert.equal(target.instance_id, before.instance_id); probes++; return { close() {} }; },
+      spawnProcess() { spawns++; throw new Error('unexpected replacement'); }, terminateProcess() {},
+    } });
+    const status = await page.appServer.ensureRunning();
+    assert.equal(status.running, true);
+    assert.equal(status.pid, before.pid);
+    assert.ok(probes > 0);
+    assert.equal(spawns, 0);
+    assert.equal(state().instance_id, before.instance_id);
+    assert.equal(state().config_hash, before.config_hash);
+    assert.equal(state().pid, before.pid);
+    for (const bearer of [null, 'wrong-token']) {
+      const denied = await post(bearer);
+      assert.equal(denied.status, 401);
+      assert.deepEqual(await denied.json(), { error: 'invalid proxy token' });
+    }
+    const ok = await post(token);
+    assert.equal(ok.status, 200);
+    assert.equal(await ok.text(), 'upstream ready');
+    const expected = { path: '/v1/responses', authorization: 'Bearer ' + gatewayKey };
+    assert.deepEqual(seen.filter((r) => r.path === expected.path), [expected, expected]);
+    const { text: html } = await rawHttpGet({ port: page.port, path: '/' });
+    const headers = { 'x-gempt-key': html.match(/name="gempt-key" content="([^"]+)"/)[1] };
+    for (const path of ['/api/overview', '/api/summary']) {
+      const response = await rawHttpGet({ port: page.port, path, headers });
+      assert.equal(response.status, 200);
+      assert.equal(response.text.includes(token), false);
+    }
+    assert.equal(JSON.stringify([status, state()]).includes(token), false);
+  });
+}
 
 test('short titles prefer the explicit value and clean historical goals', () => {
   for (const [title, goal, cwd, expected] of [

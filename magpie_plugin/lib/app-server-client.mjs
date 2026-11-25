@@ -5,6 +5,7 @@ import { openAppServerSocket } from './app-server-socket.mjs';
 
 export const UNAVAILABLE = '未检测到 Magpie 插件托管的共享 codex app-server（请先启动 Magpie 并确认 GemPT 插件已启用）。';
 export const PROVIDER = 'gempt_gateway';
+export const TERMINAL_INTERRUPT_ERR = /not found|no active|already (?:completed|finished|interrupted|stopped|ended)|unknown turn|invalid turn/i;
 export const SANDBOX_TYPES = { 'read-only': 'readOnly', 'workspace-write': 'workspaceWrite', 'danger-full-access': 'dangerFullAccess' };
 export const DEVELOPER_INSTRUCTIONS = 'Use ask_gemini for visual checks, clarifications, decisions, or blockers that require the coordinating Gemini. Provide a specific question and include the relevant context and local media paths when appropriate.';
 export const SWARM_DEVELOPER_INSTRUCTIONS = 'You are a worker on a shared GemPT Swarm message board. Use board_post to coordinate with peers (@peer-name) and report final results (@coordinator [done] ...), board_read to read board messages, and board_roster to inspect teammates.';
@@ -102,7 +103,7 @@ export async function connectAppServer(state, onEvent = () => {}, { timeoutMs = 
       }
       const request = pending.get(message.id);
       if (request) {
-        if (message.error) request.reject(new Error(message.error.message));
+        if (message.error) request.reject(Object.assign(new Error(message.error.message), { rpcError: true }));
         else request.resolve(message.result);
       }
     } catch (err) {

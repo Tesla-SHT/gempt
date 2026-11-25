@@ -8,6 +8,7 @@ import { GEMPT_VERSION } from './config.mjs';
 import { readHostContext } from './host-context.mjs';
 import { ACTIVE_STATES, interruptRun, readRun, replyToolCall, runDirectory, stateEntries, steerRun } from './runs.mjs';
 import { resolvePath, withinPath } from './state.mjs';
+import { recordInWorkspace, workspaceFileRoots } from './worktrees.mjs';
 
 const TEXT_BYTES = 96 * 1024;
 const GOAL_BYTES = 16 * 1024;
@@ -107,17 +108,10 @@ function workspaceScope({ root, workspaceRoots }) {
   return (workspaceRoots ?? (root ? [root] : null))?.map((path) => resolvePath(path)) ?? null;
 }
 
-function inWorkspace(cwd, roots) {
-  if (typeof cwd !== 'string' || !isAbsolute(cwd)) return false;
-  if (!roots) return true;
-  const path = resolvePath(cwd);
-  return roots.some((root) => withinPath(path, root));
-}
-
 function workspaceRun(id, options) {
   const record = readRun(id, options.sessionsDir);
   const roots = workspaceScope(options);
-  if (!inWorkspace(record.cwd, roots) && !inWorkspace(record.source_cwd, roots)) {
+  if (!recordInWorkspace(record, roots)) {
     throw Object.assign(new Error('Run outside host workspace'), { status: 403 });
   }
   return record;
@@ -133,13 +127,10 @@ function listRuns(args, { root, workspaceRoots, conversationId, configPath, sess
   const workspace = bound && bound === active ? workspaceName(roots?.[0] ?? array(context.workspace_paths)[0]) : '';
   let sessionCount = 0;
   const items = [];
-  const workspaces = new Map();
   for (const { id, stat } of stateEntries(sessionsDir)) {
     try {
       const record = readRun(id, sessionsDir, { stat, readonly: true });
-      const cwd = record.source_cwd || record.cwd;
-      if (!workspaces.has(cwd)) workspaces.set(cwd, inWorkspace(cwd, roots));
-      if (!workspaces.get(cwd)) continue;
+      if (!recordInWorkspace(record, roots)) continue;
       const matches = Boolean(bound && record.host_conversation_id === bound);
       if (matches) sessionCount++;
       if ((!args.session_id || record.session_id === args.session_id) && (scope === 'all' || matches)) items.push(record);
@@ -165,7 +156,7 @@ function listRuns(args, { root, workspaceRoots, conversationId, configPath, sess
     ...(args.include_consults ? {
       consult_sessions: listConsultSessions(sessionsDir, {
         limit: Math.min(limit, 50),
-        matches: (record) => (!roots || inWorkspace(record.cwd, roots))
+        matches: (record) => (!roots || recordInWorkspace(record, roots))
           && (scope === 'all' || Boolean(bound && record.host_conversation_id === bound)),
       }),
     } : {}),
@@ -413,15 +404,7 @@ function stream(record, args, options) {
   const files = journal.files.size ? [...journal.files] : array(progress.touched_files).filter((file) => typeof file === 'string');
   const touched = withinBudget([...files].reverse(), 8 * 1024).reverse();
   const cwd = typeof record.cwd === 'string' && isAbsolute(record.cwd) ? resolvePath(record.cwd) : null;
-  const allowedRoots = [];
-  if (roots) {
-    allowedRoots.push(...roots);
-    if (typeof record.worktree_path === 'string' && isAbsolute(record.worktree_path) && inWorkspace(record.source_cwd, roots)) {
-      allowedRoots.push(resolvePath(record.worktree_path));
-    }
-  } else if (cwd) {
-    allowedRoots.push(cwd);
-  }
+  const allowedRoots = workspaceFileRoots(record, roots);
   const candidateFiles = [];
   const seenFiles = new Set();
   const addCandidate = (file) => {
@@ -469,7 +452,7 @@ export async function runLiveOperation(operation, args, options) {
       try { record = readRun(args.run_id, options.sessionsDir); } catch (error) {
         if (error.status !== 404) throw error;
       }
-      if (record && (!inWorkspace(record.source_cwd || record.cwd, workspaceScope(options)) ||
+      if (record && (!recordInWorkspace(record, workspaceScope(options)) ||
           (data.scope === 'session' && (!data.bound_conversation_id ||
            record.host_conversation_id !== data.bound_conversation_id)))) record = null;
     }

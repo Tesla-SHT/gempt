@@ -6,6 +6,7 @@ import { readHostContext } from './host-context.mjs';
 import { checkArgs } from './live-service.mjs';
 import { interruptRun } from './runs.mjs';
 import { resolvePath, withinPath } from './state.mjs';
+import { recordInWorkspace, workspaceFileRoots } from './worktrees.mjs';
 import {
   getBoardHead, getSwarmOverview, getWorker, listRoster, listSwarms, openSwarmDb,
   readBoardMessages, resolveSwarmDbPath, updateWorker, validateSwarmId, validateWorkerName,
@@ -81,17 +82,9 @@ function workspaceScope({ root, workspaceRoots } = {}) {
   return (workspaceRoots ?? (root ? [root] : null))?.map((p) => resolvePath(p)) ?? null;
 }
 
-function inWorkspace(cwd, roots) {
-  if (!roots) return true;
-  if (typeof cwd !== 'string' || !isAbsolute(cwd)) return false;
-  const resolved = resolvePath(cwd);
-  return roots.some((root) => withinPath(resolved, root));
-}
-
 function swarmInScope(swarm, roots) {
-  if (!roots) return true;
-  if (!swarm?.cwd) return true;
-  return inWorkspace(swarm.cwd, roots);
+  if (!roots || typeof swarm.cwd !== 'string' || !swarm.cwd.trim()) return true;
+  return recordInWorkspace(swarm, roots);
 }
 
 export function countRosterStates(roster) {
@@ -153,18 +146,14 @@ function collectScreenshots(db, swarm, roster, roots) {
   );
   if (!rows.length) return [];
   const cwd = typeof swarm.cwd === 'string' && isAbsolute(swarm.cwd) ? resolvePath(swarm.cwd) : null;
-  const allowedRoots = [];
-  if (roots) {
-    allowedRoots.push(...roots);
-    for (const worker of roster || []) {
-      if (typeof worker.worktree_path === 'string' && isAbsolute(worker.worktree_path)
-          && inWorkspace(worker.source_cwd || swarm.cwd, roots)) {
-        allowedRoots.push(resolvePath(worker.worktree_path));
-      }
-    }
-  } else if (cwd) {
-    allowedRoots.push(cwd);
-  }
+  const allowedRoots = [...new Set([
+    ...workspaceFileRoots(swarm, roots),
+    ...roster.flatMap((worker) => workspaceFileRoots({
+      cwd: worker.worktree_path || worker.cwd,
+      worktree_path: worker.worktree_path,
+      source_cwd: worker.source_cwd || swarm.cwd,
+    }, roots)),
+  ])];
   const out = [];
   for (const row of rows) {
     let entries = [];

@@ -21,14 +21,14 @@ import { assertSafeOutDir } from '../scripts/build-agy-plugin.mjs';
 import { contextPath, readHostContext, updateHostContext } from '../core/host-context.mjs';
 import { handleSwarmAction, handleBoardAction } from '../core/swarm-engine.mjs';
 import { getWorker } from '../core/swarm-bus.mjs';
-import { runLiveOperation } from '../core/live-service.mjs';
+import { runLiveOperation, workspaceRun } from '../core/live-service.mjs';
 import { handleTool, TOOLS } from '../core/mcp-server.mjs';
 import { buildWaitCommand, dispatchRun, interruptRun, isRecentUnconfirmedRun, listActiveRoster, readRun,
-  reconcileRunState, replyToolCall, runDirectory, saveRun, steerRun, waitForRun, waitForRuns } from '../core/runs.mjs';
+  reconcileRunState, replyToolCall, runDirectory, runWithinRoot, saveRun, steerRun, waitForRun, waitForRuns } from '../core/runs.mjs';
 import { DEFAULT_LOCK_STALE_MS, isValidSessionId, lockStaleMsForBudget, validateSessionId, withLock } from '../core/state.mjs';
 import { linkTarget, listArguments, streamRenderKey, timelineMessages } from '../mcp_app/live-state.js';
 import { assertShareWorktree, ensureShareWorktree, pruneShareWorktrees,
-  removeShareWorktree, worktreesRoot } from '../core/worktrees.mjs';
+  removeShareWorktree, resolveExternalWorktreeSourceCwd, workspaceFileRoots, worktreesRoot } from '../core/worktrees.mjs';
 import { createAppServerManager } from '../magpie_plugin/lib/app-server-manager.mjs';
 import { probeGatewaySettings, readOverview, readRoutingSummary, readState, resetSettings, updateSettings } from '../magpie_plugin/lib/backend.mjs';
 import { dispatchPageApi } from '../magpie_plugin/lib/page-api.mjs';
@@ -597,13 +597,14 @@ async function appFixture(t, f, controls = {}) {
     else { res.statusCode = 404; res.end('{}'); }
   });
   server.on('upgrade', (req, socket) => {
-    if (req.headers.authorization !== 'Bearer test-token') {
+    if (req.headers.authorization !== `Bearer ${controls.token || 'test-token'}`) {
       socket.end('HTTP/1.1 401 Unauthorized\r\n\r\n');
       return;
     }
     sockets.add(socket);
     socket.on('close', () => sockets.delete(socket));
     let activeTurn;
+    socket.on('error', (err) => { if (err.code !== 'ECONNRESET') throw err; });
     serveAppServerSocket(req, socket, (packet, send) => {
       packets.push(packet);
       const { method, id, params } = packet;
@@ -615,6 +616,10 @@ async function appFixture(t, f, controls = {}) {
         }
         result = openThread(method, params);
       } else if (method === 'turn/start') {
+        if (controls.rejectStart) {
+          controls.beforeReject?.();
+          return send({ id, error: { code: -32602, message: 'Rejected turn/start' } });
+        }
         if (controls.registrations) assert.ok(controls.registrations.some((r) => r.threadId === params.threadId));
         const turnId = activeTurn = `turn-${++turnCount}`;
         const threadId = params.threadId;
@@ -631,8 +636,12 @@ async function appFixture(t, f, controls = {}) {
           return;
         }
         event('turn/started', { turn: { id: turnId, status: 'inProgress' } });
+        if (controls.changedFile) event('item/completed', { item: {
+          type: 'fileChange', id: 'edit', changes: [{ path: controls.changedFile }],
+        } });
         for (const tokenUsage of controls.usage || []) event('thread/tokenUsage/updated', { tokenUsage });
         if (params.input[0].text.includes('Disconnect the turn socket')) {
+          controls.beforeDisconnect?.();
           socket.end();
           return;
         }
@@ -643,6 +652,7 @@ async function appFixture(t, f, controls = {}) {
         } else if (!params.input[0].text.includes('Hold this turn')) turns.get(turnId)('completed');
         return;
       } else if (method === 'turn/interrupt') {
+        if (controls.interruptError) return send({ id, error: { code: -32000, message: controls.interruptError } });
         turns.get(params.turnId)?.('interrupted');
       } else if (id === 'ask-rpc') {
         turns.get(activeTurn)?.('completed');
@@ -669,7 +679,7 @@ async function appFixture(t, f, controls = {}) {
     JSON.stringify({ port, token: 'registration-token' }));
   writeFileSync(f.env.GEMPT_APP_SERVER_STATE, JSON.stringify({ status: 'running', ws_url: `ws://${address}`,
     ...(controls.registrations ? { proxy_port: port } : {}),
-    auth_header: 'Authorization', auth_token: 'test-token', gateway_url: gateway }));
+    auth_header: 'Authorization', auth_token: controls.token || 'test-token', gateway_url: gateway }));
   return packets;
 }
 
@@ -884,6 +894,97 @@ test('shared worktree entry points reject inspect and cleanup protects foreign a
   assert.equal(assertShareWorktree(otherRepo, foreign, f.env), foreign);
 });
 
+test('external linked worktrees map nested paths and require matching Git metadata', (t) => {
+  const f = fixture(t);
+  const mainSubdir = initRepo(f.cwd);
+  const tree = join(f.root, 'linked');
+  git(f.cwd, 'worktree', 'add', '--detach', tree);
+  const branchOnly = join(tree, 'branch-only');
+  mkdirSync(branchOnly);
+  assert.equal(resolveExternalWorktreeSourceCwd(f.cwd), null);
+  assert.equal(resolveExternalWorktreeSourceCwd(tree), f.cwd);
+  assert.equal(resolveExternalWorktreeSourceCwd(join(tree, 'project')), mainSubdir);
+  assert.equal(existsSync(join(f.cwd, 'branch-only')), false);
+  assert.equal(resolveExternalWorktreeSourceCwd(branchOnly), join(f.cwd, 'branch-only'));
+  assert.equal(resolveExternalWorktreeSourceCwd(join(tree, 'missing')), null);
+
+  const copied = join(f.root, 'copied');
+  mkdirSync(copied);
+  copyFileSync(join(tree, '.git'), join(copied, '.git'));
+  assert.equal(resolveExternalWorktreeSourceCwd(copied), null);
+  const childRepo = join(f.root, 'child');
+  mkdirSync(childRepo);
+  initRepo(childRepo);
+  git(f.cwd, '-c', 'protocol.file.allow=always', 'submodule', 'add', childRepo, 'submodule');
+  assert.equal(resolveExternalWorktreeSourceCwd(join(f.cwd, 'submodule')), null);
+  const bare = join(f.root, 'bare.git');
+  git(f.root, 'clone', '--bare', childRepo, bare);
+  const bareTree = join(f.root, 'bare-linked');
+  git(bare, 'worktree', 'add', '--detach', bareTree);
+  assert.equal(resolveExternalWorktreeSourceCwd(bareTree), null);
+
+  const roots = [f.cwd];
+  assert.deepEqual(workspaceFileRoots({ cwd: f.cwd, source_cwd: copied }, roots), roots);
+  assert.deepEqual(workspaceFileRoots({ cwd: copied, source_cwd: f.cwd }, roots), roots);
+  const share = { cwd: copied, source_cwd: f.cwd, worktree_path: copied };
+  assert.deepEqual(workspaceFileRoots(share, roots), roots);
+  assert.deepEqual(workspaceFileRoots({ ...share, worktree_path: tree }, roots), [...roots, tree]);
+  const managed = join(worktreesRoot(), basename(f.root));
+  assert.deepEqual(workspaceFileRoots({ ...share, worktree_path: managed }, roots), [...roots, managed]);
+  assert.deepEqual(workspaceFileRoots({ ...share, worktree_path: managed, source_cwd: childRepo }, roots), roots);
+});
+
+test('external linked worktree runs retain workspace visibility while file links require a current backlink', async (t) => {
+  const f = fixture(t);
+  initRepo(f.cwd);
+  const tree = join(f.root, 'linked');
+  git(f.cwd, 'worktree', 'add', '--detach', tree);
+  const changedFile = 'project/readme.txt';
+  await appFixture(t, f, { changedFile });
+  f.env.GEMPT_WORKSPACE_ROOT = tree;
+  const run = await dispatchRun({ goal: 'Request a cross-check', cwd: tree, workspace: 'inherit', background: true }, f);
+  await until(() => readRun(run.run_id, f.sessionsDir).state === 'waiting_gemini');
+  const disk = JSON.parse(readFileSync(join(runDirectory(run.run_id, f.sessionsDir), 'state.json')));
+  assert.equal(disk.source_cwd, f.cwd);
+  assert.equal(disk.worktree_path, null);
+  assert.equal(disk.cwd, tree);
+  const legacyId = 'a'.repeat(32);
+  state(f, legacyId, { pid: process.pid, cwd: tree, source_cwd: null, progress: { touched_files: [changedFile] } });
+  const ids = [run.run_id, legacyId].sort();
+  const scoped = { ...f, workspaceRoots: [f.cwd] };
+  const unrelated = { ...f, workspaceRoots: [join(f.root, 'other')] };
+  const listed = await runLiveOperation('runs', { scope: 'all' }, scoped);
+  assert.deepEqual(listed.runs.map((r) => r.run_id).sort(), ids);
+  assert.ok(listed.runs.every((r) => r.workspace_name === basename(f.cwd)));
+  assert.deepEqual(listActiveRoster({ ...f, root: f.cwd }).map((r) => r.run_id).sort(), ids);
+  assert.deepEqual(listActiveRoster({ ...f, root: unrelated.workspaceRoots[0] }), []);
+  assert.deepEqual((await runLiveOperation('runs', { scope: 'all' }, unrelated)).runs, []);
+  for (const run_id of ids) {
+    const record = workspaceRun(run_id, scoped);
+    assert.ok(runWithinRoot(record, f.cwd));
+    assert.equal(runWithinRoot(record, unrelated.workspaceRoots[0]), false);
+    assert.throws(() => workspaceRun(run_id, unrelated), { status: 403 });
+    const opened = await runLiveOperation('open', { run_id, scope: 'all' }, scoped);
+    assert.equal(opened.run_id, run_id);
+    const streamed = await runLiveOperation('stream', { run_id }, scoped);
+    assert.equal(streamed.file_uris[changedFile], pathToFileURL(join(tree, changedFile)).href);
+  }
+  replyToolCall(run.run_id, 'ask_1', 'Confirmed.', f);
+  await until(() => readRun(run.run_id, f.sessionsDir).state === 'finished');
+  assert.deepEqual(pruneShareWorktrees(f.cwd, { env: f.env, maxAgeMs: 0 }), { removed: [], kept: [] });
+  assert.equal(resolveExternalWorktreeSourceCwd(tree), f.cwd);
+  const moved = join(f.root, 'moved');
+  git(f.cwd, 'worktree', 'move', tree, moved);
+  mkdirSync(join(tree, 'project'), { recursive: true });
+  writeFileSync(join(tree, changedFile), 'replacement');
+  copyFileSync(join(moved, '.git'), join(tree, '.git'));
+  for (const run_id of ids) {
+    const stream = await runLiveOperation('stream', { run_id }, scoped);
+    assert.equal(stream.file_uris[changedFile], undefined);
+    assert.equal(stream.restricted_files[changedFile], 'outside_workspace');
+  }
+});
+
 test('background dispatch reuses a shared worktree and upgrades inspect to a fresh writable thread', async (t) => {
   const f = fixture(t);
   const subdir = initRepo(f.cwd);
@@ -1013,6 +1114,165 @@ test('exceptional turns attempt interruption on an open socket and after reconne
   assert.equal(outcome.remote_turn_unconfirmed, true);
   assert.match(outcome.error, /Remote Codex turn may still be running/);
   assert.ok(packets.some(({ method, params }) => method === 'turn/interrupt' && params.turnId === outcome.turn_id));
+});
+
+test('expired connecting runs and persisted terminal events reconcile without a remote hold', () => {
+  const expired = { source: 'magpie_exec', state: 'running', deadline: 1 };
+  for (const [pid, message] of [[2_147_483_000, /exited before connecting/], [process.pid, /timed out connecting/]]) {
+    const run = reconcileRunState({ ...expired, pid, progress: { phase: 'connecting' } });
+    assert.equal(run.state, 'failed');
+    assert.match(run.error, message);
+    assert.equal(run.remote_turn_unconfirmed, undefined);
+  }
+  assert.equal(reconcileRunState({ ...expired, thread_id: 'bound', progress: { phase: 'connecting' } }).state, 'outcome_unknown');
+  for (const phase of ['interrupted', 'failed', 'completed']) {
+    const run = reconcileRunState({ ...expired, turn_id: 'turn', progress: { phase }, remote_turn_unconfirmed: true });
+    assert.equal(run.state, phase === 'interrupted' ? 'interrupted' : 'failed');
+    assert.equal(run.remote_turn_unconfirmed, undefined);
+    if (phase === 'completed') assert.match(run.error, /completed.*result/);
+  }
+});
+
+test('repeated reads of a dead worker release the session after the unconfirmed hold', async (t) => {
+  const f = fixture(t);
+  const id = 'b'.repeat(32);
+  const old = new Date(Date.now() - 40 * 60_000);
+  state(f, id, { source: 'magpie_exec', pid: 2_147_483_000, deadline: old.getTime() / 1000,
+    progress: { phase: 'running', turn_id: 'turn' } });
+  for (let i = 0; i < 2; i++) {
+    const run = readRun(id, f.sessionsDir);
+    assert.equal(run.unconfirmed_at, old.toISOString());
+    assert.equal(run.remote_turn_unconfirmed, true);
+    assert.equal(isRecentUnconfirmedRun(run, old.getTime() + 29 * 60_000), true);
+    assert.equal(isRecentUnconfirmedRun(run), false);
+    assert.deepEqual(listActiveRoster(f), []);
+    await sleep(5);
+  }
+  assert.equal(JSON.parse(readFileSync(join(runDirectory(id, f.sessionsDir), 'state.json'))).state, 'running');
+});
+
+test('worker logs RPC start rejection without marking the turn unconfirmed and removes empty stderr on success', async (t) => {
+  const f = fixture(t);
+  const controls = { rejectStart: true };
+  const packets = await appFixture(t, f, controls);
+  const dispatch = () => dispatchRun({ goal: 'Check worker', cwd: f.cwd, background: true }, f);
+  const failed = await waitForRun((await dispatch()).run_id, { ...f, timeoutSec: 5 });
+  assert.equal(failed.state, 'failed');
+  assert.match(failed.error, /Rejected turn\/start/);
+  assert.equal(failed.remote_turn_unconfirmed, undefined);
+  assert.equal(packets.some((p) => p.method === 'turn/interrupt'), false);
+  assert.match(readFileSync(join(runDirectory(failed.run_id, f.sessionsDir), 'worker.stderr.log'), 'utf8'), /Rejected turn\/start/);
+
+  controls.rejectStart = false;
+  const success = await waitForRun((await dispatch()).run_id, { ...f, timeoutSec: 5 });
+  assert.equal(success.state, 'finished', success.error);
+  await until(() => !existsSync(join(runDirectory(success.run_id, f.sessionsDir), 'worker.stderr.log')));
+});
+
+test('worker retains final state read diagnostics and restores a failed state from its dispatch record', async (t) => {
+  const f = fixture(t);
+  const id = 'c'.repeat(32);
+  const directory = runDirectory(id, f.sessionsDir);
+  const file = join(directory, 'state.json');
+  await appFixture(t, f, { rejectStart: true, beforeReject: () => writeFileSync(file, 'corrupt') });
+  await dispatchRun({ run_id: id, goal: 'Check finalization', cwd: f.cwd, background: true }, f);
+  const failed = await until(() => {
+    const raw = readFileSync(file, 'utf8');
+    if (raw === 'corrupt') return false;
+    const run = JSON.parse(raw);
+    return run.state === 'failed' && run;
+  });
+  assert.match(failed.error, /JSON/);
+  assert.equal(failed.progress.phase, 'failed');
+  assert.ok(failed.finished_at);
+  assert.match(readFileSync(join(directory, 'worker.stderr.log'), 'utf8'), /readRun/);
+});
+
+test('worker retains a final save error and persists failure on the next write', async (t) => {
+  const f = fixture(t);
+  await appFixture(t, f);
+  const preload = join(f.root, 'fail-finished-write.mjs');
+  writeFileSync(preload, `
+    import fs from 'node:fs';
+    import { syncBuiltinESMExports } from 'node:module';
+    import { basename } from 'node:path';
+    const rename = fs.renameSync;
+    fs.renameSync = (src, dest) => {
+      if (basename(dest) === 'state.json' && JSON.parse(fs.readFileSync(src)).state === 'finished') {
+        throw new Error('Cannot persist final result');
+      }
+      return rename(src, dest);
+    };
+    syncBuiltinESMExports();
+  `);
+  const env = { ...f.env, NODE_OPTIONS: `--import=${pathToFileURL(preload).href}` };
+  const queued = await dispatchRun({ goal: 'Complete a turn', cwd: f.cwd, background: true }, { ...f, env });
+  const failed = await waitForRun(queued.run_id, { ...f, timeoutSec: 5 });
+  assert.equal(failed.state, 'failed');
+  assert.equal(failed.error, 'Cannot persist final result');
+  assert.equal(failed.remote_turn_unconfirmed, undefined);
+  assert.match(readFileSync(join(runDirectory(queued.run_id, f.sessionsDir), 'worker.stderr.log'), 'utf8'), /saveRun/);
+});
+
+test('worker records uncaught exceptions and unhandled rejections during a live turn', async (t) => {
+  const f = fixture(t);
+  await appFixture(t, f);
+  const preload = join(f.root, 'worker-fault.mjs');
+  writeFileSync(preload, `
+    import { existsSync } from 'node:fs';
+    const timer = setInterval(() => {
+      if (!existsSync(process.env.FAULT_TRIGGER)) return;
+      clearInterval(timer);
+      const err = new Error('Worker fault during live turn');
+      if (process.env.FAULT_KIND === 'uncaughtException') throw err;
+      Promise.reject(err);
+    }, 10);
+    timer.unref();
+  `);
+  for (const kind of ['uncaughtException', 'unhandledRejection']) {
+    const trigger = join(f.root, kind);
+    const env = { ...f.env, NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`, FAULT_TRIGGER: trigger, FAULT_KIND: kind };
+    const { run_id } = await dispatchRun({ goal: 'Request a cross-check', cwd: f.cwd, background: true }, { ...f, env });
+    assert.equal((await waitForRun(run_id, { ...f, timeoutSec: 5 })).state, 'waiting_gemini');
+    writeFileSync(trigger, '');
+    const failed = await until(() => {
+      const run = readRun(run_id, f.sessionsDir);
+      return run.state === 'failed' && run;
+    });
+    assert.equal(failed.error, 'Worker fault during live turn');
+    assert.equal(failed.pending_tool_call, null);
+    assert.equal(failed.remote_turn_unconfirmed, true);
+    assert.match(readFileSync(join(runDirectory(run_id, f.sessionsDir), 'worker.stderr.log'), 'utf8'), new RegExp(kind));
+  }
+});
+
+test('automatic interrupt accepts terminal RPC errors on the original and rotated endpoints', async (t) => {
+  const f = fixture(t);
+  const controls = { interruptError: 'Turn already completed' };
+  const packets = await appFixture(t, f, controls);
+  const asking = await dispatchRun({ goal: 'Request a cross-check', cwd: f.cwd, background: true }, f);
+  const waiting = await waitForRun(asking.run_id, { ...f, timeoutSec: 5 });
+  assert.equal(waiting.state, 'waiting_gemini', waiting.error);
+  const replies = join(runDirectory(asking.run_id, f.sessionsDir), 'tool_replies');
+  mkdirSync(replies);
+  writeFileSync(join(replies, 'ask_1.json'), '{}');
+  const failed = await until(() => {
+    const run = readRun(asking.run_id, f.sessionsDir);
+    return run.state === 'failed' && run;
+  });
+  assert.match(failed.error, /Invalid ask_gemini reply/);
+  assert.equal(failed.remote_turn_unconfirmed, undefined);
+  assert.ok(packets.some((p) => p.method === 'turn/interrupt' && p.params.turnId === waiting.turn_id));
+
+  const replacement = fixture(t);
+  const recovered = await appFixture(t, replacement, { token: 'rotated-token', interruptError: 'No active turn' });
+  const published = f.env.GEMPT_APP_SERVER_STATE;
+  controls.beforeDisconnect = () => copyFileSync(replacement.env.GEMPT_APP_SERVER_STATE, published);
+  const dead = await dispatchRun({ goal: 'Disconnect the turn socket', cwd: f.cwd, background: true }, f);
+  const outcome = await waitForRun(dead.run_id, { ...f, timeoutSec: 5 });
+  assert.equal(outcome.state, 'failed', outcome.error);
+  assert.equal(outcome.remote_turn_unconfirmed, undefined);
+  assert.ok(recovered.some((p) => p.method === 'turn/interrupt' && p.params.turnId === outcome.turn_id));
 });
 
 test('expired queued claims release occupancy, but old active sessions still protect their worktree', async (t) => {
@@ -1529,7 +1789,13 @@ test('remote_turn_unconfirmed blocks concurrent dispatch and worktree prune unti
     }),
   });
   assert.equal(clearedGone.cleared_unconfirmed, true);
-  assert.equal(readRun(goneId, f.sessionsDir).remote_turn_unconfirmed, undefined);
+  const gone = readRun(goneId, f.sessionsDir);
+  assert.equal(gone.remote_turn_unconfirmed, undefined);
+  assert.equal(gone.unconfirmed_at, undefined);
+  assert.equal(gone.state, 'failed');
+  assert.equal(gone.progress.phase, 'failed');
+  assert.ok(gone.finished_at);
+  assert.equal(gone.pending_tool_call, null);
 
   // Ancient unconfirmed run past hold window does not block forever.
   const oldIso = new Date(Date.now() - 45 * 60 * 1000).toISOString();
@@ -1540,6 +1806,35 @@ test('remote_turn_unconfirmed blocks concurrent dispatch and worktree prune unti
   // After clearing, same-session dispatch succeeds.
   const resumed = await dispatchRun({ goal: 'Resume after clear', cwd: subdir, session_id: seeded.session_id, background: true }, f);
   assert.equal((await waitForRun(resumed.run_id, { ...f, timeoutSec: 5 })).state, 'finished');
+});
+
+test('manual interrupt settles missing identity, ACK and observed terminal outcomes for an unknown run', async (t) => {
+  const f = fixture(t);
+  const id = 'd'.repeat(32);
+  for (const [confirmation, expected] of [['missing', 'failed'], ['ack', 'interrupted'],
+    ['interrupted', 'interrupted'], ['failed', 'failed'], ['completed', 'failed']]) {
+    state(f, id, { state: 'outcome_unknown', remote_turn_unconfirmed: true, unconfirmed_at: 'old',
+      progress: { thread_id: 'th', turn_id: confirmation === 'missing' ? null : 'tu' }, pending_tool_call: {} });
+    const cleared = await interruptRun(id, { ...f, confirmMs: 0, getState: () => ({ status: 'running' }),
+      connect: async (_, onEvent) => ({
+        request: async (_, { threadId, turnId }) => {
+          assert.notEqual(confirmation, 'missing');
+          if (confirmation === 'ack') return {};
+          onEvent({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: confirmation } } });
+          throw new Error('Socket closed after event');
+        },
+        close() {},
+      }),
+    });
+    assert.equal(cleared.cleared_unconfirmed, true);
+    const settled = readRun(id, f.sessionsDir);
+    assert.equal(settled.state, expected, confirmation);
+    assert.equal(settled.progress.phase, expected);
+    assert.equal(settled.pending_tool_call, null);
+    assert.ok(settled.finished_at);
+    assert.equal(settled.remote_turn_unconfirmed, undefined);
+    assert.equal(settled.unconfirmed_at, undefined);
+  }
 });
 
 test('pre-connect app-server failure does not leave an unbound session without codex_thread_id', async (t) => {

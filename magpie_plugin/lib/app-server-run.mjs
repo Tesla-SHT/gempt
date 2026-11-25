@@ -3,7 +3,7 @@ import { appendFileSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import {
   approvalReply, ASK_GEMINI, connectAppServer, DEVELOPER_INSTRUCTIONS, PROVIDER,
-  readAppServerState, SANDBOX_TYPES, SWARM_DEVELOPER_INSTRUCTIONS, textInput,
+  readAppServerState, SANDBOX_TYPES, SWARM_DEVELOPER_INSTRUCTIONS, TERMINAL_INTERRUPT_ERR, textInput,
 } from './app-server-client.mjs';
 import { saveRun, toolReplyPath } from '../../core/runs.mjs';
 import { readJsonSafe, resolveConfigPath } from '../../core/config.mjs';
@@ -11,7 +11,7 @@ import { readJsonSafe, resolveConfigPath } from '../../core/config.mjs';
 export class TurnInterrupted extends Error {}
 
 export async function runAppServer({ configPath, env, runFile, sessionId, onIdentity, prompt, cwd, model,
-  effort, sandbox, approvalPolicy, threadId, gatewayUrl, timeoutSec, sandboxUpgraded, interruptConfirmMs = 800,
+  effort, sandbox, approvalPolicy, threadId, gatewayUrl, timeoutSec, sandboxUpgraded, interruptConfirmMs = 3000,
   sessionsDir, swarmId, swarmAgent, nativeFork, onForkMode }) {
   const isSwarm = Boolean(swarmId && swarmAgent);
   const board = isSwarm ? await import('../../core/board-mcp.mjs') : null;
@@ -384,29 +384,35 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     clearTimeout(timeout);
     timeout = undefined;
     const turnId = progress.turn_id ?? observedTurnId;
+    // After acceptTurn, turn/start is the only outstanding RPC that can reject this try block.
+    if (acceptTurn && err.rpcError && !turnId) throw err;
+    let noActiveTurn = false;
     if (!terminal && turnId) {
       const params = { threadId: progress.thread_id, turnId };
-      let recovery;
-      try {
-        if (client && !client.disconnected) {
-          await client.request('turn/interrupt', params);
-          if (!terminal) await waitForTerminal(interruptConfirmMs, client);
-        }
-      } catch { /* If the socket failed during the interrupt, try a fresh connection. */ }
-      if (!terminal && (!client || client.disconnected)) {
+      const interrupt = async (connection) => {
         try {
-          recovery = await connectAppServer(state, ({ method, params: event }) => {
+          await connection.request('turn/interrupt', params);
+          if (!terminal) await waitForTerminal(interruptConfirmMs, connection);
+        } catch (error) {
+          noActiveTurn = !connection.disconnected && error.rpcError && TERMINAL_INTERRUPT_ERR.test(error.message);
+        }
+      };
+      if (client && !client.disconnected) await interrupt(client);
+      if (!terminal && !noActiveTurn && (!client || client.disconnected)) {
+        let recovery;
+        try {
+          const latest = readAppServerState(configPath, env);
+          recovery = await connectAppServer(latest, ({ method, params: event }) => {
             if (method === 'turn/completed' && event?.threadId === params.threadId && event.turn?.id === params.turnId) {
               notifyTerminal(event.turn);
             }
           });
-          await recovery.request('turn/interrupt', params);
-          if (!terminal) await waitForTerminal(interruptConfirmMs, recovery);
+          await interrupt(recovery);
         } catch { /* The original turn state is still unknown. */ }
         finally { recovery?.close(); }
       }
     }
-    if (acceptTurn && !terminal) {
+    if (acceptTurn && !terminal && !noActiveTurn) {
       throw Object.assign(new Error(`Remote Codex turn may still be running (no terminal status confirmed). ${err.message}`,
         { cause: err }), { remoteTurnUnconfirmed: true });
     }

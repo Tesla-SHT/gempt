@@ -65,6 +65,12 @@ function configFingerprint(url, key, cli, extraArgs) {
   return createHash('sha256').update(`${url || ''}\0${key || ''}`).update(cli || extraArgs.length ? JSON.stringify([cli, extraArgs]) : '').digest('hex').slice(0, 16);
 }
 
+export function resolveProxyTarget(raw) {
+  const url = String(raw?.magpie?.base_url || defaultGatewayFromEnv()).replace(/\/+$/, '');
+  const key = resolveMagpieApiKey({ magpie: { ...raw?.magpie, base_url: url } });
+  return { url, key };
+}
+
 function instanceSignature(rec) {
   if (!rec || typeof rec !== 'object') return null;
   if (typeof rec.instance_id === 'string' && rec.instance_id) return rec.instance_id;
@@ -240,12 +246,13 @@ export function createAppServerManager({
 
   function currentGatewayConfig() {
     const raw = readJsonSafe(config) || {};
-    const url = String(raw.magpie?.base_url || defaultGatewayFromEnv()).replace(/\/+$/, '');
-    const key = resolveMagpieApiKey({ magpie: { ...raw.magpie, base_url: url } });
+    const { url, key } = resolveProxyTarget(raw);
+    const cliPath = raw.execution?.cli_paths?.codex || raw.codex?.cli_path;
     const extraArgs = codexAppServerExtraArgs(raw.codex?.extra_args);
     const hash = configFingerprint(proxyBaseUrl ? JSON.stringify([url, proxyBaseUrl, proxyToken]) : url,
-      key, raw.codex?.cli_path, extraArgs);
-    return { raw, url, key, extraArgs, hash };
+      key, cliPath, extraArgs);
+    onProxyTarget?.({ url, key });
+    return { cliPath, url, key, extraArgs, hash };
   }
 
   async function probeConnection(target, timeoutMs = 800) {
@@ -261,13 +268,13 @@ export function createAppServerManager({
   }
 
   async function start() {
+    const { cliPath, url, key: gatewayKey, extraArgs, hash: cfgHash } = currentGatewayConfig();
+    gatewayUrl = url;
     if (!ownsLock && !claim()) {
       // Another plugin host owns the app-server, including during its restart.
       retry();
       return;
     }
-    const { raw, url, key: gatewayKey, extraArgs, hash: cfgHash } = currentGatewayConfig();
-    gatewayUrl = url;
     const stale = readJsonSafe(stateFile);
     if (stale?.status === 'running' && alive(stale.pid)) {
       const configMatches = (!proxyBaseUrl && !stale.config_hash) || stale.config_hash === cfgHash;
@@ -297,7 +304,7 @@ export function createAppServerManager({
       }
       clearPublished('stopped');
     }
-    const cli = findCodexCli(raw.execution?.cli_paths?.codex || raw.codex?.cli_path, env);
+    const cli = findCodexCli(cliPath, env);
     if (!cli) {
       error = '未找到 Codex CLI，共享 app-server 未启动。gempt_ask 仍可使用。';
       cleanup();
@@ -322,7 +329,6 @@ export function createAppServerManager({
         '-c', 'model_providers.gempt_gateway.wire_api="responses"', '-c', 'model_provider="gempt_gateway"'];
       if (proxyBaseUrl) {
         args.push('-c', 'model_providers.gempt_gateway.supports_websockets=false');
-        onProxyTarget?.({ url, key: gatewayKey });
       }
       if (proxyToken || gatewayKey) {
         childEnv.GEMPT_APP_SERVER_GATEWAY_TOKEN = proxyToken || gatewayKey;
@@ -344,12 +350,15 @@ export function createAppServerManager({
         try { if (existsSync(tokenFile)) unlinkSync(tokenFile); } catch { /* Retried on stop. */ }
         if (stopped) return;
         if (Date.now() - startedAt > 30000) failures = 0;
+        for (const secret of [token, proxyToken, gatewayKey]) {
+          if (secret) message = message.replaceAll(secret, '[redacted]');
+        }
         startupError = error = message;
         try { clearPublished('stopped'); } catch { connection = undefined; }
         retry();
       };
       spawned.once?.('error', (err) => exit(err.message));
-      spawned.once?.('exit', (code, signal) => exit(`Codex app-server exited (${signal || code}): ${stderr.trim().replaceAll(token, '[redacted]')}`));
+      spawned.once?.('exit', (code, signal) => exit(`Codex app-server exited (${signal || code}): ${stderr.trim()}`));
 
       const next = {
         ws_url: wsUrl,

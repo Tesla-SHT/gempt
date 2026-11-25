@@ -10,15 +10,16 @@
  * - Reuses and seamlessly takes over the port across Magpie plugin reloads,
  *   cleaning up stale identity files whose owning PID has exited.
  */
-import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { gzip } from 'node:zlib';
+import { withLockSync } from '../../core/state.mjs';
 import { readJsonSafe, resolveConfigPath, warmPageTelemetry } from './backend.mjs';
-import { createAppServerManager } from './app-server-manager.mjs';
+import { createAppServerManager, resolveProxyTarget } from './app-server-manager.mjs';
 import { createThreadCacheKeys, PROXY_PATH, proxyCodexRequest } from './codex-proxy.mjs';
 import { dispatchPageApi } from './page-api.mjs';
 import { readPageAsset } from './page-assets.mjs';
@@ -82,6 +83,32 @@ function readJsonBody(req, maxBytes = MAX_POST_BYTES) {
   });
 }
 
+function loadOrCreateProxyToken(configPath) {
+  const dir = dirname(resolveConfigPath(configPath));
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const file = join(dir, 'codex-proxy.token');
+  return withLockSync(join(dir, 'codex-proxy.token.lock'), () => {
+    let token;
+    try {
+      token = readFileSync(file, 'utf8').trim();
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    if (!token || !/^[A-Za-z0-9_-]{32,128}$/.test(token)) {
+      token = randomBytes(32).toString('base64url');
+      const temp = join(dir, `.codex-proxy-${randomUUID()}.tmp`);
+      try {
+        writeFileSync(temp, token, { mode: 0o600, flag: 'wx' });
+        renameSync(temp, file);
+      } finally {
+        rmSync(temp, { force: true });
+      }
+    }
+    if (process.platform !== 'win32') chmodSync(file, 0o600);
+    return token;
+  });
+}
+
 export async function startServer({
   port,
   configPath,
@@ -97,9 +124,9 @@ export async function startServer({
 } = {}) {
   const KEY = randomBytes(24).toString('base64url');
   const IPC_TOKEN = randomBytes(24).toString('base64url');
-  const proxyToken = randomBytes(32).toString('base64url');
+  const proxyToken = loadOrCreateProxyToken(configPath);
   const threadCacheKeys = createThreadCacheKeys();
-  let proxyTarget;
+  let proxyTarget = resolveProxyTarget(readJsonSafe(resolveConfigPath(configPath)) || {});
   const INSTANCE_ID = randomBytes(16).toString('hex');
   const resolvedConfigDir = dirname(resolveConfigPath(configPath));
   const identityFile = (p) => join(resolvedConfigDir, `page-server-${p}.json`);

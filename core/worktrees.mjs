@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { lstatSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { listActiveRoster } from './runs.mjs';
 import { resolveSessionsDir } from './config.mjs';
 import { atomicJson, resolvePath, validateSessionId, withLockSync, withinPath } from './state.mjs';
@@ -10,6 +10,92 @@ const sameOrWithin = (candidate, root) => {
   const fold = (p) => process.platform === 'win32' ? p.toLowerCase() : p;
   return withinPath(fold(candidate), fold(root));
 };
+
+export const samePath = (a, b) => relative(a, b) === '';
+
+export function resolveExternalWorktreeSourceCwd(cwd) {
+  try {
+    if (typeof cwd !== 'string' || !cwd.trim()) return null;
+    const resolvedCwd = resolvePath(cwd);
+    if (!statSync(resolvedCwd).isDirectory()) return null;
+    for (let root = resolvedCwd; ; root = dirname(root)) {
+      const marker = join(root, '.git');
+      const entry = lstatSync(marker, { throwIfNoEntry: false });
+      if (entry) {
+        if (!entry.isFile()) return null;
+        const match = /^gitdir: ([^\r\n]+)$/.exec(readFileSync(marker, 'utf8').trimEnd());
+        if (!match) return null;
+        const gitDir = resolvePath(resolve(root, match[1]));
+        const common = readFileSync(join(gitDir, 'commondir'), 'utf8').trimEnd();
+        if (!common) return null;
+        const commonDir = resolvePath(resolve(gitDir, common));
+        const adminRoot = join(commonDir, 'worktrees');
+        if (!sameOrWithin(gitDir, adminRoot) || !relative(adminRoot, gitDir)
+            || relative(join(dirname(commonDir), '.git'), commonDir) || !statSync(commonDir).isDirectory()) return null;
+        // A copied .git file must not grant its directory access to someone else's workspace.
+        const backlink = readFileSync(join(gitDir, 'gitdir'), 'utf8').trimEnd();
+        if (!backlink || relative(resolvePath(resolve(gitDir, backlink)), marker)) return null;
+        const mainRoot = dirname(commonDir);
+        if (!statSync(mainRoot).isDirectory()) return null;
+        // Keep the logical subdirectory even when it only exists on the linked branch.
+        const mapped = resolvePath(join(mainRoot, relative(root, resolvedCwd)));
+        return sameOrWithin(mapped, mainRoot) && relative(mapped, resolvedCwd) ? mapped : null;
+      }
+      if (dirname(root) === root) return null;
+    }
+  } catch {
+    return null;
+  }
+}
+
+const externalSources = new Map();
+
+export function recordSourceCwd({ cwd, source_cwd }) {
+  if (typeof source_cwd === 'string' && source_cwd.trim()) return source_cwd;
+  if (typeof cwd !== 'string' || !isAbsolute(cwd)) return null;
+  const key = process.platform === 'win32' ? cwd.toLowerCase() : cwd;
+  const now = performance.now();
+  const hit = externalSources.get(key);
+  if (hit && now < hit.expires) return hit.source;
+  const source = resolveExternalWorktreeSourceCwd(cwd);
+  externalSources.delete(key);
+  if (externalSources.size >= 512) externalSources.delete(externalSources.keys().next().value);
+  externalSources.set(key, { source, expires: now + 5000 });
+  return source;
+}
+
+function inWorkspace(cwd, roots) {
+  if (typeof cwd !== 'string' || !isAbsolute(cwd)) return false;
+  if (!roots) return true;
+  const path = resolvePath(cwd);
+  return roots.some((root) => sameOrWithin(path, root));
+}
+
+export function recordInWorkspace(record, roots) {
+  return inWorkspace(record.cwd, roots) || inWorkspace(recordSourceCwd(record), roots);
+}
+
+export function workspaceFileRoots(record, roots) {
+  const cwd = inWorkspace(record.cwd, null) ? resolvePath(record.cwd) : null;
+  if (!roots) {
+    if (!cwd) return [];
+    const source = recordSourceCwd(record);
+    return inWorkspace(source, null) ? [cwd, resolvePath(source)] : [cwd];
+  }
+  const allowed = [...roots];
+  // Visibility may use persisted or cached metadata. External file links need current Git ownership.
+  if (record.worktree_path) {
+    if (!inWorkspace(record.worktree_path, null) || !inWorkspace(record.source_cwd, roots)) return allowed;
+    const tree = resolvePath(record.worktree_path);
+    const managed = worktreesRoot();
+    if ((sameOrWithin(tree, managed) && !samePath(tree, managed))
+        || inWorkspace(resolveExternalWorktreeSourceCwd(tree), roots)) allowed.push(tree);
+    // The tree already covers its cwd and must never grant access to a sibling cwd.
+  } else if (cwd && !inWorkspace(cwd, roots) && inWorkspace(resolveExternalWorktreeSourceCwd(cwd), roots)) {
+    allowed.push(cwd);
+  }
+  return allowed;
+}
 
 export function worktreesRoot(env = process.env) {
   const override = env.GEMPT_WORKTREES_DIR?.trim();

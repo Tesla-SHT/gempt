@@ -1,23 +1,22 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, readdirSync, rmdirSync, statSync } from 'node:fs';
+import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmdirSync, statSync } from 'node:fs';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { connectAppServer, readAppServerState, textInput, UNAVAILABLE } from '../magpie_plugin/lib/app-server-client.mjs';
+import { connectAppServer, readAppServerState, TERMINAL_INTERRUPT_ERR, textInput, UNAVAILABLE } from '../magpie_plugin/lib/app-server-client.mjs';
 import { normalizeTitle, readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
 import { getMcpEffort } from './config.mjs';
 import { resolveExecTimeoutSec, validateExecTimeoutSec } from '../magpie_plugin/lib/routing.mjs';
 import { resolveNodeExecutable } from './node-executable.mjs';
 import { readHostContext } from './host-context.mjs';
 import { atomicJson, resolvePath, validateSessionId, withLock, withinPath } from './state.mjs';
-import { ensureShareWorktree } from './worktrees.mjs';
+import { ensureShareWorktree, recordInWorkspace, recordSourceCwd, resolveExternalWorktreeSourceCwd, samePath } from './worktrees.mjs';
 
 export const ACTIVE_STATES = new Set(['queued', 'running', 'waiting_gemini']);
 export { EXEC_TIMEOUT_MIN_SEC, EXEC_TIMEOUT_MAX_SEC, validateExecTimeoutSec } from '../magpie_plugin/lib/routing.mjs';
 export const UNCONFIRMED_HOLD_MS = 30 * 60 * 1000;
 const STARTUP_GRACE_MS = 60_000;
-const TERMINAL_INTERRUPT_ERR = /not found|no active|already (?:completed|finished|interrupted|stopped|ended)|unknown turn|invalid turn/i;
 const pending = (state) => state === 'queued' || state === 'running';
 const workerPath = fileURLToPath(new URL('../magpie_plugin/lib/exec-worker.mjs', import.meta.url));
 const waitPath = fileURLToPath(new URL('./wait.mjs', import.meta.url));
@@ -31,7 +30,7 @@ export function isRecentUnconfirmedRun(record, nowMs = Date.now(), modifiedAtMs 
   if (Number.isFinite(deadlineMs) && nowMs <= deadlineMs) return true;
   const ts = [record.unconfirmed_at, record.finished_at, record.progress?.updated_at, record.started_at, record.created_at]
     .map((v) => (typeof v === 'string' ? Date.parse(v) : (typeof v === 'number' ? v * (v < 1e12 ? 1000 : 1) : NaN)))
-    .find(Number.isFinite) ?? modifiedAtMs;
+    .find(Number.isFinite) ?? (Number.isFinite(modifiedAtMs) ? modifiedAtMs : deadlineMs);
   if (!Number.isFinite(ts)) return true;
   return nowMs - ts <= UNCONFIRMED_HOLD_MS;
 }
@@ -93,7 +92,9 @@ export function readRun(runId, sessionsDir, { stat, readonly = false, allowLegac
   // Reconcile time and worker liveness even when the file has not changed.
   const record = readonly ? { ...data } : structuredClone(data);
   reconcileRunState(record, () => stat?.mtimeMs);
-  record.title = normalizeTitle(record.title, record.goal, record.source_cwd || record.cwd);
+  const source = recordSourceCwd(record);
+  if (source) record.source_cwd = source;
+  record.title = normalizeTitle(record.title, record.goal, source || record.cwd);
   return record;
 }
 
@@ -105,29 +106,38 @@ export function reconcileRunState(record, modifiedAt) {
     return Object.assign(record, { state: 'failed', error: 'Codex worker startup timed out after 60s.',
       pending_tool_call: null });
   }
-  let expired = record.state !== 'waiting_gemini' && now() > (record.deadline ?? Infinity);
+  const expired = record.state !== 'waiting_gemini' && now() > (record.deadline ?? Infinity);
   let deadPid = false;
-  if (!expired && record.source === 'magpie_exec' && hasPid) {
+  if (record.source === 'magpie_exec' && hasPid) {
     try { process.kill(record.pid, 0); } catch (error) { deadPid = error.code === 'ESRCH'; }
   }
-  if (deadPid && record.progress?.phase === 'connecting'
-      && !record.progress?.thread_id && !record.progress?.turn_id
-      && !record.codex_thread_id && !record.turn_id) {
-    Object.assign(record, {
-      state: 'failed',
-      pending_tool_call: null,
-      error: 'Worker process exited before connecting to Codex app-server (phase: connecting).',
-    });
-    return record;
-  }
-  if (expired || deadPid) {
-    Object.assign(record, { state: 'outcome_unknown', pending_tool_call: null });
-    if (record.turn_id) {
+  if (!expired && !deadPid) return record;
+  const phase = record.progress?.phase;
+  const threadId = record.codex_thread_id || record.thread_id || record.progress?.thread_id;
+  const turnId = record.turn_id || record.progress?.turn_id;
+  record.pending_tool_call = null;
+  if (phase === 'connecting' && !threadId && !turnId) {
+    record.state = 'failed';
+    record.error = deadPid ? 'Worker process exited before connecting to Codex app-server (phase: connecting).'
+      : 'Worker timed out connecting to Codex app-server.';
+  } else if (['interrupted', 'failed', 'completed'].includes(phase)) {
+    record.state = phase === 'completed' ? (record.result ? 'finished' : 'failed') : phase;
+    if (phase === 'completed' && !record.result) record.error = 'Codex turn completed before the worker saved its result.';
+  } else {
+    record.state = 'outcome_unknown';
+    if (turnId) {
       record.remote_turn_unconfirmed = true;
-      record.unconfirmed_at ||= new Date().toISOString();
+      // A read cannot extend the hold. Cap a copied file's mtime at the expired deadline.
+      const deadlineMs = expired ? record.deadline * 1000 : Infinity;
+      const fileTime = Math.min(modifiedAt?.() ?? Infinity, deadlineMs);
+      record.unconfirmed_at ??= record.progress?.updated_at ?? (Number.isFinite(fileTime)
+        ? new Date(fileTime).toISOString() : record.started_at ?? record.created_at);
       record.error ||= 'Remote Codex turn may still be running (worker stopped reporting).';
     }
+    return record;
   }
+  delete record.remote_turn_unconfirmed;
+  delete record.unconfirmed_at;
   return record;
 }
 
@@ -215,7 +225,8 @@ async function controlRun(runId, method, message, {
   configPath, sessionsDir, env = process.env, getState, connect = connectAppServer, confirmMs = 500,
 } = {}) {
   const record = readRun(runId, sessionsDir);
-  const { codex_thread_id: threadId, turn_id: turnId } = record;
+  const threadId = record.codex_thread_id || record.thread_id || record.progress?.thread_id;
+  const turnId = record.turn_id || record.progress?.turn_id;
   const isInterrupt = method === 'turn/interrupt';
   const isActive = ['running', 'waiting_gemini'].includes(record.state);
   const isUnconfirmed = Boolean(record.remote_turn_unconfirmed);
@@ -237,14 +248,26 @@ async function controlRun(runId, method, message, {
     }
     throw runError(`CLI '${cli}' does not support mid-turn steer; message will be delivered on the next turn.`, 409);
   }
-  if (isInterrupt && isUnconfirmed && (!threadId || !turnId)) {
+  function confirmInterrupt(status, error, note) {
     const file = join(runDirectory(runId, sessionsDir), 'state.json');
-    const updated = { ...record, interrupt_confirmed_at: new Date().toISOString() };
+    const updated = readRun(runId, sessionsDir);
+    updated.interrupt_confirmed_at = new Date().toISOString();
     delete updated.remote_turn_unconfirmed;
     delete updated.unconfirmed_at;
+    if (updated.state === 'outcome_unknown' || (ACTIVE_STATES.has(updated.state) && !pidAlive(updated.pid))) {
+      updated.state = status;
+      updated.error = error;
+      updated.finished_at ||= updated.interrupt_confirmed_at;
+      updated.pending_tool_call = null;
+      updated.waiting_since = null;
+      updated.progress = { ...updated.progress, phase: status, updated_at: updated.interrupt_confirmed_at };
+    }
     saveRun(file, updated);
     return { ok: true, run_id: runId, session_id: record.session_id, thread_id: threadId ?? null,
-      turn_id: turnId ?? null, cleared_unconfirmed: true };
+      turn_id: turnId ?? null, cleared_unconfirmed: true, ...(note ? { note } : {}) };
+  }
+  if (isInterrupt && isUnconfirmed && (!threadId || !turnId)) {
+    return confirmInterrupt('failed', 'Worker stopped without a remote turn identity.');
   }
   if ((!isActive && !(isInterrupt && isUnconfirmed)) || !threadId || !turnId) {
     throw runError(`Run ${runId} has no active Codex turn.`, 409);
@@ -274,7 +297,7 @@ async function controlRun(runId, method, message, {
     } catch (error) {
       if (isInterrupt && isUnconfirmed && !client.disconnected && TERMINAL_INTERRUPT_ERR.test(String(error?.message || ''))) {
         note = String(error.message);
-      } else {
+      } else if (!observedTerminal) {
         throw error;
       }
     }
@@ -289,18 +312,10 @@ async function controlRun(runId, method, message, {
     client.close();
   }
   if (isInterrupt && isUnconfirmed) {
-    const file = join(runDirectory(runId, sessionsDir), 'state.json');
-    const latest = readRun(runId, sessionsDir);
-    const updated = { ...latest, interrupt_confirmed_at: new Date().toISOString() };
-    delete updated.remote_turn_unconfirmed;
-    delete updated.unconfirmed_at;
-    if (updated.state === 'outcome_unknown' && observedTerminal?.status === 'interrupted') {
-      updated.state = 'interrupted';
-      if (updated.progress) Object.assign(updated.progress, { phase: 'interrupted', updated_at: updated.interrupt_confirmed_at });
+    if (observedTerminal?.status === 'interrupted' || (!observedTerminal && !note)) {
+      return confirmInterrupt('interrupted', 'Codex turn interrupted.');
     }
-    saveRun(file, updated);
-    return { ok: true, run_id: runId, session_id: record.session_id, thread_id: threadId, turn_id: turnId,
-      cleared_unconfirmed: true, ...(note ? { note } : {}) };
+    return confirmInterrupt('failed', observedTerminal?.error?.message || note || 'Codex turn ended without a saved result.', note);
   }
   return { ok: true, run_id: runId, session_id: record.session_id, thread_id: threadId, turn_id: turnId };
 }
@@ -376,8 +391,7 @@ export function stateEntries(sessionsDir) {
 }
 
 export function runWithinRoot(record, root) {
-  const cwd = record.source_cwd || record.cwd;
-  return !root || (typeof cwd === 'string' && withinPath(resolvePath(cwd), resolvePath(root)));
+  return !root || recordInWorkspace(record, [resolvePath(root)]);
 }
 
 export function listActiveRoster({ limit = 20, root, hostConversationId, sessionId, sessionsDir, includeUnconfirmed = true } = {}) {
@@ -436,7 +450,8 @@ export async function dispatchRun(args, {
     for (let attempt = 0; ; attempt++) {
       try {
         const record = readRun(id, sessions);
-        if (record.source !== 'magpie_exec' || (record.source_cwd || record.cwd) !== requestedCwd) {
+        const originalCwd = record.worktree_path ? record.source_cwd || record.cwd : record.cwd;
+        if (record.source !== 'magpie_exec' || originalCwd !== requestedCwd) {
           throw new Error('run_id belongs to a different workspace.');
         }
         return record;
@@ -466,11 +481,13 @@ export async function dispatchRun(args, {
         sourceCwd = resolvePath(prior.source_cwd || requestedCwd);
         cwd = resolvePath(prior.cwd || prior.worktree_path);
         worktreePath = resolvePath(prior.worktree_path);
-        if ((requestedCwd !== sourceCwd && requestedCwd !== cwd) || !withinPath(cwd, worktreePath)) {
+        if ((!samePath(requestedCwd, sourceCwd) && !samePath(requestedCwd, cwd)) || !withinPath(cwd, worktreePath)) {
           throw new Error(`Exec resume must stay in the original workspace '${sourceCwd}'.`);
         }
       } else if (workspace === 'share') {
         ({ cwd, source_cwd: sourceCwd, worktree_root: worktreePath } = ensureShareWorktree(cwd, sessionId, env));
+      } else {
+        sourceCwd = resolveExternalWorktreeSourceCwd(cwd) || cwd;
       }
       hostContext = readHostContext(config, sourceCwd);
       hostId = args.host_conversation_id || prior?.host_conversation_id || hostContext.conversation_id || null;
@@ -478,7 +495,7 @@ export async function dispatchRun(args, {
       const executionTimeout = resolveExecTimeoutSec({ codex: cfg?.codex, timeoutSec, effort: getMcpEffort(cfg?.routing_policy) });
       record = {
         source: 'magpie_exec', run_id: id, cwd, state: 'queued', created_at: new Date().toISOString(),
-        worktree_path: worktreePath, source_cwd: worktreePath ? sourceCwd : null, goal: args.goal,
+        worktree_path: worktreePath, source_cwd: worktreePath || sourceCwd !== cwd ? sourceCwd : null, goal: args.goal,
         title: normalizeTitle(args.title, args.goal, sourceCwd), tier: args.tier, agent,
         host_conversation_id: hostId, session_id: sessionId, config_path: config, progress: null,
         verification: args.verification, execution_timeout_sec: executionTimeout, deadline: now() + executionTimeout,
@@ -508,9 +525,15 @@ export async function dispatchRun(args, {
     GEMPT_SESSIONS_DIR: sessions,
   } : env;
   try {
-    const child = spawn(resolveNodeExecutable({ env }), [workerPath], {
-      env: childEnv, windowsHide: true, detached: true, stdio: ['pipe', 'ignore', 'ignore'],
-    });
+    const stderr = openSync(join(directory, 'worker.stderr.log'), 'a', 0o600);
+    let child;
+    try {
+      child = spawn(resolveNodeExecutable({ env }), [workerPath], {
+        env: childEnv, windowsHide: true, detached: true, stdio: ['pipe', 'ignore', stderr],
+      });
+    } finally {
+      closeSync(stderr);
+    }
     const packet = JSON.stringify({ file, record, args: request, host, agent });
     await new Promise((resolve, reject) => {
       child.once('error', reject);

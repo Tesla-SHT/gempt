@@ -7,7 +7,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { resolvePath } from '../core/state.mjs';
 import { openDatabase } from '../core/sqlite.mjs';
 import {
   archiveChannel, computeMentionEdges, createChannel, detectSystemAttention, listChannels, markRead, openSwarmDb,
@@ -165,6 +166,44 @@ test('sqlite wrapper supports CRUD, WAL pragmas, and nested transactions', async
   const rows = db.all('SELECT id, name FROM items ORDER BY id ASC');
   assert.deepEqual(rows, [{ id: 1, name: 'alpha' }, { id: 2, name: 'beta' }]);
   assert.equal(db.get('SELECT * FROM items WHERE id = ?', 999), null);
+});
+
+test('external linked worktree Swarm scopes the board and verifies swarm and worker screenshot roots', async (t) => {
+  const dir = resolvePath(makeTmp(t));
+  const sessionsDir = join(dir, 'sessions');
+  const repo = join(dir, 'repo');
+  const tree = join(dir, 'swarm-tree');
+  const workerTree = join(dir, 'worker-tree');
+  const other = join(dir, 'other');
+  mkdirSync(repo);
+  mkdirSync(other);
+  const git = (...args) => execFileSync('git', ['-C', repo, ...args], { windowsHide: true, stdio: 'pipe' });
+  git('init', '-q');
+  git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false',
+    'commit', '--allow-empty', '-qm', 'fixture');
+  git('worktree', 'add', '--detach', tree);
+  git('worktree', 'add', '--detach', workerTree);
+
+  const opts = { sessionsDir, workspaceRoots: [repo] };
+  const unrelated = { sessionsDir, workspaceRoots: [other] };
+  const swarm_id = 'sw-linked';
+  await ensureSwarm({ swarmId: swarm_id, cwd: tree, sessionsDir });
+  await upsertWorker(swarm_id, { name: 'builder', worktree_path: workerTree, source_cwd: repo }, opts);
+  await upsertWorker(swarm_id, { name: 'old-worker', worktree_path: other, source_cwd: repo }, opts);
+  const paths = [join(tree, 'board.png'), join(workerTree, 'worker.png'), join(other, 'other.png')];
+  for (const path of paths) writeFileSync(path, 'fixture');
+  const message = await postBoardMessage(swarm_id, { text: 'Screenshots', screenshots:
+    ['board.png', ...paths.slice(1)].map((path) => ({ path, caption: path })) }, opts);
+  assert.deepEqual((await runSwarmOperation('list', { scope: 'all' }, opts)).swarms.map((s) => s.id), [swarm_id]);
+  const board = await runSwarmOperation('board', { swarm_id }, opts);
+  assert.deepEqual(board.messages.map((m) => m.seq), [message.seq]);
+  const { screenshots } = await runSwarmOperation('overview', { swarm_id }, opts);
+  assert.deepEqual(screenshots.map((s) => s.file_uri), [pathToFileURL(paths[0]).href, pathToFileURL(paths[1]).href, undefined]);
+  assert.equal(screenshots[2].restricted_reason, 'outside_workspace');
+  assert.deepEqual((await runSwarmOperation('list', { scope: 'all' }, unrelated)).swarms, []);
+  for (const op of ['overview', 'board']) {
+    await assert.rejects(runSwarmOperation(op, { swarm_id }, unrelated), { status: 403 });
+  }
 });
 
 test('swarm-bus validates worker names, parses mentions & screenshots, and manages board & deliveries', async (t) => {
