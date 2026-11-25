@@ -20,6 +20,7 @@
     </span>
     <nav class="app-tabs" role="tablist" aria-label="GemPT 视图">
       <button id="tab-live" type="button" role="tab" aria-selected="true" aria-controls="live-panel">实时流</button>
+      <button id="tab-swarm" type="button" role="tab" aria-selected="false" aria-controls="swarm-panel" tabindex="-1"><span class="tab-label">协作</span><span id="swarm-tab-badge" class="tab-badge" hidden></span></button>
       <button id="tab-overview" type="button" role="tab" aria-selected="false" aria-controls="overview" tabindex="-1">概览</button>
       <button id="tab-requests" type="button" role="tab" aria-selected="false" aria-controls="requests" tabindex="-1">请求</button>
       <button id="tab-sessions" type="button" role="tab" aria-selected="false" aria-controls="sessions" tabindex="-1">会话</button>
@@ -154,6 +155,159 @@
       </div>
     </section>
   </main>
+  <main id="swarm-panel" class="swarm-shell" role="tabpanel" aria-labelledby="tab-swarm" hidden>
+    <header class="swarm-header">
+      <div class="swarm-header-top">
+        <div class="swarm-identity">
+          <select id="swarm-picker" class="swarm-picker" aria-label="切换 Swarm" hidden></select>
+          <h1 id="swarm-title" class="swarm-title">Swarm 协作</h1>
+          <button id="swarm-edit-title" class="btn-ghost swarm-edit-btn" type="button" title="重命名 Swarm" aria-label="重命名 Swarm" hidden>改名</button>
+        </div>
+        <div class="top-actions swarm-header-actions">
+          <div id="swarm-scope-switch" class="scope-switch" role="group" aria-label="Swarm 范围" hidden>
+            <button id="swarm-scope-session" type="button" aria-pressed="true">当前会话</button>
+            <button id="swarm-scope-all" type="button" aria-pressed="false">全部</button>
+          </div>
+          <button id="swarm-refresh" class="icon-btn" type="button" title="刷新 Swarm" aria-label="刷新 Swarm" data-icon="refresh"></button>
+        </div>
+      </div>
+      <form id="swarm-title-form" class="swarm-title-form" hidden>
+        <input id="swarm-title-input" class="steer-input" type="text" maxlength="200" aria-label="Swarm 标题" placeholder="输入新标题…">
+        <button id="swarm-title-save" class="btn-primary" type="submit">保存</button>
+        <button id="swarm-title-cancel" class="btn-ghost" type="button">取消</button>
+      </form>
+      <p id="swarm-goal" class="swarm-goal" hidden></p>
+      <div id="swarm-pills" class="swarm-pills" hidden></div>
+      <div id="swarm-subtabs" class="swarm-subtabs" role="tablist" aria-label="Swarm 视图" hidden>
+        <button id="swarm-subtab-overview" type="button" role="tab" aria-selected="true" aria-controls="swarm-sub-overview">总览</button>
+        <button id="swarm-subtab-board" type="button" role="tab" aria-selected="false" aria-controls="swarm-sub-board" tabindex="-1">消息板</button>
+        <button id="swarm-subtab-graph" type="button" role="tab" aria-selected="false" aria-controls="swarm-sub-graph" tabindex="-1">关系图</button>
+        <button id="swarm-subtab-raw" type="button" role="tab" aria-selected="false" aria-controls="swarm-sub-raw" tabindex="-1">原始数据</button>
+      </div>
+    </header>
+    <p id="swarm-error" class="notice" role="status" hidden></p>
+    <section id="swarm-opaque-banner" class="warn-banner" role="status" hidden>
+      <div class="reading-column warn-banner-row">
+        <div class="warn-banner-copy">
+          <strong>嵌入式只读视图</strong>
+          <p id="swarm-opaque-text">当前在沙箱框架中仅支持查看；如需发消息或控制工位，请在独立控制台打开。</p>
+        </div>
+        <div class="warn-banner-actions">
+          <a id="swarm-standalone-link" class="btn-ghost" target="_blank" rel="noopener noreferrer" hidden>在独立控制台打开</a>
+          <button id="swarm-copy-link" class="btn-ghost" type="button" hidden>复制控制台地址</button>
+        </div>
+      </div>
+    </section>
+    <div id="swarm-loading" class="swarm-loading" role="status" aria-label="正在加载 Swarm" hidden>
+      <div class="reading-column skeleton-list">
+        <div class="skeleton-card"></div><div class="skeleton-card"></div>
+      </div>
+    </div>
+    <div id="swarm-empty" class="empty swarm-empty" hidden>
+      <span class="empty-icon" data-icon="users"></span>
+      <p id="swarm-empty-title" class="empty-title">暂无协作 Swarm</p>
+      <p id="swarm-empty-message">通过 gpt_swarm 或 gempt swarm 启动协作后，工位与消息板会显示在这里。</p>
+      <button id="swarm-empty-show-all" class="btn-ghost" type="button" hidden>查看全部 Swarm</button>
+    </div>
+    <section id="swarm-sub-overview" class="swarm-body" role="tabpanel" aria-labelledby="swarm-subtab-overview" hidden>
+      <div id="swarm-view-overview" class="reading-column swarm-overview-col" hidden>
+        <section id="swarm-attention" aria-label="需要关注" hidden></section>
+        <div id="swarm-team" aria-label="协作成员"></div>
+        <div id="swarm-threads" class="swarm-threads"></div>
+        <section id="swarm-screenshots-card" class="swarm-card swarm-screenshots-card" hidden>
+          <header class="swarm-card-head">
+            <span data-icon="image"></span>
+            <h2 class="swarm-card-title">截图时间线</h2>
+            <span id="swarm-screenshots-count" class="swarm-card-meta"></span>
+          </header>
+          <ol id="swarm-screenshots-list" class="swarm-screenshots-list"></ol>
+        </section>
+      </div>
+    </section>
+    <section id="swarm-sub-board" class="swarm-board-view" role="tabpanel" aria-labelledby="swarm-subtab-board" hidden>
+      <div id="swarm-view-board" class="swarm-board-view" hidden>
+      <div class="sw-board-bar"><div class="reading-column">
+          <section class="sw-board-tools">
+            <div class="sw-tool-row"><input id="swarm-search" type="search" placeholder="搜索消息" aria-label="搜索消息">
+              <button type="button" id="swarm-filter-toggle" class="btn-ghost" aria-controls="swarm-filters" aria-expanded="false">筛选</button>
+            </div>
+            <div id="swarm-filters" class="sw-tool-row" hidden>
+              <label>发送者 <select id="swarm-from"></select></label>
+              <label>提及 <select id="swarm-mentioned"></select></label>
+              <label>频道 <select id="swarm-channel-filter"></select></label>
+            </div>
+            <div class="sw-tool-row"><div id="swarm-channel-tabs" class="sw-channels" role="group" aria-label="频道"></div>
+              <button id="swarm-new-channel" type="button" class="btn-ghost" aria-expanded="false" aria-controls="swarm-channel-form" hidden>新建频道</button>
+              <button id="swarm-archive" type="button" class="btn-ghost" hidden>归档频道</button>
+            </div>
+            <form id="swarm-channel-form" class="sw-tool-row" hidden>
+              <input id="swarm-channel-name" placeholder="频道名称" aria-label="频道名称" required maxlength="24" pattern="[a-z][a-z0-9\-]{0,23}">
+              <input id="swarm-channel-topic" placeholder="主题（可选）" aria-label="主题（可选）">
+              <button class="btn-primary" type="submit">创建</button>
+            </form>
+          </section>
+      </div></div>
+      <div id="swarm-board-wrap" class="swarm-board-wrap">
+        <div class="reading-column">
+          <div id="swarm-board-empty" class="empty" hidden>
+            <span class="empty-icon" data-icon="chat"></span>
+            <p class="empty-title">消息板暂无消息</p>
+            <p>发送消息或等待工位上报后，动态会按顺序显示在这里。</p>
+          </div>
+          <ol id="swarm-board-feed" class="swarm-board-feed"></ol>
+        </div>
+      </div>
+      <footer id="swarm-composer" class="composer swarm-composer" aria-label="向消息板发送消息">
+        <div class="reading-column swarm-composer-col">
+          <label id="swarm-target-label" hidden>发布到 <select id="swarm-target"></select></label>
+          <div id="swarm-mention-chips" class="swarm-mention-chips" aria-label="快捷 @提及"></div>
+          <div id="swarm-reply-banner" class="swarm-reply-banner" hidden>
+            <span id="swarm-reply-label"></span>
+            <button id="swarm-reply-clear" class="icon-btn" type="button" aria-label="取消回复" data-icon="close"></button>
+          </div>
+          <div class="swarm-composer-row">
+            <textarea id="swarm-composer-input" class="swarm-textarea" rows="2" aria-label="消息内容" placeholder="输入消息，@工位名 可直接唤醒或纠偏…（Ctrl/Cmd+Enter 发送）"></textarea>
+            <button id="swarm-composer-send" class="btn-primary swarm-send-btn" type="button" disabled>发送</button>
+          </div>
+          <p id="swarm-composer-status" class="ctrl-status" role="status" hidden></p>
+        </div>
+      </footer>
+      </div>
+    </section>
+    <section id="swarm-sub-graph" class="swarm-body" role="tabpanel" aria-labelledby="swarm-subtab-graph" hidden>
+      <div class="reading-column sw-graph">
+        <div class="sw-tool-row sw-graph-head">
+          <div class="scope-switch" role="group" aria-label="图表视图">
+            <button type="button" data-graph-mode="hive" aria-pressed="true">蜂巢</button><button type="button" data-graph-mode="mentions" aria-pressed="false">提及关系</button>
+          </div>
+          <button type="button" id="swarm-export" class="btn-ghost">导出 GIF</button>
+        </div>
+        <div class="sw-tool-row sw-playback" aria-label="回放控制">
+          <button id="swarm-start" aria-label="回到起点" title="回到起点">⏮</button><button id="swarm-prev" aria-label="上一步" title="上一步">‹</button>
+          <button id="swarm-play" aria-label="播放" title="播放">▶</button><button id="swarm-next" aria-label="下一步" title="下一步">›</button>
+          <input id="swarm-scrubber" aria-label="回放进度" type="range" min="0" max="0" value="0">
+          <span id="swarm-step" class="mono"></span><button id="swarm-live" aria-pressed="true">实时</button>
+        </div>
+        <div class="sw-tool-row sw-graph-options">
+          <label id="swarm-hide-label"><input type="checkbox" id="swarm-hide-inactive"> 隐藏非活跃成员</label>
+          <label id="swarm-expand-label"><input type="checkbox" id="swarm-expand"> 展开 @all</label>
+          <label><select id="swarm-pace" aria-label="回放节奏"><option value="even">均匀节奏</option><option value="real">实际时间</option></select></label>
+          <select id="swarm-speed" aria-label="回放速度"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option><option value="8">8×</option></select>
+        </div>
+        <div id="swarm-hive-view"></div>
+        <div id="swarm-mentions-wrap" hidden><svg id="swarm-mentions-svg" role="img" aria-label="成员提及关系图"></svg></div>
+        <div id="swarm-legend"></div><p id="swarm-replay-caption"></p>
+      </div>
+    </section>
+    <section id="swarm-sub-raw" class="swarm-body" role="tabpanel" aria-labelledby="swarm-subtab-raw" hidden>
+      <div class="reading-column"><div class="sw-tool-row sw-raw-tools">
+        <div class="scope-switch" role="group" aria-label="数据文件">
+          <button data-raw="members" aria-pressed="true">members.json</button><button data-raw="board" aria-pressed="false">board.jsonl</button><button data-raw="plan" aria-pressed="false">plan.json</button>
+        </div><span id="swarm-raw-meta" role="status"></span><button id="swarm-raw-copy" class="btn-ghost">复制</button>
+      </div><pre id="swarm-raw-content" tabindex="0"></pre></div>
+    </section>
+
+  </main>
   <div id="view-console" class="console-host" hidden>
     <div class="page-shell">
     <p id="sync-announcement" class="sr-only" role="status"></p>
@@ -180,48 +334,28 @@
       <section class="section" aria-labelledby="route-section-label">
         <div class="section-head">
           <span id="route-section-label" class="section-eyebrow">当前路由</span>
-          <fieldset class="mode-fieldset">
-            <legend class="sr-only">接入方式</legend>
-            <div class="seg-control seg-compact">
-              <span class="seg-option">
-                <input id="mode-mcp" class="seg-radio sr-only" type="radio" name="view_mode" value="mcp">
-                <label class="seg-label" for="mode-mcp">MCP 编排</label>
-              </span>
-              <span class="seg-option">
-                <input id="mode-native" class="seg-radio sr-only" type="radio" name="view_mode" value="native">
-                <label class="seg-label" for="mode-native">路由组直连</label>
-              </span>
-            </div>
-          </fieldset>
         </div>
 
         <article class="surface route-card">
           <div class="route-title-row">
-            <div class="route-title-group">
-              <strong id="active-tier-name" class="route-tier-name">Antigravity MCP</strong>
-              <button id="active-tier-target" type="button" class="pill-copy-btn" data-copy="group/gempt-sonnet" hidden>group/gempt-sonnet</button>
-              <span id="active-tier-ready-badge" class="inline-state-badge" hidden>未创建</span>
-            </div>
+            <strong class="route-tier-name">Antigravity MCP</strong>
             <span id="active-tier-effort" class="effort-tag"></span>
           </div>
 
           <div class="route-strip">
             <span class="route-path">
-              <strong id="source-title">Antigravity</strong>
+              <strong>Antigravity</strong>
               <span aria-hidden="true">→</span>
               <strong>Magpie</strong>
-              <span id="hub-mode-text"></span>
             </span>
-            <div id="source-actions" class="source-actions">
+            <div class="source-actions">
               <button id="copy-mcp-btn" type="button" class="pill-copy-btn">复制 MCP 配置</button>
               <button id="copy-rules-btn" type="button" class="pill-copy-btn">复制协作规则</button>
               <button id="active-slash-btn" type="button" class="pill-copy-btn" data-copy="/gempt " hidden>/gempt</button>
             </div>
-            <span id="native-client-caption" hidden></span>
           </div>
-          <ul id="route-chain" class="route-chain" aria-label="直连路由组成员" hidden></ul>
 
-          <section id="work-controls" class="work-controls" tabindex="-1" aria-labelledby="work-label" hidden>
+          <section id="work-controls" class="work-controls" tabindex="-1" aria-labelledby="work-label">
             <fieldset class="control-fieldset">
               <legend id="work-label" class="control-legend">普通对话 · 工作分工</legend>
               <div id="work-options" class="work-options"></div>
@@ -257,37 +391,43 @@
               </div>
             </fieldset>
             <fieldset class="control-fieldset">
-              <legend class="control-legend">原生 Swarm 派单</legend>
+              <legend class="control-legend">Swarm 协作模式</legend>
               <div class="seg-control swarm-dispatch">
                 <span class="seg-option">
-                  <input id="dispatch-swarm" class="seg-radio sr-only" type="radio" name="native_swarm" value="true" disabled>
-                  <label class="seg-label" for="dispatch-swarm">强制 Swarm（原生 worktree）</label>
+                  <input id="dispatch-direct" class="seg-radio sr-only" type="radio" name="native_swarm" value="false" disabled>
+                  <label class="seg-label" for="dispatch-direct">无壳 GemPT Swarm（默认）</label>
                 </span>
                 <span class="seg-option">
-                  <input id="dispatch-direct" class="seg-radio sr-only" type="radio" name="native_swarm" value="false" disabled>
-                  <label class="seg-label" for="dispatch-direct">直调 gpt_run</label>
+                  <input id="dispatch-swarm" class="seg-radio sr-only" type="radio" name="native_swarm" value="true" disabled>
+                  <label class="seg-label" for="dispatch-swarm">AGY 原生 Swarm（混编）</label>
                 </span>
               </div>
+              <span class="control-hint">默认使用无壳 GemPT Swarm（gpt_swarm / gpt_board）；需与 AGY 原生 Gemini/Claude 工位混编时可切到原生 Swarm。</span>
             </fieldset>
             <div class="swarm-settings">
               <div class="swarm-choice">
-                <label for="swarm-shell-model" class="control-legend">Swarm 工位模型</label>
-                <input id="swarm-shell-model" name="swarm_shell_model" list="swarm-shell-presets" maxlength="128" disabled>
-                <datalist id="swarm-shell-presets"></datalist>
+                <label for="execution-cli" class="control-legend">执行 CLI</label>
+                <select id="execution-cli" name="default_cli" aria-describedby="execution-cli-hint"></select>
+                <span id="execution-cli-hint" class="control-hint"></span>
               </div>
               <div class="swarm-choice">
                 <label for="swarm-split" class="control-legend">Swarm 工作分工</label>
                 <select id="swarm-split" name="swarm_split" aria-describedby="swarm-detail"></select>
                 <span id="swarm-detail" class="control-hint"></span>
               </div>
+              <div class="swarm-choice">
+                <label for="swarm-shell-model" class="control-legend">原生 Swarm 工位模型</label>
+                <input id="swarm-shell-model" name="swarm_shell_model" list="swarm-shell-presets" maxlength="128" disabled>
+                <datalist id="swarm-shell-presets"></datalist>
+              </div>
             </div>
             <fieldset id="pairing-controls" class="control-fieldset">
               <legend class="control-legend">Gemini 下属模型</legend>
               <div class="pairing-options" id="pairing-options"></div>
-              <span class="control-hint">从 Magpie 选择下属模型或路由组。Swarm 跟随协调者的配对。</span>
+              <span class="control-hint">从 Magpie 选择下属模型。Swarm 跟随协调者的配对。</span>
             </fieldset>
           </section>
-          <div id="mcp-controls-bar" class="route-controls">
+          <div class="route-controls">
             <fieldset id="sandbox-control-group" class="control-fieldset">
               <legend class="control-legend">Codex 执行权限</legend>
               <div class="seg-control">
@@ -357,8 +497,12 @@
                 <label class="advanced-field">排除模型<textarea id="excluded-models" rows="2" placeholder="用逗号或换行分隔"></textarea></label>
               </fieldset>
               <fieldset>
-                <legend>Codex 运行时与超时</legend>
+                <legend>执行 CLI 与超时</legend>
                 <label class="advanced-field">Codex CLI 路径<input id="codex-cli-path" spellcheck="false"></label>
+                <div class="runner-catalog">
+                  <span class="control-legend">已支持的 11 种执行 CLI</span>
+                  <ul id="runner-cli-list" class="runner-cli-list"></ul>
+                </div>
                 <label class="advanced-field">咨询超时（秒）<input id="consult-timeout" type="number" min="15" max="1800" step="1" required></label>
             <div class="control-fieldset timeout-form">
               <label for="codex-timeout" class="control-legend">执行超时（秒）</label>
@@ -398,87 +542,7 @@
               </fieldset>
             </form>
           </details>
-
-          <div id="native-controls-bar" class="native-controls" hidden>
-            <p class="control-hint">直连组按回合选模型。需要 Gemini 解说 GPT 的工作结果时，请使用 MCP 编排与工作分工。</p>
-            <p id="native-status-copy" class="native-copy">尚未在 Magpie 创建直连路由组，创建后可在任意客户端直接选 group/gempt-* 使用。</p>
-            <div id="native-ready-pills" class="native-ready-pills" hidden>
-              <button type="button" class="pill-copy-btn" data-copy="group/gempt-sonnet">group/gempt-sonnet</button>
-              <button type="button" class="pill-copy-btn" data-copy="group/gempt-opus">group/gempt-opus</button>
-              <button type="button" class="pill-copy-btn" data-copy="group/gempt-fable">group/gempt-fable</button>
-            </div>
-            <button id="create-native-btn" type="button" class="primary-btn" hidden>一键创建直连路由组</button>
-          </div>
         </article>
-      </section>
-
-      <section id="tiers-section" class="section" aria-labelledby="tiers-section-label" hidden>
-        <div class="section-head">
-          <span id="tiers-section-label" class="section-eyebrow">直连路由组档位</span>
-          <span class="section-meta">供其他 Agent / 客户端选用 · 点击切换预览</span>
-        </div>
-
-        <fieldset class="tier-fieldset">
-          <legend class="sr-only">预览直连路由组</legend>
-          <div id="tier-list" class="tier-list">
-            <label class="card tier-row" for="tier-sonnet" data-tier="sonnet">
-              <input id="tier-sonnet" class="tier-radio sr-only" type="radio" name="native_preview_tier" value="sonnet">
-              <span class="tier-bullet" aria-hidden="true"></span>
-              <span class="tier-body">
-                <span class="tier-line-top">
-                  <strong class="tier-title" data-field="short_name">Sonnet</strong>
-                  <code class="pill-code" data-field="target_pill">group/gempt-sonnet</code>
-                </span>
-                <span class="tier-line-sub" data-field="chain_summary">GPT-6.2-Sol</span>
-              </span>
-              <span class="tier-tail">
-                <span class="tier-when" data-field="role_desc">日常高频 · ~75%</span>
-                <span class="tier-effort-chip" data-field="effort_tag">未创建</span>
-                <svg class="tier-check" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                  <path d="M3.5 8.5L6.5 11.5L12.5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-              </span>
-            </label>
-
-            <label class="card tier-row" for="tier-opus" data-tier="opus">
-              <input id="tier-opus" class="tier-radio sr-only" type="radio" name="native_preview_tier" value="opus">
-              <span class="tier-bullet" aria-hidden="true"></span>
-              <span class="tier-body">
-                <span class="tier-line-top">
-                  <strong class="tier-title" data-field="short_name">Opus</strong>
-                  <code class="pill-code" data-field="target_pill">group/gempt-opus</code>
-                </span>
-                <span class="tier-line-sub" data-field="chain_summary">GPT-6.2-Sol ↗ 升级 GPT-6.2-Astra</span>
-              </span>
-              <span class="tier-tail">
-                <span class="tier-when" data-field="role_desc">复杂工程 · ~20%</span>
-                <span class="tier-effort-chip" data-field="effort_tag">未创建</span>
-                <svg class="tier-check" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                  <path d="M3.5 8.5L6.5 11.5L12.5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-              </span>
-            </label>
-
-            <label class="card tier-row" for="tier-fable" data-tier="fable">
-              <input id="tier-fable" class="tier-radio sr-only" type="radio" name="native_preview_tier" value="fable">
-              <span class="tier-bullet" aria-hidden="true"></span>
-              <span class="tier-body">
-                <span class="tier-line-top">
-                  <strong class="tier-title" data-field="short_name">Fable</strong>
-                  <code class="pill-code" data-field="target_pill">group/gempt-fable</code>
-                </span>
-                <span class="tier-line-sub" data-field="chain_summary">GPT-6.2-Astra</span>
-              </span>
-              <span class="tier-tail">
-                <span class="tier-when" data-field="role_desc">顶配攻坚 · ~5%</span>
-                <span class="tier-effort-chip" data-field="effort_tag">未创建</span>
-                <svg class="tier-check" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                  <path d="M3.5 8.5L6.5 11.5L12.5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-              </span>
-            </label>
-          </div>
-        </fieldset>
       </section>
 
       <div class="bottom-grid">
@@ -491,11 +555,6 @@
           </header>
 
           <div class="readiness-row" aria-label="各客户端就绪状态">
-            <button id="chip-native" type="button" class="status-chip" title="切换到路由组直连视图">
-              <span class="chip-dot" aria-hidden="true"></span>
-              <span class="chip-name">路由组直连</span>
-              <span id="chip-native-val" class="chip-val">0/3</span>
-            </button>
             <button id="chip-mcp" type="button" class="status-chip" title="点击复制独立 MCP JSON 配置">
               <span class="chip-dot" aria-hidden="true"></span>
               <span class="chip-name">内置 MCP 工具</span>
@@ -513,6 +572,7 @@
             </button>
           </div>
           <p id="app-server-error" class="app-server-error" hidden></p>
+          <p id="zero-cli-guide" class="zero-cli-guide control-hint" hidden></p>
           <details id="agy-setup" class="advanced-settings" hidden>
             <summary id="agy-setup-title">启用 Antigravity 集成</summary>
             <p class="control-hint">安装在运行 Magpie 的机器上。如果 Antigravity 在另一台机器，请在那台机器运行安装器。</p>
@@ -533,7 +593,7 @@
                   <strong>Chore</strong>
                   <code id="chore-model" class="pill-code">auto/deepseek-v4.1-flash</code>
                 </div>
-                <span id="chore-sub" class="utility-sub">仅咨询 · 自动压缩上下文</span>
+                <span id="chore-sub" class="utility-sub">仅咨询</span>
               </div>
             </div>
             <button type="button" class="icon-btn" data-copy="/gempt-chore " aria-label="复制 /gempt-chore" title="复制 /gempt-chore">
@@ -545,15 +605,6 @@
           </div>
 
           <div class="shortcut-stack">
-            <div id="strip-native-ids" class="slash-strip" aria-label="外部客户端直连模型 ID" hidden>
-              <span class="slash-label">直连模型 ID</span>
-              <div class="slash-buttons">
-                <button type="button" class="slash-btn" data-copy="group/gempt-sonnet">group/gempt-sonnet</button>
-                <button type="button" class="slash-btn" data-copy="group/gempt-opus">group/gempt-opus</button>
-                <button type="button" class="slash-btn" data-copy="group/gempt-fable">group/gempt-fable</button>
-              </div>
-            </div>
-
             <div id="strip-agy-slash" class="slash-strip" aria-label="Antigravity 单轮快捷指令" hidden>
               <span class="slash-label">Antigravity 单轮</span>
               <div class="slash-buttons">

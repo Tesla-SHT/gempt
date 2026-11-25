@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 import { existsSync, realpathSync } from 'node:fs';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { ACTIVE_STATES, compactReceiptText, readRun, waitForRuns } from './runs.mjs';
+import { detectSystemAttention, getBoardHead, listChannels, listRoster, mentionMatchesAgent, openSwarmDb, readBoardMessages } from './swarm-bus.mjs';
+
+import { ALL, activeAt, countsUnread, mentionsIn } from './swarm-channels.mjs';
 
 function compactRecord(record) {
   const { before, after, goal, progress, result, config_path, source, pid, ...receipt } = record;
@@ -34,16 +38,107 @@ function compactRecord(record) {
   return receipt;
 }
 
+function compactRoster(roster) {
+  return roster.map(({ name, state, cli, model, run_id, session_id, last_seq, parked_on, error, task_summary }) => ({
+    name, state, cli, model, run_id, session_id, last_seq, parked_on, error, task_summary,
+  }));
+}
+
+function rosterSignature(roster) {
+  return roster.map((w) => `${w.name}:${w.state}:${w.run_id || ''}:${w.parked_on || ''}:${w.error || ''}`).join('|');
+}
+
+function isAttentionWorker(worker) {
+  return worker.state === 'waiting_reply'
+    || worker.state === 'failed'
+    || worker.state === 'interrupted'
+    || (worker.state === 'stopped' && Boolean(worker.error));
+}
+
+export async function waitForBoard(swarmId, {
+  since = 0, allMessages = false, channel, sessionsDir, pollIntervalMs = 200, timeoutMs = Infinity,
+} = {}) {
+  const after = Math.max(0, Math.trunc(Number(since) || 0));
+  const deadline = Number.isFinite(timeoutMs) ? performance.now() + timeoutMs : Infinity;
+  const db = await openSwarmDb(sessionsDir);
+  try {
+    const initialRoster = await listRoster(swarmId, { includeKilled: false, db });
+    const initialSig = rosterSignature(initialRoster);
+    let previousHead = -1, previousSig, history = [], channels = [];
+    let messages = [], matching = [], system_attention = [];
+    while (true) {
+      const [head, roster] = await Promise.all([
+        getBoardHead(swarmId, { db }),
+        listRoster(swarmId, { includeKilled: false, db }),
+      ]);
+      const boardChanged = head !== previousHead;
+      if (boardChanged) {
+        const fresh = await readBoardMessages(swarmId, { since: Math.max(0, previousHead), limit: Infinity, db });
+        history = history.concat(fresh);
+        channels = await listChannels(swarmId, { db });
+        previousHead = fresh.at(-1)?.seq ?? head;
+        const active = activeAt(channels, fresh);
+        const visible = (m) => m.seq > after && (!channel || channel === ALL || m.channel === channel) && countsUnread(m);
+        messages = messages.concat(fresh.filter(visible)).slice(0, 100);
+        matching = allMessages ? messages : fresh.filter((m, i) => visible(m) && m.from_agent !== 'coordinator' &&
+          (m.kind === 'question' || mentionMatchesAgent(m.mentions, 'coordinator') ||
+            mentionsIn(m.text, 'coordinator', [ALL], active[i]))).slice(0, 100);
+      }
+      const attention = roster.some(isAttentionWorker);
+      const anyWorking = roster.some((w) => w.state === 'working');
+      const sig = rosterSignature(roster);
+      if (boardChanged || sig !== previousSig) {
+        system_attention = detectSystemAttention(null, roster, history, channels);
+        previousSig = sig;
+      }
+      const allIdleWithChange = roster.length > 0 && !anyWorking && (messages.length || sig !== initialSig);
+      const remaining = deadline - performance.now();
+      if (matching.length > 0 || system_attention.some((item) => item.kind === 'stall') || attention || allIdleWithChange || remaining <= 0) {
+        return {
+          swarm_id: swarmId,
+          head: previousHead,
+          messages: allMessages ? messages : (matching.length ? matching : messages),
+          roster: compactRoster(roster), system_attention,
+        };
+      }
+      await sleep(Math.min(pollIntervalMs, Math.max(10, remaining)));
+    }
+  } finally {
+    db.close();
+  }
+}
+
 export async function runWait(args, { sessionsDir, readOnly = false } = {}) {
   const legacy = args[0] === 'status';
   try {
     const { values, positionals } = parseArgs({ args: legacy ? args.slice(1) : args, allowPositionals: !legacy,
       options: legacy ? { 'run-id': { type: 'string' }, 'run-ids': { type: 'string' },
         wait: { type: 'boolean' }, 'wait-all': { type: 'boolean' } }
-        : { all: { type: 'boolean' } } });
+        : {
+          all: { type: 'boolean' },
+          board: { type: 'string' },
+          since: { type: 'string' },
+          channel: { type: 'string' },
+          'all-messages': { type: 'boolean' },
+        } });
+    if (!legacy && values.board) {
+      if (positionals.length > 0) {
+        throw new Error('Usage: gempt-wait --board SWARM_ID [--since SEQ] [--channel NAME] [--all-messages]');
+      }
+      const since = values.since !== undefined ? Number(values.since) : 0;
+      if (!Number.isFinite(since) || since < 0) throw new Error('Invalid --since value.');
+      const snapshot = await waitForBoard(values.board, {
+        since,
+        allMessages: Boolean(values['all-messages']),
+        channel: values.channel,
+        sessionsDir,
+      });
+      console.log(JSON.stringify(snapshot));
+      return 0;
+    }
     const ids = legacy ? values['run-id'] || values['run-ids'] : positionals[0];
     if (!ids || positionals.length > 1 || (values['run-id'] && values['run-ids'])) {
-      throw new Error('Usage: gempt-wait [--all] RUN_ID[,RUN_ID...]');
+      throw new Error('Usage: gempt-wait [--all] RUN_ID[,RUN_ID...] | gempt-wait --board SWARM_ID [--since SEQ] [--channel NAME] [--all-messages]');
     }
     const waitAll = Boolean(values.all || values['wait-all']);
     const wait = !readOnly || values.wait || waitAll;

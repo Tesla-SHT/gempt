@@ -7,6 +7,7 @@ import { readHostContext } from './host-context.mjs';
 import { runLiveOperation } from './live-service.mjs';
 import { ACTIVE_STATES, buildWaitCommand, compactReceiptText, dispatchRun, interruptRun, readRun, replyToolCall, runWithinRoot, steerRun, validateExecTimeoutSec } from './runs.mjs';
 import { lockStaleMsForBudget, resolvePath, validateSessionId, withLock } from './state.mjs';
+import { handleBoardAction, handleSwarmAction } from './swarm-engine.mjs';
 import { TOOLS } from './tool-schemas.mjs';
 export { TOOLS };
 
@@ -79,6 +80,18 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
     magpieConfigDir: env.MAGPIE_CONFIG_DIR, ...overrides,
   };
   if (name === 'gpt_ctl') return control(args, options);
+  if (name === 'gpt_swarm') {
+    return textResult(await handleSwarmAction(args, {
+      ...options,
+      agent: typeof callCtx?.agent === 'string' ? callCtx.agent : undefined,
+    }));
+  }
+  if (name === 'gpt_board') {
+    return textResult(await handleBoardAction(args, {
+      ...options,
+      agent: typeof callCtx?.agent === 'string' ? callCtx.agent : undefined,
+    }));
+  }
   if (!['gpt_run', 'gpt_ask'].includes(name)) throw new Error(`Unknown tool: ${name}`);
   const goal = String(args.goal || '').trim();
   if (!goal) throw new Error('`goal` is required.');
@@ -112,6 +125,7 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
   const syncBudget = Number(env.GEMPT_GPT_RUN_SYNC_SEC);
   const waitSec = Number.isFinite(syncBudget) && syncBudget > 0 ? Math.min(syncBudget, 10) : 0;
   const res = await dispatchRun({ goal, cwd, access, workspace: args.workspace, title: args.title, tier: args.tier,
+    ...(args.cli ? { cli: args.cli } : {}),
     ...(timeoutSec !== undefined ? { timeout_sec: timeoutSec } : {}),
     host_conversation_id: args.host_conversation_id, gemini_family: args.gemini_family, mcp: true, session_id: sessionId,
     background: args.background ?? waitSec === 0, sandbox: access === 'inspect' ? 'read-only' : undefined,
@@ -120,14 +134,15 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
   if (ACTIVE_STATES.has(res.state) || res.state === 'interrupted') {
     const wait = buildWaitCommand(res.run_id, options);
     return textResult({ run_id: res.run_id, session_id: res.session_id, state: res.state, wait_command: wait,
+      ...(res.cli ? { cli: res.cli } : {}),
       text: res.state === 'waiting_gemini'
         ? `Run ${res.run_id} is waiting for ask_gemini reply (use gpt_ctl action='reply').`
         : `Run ${res.run_id} started. Execute \`${wait}\` via run_command(WaitMsBeforeAsync=500) for zero-poll wakeup.`,
       ...(res.worktree_path ? { worktree_path: res.worktree_path } : {}),
     }, { isError: res.state === 'interrupted' });
   }
-  const { run_id, session_id, model, tier, reasoning_effort, worktree_path, verification, usage, text } = res;
-  return textResult({ run_id, session_id, model, tier, reasoning_effort, worktree_path, verification, usage,
+  const { run_id, session_id, cli, model, tier, reasoning_effort, worktree_path, verification, usage, text } = res;
+  return textResult({ run_id, session_id, ...(cli ? { cli } : {}), model, tier, reasoning_effort, worktree_path, verification, usage,
     text: compactReceiptText(text, session_id) }, { isError: ['failed', 'unverified'].includes(verification?.status) });
 }
 

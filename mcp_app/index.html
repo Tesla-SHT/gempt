@@ -22,6 +22,7 @@
     </span>
     <nav class="app-tabs" role="tablist" aria-label="GemPT 视图">
       <button id="tab-live" type="button" role="tab" aria-selected="true" aria-controls="live-panel">实时流</button>
+      <button id="tab-swarm" type="button" role="tab" aria-selected="false" aria-controls="swarm-panel" tabindex="-1"><span class="tab-label">协作</span><span id="swarm-tab-badge" class="tab-badge" hidden></span></button>
       <button id="tab-overview" type="button" role="tab" aria-selected="false" aria-controls="overview" tabindex="-1">概览</button>
       <button id="tab-requests" type="button" role="tab" aria-selected="false" aria-controls="requests" tabindex="-1">请求</button>
       <button id="tab-sessions" type="button" role="tab" aria-selected="false" aria-controls="sessions" tabindex="-1">会话</button>
@@ -155,6 +156,159 @@
         </footer>
       </div>
     </section>
+  </main>
+  <main id="swarm-panel" class="swarm-shell" role="tabpanel" aria-labelledby="tab-swarm" hidden>
+    <header class="swarm-header">
+      <div class="swarm-header-top">
+        <div class="swarm-identity">
+          <select id="swarm-picker" class="swarm-picker" aria-label="切换 Swarm" hidden></select>
+          <h1 id="swarm-title" class="swarm-title">Swarm 协作</h1>
+          <button id="swarm-edit-title" class="btn-ghost swarm-edit-btn" type="button" title="重命名 Swarm" aria-label="重命名 Swarm" hidden>改名</button>
+        </div>
+        <div class="top-actions swarm-header-actions">
+          <div id="swarm-scope-switch" class="scope-switch" role="group" aria-label="Swarm 范围" hidden>
+            <button id="swarm-scope-session" type="button" aria-pressed="true">当前会话</button>
+            <button id="swarm-scope-all" type="button" aria-pressed="false">全部</button>
+          </div>
+          <button id="swarm-refresh" class="icon-btn" type="button" title="刷新 Swarm" aria-label="刷新 Swarm" data-icon="refresh"></button>
+        </div>
+      </div>
+      <form id="swarm-title-form" class="swarm-title-form" hidden>
+        <input id="swarm-title-input" class="steer-input" type="text" maxlength="200" aria-label="Swarm 标题" placeholder="输入新标题…">
+        <button id="swarm-title-save" class="btn-primary" type="submit">保存</button>
+        <button id="swarm-title-cancel" class="btn-ghost" type="button">取消</button>
+      </form>
+      <p id="swarm-goal" class="swarm-goal" hidden></p>
+      <div id="swarm-pills" class="swarm-pills" hidden></div>
+      <div id="swarm-subtabs" class="swarm-subtabs" role="tablist" aria-label="Swarm 视图" hidden>
+        <button id="swarm-subtab-overview" type="button" role="tab" aria-selected="true" aria-controls="swarm-sub-overview">总览</button>
+        <button id="swarm-subtab-board" type="button" role="tab" aria-selected="false" aria-controls="swarm-sub-board" tabindex="-1">消息板</button>
+        <button id="swarm-subtab-graph" type="button" role="tab" aria-selected="false" aria-controls="swarm-sub-graph" tabindex="-1">关系图</button>
+        <button id="swarm-subtab-raw" type="button" role="tab" aria-selected="false" aria-controls="swarm-sub-raw" tabindex="-1">原始数据</button>
+      </div>
+    </header>
+    <p id="swarm-error" class="notice" role="status" hidden></p>
+    <section id="swarm-opaque-banner" class="warn-banner" role="status" hidden>
+      <div class="reading-column warn-banner-row">
+        <div class="warn-banner-copy">
+          <strong>嵌入式只读视图</strong>
+          <p id="swarm-opaque-text">当前在沙箱框架中仅支持查看；如需发消息或控制工位，请在独立控制台打开。</p>
+        </div>
+        <div class="warn-banner-actions">
+          <a id="swarm-standalone-link" class="btn-ghost" target="_blank" rel="noopener noreferrer" hidden>在独立控制台打开</a>
+          <button id="swarm-copy-link" class="btn-ghost" type="button" hidden>复制控制台地址</button>
+        </div>
+      </div>
+    </section>
+    <div id="swarm-loading" class="swarm-loading" role="status" aria-label="正在加载 Swarm" hidden>
+      <div class="reading-column skeleton-list">
+        <div class="skeleton-card"></div><div class="skeleton-card"></div>
+      </div>
+    </div>
+    <div id="swarm-empty" class="empty swarm-empty" hidden>
+      <span class="empty-icon" data-icon="users"></span>
+      <p id="swarm-empty-title" class="empty-title">暂无协作 Swarm</p>
+      <p id="swarm-empty-message">通过 gpt_swarm 或 gempt swarm 启动协作后，工位与消息板会显示在这里。</p>
+      <button id="swarm-empty-show-all" class="btn-ghost" type="button" hidden>查看全部 Swarm</button>
+    </div>
+    <section id="swarm-sub-overview" class="swarm-body" role="tabpanel" aria-labelledby="swarm-subtab-overview" hidden>
+      <div id="swarm-view-overview" class="reading-column swarm-overview-col" hidden>
+        <section id="swarm-attention" aria-label="需要关注" hidden></section>
+        <div id="swarm-team" aria-label="协作成员"></div>
+        <div id="swarm-threads" class="swarm-threads"></div>
+        <section id="swarm-screenshots-card" class="swarm-card swarm-screenshots-card" hidden>
+          <header class="swarm-card-head">
+            <span data-icon="image"></span>
+            <h2 class="swarm-card-title">截图时间线</h2>
+            <span id="swarm-screenshots-count" class="swarm-card-meta"></span>
+          </header>
+          <ol id="swarm-screenshots-list" class="swarm-screenshots-list"></ol>
+        </section>
+      </div>
+    </section>
+    <section id="swarm-sub-board" class="swarm-board-view" role="tabpanel" aria-labelledby="swarm-subtab-board" hidden>
+      <div id="swarm-view-board" class="swarm-board-view" hidden>
+      <div class="sw-board-bar"><div class="reading-column">
+          <section class="sw-board-tools">
+            <div class="sw-tool-row"><input id="swarm-search" type="search" placeholder="搜索消息" aria-label="搜索消息">
+              <button type="button" id="swarm-filter-toggle" class="btn-ghost" aria-controls="swarm-filters" aria-expanded="false">筛选</button>
+            </div>
+            <div id="swarm-filters" class="sw-tool-row" hidden>
+              <label>发送者 <select id="swarm-from"></select></label>
+              <label>提及 <select id="swarm-mentioned"></select></label>
+              <label>频道 <select id="swarm-channel-filter"></select></label>
+            </div>
+            <div class="sw-tool-row"><div id="swarm-channel-tabs" class="sw-channels" role="group" aria-label="频道"></div>
+              <button id="swarm-new-channel" type="button" class="btn-ghost" aria-expanded="false" aria-controls="swarm-channel-form" hidden>新建频道</button>
+              <button id="swarm-archive" type="button" class="btn-ghost" hidden>归档频道</button>
+            </div>
+            <form id="swarm-channel-form" class="sw-tool-row" hidden>
+              <input id="swarm-channel-name" placeholder="频道名称" aria-label="频道名称" required maxlength="24" pattern="[a-z][a-z0-9\-]{0,23}">
+              <input id="swarm-channel-topic" placeholder="主题（可选）" aria-label="主题（可选）">
+              <button class="btn-primary" type="submit">创建</button>
+            </form>
+          </section>
+      </div></div>
+      <div id="swarm-board-wrap" class="swarm-board-wrap">
+        <div class="reading-column">
+          <div id="swarm-board-empty" class="empty" hidden>
+            <span class="empty-icon" data-icon="chat"></span>
+            <p class="empty-title">消息板暂无消息</p>
+            <p>发送消息或等待工位上报后，动态会按顺序显示在这里。</p>
+          </div>
+          <ol id="swarm-board-feed" class="swarm-board-feed"></ol>
+        </div>
+      </div>
+      <footer id="swarm-composer" class="composer swarm-composer" aria-label="向消息板发送消息">
+        <div class="reading-column swarm-composer-col">
+          <label id="swarm-target-label" hidden>发布到 <select id="swarm-target"></select></label>
+          <div id="swarm-mention-chips" class="swarm-mention-chips" aria-label="快捷 @提及"></div>
+          <div id="swarm-reply-banner" class="swarm-reply-banner" hidden>
+            <span id="swarm-reply-label"></span>
+            <button id="swarm-reply-clear" class="icon-btn" type="button" aria-label="取消回复" data-icon="close"></button>
+          </div>
+          <div class="swarm-composer-row">
+            <textarea id="swarm-composer-input" class="swarm-textarea" rows="2" aria-label="消息内容" placeholder="输入消息，@工位名 可直接唤醒或纠偏…（Ctrl/Cmd+Enter 发送）"></textarea>
+            <button id="swarm-composer-send" class="btn-primary swarm-send-btn" type="button" disabled>发送</button>
+          </div>
+          <p id="swarm-composer-status" class="ctrl-status" role="status" hidden></p>
+        </div>
+      </footer>
+      </div>
+    </section>
+    <section id="swarm-sub-graph" class="swarm-body" role="tabpanel" aria-labelledby="swarm-subtab-graph" hidden>
+      <div class="reading-column sw-graph">
+        <div class="sw-tool-row sw-graph-head">
+          <div class="scope-switch" role="group" aria-label="图表视图">
+            <button type="button" data-graph-mode="hive" aria-pressed="true">蜂巢</button><button type="button" data-graph-mode="mentions" aria-pressed="false">提及关系</button>
+          </div>
+          <button type="button" id="swarm-export" class="btn-ghost">导出 GIF</button>
+        </div>
+        <div class="sw-tool-row sw-playback" aria-label="回放控制">
+          <button id="swarm-start" aria-label="回到起点" title="回到起点">⏮</button><button id="swarm-prev" aria-label="上一步" title="上一步">‹</button>
+          <button id="swarm-play" aria-label="播放" title="播放">▶</button><button id="swarm-next" aria-label="下一步" title="下一步">›</button>
+          <input id="swarm-scrubber" aria-label="回放进度" type="range" min="0" max="0" value="0">
+          <span id="swarm-step" class="mono"></span><button id="swarm-live" aria-pressed="true">实时</button>
+        </div>
+        <div class="sw-tool-row sw-graph-options">
+          <label id="swarm-hide-label"><input type="checkbox" id="swarm-hide-inactive"> 隐藏非活跃成员</label>
+          <label id="swarm-expand-label"><input type="checkbox" id="swarm-expand"> 展开 @all</label>
+          <label><select id="swarm-pace" aria-label="回放节奏"><option value="even">均匀节奏</option><option value="real">实际时间</option></select></label>
+          <select id="swarm-speed" aria-label="回放速度"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option><option value="8">8×</option></select>
+        </div>
+        <div id="swarm-hive-view"></div>
+        <div id="swarm-mentions-wrap" hidden><svg id="swarm-mentions-svg" role="img" aria-label="成员提及关系图"></svg></div>
+        <div id="swarm-legend"></div><p id="swarm-replay-caption"></p>
+      </div>
+    </section>
+    <section id="swarm-sub-raw" class="swarm-body" role="tabpanel" aria-labelledby="swarm-subtab-raw" hidden>
+      <div class="reading-column"><div class="sw-tool-row sw-raw-tools">
+        <div class="scope-switch" role="group" aria-label="数据文件">
+          <button data-raw="members" aria-pressed="true">members.json</button><button data-raw="board" aria-pressed="false">board.jsonl</button><button data-raw="plan" aria-pressed="false">plan.json</button>
+        </div><span id="swarm-raw-meta" role="status"></span><button id="swarm-raw-copy" class="btn-ghost">复制</button>
+      </div><pre id="swarm-raw-content" tabindex="0"></pre></div>
+    </section>
+
   </main>
   <!-- CONSOLE MARKUP -->
   <dialog id="console-copy-dialog" aria-labelledby="console-copy-label">

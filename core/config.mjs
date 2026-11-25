@@ -8,7 +8,7 @@ import { RUNTIME_ROOT, resolvePluginRoot } from './bundle-paths.mjs';
 import { withLockSync } from './state.mjs';
 
 export const GEMPT_VERSION = readJsonSafe(join(RUNTIME_ROOT, 'package.json'))?.version
-  || readJsonSafe(join(resolvePluginRoot(), 'plugin.json'))?.version || '0.7.1';
+  || readJsonSafe(join(resolvePluginRoot(), 'plugin.json'))?.version || '0.8.0';
 export const TIER_ORDER = ['sonnet', 'opus', 'fable'];
 export const TIER_ALIASES = { lite: 'sonnet', mid: 'opus', max: 'fable' };
 export const VALID_SANDBOXES = ['read-only', 'workspace-write', 'danger-full-access'];
@@ -22,6 +22,25 @@ export const SAFE_MODEL_ID = /^[A-Za-z0-9._:/@-]{1,128}$/;
 export const UI_LANGUAGES = ['auto', 'zh', 'en'];
 export const UTILITY_EFFORTS = ['', 'low', 'medium', 'high'];
 export const DEFAULT_CONSULT_TIMEOUT_SEC = 180;
+export const RUNNER_IDS = Object.freeze([
+  'codex', 'opencode', 'claude', 'gemini', 'pi', 'cursor', 'kimi', 'grok', 'kilo', 'copilot', 'qoder',
+]);
+export const CLI_CHOICES = Object.freeze(['auto', ...RUNNER_IDS]);
+
+export function getExecutionConfig(cfg) {
+  const exec = cfg?.execution && typeof cfg.execution === 'object' && !Array.isArray(cfg.execution) ? cfg.execution : {};
+  const rawDefault = String(exec.default_cli || 'auto').trim().toLowerCase();
+  const default_cli = CLI_CHOICES.includes(rawDefault) ? rawDefault : 'auto';
+  const rawPaths = exec.cli_paths && typeof exec.cli_paths === 'object' && !Array.isArray(exec.cli_paths) ? exec.cli_paths : {};
+  const cli_paths = {};
+  for (const id of RUNNER_IDS) {
+    const val = typeof rawPaths[id] === 'string' ? rawPaths[id].trim() : '';
+    if (val) cli_paths[id] = val;
+  }
+  const legacyCodex = typeof cfg?.codex?.cli_path === 'string' ? cfg.codex.cli_path.trim() : '';
+  if (!cli_paths.codex && legacyCodex) cli_paths.codex = legacyCodex;
+  return { default_cli, cli_paths };
+}
 
 export const hasRuntimeConfig = (cfg) => Boolean(cfg && Object.keys(cfg).some((key) => key !== 'ui'));
 export const getUiLanguage = (cfg) => UI_LANGUAGES.includes(cfg?.ui?.language) ? cfg.ui.language : 'auto';
@@ -38,7 +57,6 @@ export const DEFAULT_TIERS = {
     api_mode: 'responses',
     max_output_tokens: 16384,
     fallback_models: [],
-    magpie_group_members: [],
   },
   opus: {
     label: 'Opus · 复杂工程',
@@ -52,7 +70,6 @@ export const DEFAULT_TIERS = {
     api_mode: 'responses',
     max_output_tokens: 24576,
     fallback_models: [],
-    magpie_group_members: [],
   },
   fable: {
     label: 'Fable · 顶配攻坚',
@@ -64,7 +81,6 @@ export const DEFAULT_TIERS = {
     api_mode: 'responses',
     max_output_tokens: 32768,
     fallback_models: [],
-    magpie_group_members: [],
   },
 };
 
@@ -75,7 +91,6 @@ export const DEFAULT_UTILITY = {
   api_mode: 'chat',
   max_output_tokens: 4096,
   fallback_models: [],
-  use_for_magpie_compact: true,
   use_as_classifier: false,
 };
 
@@ -165,9 +180,6 @@ export function buildTierView(tierId, tierCfg, defaultTier, fallbackPreset) {
     escalate_effort_threshold: String(merged.escalate_effort_threshold || fallback.escalate_effort_threshold || 'high').trim(),
     reasoning_effort: String(merged.reasoning_effort || fallback.reasoning_effort),
     fallback_models: Array.isArray(merged.fallback_models) ? merged.fallback_models.filter(Boolean).map(String) : [],
-    magpie_group_members: Array.isArray(merged.magpie_group_members)
-      ? merged.magpie_group_members.filter(Boolean).map(String)
-      : [],
     active: tierId === defaultTier,
   };
 }
@@ -393,8 +405,7 @@ export function editEffortSettings(loaded, { mcpEffort, tierEffort, tier, autoEf
   if (cleanEffort) {
     const usesAstra = targetTier === 'fable'
       || isAstraModel(targetTierCfg.consult_model)
-      || isAstraModel(targetTierCfg.exec_model)
-      || (Array.isArray(targetTierCfg.magpie_group_members) && targetTierCfg.magpie_group_members.some((m) => isAstraModel(m)));
+      || isAstraModel(targetTierCfg.exec_model);
     if (usesAstra && EFFORT_RANK[cleanEffort] < EFFORT_RANK.medium) {
       return {
         ok: false,
@@ -479,6 +490,11 @@ const settingRules = {
   routing_policy: { swarm_shell_model: isSafeModelId, excluded_models: cleanArray },
   utility: { model: (value) => cleanText(value) && /^\S{1,256}$/u.test(value.trim()), reasoning_effort: (value) => UTILITY_EFFORTS.includes(value) },
   codex: { cli_path: cleanText, extra_args: cleanArray },
+  execution: {
+    default_cli: (value) => typeof value === 'string' && CLI_CHOICES.includes(value.trim().toLowerCase()),
+    cli_paths: (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value))
+      && Object.entries(value).every(([k, v]) => RUNNER_IDS.includes(k) && cleanText(v)),
+  },
   limits: { consult_timeout_sec: (value) => Number.isInteger(value) && value >= 15 && value <= 1800 },
   ui: { language: (value) => UI_LANGUAGES.includes(value) },
 };
@@ -503,6 +519,38 @@ export function editAdvancedSettings({ data }, section, fields, fallbackUrl = DE
     }
     if (patch.clear_api_key) patch.api_key = '';
     delete patch.clear_api_key;
+  }
+  if (section === 'execution') {
+    const existingExec = getExecutionConfig(data);
+    const nextExec = { ...existingExec };
+    if (patch.default_cli !== undefined) nextExec.default_cli = patch.default_cli.toLowerCase();
+    if (patch.cli_paths !== undefined) {
+      const mergedPaths = { ...existingExec.cli_paths };
+      for (const [k, v] of Object.entries(patch.cli_paths)) {
+        const clean = String(v || '').trim();
+        if (clean) mergedPaths[k] = clean;
+        else delete mergedPaths[k];
+      }
+      nextExec.cli_paths = mergedPaths;
+    }
+    const next = { ...data, execution: nextExec };
+    if (patch.cli_paths && Object.hasOwn(patch.cli_paths, 'codex')) {
+      next.codex = { ...(data.codex && typeof data.codex === 'object' ? data.codex : {}), cli_path: String(patch.cli_paths.codex || '').trim() };
+    }
+    return { next };
+  }
+  if (section === 'codex' && Object.hasOwn(patch, 'cli_path')) {
+    const existingExec = getExecutionConfig(data);
+    const nextPaths = { ...existingExec.cli_paths };
+    if (patch.cli_path) nextPaths.codex = patch.cli_path;
+    else delete nextPaths.codex;
+    return {
+      next: {
+        ...data,
+        codex: { ...data.codex, ...patch },
+        execution: { ...existingExec, cli_paths: nextPaths },
+      },
+    };
   }
   return { next: { ...data, [section]: { ...data[section], ...patch } } };
 }

@@ -8,20 +8,20 @@ import { agyInstallPaths, RUNTIME_ROOT, resolvePluginRoot } from '../../core/bun
 import { GEMPT_VERSION } from '../../core/config.mjs';
 import { resolveNodeExecutable } from '../../core/node-executable.mjs';
 import {
-  DEFAULT_CONSULT_TIMEOUT_SEC, DEFAULT_TIERS, DEFAULT_UTILITY, FEATURES, TIER_ORDER, VALID_FAILOVER_MODES, VALID_SANDBOXES,
+  CLI_CHOICES, DEFAULT_CONSULT_TIMEOUT_SEC, DEFAULT_TIERS, DEFAULT_UTILITY, FEATURES, TIER_ORDER, VALID_FAILOVER_MODES, VALID_SANDBOXES,
   buildTierView, editAdvancedSettings, editDefaultSandbox, editEffortSettings, editPairing, editWorkSplit, expandUser,
-  getMcpEffort, getNativeSwarmPolicy, getPairing, getUiLanguage, hasApiSnapshot, hasRuntimeConfig,
+  getExecutionConfig, getMcpEffort, getNativeSwarmPolicy, getPairing, getUiLanguage, hasApiSnapshot, hasRuntimeConfig,
   isCodexModelId, isSafeModelId, normalizeDefaultTier, readJsonSafe, readPluginExecOption, readPluginMcpToolsOption,
   resolveConfigPath, resolveMagpieConfigDir, resolveSessionsDir, validateEffortSettings, withConfigTransaction,
 } from '../../core/config.mjs';
+import { detectAvailableRunners } from '../../core/runners/registry.mjs';
 import {
-  NATIVE_GROUP_SPECS, dedupe, defaultGatewayFromEnv, findApiBackup, pickDelegatePlan, pickNativeGroupPlan,
-  pickSubscriptionPlan, probeMagpie, readMagpieNativeGroups, resolveExcludedTokens,
-  resolveMagpieApiKey, syncHarnessGroups,
+  dedupe, defaultGatewayFromEnv, findApiBackup, pickDelegatePlan, pickSubscriptionPlan,
+  probeMagpie, resolveExcludedTokens, resolveMagpieApiKey,
 } from '../../core/magpie.mjs';
 import { findCodexCli } from './app-server-manager.mjs';
 import { configuredExecTimeoutSec, validateExecTimeoutSec } from './routing.mjs';
-import { readActiveRuns, readDispatchActivity, readExternalGroupUsage, readOverviewActivity, readRecentActivity } from './activity.mjs';
+import { readActiveRuns, readDispatchActivity, readOverviewActivity, readRecentActivity } from './activity.mjs';
 
 export {
   DEFAULT_MAGPIE_URL, DEFAULT_TIERS, DEFAULT_UTILITY, EFFORT_RANK, FEATURES, TIER_ALIASES,
@@ -31,13 +31,12 @@ export {
   setWorkSplit, writeConfigAtomic,
 } from '../../core/config.mjs';
 export {
-  buildMagpieCliEnv, createNativeGroups, defaultGatewayFromEnv, findMagpieCli, isHarnessGroup,
-  pickNativeGroupPlan, pickSubscriptionPlan, previewNativeGroups, probeMagpie,
-  readMagpieNativeGroups, resolveExcludedTokens, resolveMagpieApiKey, verifySubscriptionGroup,
+  defaultGatewayFromEnv, findMagpieCli, pickSubscriptionPlan, probeMagpie,
+  resolveExcludedTokens, resolveMagpieApiKey,
 } from '../../core/magpie.mjs';
 export {
   explicitTitle, getDispatchActivity, isActivityId, listDispatchActivity, normalizeTitle,
-  readActiveRuns, readExternalGroupUsage, readRecentActivity, sessionGoal, workspaceName,
+  readActiveRuns, readRecentActivity, sessionGoal, workspaceName,
 } from './activity.mjs';
 
 export { WORKLOAD };
@@ -211,59 +210,14 @@ export async function readMagpieStatus({ configPath, force = false, probeTimeout
   return entry.pending;
 }
 
-function overviewGatewayFields(magpie, rawCfg, resolvedMagpieDir) {
+function overviewGatewayFields(magpie, rawCfg) {
   const recommended = pickSubscriptionPlan(magpie);
-  const nativePlan = pickNativeGroupPlan(magpie);
-  const liveNativeGroups = readMagpieNativeGroups(resolvedMagpieDir);
-
-  const liveNativeSet = new Set([
-    ...(magpie.native_groups || []),
-    ...Object.values(liveNativeGroups).map((g) => g.group_id),
-  ]);
-
-  const nativeTiers = NATIVE_GROUP_SPECS.map((spec) => {
-    const live = liveNativeGroups[spec.id];
-    const isInstalled = liveNativeSet.has(spec.group_id);
-    if (live) {
-      return live;
-    }
-    const preview = nativePlan?.tiers?.[spec.id];
-    return {
-      id: spec.id,
-      group_id: spec.group_id,
-      installed: isInstalled,
-      members: preview?.members || [],
-      nodes: preview?.nodes || [],
-      routing: 'order',
-      rules_count: 0,
-    };
-  });
-
-  const readyCount = nativeTiers.filter((t) => t.installed).length;
-  let missingReason = '';
-  if (!magpie.reachable) {
-    missingReason = '尚未连上本地 Magpie 网关。';
-  } else if (!(magpie.gemini_models || []).length && !(magpie.codex_models || []).length) {
-    missingReason = '需要 Magpie 中同时接入 Gemini 与 Codex 模型。';
-  } else if (!(magpie.gemini_models || []).length) {
-    missingReason = 'Magpie 中尚未检测到可用的 Gemini 模型。';
-  } else if (!(magpie.codex_models || []).length) {
-    missingReason = 'Magpie 中尚未检测到 Codex 订阅模型。';
-  }
-
   return {
     mcp_default_model: pickDelegatePlan(magpie)?.tiers.sonnet.consult_model || null,
     subscription: {
       connected: Boolean(magpie.codex_ready),
       codex_count: (magpie.codex_models || []).length,
       recommended,
-    },
-    native_groups: {
-      ready_count: readyCount,
-      complete: readyCount === NATIVE_GROUP_SPECS.length,
-      can_create: Boolean(nativePlan),
-      missing_reason: missingReason,
-      tiers: nativeTiers,
     },
     api_fallback: {
       available: (magpie.openai_models || []).length > 0 || hasApiSnapshot(rawCfg),
@@ -277,7 +231,7 @@ export async function readPageMagpieStatus(options = {}) {
   const magpie = await readMagpieStatus(options);
   const { config, url } = gateway(options.configPath);
   if (url !== magpie.url) return { reachable: null, url, ui: { language: getUiLanguage(config) } };
-  return { ...magpie, ui: { language: getUiLanguage(config) }, overview: overviewGatewayFields(magpie, config, resolveMagpieConfigDir(options.magpieConfigDir)) };
+  return { ...magpie, ui: { language: getUiLanguage(config) }, overview: overviewGatewayFields(magpie, config) };
 }
 
 export function readRatio({ range = '24h', configPath, sessionsDir, magpieConfigDir, env } = {}) {
@@ -313,7 +267,7 @@ export function readOverview(options = {}) {
   return readState({ ...options, overview: true });
 }
 
-export async function readState({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, agyBinDir, execEnabled, mcpToolsEnabled, appServer, ratioRange = '24h', probeTimeoutMs = 2000, overview = false } = {}) {
+export async function readState({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, agyBinDir, execEnabled, mcpToolsEnabled, appServer, ratioRange = '24h', probeTimeoutMs = 2000, overview = false, env = process.env } = {}) {
   const resolvedConfigPath = resolveConfigPath(configPath);
   const resolvedSessionsDir = resolveSessionsDir(sessionsDir);
   const resolvedMagpieDir = resolveMagpieConfigDir(magpieConfigDir);
@@ -330,7 +284,7 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     const { key, excluded } = gatewayIdentity(rawCfg, baseUrl);
     magpie = await probeMagpie(baseUrl, key, probeTimeoutMs, excluded);
   }
-  const { subscription, ...gatewayFields } = overviewGatewayFields(magpie, rawCfg, resolvedMagpieDir);
+  const { subscription, ...gatewayFields } = overviewGatewayFields(magpie, rawCfg);
   const recommended = subscription.recommended;
   const pairings = Object.fromEntries(Object.keys(WORKLOAD.pairings).map((family) => [family, getPairing(policy, family)]));
   const clients = detectClients({ magpieConfigDir: resolvedMagpieDir, antigravityPluginDir, agyBinDir });
@@ -345,8 +299,12 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
   ));
 
   const gatewayKey = rawCfg ? resolveMagpieApiKey({ magpie: { ...rawCfg.magpie, base_url: baseUrl } }, baseUrl, { allowLocalFallback: false }) : '';
-  const codexPath = rawCfg?.codex?.cli_path || '';
-  const resolvedCodexPath = findCodexCli(codexPath);
+  const execution = getExecutionConfig(rawCfg);
+  const runners = detectAvailableRunners(rawCfg || {}, env);
+  const codexRunnerInfo = runners.find((r) => r.id === 'codex');
+  const codexPath = execution.cli_paths.codex || rawCfg?.codex?.cli_path || '';
+  const resolvedCodexPath = codexRunnerInfo?.path ?? findCodexCli(codexPath, env);
+  const availableRunners = runners.filter((r) => r.available).map((r) => r.id);
   const utilRaw = rawCfg?.utility || {};
   const utility = {
     label: String(utilRaw.label || DEFAULT_UTILITY.label),
@@ -354,12 +312,11 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     model: String(utilRaw.model || (!configured && recommended?.utility_model ? recommended.utility_model : DEFAULT_UTILITY.model)),
     reasoning_effort: String(utilRaw.reasoning_effort ?? DEFAULT_UTILITY.reasoning_effort),
     fallback_models: Array.isArray(utilRaw.fallback_models) ? utilRaw.fallback_models.filter(Boolean).map(String) : [],
-    use_for_magpie_compact: utilRaw.use_for_magpie_compact !== undefined ? Boolean(utilRaw.use_for_magpie_compact) : true,
   };
 
-  const { recentSessions, recentRuns, activityTotals, activeRuns, recentGroupCalls } = overview
-    ? await readOverviewActivity(resolvedSessionsDir, resolvedMagpieDir)
-    : { ...readRecentActivity(resolvedSessionsDir, 6), recentGroupCalls: readExternalGroupUsage(resolvedMagpieDir, 6),
+  const { recentSessions, recentRuns, activityTotals, activeRuns } = overview
+    ? await readOverviewActivity(resolvedSessionsDir)
+    : { ...readRecentActivity(resolvedSessionsDir, 6),
         activityTotals: readDispatchActivity(resolvedSessionsDir).totals, activeRuns: readActiveRuns(resolvedSessionsDir) };
   const workSplit = policy.work_split ?? 'balanced';
   const tokenRatio = overview ? null : await readRatio({
@@ -384,8 +341,12 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     codex_cli_path: codexPath,
     codex_cli_resolved_path: resolvedCodexPath,
     codex_cli_available: Boolean(resolvedCodexPath),
-    codex_auto_detected_path: codexPath ? findCodexCli() : resolvedCodexPath,
+    codex_auto_detected_path: codexRunnerInfo?.auto_detected_path ?? (codexPath ? findCodexCli('', env) : resolvedCodexPath),
     codex_extra_args: rawCfg?.codex?.extra_args || [],
+    execution,
+    runners,
+    available_runners: availableRunners,
+    has_any_runner: availableRunners.length > 0,
     consult_timeout_sec: rawCfg?.limits?.consult_timeout_sec ?? DEFAULT_CONSULT_TIMEOUT_SEC,
     work_split: workSplit,
     swarm_split: policy.swarm_split ?? 'inherit',
@@ -410,7 +371,6 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
       exec_enabled: typeof execEnabled === 'boolean' ? execEnabled : readPluginExecOption(resolvedMagpieDir),
       endpoint: `${baseUrl}/mcp/magpie/tools/gempt`,
     },
-    recent_group_calls: recentGroupCalls,
     magpie,
     tiers,
     utility,
@@ -421,8 +381,8 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
   };
 }
 
-export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000, sandbox, strategy,
-  utilityModel, failover, useGroups = false, syncGroups = false, dryRun = false,
+export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000, sandbox,
+  utilityModel, failover, dryRun = false,
   chooseSettings,
 } = {}) {
   const resolvedConfigPath = resolveConfigPath(configPath);
@@ -455,8 +415,8 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
     };
   }
 
-  if (chooseSettings) ({ sandbox, utilityModel, failover, syncGroups, useGroups } = await chooseSettings({
-    sandbox, utilityModel, failover, syncGroups, useGroups, plan,
+  if (chooseSettings) ({ sandbox, utilityModel, failover } = await chooseSettings({
+    sandbox, utilityModel, failover, plan,
   }));
   if (failover === 'subscription_only' && !subscription) {
     return { ok: false, status: 400, error: '未检测到可用的 Codex 订阅模型。' };
@@ -485,6 +445,7 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
       timeout_sec: configuredExecTimeoutSec(existingCodex),
       ...(existingCodex.timeout_sec_customized === true ? { timeout_sec_customized: true } : {}),
     },
+    execution: getExecutionConfig(existing),
     routing_policy: {
       work_split: existingPolicy.work_split ?? 'balanced',
       swarm_split: existingPolicy.swarm_split ?? 'inherit',
@@ -494,7 +455,6 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
         failover_mode: failover ?? 'paired',
       auto_effort: Boolean(existingPolicy.auto_effort),
       mcp_effort: getMcpEffort(existingPolicy),
-      magpie_group_strategy: strategy || String(existingPolicy.magpie_group_strategy || 'pace'),
       excluded_models: excludedList,
     },
     tiers: plan.tiers,
@@ -519,13 +479,6 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
     if (!result.ok) return result;
     config = result.config;
   }
-  if (useGroups) {
-    config.tiers = Object.fromEntries(TIER_ORDER.map((tier) => {
-      const group = `group/gempt-harness-${tier}`;
-      return [tier, { ...config.tiers[tier], consult_model: group, exec_model: group }];
-    }));
-  }
-  const magpieGroups = syncGroups ? await syncHarnessGroups(config, { dryRun }) : [];
   if (!dryRun) {
     const written = withConfigTransaction(resolvedConfigPath, ({ data }) =>
       isDeepStrictEqual(data, existing) ? { next: config }
@@ -542,7 +495,6 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
     plan,
     saved: !dryRun,
     ...(dryRun ? { config: { ...config, magpie: { ...config.magpie, api_key: config.magpie.api_key ? '[REDACTED]' : '' } } } : {}),
-    ...(syncGroups ? { magpie_groups_sync: magpieGroups } : {}),
   };
 }
 
@@ -551,10 +503,17 @@ export function setFailoverMode(mode, options) {
 }
 
 export async function updateSettings(settings, { configPath, probeTimeoutMs = 2000, candidate, probe } = {}) {
-  const advancedEdits = Object.fromEntries(['magpie', 'routing_policy', 'utility', 'codex', 'limits', 'ui'].map((section) =>
+  const advancedEdits = Object.fromEntries(['magpie', 'routing_policy', 'utility', 'codex', 'execution', 'limits', 'ui'].map((section) =>
     [section, (loaded, value) => editAdvancedSettings(loaded, section, value, defaultGatewayFromEnv())]));
   const edits = {
     ...advancedEdits,
+    default_cli: (loaded, value) => {
+      const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+      if (!CLI_CHOICES.includes(normalized)) {
+        return { ok: false, status: 400, error: `Invalid default_cli. Expected one of: ${CLI_CHOICES.join(', ')}.` };
+      }
+      return editAdvancedSettings(loaded, 'execution', { default_cli: normalized }, defaultGatewayFromEnv());
+    },
     codex_timeout_sec: (loaded, value) => {
       try {
         if (validateExecTimeoutSec(value) === undefined) throw new Error('Missing codex_timeout_sec.');
@@ -655,22 +614,19 @@ function planFailover(current, normalized, probe) {
   const nextTiers = { ...curTiers };
 
   if (normalized === 'subscription_only') {
-    const usesGroupOrApi = TIER_ORDER.some((t) => {
+    const usesNonSubscriptionModels = TIER_ORDER.some((t) => {
       const tier = curTiers[t] || {};
       const c = String(tier.consult_model || '').trim();
       const e = String(tier.exec_model || '').trim();
       const fbs = Array.isArray(tier.fallback_models) ? tier.fallback_models : [];
-      const mems = Array.isArray(tier.magpie_group_members) ? tier.magpie_group_members : [];
       return (
-        c.startsWith('group/')
-        || (c && !isCodexModelId(c))
+        (c && !isCodexModelId(c))
         || (e && !isCodexModelId(e))
         || fbs.some((m) => !isCodexModelId(m))
-        || mems.some((m) => !isCodexModelId(m))
       );
     });
 
-    if (curPolicy.failover_mode === 'api_fallback' || usesGroupOrApi) {
+    if (curPolicy.failover_mode === 'api_fallback' || usesNonSubscriptionModels) {
       const snapshot = {};
       for (const t of TIER_ORDER) {
         const tier = curTiers[t] || {};
@@ -679,7 +635,6 @@ function planFailover(current, normalized, probe) {
           exec_model: String(tier.exec_model || ''),
           escalate_model: String(tier.escalate_model || ''),
           fallback_models: Array.isArray(tier.fallback_models) ? [...tier.fallback_models] : [],
-          magpie_group_members: Array.isArray(tier.magpie_group_members) ? [...tier.magpie_group_members] : [],
         };
       }
       nextPolicy.api_fallback_snapshot = snapshot;
@@ -687,9 +642,7 @@ function planFailover(current, normalized, probe) {
 
     for (const t of TIER_ORDER) {
       const baseTier = { ...DEFAULT_TIERS[t], ...(curTiers[t] && typeof curTiers[t] === 'object' ? curTiers[t] : {}) };
-      const members = Array.isArray(baseTier.magpie_group_members) ? baseTier.magpie_group_members : [];
-      let primary = members.find((m) => isCodexModelId(m))
-        || (isCodexModelId(baseTier.consult_model) ? String(baseTier.consult_model).trim() : '')
+      let primary = (isCodexModelId(baseTier.consult_model) ? String(baseTier.consult_model).trim() : '')
         || (isCodexModelId(baseTier.exec_model) ? String(baseTier.exec_model).trim() : '');
 
       let subPlan = null;
@@ -709,13 +662,9 @@ function planFailover(current, normalized, probe) {
       let escalateModel = String(baseTier.escalate_model || '').trim();
       if (t === 'opus') {
         if (escalateModel && !isCodexModelId(escalateModel)) {
-          const memberEsc = members.find((m) => isCodexModelId(m) && m !== primary);
-          if (memberEsc) escalateModel = memberEsc;
-          else {
-            if (!probe) return null;
-            subPlan ||= pickSubscriptionPlan(probe);
-            escalateModel = subPlan?.tiers?.opus?.escalate_model || '';
-          }
+          if (!probe) return null;
+          subPlan ||= pickSubscriptionPlan(probe);
+          escalateModel = subPlan?.tiers?.opus?.escalate_model || '';
         }
       } else {
         escalateModel = '';
@@ -726,7 +675,6 @@ function planFailover(current, normalized, probe) {
         consult_model: primary,
         exec_model: primary,
         fallback_models: [],
-        magpie_group_members: t === 'opus' && escalateModel ? dedupe([primary, escalateModel]) : [primary],
       };
       if (t === 'opus') {
         if (escalateModel) cleanTier.escalate_model = escalateModel;
@@ -746,7 +694,6 @@ function planFailover(current, normalized, probe) {
           if (savedTier.escalate_model) baseTier.escalate_model = String(savedTier.escalate_model);
           else delete baseTier.escalate_model;
           baseTier.fallback_models = Array.isArray(savedTier.fallback_models) ? [...savedTier.fallback_models] : [];
-          baseTier.magpie_group_members = Array.isArray(savedTier.magpie_group_members) ? [...savedTier.magpie_group_members] : [];
         }
         nextTiers[t] = baseTier;
       }
@@ -776,16 +723,13 @@ function planFailover(current, normalized, probe) {
           : (subPlan?.tiers?.[t]?.consult_model || DEFAULT_TIERS[t].consult_model);
         const backup = findApiBackup(primary, openaiModels);
         const escalateModel = t === 'opus' ? String(baseTier.escalate_model || subPlan?.tiers?.opus?.escalate_model || '').trim() : '';
-        const escalateBackup = escalateModel && escalateModel !== primary ? findApiBackup(escalateModel, openaiModels) : '';
         const fallbacks = dedupe([backup].filter((b) => b && b !== primary));
-        const members = dedupe([primary, escalateModel, backup, escalateBackup]);
         nextTiers[t] = {
           ...baseTier,
           consult_model: primary,
           exec_model: primary,
           ...(t === 'opus' && escalateModel ? { escalate_model: escalateModel } : {}),
           fallback_models: fallbacks,
-          magpie_group_members: members,
         };
       }
     }

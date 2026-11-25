@@ -1,6 +1,5 @@
 import { RATIO_RANGES } from './token-ratio.mjs';
 import {
-  createNativeGroups,
   getDispatchActivity,
   initSubscriptionConfig,
   isActivityId,
@@ -18,12 +17,13 @@ import {
 } from './backend.mjs';
 
 import { LIVE_OPERATIONS, runLiveOperation } from '../../core/live-service.mjs';
+import { SWARM_OPERATIONS, runSwarmOperation } from '../../core/swarm-service.mjs';
 import { installAgy } from '../../core/agy-install.mjs';
 
 export async function dispatchPageApi({ method, url, rawPath = url.pathname, readBody, opaqueOrigin }, options) {
   const pathname = url.pathname;
   const { configPath, sessionsDir, magpieConfigDir, antigravityPluginDir,
-    execEnabled, mcpToolsEnabled, appServer, probeTimeoutMs, agyBinDir, magpieCliPath } = options;
+    execEnabled, mcpToolsEnabled, appServer, probeTimeoutMs, agyBinDir } = options;
   const reply = (status, body, type = 'application/json; charset=utf-8') => ({ status, body, type });
   // Validate the raw segment before URL normalization can collapse dot paths.
   const activity = /^\/api\/(requests|sessions)(?:\/(.*))?$/.exec(rawPath);
@@ -54,6 +54,22 @@ export async function dispatchPageApi({ method, url, rawPath = url.pathname, rea
       args.limit ??= 50;
     }
     const data = await runLiveOperation(live, args, options);
+    return reply(200, data);
+  }
+  const swarmOp = /^\/api\/swarm\/(list|overview|board|post|action|raw)$/.exec(pathname)?.[1];
+  if (swarmOp) {
+    const read = swarmOp === 'list' || swarmOp === 'overview' || swarmOp === 'board' || swarmOp === 'raw';
+    if (method !== (read ? 'GET' : 'POST')) return reply(405, { error: 'method not allowed' });
+    if (!read && opaqueOrigin) return reply(403, { error: 'invalid origin' });
+    const args = read ? Object.fromEntries([...url.searchParams].map(([key, value]) => {
+      const field = Object.hasOwn(SWARM_OPERATIONS[swarmOp].properties, key) && SWARM_OPERATIONS[swarmOp].properties[key];
+      return [key, field?.type === 'integer' && /^\d+$/.test(value) ? Number(value)
+        : field?.type === 'boolean' && ['true', 'false'].includes(value) ? value === 'true' : value];
+    })) : await readBody();
+    if (swarmOp === 'list') {
+      args.scope ??= options.conversationId === undefined ? 'all' : 'session';
+    }
+    const data = await runSwarmOperation(swarmOp, args, options);
     return reply(200, data);
   }
   if (method === 'GET') {
@@ -107,20 +123,12 @@ export async function dispatchPageApi({ method, url, rawPath = url.pathname, rea
       appServer,
       ratioRange,
       probeTimeoutMs,
+      env: options.env,
     });
     return reply(200, state);
   }
   if (method === 'POST' && pathname === '/api/init') {
     const result = await initSubscriptionConfig({ configPath, probeTimeoutMs });
-    return reply(result.status, result);
-  }
-  if (method === 'POST' && pathname === '/api/native-groups') {
-    const result = await createNativeGroups({
-      configPath,
-      magpieConfigDir,
-      magpieCliPath,
-      probeTimeoutMs,
-    });
     return reply(result.status, result);
   }
   if (method === 'POST' && pathname === '/api/tier') {

@@ -3,12 +3,13 @@ import { mountConsole } from "../magpie_plugin/ui/app.js";
 import { icon } from "./icons.js";
 import { renderMarkdown } from "./markdown.js";
 import { linkTarget, listArguments, streamRenderKey, timelineMessages } from "./live-state.js";
+import { mountSwarm } from "./swarm-ui.js";
 
 export function mountLive({ transport, host, sidecar }) {
   const applyLanguage = bindLanguage(document.body);
   const embedded = Boolean(host);
   const params = new URLSearchParams(location.search);
-  const tabs = ["live", "overview", "requests", "sessions"];
+  const tabs = ["live", "swarm", "overview", "requests", "sessions"];
   const active = new Set(["queued", "running", "waiting_gemini"]);
   const statuses = {
     queued: "排队中", running: "运行中", waiting_gemini: "等待回复", finished: "已完成",
@@ -35,6 +36,7 @@ export function mountLive({ transport, host, sidecar }) {
   let supportsTools = false;
   let appTab = "live";
   let sharedConsole;
+  let swarmController;
   let latestMagpieStatus;
   let routingSummary;
   let languagePreference = "auto";
@@ -137,9 +139,23 @@ export function mountLive({ transport, host, sidecar }) {
     }
     if (focus) $(`tab-${tab}`).focus();
     const live = tab === "live";
+    const swarm = tab === "swarm";
+    const consoleTab = !live && !swarm;
     $("live-panel").hidden = !live;
-    $("view-console").hidden = live;
-    if (!live && supportsTools && !sharedConsole) {
+    $("swarm-panel").hidden = !swarm;
+    $("view-console").hidden = !consoleTab;
+    if (swarm && supportsTools && !swarmController) {
+      swarmController = mountSwarm({
+        transport,
+        sidecar,
+        navigate,
+        openLink,
+        copy,
+        showToast: (message, kind) => toast(message, "", kind),
+      });
+    }
+    swarmController?.setActive(swarm, { swarmId: swarm ? id : undefined });
+    if (consoleTab && supportsTools && !sharedConsole) {
       const mode = params.get("mode")?.trim().toLowerCase();
       sharedConsole = mountConsole($("view-console"), transport, {
         queryViewMode: ["mcp", "native"].includes(mode) ? mode : "",
@@ -155,8 +171,9 @@ export function mountLive({ transport, host, sidecar }) {
       });
       if (latestMagpieStatus) sharedConsole.patchGatewayStatus(latestMagpieStatus);
     }
-    sharedConsole?.setTab(tab, { id, work });
-    if (!live && (connectFailed || (ready && !supportsTools))) showConsoleError(tr("当前宿主未开放控制台工具。"));
+    if (consoleTab) sharedConsole?.setTab(tab, { id, work });
+    else sharedConsole?.setTab("live", {});
+    if (consoleTab && (connectFailed || (ready && !supportsTools))) showConsoleError(tr("当前宿主未开放控制台工具。"));
     clearTimeout(listTimer);
     clearTimeout(streamTimer);
     if (live) {
@@ -205,7 +222,10 @@ export function mountLive({ transport, host, sidecar }) {
   function scheduleMagpieStatus(delay = 15_000) {
     clearTimeout(magpieTimer);
     magpieTimer = setTimeout(async () => {
-      if (!document.hidden) await refreshMagpieStatus();
+      if (!document.hidden) {
+        await refreshMagpieStatus();
+        void swarmController?.pollBadge();
+      }
       scheduleMagpieStatus();
     }, delay);
   }
@@ -220,7 +240,7 @@ export function mountLive({ transport, host, sidecar }) {
   function applyRoutingBadge(routing) {
     if (!routing || !Number.isFinite(routing.gpt_share)) return;
     routingSummary = routing;
-    const mode = routing.gpt_share === 0 ? tr("关闭") : routing.native_swarm ? "Swarm" : tr("直调");
+    const mode = routing.gpt_share === 0 ? tr("关闭") : routing.native_swarm ? tr("原生") : "Swarm";
     put("routing-badge", `${routing.gpt_share}% · ${mode}`);
     $("routing-badge").disabled = false;
   }
@@ -236,6 +256,7 @@ export function mountLive({ transport, host, sidecar }) {
     delete $("stream").dataset.key;
     render();
     sharedConsole?.renderLanguage();
+    swarmController?.renderLanguage();
   }
 
   async function saveLanguage(preference) {
@@ -1054,6 +1075,7 @@ export function mountLive({ transport, host, sidecar }) {
     button.classList.add("is-spinning");
     try {
       if (appTab === "live") await Promise.all([refreshRuns(), refreshStream()]);
+      else if (appTab === "swarm") await swarmController?.refresh();
       else if (appTab === "overview") {
         await Promise.all([refreshMagpieStatus(true), sharedConsole?.refresh()]);
       } else await sharedConsole?.refresh();
@@ -1141,6 +1163,17 @@ export function mountLive({ transport, host, sidecar }) {
         if (!magpieCheck && $("magpie-status").dataset.state === "checking") renderMagpieStatus(magpie);
       }).catch(() => {});
       void refreshMagpieStatus().finally(() => scheduleMagpieStatus(1500));
+      if (transport.swarm && !swarmController) {
+        swarmController = mountSwarm({
+          transport,
+          sidecar,
+          navigate,
+          openLink,
+          copy,
+          showToast: (message, kind) => toast(message, "", kind),
+        });
+      }
+      void swarmController?.pollBadge();
     }
     if (embedded) navigate(appTab, { preserveLive: true });
     else {
@@ -1218,6 +1251,7 @@ export function mountLive({ transport, host, sidecar }) {
         render();
         void refreshRuns();
         if (first && selected) void refreshStream();
+        swarmController?.onWorkspaceChange();
       });
     } else {
       $("scope-session").hidden = true;

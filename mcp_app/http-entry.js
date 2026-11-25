@@ -57,7 +57,7 @@ function mountSidecar() {
           "Content-Type": "application/json", ...(!bridge?.fetch && token ? { "X-Sidecar-Token": token } : {}),
         },
         body: JSON.stringify({ path, body: body === undefined ? undefined : JSON.parse(body), conversationId,
-          workspaceUris: path.startsWith("./api/live/") ? workspaceUris : undefined }),
+          workspaceUris: (path.startsWith("./api/live/") || path.startsWith("./api/swarm/")) ? workspaceUris : undefined }),
       });
     } finally {
       cleanup();
@@ -81,8 +81,10 @@ if (document.documentElement.hasAttribute("data-sidecar")) {
   const apiKey = document.querySelector('meta[name="gempt-key"]')?.content;
   const transport = createHttpTransport(apiKey);
   if (apiKey) {
-    if (self.origin === 'null') transport.installPage = new URL('.', location.href).href;
-    else transport.installAgy = () => transport.runAction('install_agy');
+    if (self.origin === 'null') {
+      transport.installPage = new URL('.', location.href).href;
+      transport.opaqueOrigin = true;
+    } else transport.installAgy = () => transport.runAction('install_agy');
   }
   mountLive({ transport });
 }

@@ -1,22 +1,12 @@
 import http from 'node:http';
 import https from 'node:https';
-import { execFile } from 'node:child_process';
 import { accessSync, constants, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, delimiter, join, resolve } from 'node:path';
-import { promisify } from 'node:util';
 import {
-  DEFAULT_MAGPIE_URL, DEFAULT_TIERS, DEFAULT_UTILITY, TIER_ORDER, expandUser, isCodexModelId,
-  isPairingModelId, normalizeGatewayUrl, readJsonSafe, resolveConfigPath, resolveSessionsDir,
+  DEFAULT_MAGPIE_URL, DEFAULT_TIERS, DEFAULT_UTILITY, expandUser,
+  isPairingModelId, normalizeGatewayUrl, readJsonSafe,
 } from './config.mjs';
-
-const execFileAsync = promisify(execFile);
-
-export const NATIVE_GROUP_SPECS = [
-  { id: 'sonnet', name: 'gempt-sonnet', group_id: 'group/gempt-sonnet' },
-  { id: 'opus', name: 'gempt-opus', group_id: 'group/gempt-opus' },
-  { id: 'fable', name: 'gempt-fable', group_id: 'group/gempt-fable' },
-];
 
 export function defaultGatewayFromEnv() {
   let raw = String(process.env.MAGPIE_ADDR || process.env.MAGPIE_GATEWAY || '').trim();
@@ -160,7 +150,7 @@ export function pickDelegatePlan(probe) {
   const subscription = pickSubscriptionPlan(probe);
   if (subscription) return subscription;
   const available = (probe.models || []).filter(id => isPairingModelId(id)
-    && !id.startsWith('group/gempt-') && !/(?:embedding|rerank|image|tts|whisper|veo)/i.test(id));
+    && !/(?:embedding|rerank|image|tts|whisper|veo)/i.test(id));
   const preferred = available.filter(id => /(?:^|[/-])gpt(?:[/-]|$)/i.test(id));
   const models = preferred.length ? preferred : available;
   return pickTierPlan(models, probe.utility_candidates?.length ? probe.utility_candidates : models);
@@ -180,7 +170,6 @@ export function pickTierPlan(models, utilityIds) {
         exec_model: sonnetModel,
         reasoning_effort: 'medium',
         fallback_models: [],
-        magpie_group_members: [sonnetModel],
       },
       opus: {
         ...DEFAULT_TIERS.opus,
@@ -190,7 +179,6 @@ export function pickTierPlan(models, utilityIds) {
         escalate_effort_threshold: 'xhigh',
         reasoning_effort: 'high',
         fallback_models: [],
-        magpie_group_members: dedupe([sonnetModel, fableModel]),
       },
       fable: {
         ...DEFAULT_TIERS.fable,
@@ -198,7 +186,6 @@ export function pickTierPlan(models, utilityIds) {
         exec_model: fableModel,
         reasoning_effort: 'xhigh',
         fallback_models: [],
-        magpie_group_members: [fableModel],
       },
     },
     utility_model: utilityModel,
@@ -209,81 +196,8 @@ function isGeminiCandidate(id, excludedTokens) {
   const raw = String(id || '').trim();
   const lower = raw.toLowerCase();
   if (!raw || isExcludedModel(raw, excludedTokens)) return false;
-  if (lower.startsWith('group/gempt-')) return false;
   if (!lower.includes('gemini')) return false;
   return !['embedding', 'tts', 'image', 'imagen', 'veo'].some((bad) => lower.includes(bad));
-}
-
-function pickGeminiSlot(geminiIds, slot) {
-  const patternsBySlot = {
-    hydrogen: [['gemini-4-hydrogen', 320], ['hydrogen', 240], ['flash', 140], ['neon', 80], ['carbon', 60]],
-    neon: [['gemini-4-neon', 320], ['neon', 240], ['carbon', 160], ['pro', 100], ['hydrogen', 60]],
-    argon: [['gemini-4-argon', 320], ['argon', 240], ['neon', 180], ['carbon', 140], ['pro', 100]],
-  };
-  const patterns = patternsBySlot[slot] || [];
-  if (!geminiIds.length) return '';
-  const ranked = [...geminiIds].sort((a, b) => {
-    const score = (id) => {
-      const lower = id.toLowerCase();
-      let p = 100;
-      if (lower.startsWith('agy-cli/') || lower.startsWith('antigravity/') || lower.startsWith('google/') || lower.startsWith('gemini/')) p = 400;
-      else if (lower.startsWith('auto/')) p = 220;
-      return p + scoreModel(id, patterns);
-    };
-    const diff = score(b) - score(a);
-    if (diff !== 0) return diff;
-    return b.localeCompare(a);
-  });
-  return ranked[0];
-}
-
-export function pickNativeGroupPlan(probe) {
-  const geminiIds = Array.isArray(probe?.gemini_models) ? probe.gemini_models : [];
-  const codexIds = Array.isArray(probe?.codex_models) ? probe.codex_models : [];
-  const utilityIds = Array.isArray(probe?.utility_candidates) ? probe.utility_candidates : [];
-  if (!geminiIds.length || !codexIds.length) return null;
-
-  const hydrogen = pickGeminiSlot(geminiIds, 'hydrogen');
-  const neon = pickGeminiSlot(geminiIds, 'neon');
-  const argon = pickGeminiSlot(geminiIds, 'argon');
-  const terra = pickBest(codexIds, [['6.1-terra', 320], ['terra', 240], ['sol', 140]]);
-  const sol = pickBest(codexIds, [['6.2-sol', 300], ['sol', 240], ['terra', 140], ['luna', 100]]);
-  const astra = pickBest(codexIds, [['6.2-astra', 320], ['astra', 260], ['pro', 180], ['sol', 100]]);
-  const flash = utilityIds[0] || '';
-
-  return {
-    models: { hydrogen, neon, argon, terra, sol, astra, flash },
-    tiers: {
-      sonnet: {
-        group_id: 'group/gempt-sonnet',
-        members: dedupe([hydrogen, terra, flash]),
-        nodes: [
-          { id: hydrogen, role: 'planner' },
-          { id: terra, role: 'coder' },
-          ...(flash ? [{ id: flash, role: 'utility' }] : []),
-        ],
-      },
-      opus: {
-        group_id: 'group/gempt-opus',
-        members: dedupe([neon, sol, astra, flash]),
-        nodes: [
-          { id: neon, role: 'planner' },
-          { id: sol, role: 'coder' },
-          ...(astra !== sol ? [{ id: astra, role: 'escalate' }] : []),
-          ...(flash ? [{ id: flash, role: 'utility' }] : []),
-        ],
-      },
-      fable: {
-        group_id: 'group/gempt-fable',
-        members: dedupe([argon, astra, flash]),
-        nodes: [
-          { id: argon, role: 'planner' },
-          { id: astra, role: 'coder' },
-          ...(flash ? [{ id: flash, role: 'utility' }] : []),
-        ],
-      },
-    },
-  };
 }
 
 function emptyProbeResult(url, error) {
@@ -297,8 +211,6 @@ function emptyProbeResult(url, error) {
     gemini_models: [],
     codex_ready: false,
     utility_candidates: [],
-    harness_groups: [],
-    native_groups: [],
     error,
   };
 }
@@ -359,8 +271,6 @@ export function probeMagpie(baseUrl = DEFAULT_MAGPIE_URL, apiKey = '', timeoutMs
             const openaiSet = new Set();
             const geminiSet = new Set();
             const utilSet = new Set();
-            const harnessGroups = [];
-            const nativeGroups = [];
             for (const item of models) {
               const id = typeof item?.id === 'string' ? item.id : '';
               if (!id || (apiKey && (id === apiKey || (apiKey.length >= 8 && id.includes(apiKey)))) || isExcludedModel(id, excludedTokens)) continue;
@@ -372,10 +282,6 @@ export function probeMagpie(baseUrl = DEFAULT_MAGPIE_URL, apiKey = '', timeoutMs
                 geminiSet.add(id);
               }
               if (isGroup) {
-                if (id.startsWith('group/gempt-harness-')) harnessGroups.push(id);
-                else if (id === 'group/gempt-sonnet' || id === 'group/gempt-opus' || id === 'group/gempt-fable') {
-                  nativeGroups.push(id);
-                }
                 if (isUtilityCandidate(item, excludedTokens)) utilSet.add(id);
               } else if (id.startsWith('codex/')) {
                 codexSet.add(id);
@@ -403,8 +309,6 @@ export function probeMagpie(baseUrl = DEFAULT_MAGPIE_URL, apiKey = '', timeoutMs
               gemini_models: geminiModels,
               codex_ready: codexModels.length > 0,
               utility_candidates: utilityCandidates,
-              harness_groups: harnessGroups,
-              native_groups: nativeGroups,
               error: '',
             });
           } catch {
@@ -422,54 +326,6 @@ export function probeMagpie(baseUrl = DEFAULT_MAGPIE_URL, apiKey = '', timeoutMs
     });
     req.end();
   });
-}
-
-export function readMagpieNativeGroups(magpieConfigDir) {
-  const providersFile = join(magpieConfigDir, 'providers.json');
-  const data = readJsonSafe(providersFile);
-  const groups = Array.isArray(data?.groups) ? data.groups : [];
-  const byTier = {};
-  for (const spec of NATIVE_GROUP_SPECS) {
-    const found = groups.find((g) => String(g?.id || '') === spec.name);
-    if (!found) continue;
-    const members = Array.isArray(found.members) ? found.members.filter(Boolean).map(String) : [];
-    const nodes = [];
-    let coderSeen = false;
-    for (let idx = 0; idx < members.length; idx += 1) {
-      const m = members[idx];
-      const lower = m.toLowerCase();
-      if (isUtilityCandidate({ id: m }, []) || lower.includes('deepseek') || lower.includes('flash') || lower.includes('free')) {
-        nodes.push({ id: m, role: 'utility' });
-      } else if (idx === 0 && !lower.startsWith('codex/')) {
-        nodes.push({ id: m, role: 'planner' });
-      } else if (spec.id === 'opus' && coderSeen) {
-        nodes.push({ id: m, role: 'escalate' });
-      } else {
-        coderSeen = true;
-        nodes.push({ id: m, role: 'coder' });
-      }
-    }
-    byTier[spec.id] = {
-      id: spec.id,
-      group_id: spec.group_id,
-      installed: true,
-      members,
-      nodes,
-      routing: String(found.routing || 'order'),
-      rules_count: Array.isArray(found.rules) ? found.rules.length : 0,
-    };
-  }
-  return byTier;
-}
-
-const SAFE_MODEL_ID_RE = /^[A-Za-z0-9_./:@#-]+$/;
-
-function normalizeGroupMember(modelId) {
-  const m = String(modelId || '').trim();
-  if (m.startsWith('auto/')) {
-    return `group/auto-${m.slice('auto/'.length).replace(/\./g, '-')}`;
-  }
-  return m;
 }
 
 export function buildMagpieCliEnv() {
@@ -525,256 +381,6 @@ export function findMagpieCli(configuredPath = '') {
     }
   }
   return findExecutable([...candidates, ...dirs.flatMap((dir) => names.map((name) => join(dir, name)))]);
-}
-
-async function execMagpieCli(cliPath, args, { timeoutMs = 20000 } = {}) {
-  const env = buildMagpieCliEnv();
-  const isWinBatch = process.platform === 'win32' && /\.(cmd|bat)$/i.test(cliPath);
-  const bin = isWinBatch ? (process.env.COMSPEC || 'cmd.exe') : cliPath;
-  const fullArgs = isWinBatch ? ['/d', '/c', cliPath, ...args] : args;
-  try {
-    const { stdout, stderr } = await execFileAsync(bin, fullArgs, {
-      env,
-      timeout: timeoutMs,
-      windowsHide: true,
-    });
-    return { ok: true, code: 0, stdout: String(stdout || ''), stderr: String(stderr || '') };
-  } catch (err) {
-    return {
-      ok: false,
-      code: typeof err?.code === 'number' ? err.code : 1,
-      stdout: String(err?.stdout || ''),
-      stderr: String(err?.stderr || err?.message || ''),
-    };
-  }
-}
-
-export async function createNativeGroups({ configPath, magpieConfigDir, magpieCliPath, probeTimeoutMs = 2000 } = {}) {
-  void magpieConfigDir;
-  const resolvedConfigPath = resolveConfigPath(configPath);
-  const rawCfg = readJsonSafe(resolvedConfigPath) || {};
-  const baseUrl = String(rawCfg?.magpie?.base_url || defaultGatewayFromEnv()).replace(/\/+$/, '');
-  const apiKey = rawCfg ? resolveMagpieApiKey({ magpie: { ...(rawCfg.magpie || {}), base_url: baseUrl } }) : '';
-  const excludedTokens = resolveExcludedTokens(rawCfg);
-
-  const probe = await probeMagpie(baseUrl, apiKey, probeTimeoutMs, excludedTokens);
-  if (!probe.reachable) {
-    return { ok: false, status: 503, error: '无法连接本地 Magpie 网关，请先启动 Magpie。' };
-  }
-
-  const plan = pickNativeGroupPlan(probe);
-  if (!plan) {
-    return {
-      ok: false,
-      status: 400,
-      error: '需要 Magpie 中同时接入 Gemini 与 Codex 订阅模型后，才能创建直连路由组。',
-    };
-  }
-
-  for (const val of Object.values(plan.models)) {
-    if (val && !SAFE_MODEL_ID_RE.test(val)) {
-      return { ok: false, status: 400, error: `检测到非法模型 ID: ${val}` };
-    }
-  }
-
-  const cliPath = findMagpieCli(magpieCliPath || rawCfg?.magpie?.cli_path || '');
-  if (!cliPath) {
-    return { ok: false, status: 400, error: '未找到 Magpie CLI（请确认安装路径或设置 MAGPIE_BIN）。' };
-  }
-
-  const tierCommands = nativeGroupCommands(plan.models);
-  const created = [];
-  const skipped = [];
-  for (const spec of NATIVE_GROUP_SPECS) {
-    const showRes = await execMagpieCli(cliPath, ['group', 'show', spec.name]);
-    if (showRes.ok) {
-      skipped.push(spec.group_id);
-      continue;
-    }
-    const detail = `${showRes.stderr}\n${showRes.stdout}`.trim();
-    if (!detail.includes(`no group "${spec.name}"`) && showRes.code !== 1) {
-      return { ok: false, status: 500, error: `检查路由组 ${spec.group_id} 失败: ${detail || 'unknown error'}` };
-    }
-    for (const cmd of tierCommands[spec.name]) {
-      const runRes = await execMagpieCli(cliPath, cmd);
-      if (!runRes.ok) {
-        return {
-          ok: false,
-          status: 500,
-          error: `创建路由组 ${spec.group_id} 失败: ${(runRes.stderr || runRes.stdout).trim()}`,
-        };
-      }
-    }
-    created.push(spec.group_id);
-  }
-
-  return { ok: true, status: 200, created, skipped, groups: NATIVE_GROUP_SPECS.map((spec) => spec.group_id), models: plan.models };
-}
-
-export function isHarnessGroup(model) {
-  return /^group\/gempt-harness-(sonnet|opus|fable)$/.test(model);
-}
-
-function groupMemberRows(report) {
-  return (report.match(/^[ \t]*models[ \t]+([^\r\n]+(?:\r?\n[ \t]+\d+[ \t]+[^\r\n]+)*)/m)?.[1] || '')
-    .split(/\r?\n/).filter(Boolean);
-}
-
-function groupRules(report) {
-  return [...report.matchAll(/^[ \t]*(?:rules[ \t]+)?\d+[ \t]+(.+ → .+)$/gm)].map((match) => match[1].trim());
-}
-
-export async function verifySubscriptionGroup(config, model) {
-  if (!isHarnessGroup(model) || String(config.magpie?.base_url || DEFAULT_MAGPIE_URL).replace(/\/+$/, '') !== DEFAULT_MAGPIE_URL) {
-    throw new Error(`Cannot verify subscription group '${model}' against the local Magpie gateway.`);
-  }
-  const cli = findMagpieCli(config.magpie?.cli_path);
-  if (!cli) throw new Error('Subscription group verification requires Magpie CLI.');
-  const result = await execMagpieCli(cli, ['group', 'show', model.slice('group/'.length)]);
-  if (!result.ok) throw new Error(`Unable to verify subscription group '${model}'.`);
-  const members = groupMemberRows(result.stdout).map((row) => row.match(/^\s*\d+\s+(\S+)\s+.+ · .+$/)?.[1]);
-  const targets = groupRules(result.stdout).map((rule) => rule.split(' → ').at(-1));
-  if (!members.length || ![...members, ...targets].every(isCodexModelId)) {
-    throw new Error(`Subscription group '${model}' must contain only concrete codex/* models.`);
-  }
-}
-
-function nativeGroupCommands(models) {
-  const h = normalizeGroupMember(models.hydrogen);
-  const n = normalizeGroupMember(models.neon);
-  const a = normalizeGroupMember(models.argon);
-  const terra = normalizeGroupMember(models.terra);
-  const s = normalizeGroupMember(models.sol);
-  const t = normalizeGroupMember(models.astra);
-  const f = models.flash ? normalizeGroupMember(models.flash) : '';
-  return {
-    'gempt-sonnet': [
-      ['group', 'add', 'gempt-sonnet', `models=${dedupe([h, terra, f]).join(',')}`, 'routing=order', 'stays=turn'],
-      ...(f ? [
-        ['group', 'rule', 'add', 'gempt-sonnet', `use=${f}`, 'compact'],
-        ['group', 'rule', 'add', 'gempt-sonnet', `use=${f}`, `classifier=${f}`, 'intent=simple formatting, adding comments, renaming, translating, writing boilerplate, or trivial quick questions'],
-      ] : []),
-      ['group', 'rule', 'add', 'gempt-sonnet', `use=${terra}`, 'when=subagent'],
-      ['group', 'rule', 'add', 'gempt-sonnet', `use=${terra}`, 'intent=writing code, editing files, running tests, or fixing bugs'],
-    ],
-    'gempt-opus': [
-      ['group', 'add', 'gempt-opus', `models=${dedupe([n, s, t, f]).join(',')}`, 'routing=order', 'stays=turn'],
-      ...(f ? [
-        ['group', 'rule', 'add', 'gempt-opus', `use=${f}`, 'compact'],
-        ['group', 'rule', 'add', 'gempt-opus', `use=${t}`, `classifier=${f}`, 'intent=debugging hard bugs, complex algorithms, math/physics derivations, or critical architecture changes'],
-      ] : []),
-      ['group', 'rule', 'add', 'gempt-opus', `use=${s}`, 'when=subagent'],
-      ['group', 'rule', 'add', 'gempt-opus', `use=${s}`, 'intent=writing code, editing files, implementing features, or writing tests'],
-    ],
-    'gempt-fable': [
-      ['group', 'add', 'gempt-fable', `models=${dedupe([a, t, f]).join(',')}`, 'routing=order', 'stays=turn'],
-      ...(f ? [['group', 'rule', 'add', 'gempt-fable', `use=${f}`, 'compact']] : []),
-      ['group', 'rule', 'add', 'gempt-fable', `use=${t}`, 'when=subagent'],
-      [
-        'group',
-        'rule',
-        'add',
-        'gempt-fable',
-        `use=${t}`,
-        ...(f ? [`classifier=${f}`] : []),
-        'intent=writing code, editing files, debugging, or executing tasks',
-      ],
-    ],
-  };
-
-}
-
-export function previewNativeGroups(env = process.env) {
-  const models = {
-    hydrogen: env.GEMPT_HYDROGEN?.trim() || 'antigravity/gemini-4-hydrogen',
-    neon: env.GEMPT_NEON?.trim() || 'antigravity/gemini-4-neon',
-    argon: env.GEMPT_ARGON?.trim() || 'antigravity/gemini-4-carbon',
-    terra: env.GEMPT_TERRA?.trim() || env.GEMPT_SOL?.trim() || 'codex/gpt-6.1-terra',
-    sol: env.GEMPT_SOL?.trim() || 'codex/gpt-6.2-sol',
-    astra: env.GEMPT_ASTRA?.trim() || 'codex/gpt-6.2-astra',
-    flash: env.DEEPSEEK_FLASH?.trim() || DEFAULT_UTILITY.model,
-  };
-  return { applied: false, models, commands: Object.values(nativeGroupCommands(models)).flat()
-    .map((args) => [env.MAGPIE_BIN?.trim() || 'magpie', ...args]) };
-}
-
-export async function syncHarnessGroups(config, { dryRun }) {
-  const cli = findMagpieCli(config.magpie.cli_path);
-  if (!cli && !dryRun) throw new Error('Magpie CLI not found. Set MAGPIE_BIN to sync routing groups.');
-  const { failover_mode: mode, magpie_group_strategy: strategy } = config.routing_policy;
-  const utility = config.utility.use_for_magpie_compact ? normalizeGroupMember(config.utility.model) : '';
-  const compact = mode === 'subscription_only' && !isCodexModelId(utility) ? '' : utility;
-  const plans = TIER_ORDER.map((tier) => {
-    const data = config.tiers[tier];
-    const name = `gempt-harness-${tier}`;
-    const members = dedupe([...(data.magpie_group_members || []), compact].filter(Boolean).map(normalizeGroupMember));
-    const note = `gempt ${tier} (${data.label || tier})`;
-    const settings = [`models=${members.join(',')}`, `routing=${strategy}`, 'stays=session'];
-    const commands = [['group', 'add', name, ...settings, `note=${note}`]];
-    const escalation = normalizeGroupMember(data.escalate_model);
-    if (tier === 'opus' && escalation && members.includes(escalation) && escalation !== members[0]) {
-      commands.push(['group', 'rule', 'add', name, `use=${escalation}`, `effort=${data.escalate_effort_threshold || 'high'}`]);
-    }
-    if (compact) commands.push(['group', 'rule', 'add', name, `use=${compact}`, 'compact']);
-    return { tier, name, note, settings, members, commands };
-  });
-  if (!dryRun) {
-    const run = async (args) => {
-      const result = await execMagpieCli(cli, args);
-      if (!result.ok) throw new Error(result.stderr.trim() || result.stdout.trim() || `Magpie ${args.join(' ')} failed.`);
-      return result.stdout;
-    };
-    const { withLock } = await import('../../core/state.mjs');
-    await withLock(join(resolveSessionsDir(), '.groups.lock'), async () => {
-      for (const { name, note, settings, members, commands } of plans) {
-        const show = await execMagpieCli(cli, ['group', 'show', name]);
-        let report = show.stdout;
-        if (!show.ok) {
-          if (!`${show.stdout}\n${show.stderr}`.includes(`no group "${name}"`)) {
-            throw new Error(show.stderr.trim() || `Unable to inspect group/${name}.`);
-          }
-          await run(commands[0]);
-          report = await run(['group', 'show', name]);
-        }
-        const lines = report.split(/\r?\n/).map((line) => line.trim());
-        if (!lines.some((line) => line.startsWith('note') && line.replace(/^note\s+/, '') === note)) {
-          throw new Error(`Existing group/${name} has a different owner.`);
-        }
-        const groupMembers = (output) => groupMemberRows(output).map((line) => line.match(/^\s*\d+\s+(\S+)/)?.[1]).filter(Boolean);
-        const rules = groupRules(report);
-        const current = groupMembers(report);
-        if (!current.length) throw new Error(`Cannot read members for group/${name}.`);
-        if (rules.some((rule) => !members.includes(rule.split(' → ').at(-1)))) {
-          throw new Error(`Changing members would invalidate an existing rule on group/${name}.`);
-        }
-        const expectedRules = [];
-        const additions = commands.slice(1).filter((command) => {
-          const target = command.at(-2).slice(4);
-          const condition = command.at(-1) === 'compact' ? 'compacting' : `effort ≥ ${command.at(-1).slice(7)}`;
-          const expected = `${condition} → ${target}`;
-          expectedRules.push(expected);
-          if (rules.includes(expected)) return false;
-          if (rules.some((rule) => rule.startsWith(`${condition} → `))) throw new Error(`Conflicting rule on group/${name}: ${condition}`);
-          return true;
-        });
-        const hasSettings = (output) => settings.slice(1).every((setting) => {
-          const [key, value] = setting.split('=');
-          return new RegExp(`^\\s*${key}\\s+${value}\\s*$`, 'm').test(output);
-        });
-        const sameMembers = (values) => values.join(',') === members.join(',');
-        const update = !sameMembers(current) || !hasSettings(report);
-        if (update) await run(['group', 'set', name, ...settings]);
-        for (const command of additions) await run(command);
-        const final = update || additions.length ? await run(['group', 'show', name]) : report;
-        if (!hasSettings(final) || !sameMembers(groupMembers(final)) ||
-            !expectedRules.every((rule) => groupRules(final).includes(rule))) {
-          throw new Error(`Group readback differs for group/${name}.`);
-        }
-      }
-    });
-  }
-  return plans.map(({ tier, name, commands }) => ({ tier, group: `group/${name}`,
-    commands: commands.map((command) => [cli || 'magpie', ...command]) }));
 }
 
 export function findApiBackup(subModel, openaiModels) {

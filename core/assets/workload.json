@@ -43,7 +43,7 @@
       "detail": "实质任务直接派给 GPT。Gemini 澄清需求、补充视觉观察，并用用户听得懂的话解释结果。"
     }
   },
-  "native_swarm": true,
+  "native_swarm": false,
   "swarm_shell_model": "gemini-4-hydrogen-low",
   "swarm_shell_models": ["gemini-4-hydrogen-low", "gemini-3.8-flash-low", "gpt-oss-120b-medium"],
   "pairings": {

@@ -1,7 +1,7 @@
 import { isRunOccupying, readRun, reconcileRunState, stateEntries } from '../../core/runs.mjs';
 import { isValidSessionId } from '../../core/state.mjs';
 import {
-  closeSync, existsSync, fstatSync, lstatSync, openSync, readSync, readdirSync, statSync,
+  existsSync, lstatSync, readdirSync, statSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { isMainThread, workerData } from 'node:worker_threads';
@@ -723,7 +723,7 @@ const overviewWorker = createBackgroundWorker(new URL(import.meta.url), 'gempt-o
 const overviewReads = new Map();
 const overviewSnapshots = new WeakMap();
 
-function snapshotOverviewActivity(dir, magpieConfigDir) {
+function snapshotOverviewActivity(dir) {
   const ledger = readDispatchActivity(dir);
   if (!overviewSnapshots.has(ledger)) {
     const { recentSessions, recentRuns } = readRecentActivity(dir, 6);
@@ -731,17 +731,15 @@ function snapshotOverviewActivity(dir, magpieConfigDir) {
       activityTotals: ledger.totals, recentSessions, recentRuns, activeRuns: readActiveRuns(dir),
     });
   }
-  return { ...overviewSnapshots.get(ledger), recentGroupCalls: readExternalGroupUsage(magpieConfigDir, 6) };
+  return overviewSnapshots.get(ledger);
 }
 
-export function readOverviewActivity(sessionsDir, magpieConfigDir) {
+export function readOverviewActivity(sessionsDir) {
   const dir = resolveSessionsDir(sessionsDir);
-  const magpieDir = resolveMagpieConfigDir(magpieConfigDir);
-  const key = JSON.stringify([dir, magpieDir]);
-  if (!overviewReads.has(key)) {
-    overviewReads.set(key, overviewWorker(dir, magpieDir).finally(() => overviewReads.delete(key)));
+  if (!overviewReads.has(dir)) {
+    overviewReads.set(dir, overviewWorker(dir).finally(() => overviewReads.delete(dir)));
   }
-  return overviewReads.get(key);
+  return overviewReads.get(dir);
 }
 
 if (!isMainThread && workerData === 'gempt-overview') serveBackgroundWorker(snapshotOverviewActivity);
@@ -966,62 +964,4 @@ export async function getDispatchActivity(kind, id, sessionsDir, magpieConfigDir
   const { requests: turns, ...detail } = session;
   return { ...detail, turns: [...turns].reverse().map(renderTurn).reverse(),
     gateway_requests: turns.flatMap((row) => row.gateway_requests).sort((a, b) => a.timestamp.localeCompare(b.timestamp)) };
-}
-
-export function readExternalGroupUsage(magpieConfigDir, limit = 6) {
-  const usageFile = join(magpieConfigDir, 'usage.jsonl');
-  if (!existsSync(usageFile)) return [];
-  const maxTail = 256 * 1024;
-  let text = '';
-  let startOffset = 0;
-  let fd;
-  try {
-    fd = openSync(usageFile, 'r');
-    const size = fstatSync(fd).size;
-    startOffset = Math.max(0, size - maxTail);
-    const len = size - startOffset;
-    if (len <= 0) return [];
-    const buf = Buffer.alloc(len);
-    let bytesRead = 0;
-    while (bytesRead < len) {
-      const n = readSync(fd, buf, bytesRead, len - bytesRead, startOffset + bytesRead);
-      if (n <= 0) break;
-      bytesRead += n;
-    }
-    text = buf.subarray(0, bytesRead).toString('utf-8');
-  } catch {
-    return [];
-  } finally {
-    if (fd !== undefined) {
-      try { closeSync(fd); } catch { /* ignore */ }
-    }
-  }
-
-  let lines = text.split(/\r?\n/);
-  if (startOffset > 0 && lines.length > 0) lines = lines.slice(1);
-
-  const out = [];
-  for (let i = lines.length - 1; i >= 0 && out.length < limit; i -= 1) {
-    const raw = lines[i].trim();
-    if (!raw) continue;
-    let rec;
-    try {
-      rec = JSON.parse(raw);
-    } catch {
-      continue;
-    }
-    const req = String(rec?.req || '').trim();
-    const match = req.match(/^(?:group\/)?gempt-(sonnet|opus|fable)(?::|#|$)/i);
-    if (!match) continue;
-    out.push({
-      source: 'magpie_group',
-      tier: match[1].toLowerCase(),
-      req,
-      agent: String(rec.agent || ''),
-      served_model: String(rec.served || (rec.provider && rec.model ? `${rec.provider}/${rec.model}` : (rec.model || ''))),
-      status: Number.isFinite(Number(rec.status)) ? Number(rec.status) : 0,
-      updated_at: String(rec.t || ''),
-    });
-  }
-  return out;
 }

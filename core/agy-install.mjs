@@ -166,7 +166,7 @@ export async function validatePluginBundle(staged, nodeBin, env = process.env, {
     if (results.get(1)?.serverInfo?.name !== 'gempt') throw new Error('Staged MCP server did not identify itself as gempt.');
     if (results.get(1)?.capabilities?.resources) throw new Error('Staged MCP server must not advertise legacy MCP App resources.');
     const tools = results.get(2)?.tools;
-    const expected = ['gpt_ask', 'gpt_ctl', 'gpt_run'];
+    const expected = ['gpt_ask', 'gpt_board', 'gpt_ctl', 'gpt_run', 'gpt_swarm'];
     if (JSON.stringify(tools?.map(({ name }) => name).sort()) !== JSON.stringify(expected)) {
       throw new Error(`Staged MCP server did not advertise the expected set of ${expected.length} GemPT tools.`);
     }

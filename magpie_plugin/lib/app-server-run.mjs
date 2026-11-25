@@ -1,12 +1,29 @@
 import { appendFileSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { approvalReply, ASK_GEMINI, connectAppServer, DEVELOPER_INSTRUCTIONS, PROVIDER, readAppServerState, SANDBOX_TYPES, textInput } from './app-server-client.mjs';
+import {
+  approvalReply, ASK_GEMINI, connectAppServer, DEVELOPER_INSTRUCTIONS, PROVIDER,
+  readAppServerState, SANDBOX_TYPES, SWARM_DEVELOPER_INSTRUCTIONS, textInput,
+} from './app-server-client.mjs';
 import { saveRun, toolReplyPath } from '../../core/runs.mjs';
 
 export class TurnInterrupted extends Error {}
 
 export async function runAppServer({ configPath, env, runFile, sessionId, onIdentity, prompt, cwd, model,
-  effort, sandbox, approvalPolicy, threadId, gatewayUrl, timeoutSec, sandboxUpgraded, interruptConfirmMs = 800 }) {
+  effort, sandbox, approvalPolicy, threadId, gatewayUrl, timeoutSec, sandboxUpgraded, interruptConfirmMs = 800,
+  sessionsDir, swarmId, swarmAgent }) {
+  const isSwarm = Boolean(swarmId && swarmAgent);
+  const board = isSwarm ? await import('../../core/board-mcp.mjs') : null;
+  const swarmTools = board?.BOARD_TOOLS.filter((tool) => tool.name !== 'board_ask').map((t) => ({ type: 'function', ...t })) || [];
+  const isBoardTool = (name) => swarmTools.some((t) => t.name === name);
+  const swarmHooks = [];
+  const trackSwarmHook = (promise) => {
+    const tracked = Promise.resolve(promise).catch(() => {});
+    swarmHooks.push(tracked);
+    tracked.finally(() => {
+      const idx = swarmHooks.indexOf(tracked);
+      if (idx >= 0) swarmHooks.splice(idx, 1);
+    });
+  };
   const start = Date.now();
   let deadline = start + timeoutSec * 1000;
   let pausedAt = null;
@@ -137,7 +154,8 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     const sameTurn = !eventTurn || !progress.turn_id || eventTurn === progress.turn_id;
     if (acceptTurn && related && sameTurn && eventTurn) {
       if (method === 'turn/started' || method === 'turn/completed'
-          || (id !== undefined && method === 'item/tool/call' && params.tool === 'ask_gemini')) {
+          || (id !== undefined && method === 'item/tool/call'
+            && (params.tool === 'ask_gemini' || isBoardTool(params.tool)))) {
         observedTurnId = eventTurn;
         observeTurn(eventTurn);
       }
@@ -153,6 +171,52 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
           tools.set(id, { call_id: params.callId, tool: 'ask_gemini',
             arguments: params.arguments, requested_at: new Date().toISOString() });
           pendingChanged();
+          if (isSwarm) {
+            trackSwarmHook((async () => {
+              const { postBoardMessage, updateWorker } = await import('../../core/swarm-bus.mjs');
+              const q = String(params.arguments?.question || '').trim() || 'Needs coordinator input.';
+              const ctxLine = params.arguments?.context ? `\n\nContext: ${String(params.arguments.context).trim()}` : '';
+              const mediaLines = Array.isArray(params.arguments?.media_paths)
+                ? params.arguments.media_paths.filter(Boolean).map((p) => `\nScreenshot: ${p} | ask_gemini attachment`).join('')
+                : '';
+              await postBoardMessage(swarmId, {
+                from: swarmAgent,
+                kind: 'question',
+                text: `@coordinator ${q}${ctxLine}${mediaLines}`,
+                meta: {
+                  call_id: params.callId,
+                  run_id: record.run_id,
+                  reason: params.arguments?.reason || 'clarification',
+                },
+              }, { sessionsDir });
+              await updateWorker(swarmId, swarmAgent, {
+                state: 'waiting_reply',
+                parked_on: params.callId,
+              }, { sessionsDir });
+            })());
+          }
+        } else if (isBoardTool(params.tool)) {
+          identity(params.threadId, params.turnId);
+          trackSwarmHook((async () => {
+            try {
+              const toolArgs = params.arguments && typeof params.arguments === 'object' ? params.arguments : {};
+              const result = await board.handleBoardMcpTool(params.tool, toolArgs, env, {
+                swarmId, agentName: swarmAgent, sessionsDir, configPath, runId: record.run_id,
+              });
+              const payload = JSON.parse(result.content[0].text);
+              if (params.tool === 'board_post') {
+                payload.seq = payload.message.seq;
+                payload.mentions = payload.message.mentions;
+              }
+              if (!client.disconnected) {
+                client.reply(id, { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(payload) }] });
+              }
+            } catch (toolErr) {
+              if (!client.disconnected) {
+                client.reply(id, { success: false, contentItems: [{ type: 'inputText', text: String(toolErr?.message || toolErr) }] });
+              }
+            }
+          })());
         } else client.reply(id, { success: false, contentItems: [{ type: 'inputText', text: 'Unsupported tool.' }] });
       } else {
         const approval = approvalReply(method, params, sandbox);
@@ -209,10 +273,14 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
   try {
     client = await connectAppServer(state, onEvent);
     client.onFailure(fail);
-    const common = { cwd, model, modelProvider: PROVIDER, sandbox, approvalPolicy, developerInstructions: DEVELOPER_INSTRUCTIONS };
+    const developerInstructions = isSwarm
+      ? `${DEVELOPER_INSTRUCTIONS}\n${SWARM_DEVELOPER_INSTRUCTIONS} (Swarm: ${swarmId}, Worker: ${swarmAgent}.)`
+      : DEVELOPER_INSTRUCTIONS;
+    const dynamicTools = isSwarm ? [ASK_GEMINI, ...swarmTools] : [ASK_GEMINI];
+    const common = { cwd, model, modelProvider: PROVIDER, sandbox, approvalPolicy, developerInstructions };
     const thread = threadId
       ? await client.request('thread/resume', { ...common, threadId, excludeTurns: true }, remaining())
-      : await client.request('thread/start', { ...common, dynamicTools: [ASK_GEMINI], allowProviderModelFallback: false }, remaining());
+      : await client.request('thread/start', { ...common, dynamicTools, allowProviderModelFallback: false }, remaining());
     if (threadId && thread.thread.id !== threadId) throw new Error('Codex returned a different thread on resume.');
     const sandboxTypes = Object.values(SANDBOX_TYPES);
     const actual = sandboxTypes.indexOf(thread.sandbox?.type);
@@ -237,6 +305,12 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
         client.reply(id, { success: reply.success, contentItems: [{ type: 'inputText', text: reply.answer }] });
         tools.delete(id);
         pendingChanged();
+        if (isSwarm && !tools.size) {
+          trackSwarmHook((async () => {
+            const { updateWorker } = await import('../../core/swarm-bus.mjs');
+            await updateWorker(swarmId, swarmAgent, { state: 'working', parked_on: null }, { sessionsDir });
+          })());
+        }
       } catch (err) {
         if (!['ENOENT', 'EPERM', 'EBUSY'].includes(err.code)) fail(err);
       }
@@ -291,5 +365,6 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     clearInterval(poll);
     clearTimeout(timeout);
     client?.close();
+    if (swarmHooks.length) await Promise.allSettled([...swarmHooks]);
   }
 }

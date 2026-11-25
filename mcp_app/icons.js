@@ -14,6 +14,9 @@ const shapes = {
   copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
   file: '<path d="M6 3h8l4 4v14H6Zm8 0v5h4"/>',
   link: '<path d="M13 5h6v6m0-6-8 8m6 0v6H5V7h6"/>',
+  send: '<path d="M21 3 10 14"/><path d="m21 3-6.5 18-3.5-8-8-3.5Z"/>',
+  image: '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="m21 15-5-5L5 19"/>',
+  users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
 };
 
 export function icon(name, className = "") {

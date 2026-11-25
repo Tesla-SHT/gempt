@@ -46,19 +46,19 @@ const PKG = (() => {
   }
 })();
 
-const BUILD_ID = `${PKG.version || '0.7.1'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
+const BUILD_ID = `${PKG.version || '0.8.0'}-${Math.trunc(statSync(THIS_FILE).mtimeMs)}`;
 const pidAlive = (pid) => {
   if (!Number.isSafeInteger(pid) || pid < 1) return false;
   try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }
 };
 const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
-function readJsonBody(req) {
+function readJsonBody(req, maxBytes = MAX_POST_BYTES) {
   return new Promise((resolveBody, rejectBody) => {
     const chunks = [];
     let total = 0;
     req.on('data', (chunk) => {
       total += chunk.length;
-      if (total > MAX_POST_BYTES) {
+      if (total > maxBytes) {
         rejectBody(Object.assign(new Error('Request body too large'), { status: 413 }));
         req.destroy();
         return;
@@ -88,7 +88,6 @@ export async function startServer({
   magpieConfigDir,
   antigravityPluginDir,
   agyBinDir,
-  magpieCliPath,
   execEnabled = false,
   mcpToolsEnabled,
   probeTimeoutMs = 2000,
@@ -96,14 +95,17 @@ export async function startServer({
   appServerOptions,
 } = {}) {
   const KEY = randomBytes(24).toString('base64url');
+  const IPC_TOKEN = randomBytes(24).toString('base64url');
   const INSTANCE_ID = randomBytes(16).toString('hex');
   const resolvedConfigDir = dirname(resolveConfigPath(configPath));
   const identityFile = (p) => join(resolvedConfigDir, `page-server-${p}.json`);
+  const ipcFile = (p) => join(resolvedConfigDir, `page-server-${p}.ipc`);
   let publishedIdentityPath = null;
+  let publishedIpcPath = null;
   let exitHookRegistered = false;
 
   const cleanStaleIdentity = (file) => {
-    if (!file || file === publishedIdentityPath || !existsSync(file)) return false;
+    if (!file || file === publishedIdentityPath || file === publishedIpcPath || !existsSync(file)) return false;
     try {
       const rec = readJsonSafe(file);
       const stale = !rec
@@ -111,6 +113,12 @@ export async function startServer({
           && (!pidAlive(rec.pid) || typeof rec.instance_id !== 'string' || !rec.instance_id));
       if (stale) {
         unlinkSync(file);
+        if (file.endsWith('.json')) {
+          const siblingIpc = `${file.slice(0, -5)}.ipc`;
+          if (siblingIpc !== publishedIpcPath && existsSync(siblingIpc)) {
+            try { unlinkSync(siblingIpc); } catch { /* ignore */ }
+          }
+        }
         return true;
       }
     } catch { /* Ignore cleanup races or read-only directories. */ }
@@ -121,21 +129,31 @@ export async function startServer({
     try {
       if (!existsSync(resolvedConfigDir)) return;
       for (const name of readdirSync(resolvedConfigDir)) {
-        if (!/^page-server-\d+\.json$/.test(name)) continue;
+        if (!/^page-server-\d+\.(?:json|ipc)$/.test(name)) continue;
         cleanStaleIdentity(join(resolvedConfigDir, name));
       }
     } catch { /* Best effort. */ }
   };
 
   const clearIdentity = () => {
-    if (!publishedIdentityPath) return;
-    try {
-      const current = readJsonSafe(publishedIdentityPath);
-      if (current?.instance_id === INSTANCE_ID && existsSync(publishedIdentityPath)) {
-        unlinkSync(publishedIdentityPath);
-      }
-    } catch { /* Ignore cleanup errors. */ }
-    publishedIdentityPath = null;
+    if (publishedIdentityPath) {
+      try {
+        const current = readJsonSafe(publishedIdentityPath);
+        if (current?.instance_id === INSTANCE_ID && existsSync(publishedIdentityPath)) {
+          unlinkSync(publishedIdentityPath);
+        }
+      } catch { /* Ignore cleanup errors. */ }
+      publishedIdentityPath = null;
+    }
+    if (publishedIpcPath) {
+      try {
+        const current = readJsonSafe(publishedIpcPath);
+        if (current?.instance_id === INSTANCE_ID && existsSync(publishedIpcPath)) {
+          unlinkSync(publishedIpcPath);
+        }
+      } catch { /* Ignore cleanup errors. */ }
+      publishedIpcPath = null;
+    }
   };
 
   const publishIdentity = (p) => {
@@ -150,6 +168,15 @@ export async function startServer({
         build: BUILD_ID,
       }) + '\n', { mode: 0o600 });
       publishedIdentityPath = file;
+      const ipc = ipcFile(p);
+      writeFileSync(ipc, JSON.stringify({
+        service: 'gempt-magpie-plugin',
+        instance_id: INSTANCE_ID,
+        pid: process.pid,
+        port: p,
+        token: IPC_TOKEN,
+      }) + '\n', { mode: 0o600 });
+      publishedIpcPath = ipc;
       if (!exitHookRegistered) {
         exitHookRegistered = true;
         process.once('exit', clearIdentity);
@@ -160,7 +187,7 @@ export async function startServer({
   let actualPort = 0;
   let appServer;
   const pageOptions = () => ({ configPath, sessionsDir, magpieConfigDir, antigravityPluginDir, agyBinDir,
-    magpieCliPath, execEnabled, mcpToolsEnabled, appServer, probeTimeoutMs, env: appServerOptions?.env,
+    execEnabled, mcpToolsEnabled, appServer, probeTimeoutMs, env: appServerOptions?.env,
     connect: appServerOptions?.connect });
   let OWN = new Set();
   let HOSTS = new Set();
@@ -227,6 +254,11 @@ export async function startServer({
     const want = Buffer.from(KEY);
     return got.length === want.length && timingSafeEqual(got, want);
   };
+  const ipcOK = (req) => {
+    const got = Buffer.from(String(req.headers['x-gempt-ipc-token'] || ''));
+    const want = Buffer.from(IPC_TOKEN);
+    return got.length === want.length && timingSafeEqual(got, want);
+  };
 
   const server = createServer(async (req, res) => {
     if (!hostAllowed(req)) {
@@ -258,6 +290,31 @@ export async function startServer({
         }, undefined, false);
       }
 
+      if (pathname === '/api/internal/dispatch') {
+        if (req.method !== 'POST') return send(req, res, 405, { error: 'method not allowed' }, undefined, false);
+        const remote = String(req.socket?.remoteAddress || '');
+        const isLoopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+        if (!isLoopback || !ipcOK(req)) {
+          return send(req, res, 401, { error: 'unauthorized: valid loopback x-gempt-ipc-token required' }, undefined, false);
+        }
+        const body = await readJsonBody(req, 1024 * 1024);
+        if (!body || typeof body !== 'object' || !body.args || typeof body.args !== 'object') {
+          return send(req, res, 400, { error: 'invalid dispatch payload' }, undefined, false);
+        }
+        const { dispatchRun } = await import('../../core/runs.mjs');
+        const reqOpts = body.options && typeof body.options === 'object' ? body.options : {};
+        const run = await dispatchRun(body.args, {
+          configPath: reqOpts.configPath || configPath,
+          sessionsDir: reqOpts.sessionsDir || sessionsDir,
+          magpieConfigDir: reqOpts.magpieConfigDir || magpieConfigDir,
+          probeTimeoutMs,
+          waitSec: reqOpts.waitSec,
+          agent: reqOpts.agent,
+          env: appServerOptions?.env || process.env,
+        });
+        return send(req, res, 200, { ok: true, run }, undefined, false);
+      }
+
       const rawPath = (req.url || '/').split('?', 1)[0];
       if (pathname.startsWith('/api/') || /^\/api\/(requests|sessions)(?:\/|$)/.test(rawPath)) {
         if (!keyOK(req)) return send(req, res, 401, { error: 'unauthorized: send the x-gempt-key header' });
@@ -285,7 +342,7 @@ export async function startServer({
         const asset = await readPageAsset('/index.html');
         const html = asset.data.toString('utf8')
           .replace('<head>', `<head>\n  <meta name="gempt-key" content="${KEY}">`);
-        const ownOrigins = [...OWN].join(' ');
+        const ownOrigins = [...OWN].filter((o) => !o.includes('[::1]')).join(' ');
         return await send(req, res, 200, html, asset.type, false, undefined, {
           'content-security-policy': `default-src 'none'; script-src 'self' ${ownOrigins}; connect-src 'self' ${ownOrigins}; style-src 'self' ${ownOrigins} 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'`,
         });

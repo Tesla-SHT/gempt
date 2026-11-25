@@ -24,9 +24,10 @@ const waitCommand = /\bgempt-wait\b|\bgempt\s+status\b[^\n]*--wait\b/i;
 const readCommand = /(?:^|[;&|\r\n]\s*)(?:(?:sudo|command|time)\s+)?(?:Get-Content|Select-String|Get-ChildItem|gc|sls|gci|cat|head|tail|rg|ripgrep|grep|findstr|find|ls|dir|tree|sed|awk|wc|git\s+(?:diff|show|log|grep|status)|type)(?:\.exe)?(?=\s|$)/i;
 const milestones = [120, 200, 280];
 const banners = {
-  gemini_first: 'Handle routine edits/reads in Gemini; route heavy debugging, long test loops, expert review, or Swarm verification to gpt_run / gpt_ask.',
-  gpt: "Route repo investigation & code changes directly to gpt_run(cwd, access='inspect'|'change') or gpt_ask(file_paths); keep quick Gemini checks <=5 steps.",
-  gpt_first: 'Delegate this turn to a persistent gpt_run(cwd, session_id=...) thread immediately; reserve Gemini for <=2 quick checks/visuals (for coding-only workspaces, consider using Codex CLI directly).',
+  gemini_first: 'Handle routine edits/reads in Gemini; route heavy debugging, long test loops, expert review, or multi-worker tasks to gpt_swarm / gpt_run / gpt_ask.',
+  balanced: 'Coordinate conversation & design in Gemini; delegate engineering, source edits, and multi-worker tasks via shell-free gpt_swarm(action="add") / gpt_board or gpt_run.',
+  gpt: "Route repo investigation & code changes to shell-free gpt_swarm(action='add') / gpt_board (or single-task gpt_run) / gpt_ask(file_paths); keep quick Gemini checks <=5 steps.",
+  gpt_first: 'Delegate this turn immediately via shell-free gpt_swarm(action="add") + gpt_board or a persistent gpt_run(cwd, session_id=...) thread; reserve Gemini for <=2 quick checks/visuals (for coding-only workspaces, consider using Codex CLI directly).',
 };
 const now = () => Date.now() / 1000;
 const text = (value) => typeof value === 'string' ? value.trim() : '';
@@ -123,16 +124,21 @@ function setCount(state, key, count) {
 }
 
 function healthy() {
-  const overridePath = text(process.env.GEMPT_APP_SERVER_STATE);
-  let state;
-  try {
-    state = readJsonSafe(overridePath ? resolvePath(overridePath) : join(dirname(configPath), 'app-server.json'));
-  } catch {
-    return false;
+  const cfg = readJsonSafe(configPath);
+  const configuredCli = String(cfg?.execution?.default_cli || 'auto').trim().toLowerCase();
+  const requiresAppServer = !configuredCli || configuredCli === 'auto' || configuredCli === 'codex';
+  if (requiresAppServer) {
+    const overridePath = text(process.env.GEMPT_APP_SERVER_STATE);
+    let state;
+    try {
+      state = readJsonSafe(overridePath ? resolvePath(overridePath) : join(dirname(configPath), 'app-server.json'));
+    } catch {
+      return false;
+    }
+    const pid = Math.trunc(Number(state?.pid));
+    if (state?.status !== 'running' || state.healthy === false || !state.ws_url || !(pid > 0)) return false;
+    try { process.kill(pid, 0); } catch (error) { if (error.code !== 'EPERM') return false; }
   }
-  const pid = Math.trunc(Number(state?.pid));
-  if (state?.status !== 'running' || state.healthy === false || !state.ws_url || !(pid > 0)) return false;
-  try { process.kill(pid, 0); } catch (error) { if (error.code !== 'EPERM') return false; }
   const runs = join(resolveSessionsDir(), 'runs');
   let files;
   try {
@@ -259,7 +265,7 @@ async function handle(payload) {
       if (input.ToolName === 'gpt_run' && nativeSwarm) {
         return { decision: 'deny', reason: swarmDispatch };
       }
-      if (['gpt_run', 'gpt_ask'].includes(input.ToolName)) {
+      if (['gpt_run', 'gpt_ask', 'gpt_swarm', 'gpt_board'].includes(input.ToolName)) {
         await updateState(conversationId, (state) => setCount(state, key, 0));
         const parentId = text(input.Arguments?.host_conversation_id);
         if (parentId && parentId !== conversationId) {
@@ -274,9 +280,9 @@ async function handle(payload) {
     const cwd = text(payload.cwd) || text(workspacePaths?.[0]) || (extname(target) ? dirname(target) : target) || '.';
     if (['edit_file', 'write_file'].includes(name)) {
       if (!sourceWrite(target, input)) return allow;
-      return { decision: 'deny', reason: `[GemPT ${pct}% Write Gate] Source edit (${basename(target)}) routed to Codex. `
-        + (nativeSwarm ? swarmDispatch : `Call call_mcp_tool(ServerName="gempt_gempt", ToolName="gpt_run", Arguments={"goal": "Edit ${target}: <change & verify>", "cwd": "${cwd}", "access": "change"}) `
-        + 'then run the returned `gempt-wait <id>` via run_command(WaitMsBeforeAsync=500). (User can say "自己改" to bypass.)') };
+      return { decision: 'deny', reason: `[GemPT ${pct}% Write Gate] Source edit (${basename(target)}) routed to GemPT execution. `
+        + (nativeSwarm ? swarmDispatch : `Use call_mcp_tool(ServerName="gempt_gempt", ToolName="gpt_swarm", Arguments={"action": "add", "name": "worker", "brief": "Edit ${target}: <change & verify>", "cwd": "${cwd}", "access": "change"}) (or single-task gpt_run) `
+        + 'then run the returned `gempt-wait` command via run_command(WaitMsBeforeAsync=500). (User can say "自己改" to bypass.)') };
     }
     if (ordinary === 'balanced') return allow;
     const command = String(input.CommandLine || '').trim();
@@ -288,16 +294,18 @@ async function handle(payload) {
     if (count <= limit) return allow;
     const extra = ordinary === 'gpt_first' ? ' For coding-only workspaces, prefer Codex CLI directly.' : '';
     return { decision: 'deny', reason: `[GemPT ${pct}% Explore Stop-Loss] ${count} non-exempt workspace reads/searches this turn (limit ${limit}). `
-      + (nativeSwarm ? swarmDispatch : `Dispatch deep inspection to Codex: call_mcp_tool(ServerName="gempt_gempt", ToolName="gpt_run", Arguments={"goal": "<what to inspect>", "cwd": "${cwd}", "access": "inspect"}) `
-      + `then run returned \`gempt-wait <id>\` via run_command(WaitMsBeforeAsync=500).${extra} (Say "自己查" to bypass.)`) };
+      + (nativeSwarm ? swarmDispatch : `Dispatch deep inspection via gpt_swarm(action="add", access="inspect") or gpt_run(cwd="${cwd}", access="inspect") `
+      + `then run the returned \`gempt-wait\` command via run_command(WaitMsBeforeAsync=500).${extra} (Say "自己查" to bypass.)`) };
   }
   if (hookEventName === 'SessionStart') {
     if (pct <= 0 && !nativeSwarm) return {};
     return { injectSteps: [step(`GemPT v2 active: ${ordinary} (${pct}% GPT${family ? `, family=${family}` : ''}${isSwarm ? ', swarm' : ''}).\n`
       + (nativeSwarm ? swarmDispatch + '\nKeep quick gpt_ask (including tier="chore") and gpt_ctl direct.'
-        : 'Tools (ServerName="gempt_gempt"): gpt_run(goal,cwd,access="change"|"inspect",workspace="inherit"|"share",session_id?) | '
+        : 'Default mode: shell-free GemPT Swarm (`gpt_swarm` + `gpt_board` + `gempt-wait --board`). Tools (ServerName="gempt_gempt"): '
+      + 'gpt_swarm(action="title"|"plan"|"add"|"status"|"model"|"kill", cli?, ...) | gpt_board(action="post"|"read"|"wait"|"roster") | '
+      + 'gpt_run(goal,cwd,access="change"|"inspect",workspace="inherit"|"share",cli?,session_id?) | '
       + 'gpt_ask(goal,file_paths?,cwd?,tier?,session_id?) | gpt_ctl(action="status"|"steer"|"interrupt"|"reply",run_id?,message?,call_id?).\n'
-      + "Run gpt_run's returned `gempt-wait <id>` via run_command(WaitMsBeforeAsync=500); never poll status."))] };
+      + 'Execute the returned `gempt-wait` command via run_command(WaitMsBeforeAsync=500); never poll status.'))] };
   }
   const tokens = Math.floor(contextTokens(payload.transcriptPath) / 1000);
   const steps = await updateState(conversationId, (state) => {

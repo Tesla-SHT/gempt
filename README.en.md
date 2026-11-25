@@ -1,16 +1,16 @@
-# GemPT v0.7.1
+# GemPT v0.8.0
 
 [中文文档](./README.md) · [Antigravity Plugin README](./plugin/README.md) · [Third-Party Licenses](./THIRD_PARTY_LICENSES.txt)
 
 GemPT enables Gemini to consult any delegate model available in Magpie (`gpt_ask`), delegate repository inspection and coding tasks through the Codex execution service (`gpt_run`), and observe or steer runs in real time in the **GemPT** side pane (`gpt_ctl`), routed through your local [Magpie](https://github.com/yetone/magpie) gateway.
 
-Runtime code uses only Node.js built-in modules (`>= 20.11.0`). The GemPT panel ships prebuilt with full third-party license notices in [THIRD_PARTY_LICENSES.txt](./THIRD_PARTY_LICENSES.txt).
+Runtime code uses only Node.js built-in modules (`>= 22.13.0`). The GemPT panel ships prebuilt with full third-party license notices in [THIRD_PARTY_LICENSES.txt](./THIRD_PARTY_LICENSES.txt).
 
 ## Prerequisites
 
-- **Node.js `>= 20.11.0`**
+- **Node.js `>= 22.13.0`**
 - **Magpie `>= 0.1.1340`** ([yetone/magpie](https://github.com/yetone/magpie) / [usemagpie.ai](https://usemagpie.ai)), connected to at least one chat model. GPT is recommended. Set the gateway address in GemPT if using a custom endpoint.
-- **Magpie-side GemPT plugin**: hosts the `Plugins → GemPT` control page and manages the shared Codex `app-server` (installing Codex CLI alone cannot replace it).
+- **Magpie-side GemPT plugin `0.8.0`**: hosts the `Plugins → GemPT` control page and manages the shared Codex `app-server` (installing Codex CLI alone cannot replace it).
 - **Codex CLI** (`npm install -g @openai/codex`, tested with `0.164.0`): required for `gpt_run` repository execution (optional if you only use `gpt_ask`).
 - **Git**: required when using `workspace="share"` for isolated worktrees.
 
@@ -22,7 +22,7 @@ Search for **GemPT** directly in the Magpie Plugin Marketplace, or install from 
 
 ```bash
 # Recommended: install from the GitHub release tag
-magpie plugin add github:yizhang-dream/gempt#v0.7.1
+magpie plugin add github:yizhang-dream/gempt#v0.8.0
 ```
 
 > **Note:** `gempt` is not yet published on the npm registry; do not run bare `magpie plugin add gempt` yet (it returns 404).
@@ -37,10 +37,10 @@ Installation targets the account running Magpie. For a custom layout, set `GEMPT
 
 ```bash
 # Recommended: one-command install from the GitHub release tag
-npx --yes github:yizhang-dream/gempt#v0.7.1 install-agy
+npx --yes github:yizhang-dream/gempt#v0.8.0 install-agy
 ```
 
-> **Note:** Since `gempt` is not yet published on the npm registry, use the GitHub tag above or install from a local checkout (bare `npx --yes gempt@0.7.1 install-agy` is not yet active).
+> **Note:** Since `gempt` is not yet published on the npm registry, use the GitHub tag above or install from a local checkout (bare `npx --yes gempt@0.8.0 install-agy` is not yet active).
 
 From a local checkout:
 - **Linux / macOS**: `bash install.sh`
@@ -76,8 +76,8 @@ The **中 / EN** control switches the interface immediately. Use **Overview → 
 
 ## Control Panel
 
-- **MCP orchestration for Antigravity.** In **Plugins → GemPT → MCP 编排**, pair Hydrogen, Neon, and Carbon with any model or routing group listed by the Magpie gateway (repository runs require Responses and tool support) or select the default Codex subscription model. The panel also controls reasoning effort, execution permissions, and Swarm, and shows actual token share. Work-split profiles are `0%` off, `15%` heavy-task hints, `35%` source-write gate, `60%` source-write plus a five-step read limit, and `80%` direct delegation plus a two-step read limit. Use `/gempt` for orchestration and `/gempt-chore` for utility consultations.
-- **Direct routing groups for other agents and clients.** Use **路由组直连** to preview, create, and copy `group/gempt-sonnet`, `group/gempt-opus`, or `group/gempt-fable`, then select that ID in the client's model picker. The CLI equivalents are `gempt presets --preview` and `gempt presets --apply`.
+- **Native Swarm kernel and Workbench.** Assign workers with `gpt_swarm` and exchange messages by channel with `gpt_board`. In the Swarm Workbench, use Hive to inspect members and Mentions to trace who mentioned whom, export a replay as a GIF, manage channels, or inspect the underlying data in Raw.
+- **MCP orchestration for Antigravity.** In **Plugins → GemPT**, pair Hydrogen, Neon, and Carbon with any model listed by the Magpie gateway (including custom Magpie group IDs you manage yourself; repository runs require Responses and tool support) or select the default Codex subscription model. The panel also controls reasoning effort, execution permissions, and Swarm, and shows actual token share. Work-split profiles are `0%` off, `15%` heavy-task hints, `35%` source-write gate, `60%` source-write plus a five-step read limit, and `80%` direct delegation plus a two-step read limit. Use `/gempt` for orchestration and `/gempt-chore` for utility consultations.
 
 ## Security & Permissions
 

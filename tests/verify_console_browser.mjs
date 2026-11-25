@@ -13,6 +13,7 @@ import { serveAppServerSocket } from './app-server-fixture.mjs';
 import { updateHostContext } from '../core/host-context.mjs';
 import { runDirectory, saveRun } from '../core/runs.mjs';
 import { resolvePath } from '../core/state.mjs';
+import { ensureSwarm, postBoardMessage, setSwarmPlan, upsertWorker } from '../core/swarm-bus.mjs';
 import { updateSettings } from '../magpie_plugin/lib/backend.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
 
@@ -45,6 +46,8 @@ const controlPackets = [];
 const controlSockets = new Set();
 const codexToken = 'browser-codex-fixture';
 const priorRunId = 'd'.repeat(32);
+const swarmWorkerRunId = 'f'.repeat(32);
+const swarmId = 'sw-verify-ui';
 const appPath = join(root, 'app-server.json');
 const env = { ...process.env, GEMPT_CONFIG: configPath, GEMPT_SESSIONS_DIR: sessionsDir,
   MAGPIE_CONFIG_DIR: magpieConfigDir, GEMPT_APP_SERVER_STATE: appPath, GEMPT_AGY_BRAIN_DIR: brainDir };
@@ -196,6 +199,43 @@ function seed(url) {
   });
   writeFileSync(join(runPath, 'events.jsonl'), events.map(([method, params]) =>
     JSON.stringify({ method, params: { threadId, turnId, ...params } })).join('\n') + '\n');
+  saveRun(join(runDirectory(swarmWorkerRunId, sessionsDir), 'state.json'), {
+    source: 'magpie_exec', run_id: swarmWorkerRunId, session_id: 'exec-swarm-designer', title: '核对暗黑主题对比度',
+    cwd, host_conversation_id: host, state: 'waiting_gemini', started_at: stamp(5), created_at: stamp(5),
+    pid: process.pid, model, tier: 'opus',
+    pending_tool_call: { call_id: 'ask_swarm_1', tool: 'ask_gemini', requested_at: stamp(1),
+      arguments: { question: 'Swarm 面板在浅色和深色主题下的层级是否清晰？' } },
+  });
+}
+
+async function seedSwarm() {
+  await ensureSwarm({ swarmId, hostConversationId: host, cwd, title: 'Swarm 工作台验收', sessionsDir });
+  await upsertWorker(swarmId, {
+    name: 'frontend', cli: 'codex', model, workspace: 'share',
+    worktree_path: join(cwd, 'worktree'), source_cwd: cwd, state: 'waiting_reply',
+    run_id: swarmWorkerRunId, session_id: 'exec-swarm-designer', parked_on: 'ask_swarm_1',
+    task_summary: '实现总览线程卡片、截图时间线与消息板发送器',
+  }, { sessionsDir });
+  await upsertWorker(swarmId, {
+    name: 'reviewer', cli: 'codex', model, workspace: 'inherit',
+    source_cwd: cwd, state: 'waiting', run_id: priorRunId, session_id: sessionId,
+    task_summary: '核对窄屏 Sidecar 响应式与无障碍属性',
+  }, { sessionsDir });
+  await setSwarmPlan(swarmId, {
+    goal: { title: 'Phase 2 UI', line: '在 Sidecar 与 Magpie 控制台上线 Swarm 工作台' },
+    threads: [
+      { id: 'ui', title: '工作台界面', goal: '总览工位卡片 + 消息板互动', workers: ['frontend'], tasks: ['线程卡片', '消息板'] },
+      { id: 'qa', title: '双端回归', goal: '窄屏 420px 与宽屏 1280px 校验', workers: ['reviewer'] },
+    ],
+  }, { sessionsDir });
+  await postBoardMessage(swarmId, {
+    from: 'coordinator', kind: 'brief',
+    text: '@frontend 实现 Swarm 总览与消息板，@reviewer 核对窄屏布局。',
+  }, { sessionsDir });
+  await postBoardMessage(swarmId, {
+    from: 'frontend', kind: 'question',
+    text: '@coordinator 面板初版已完成，暗黑主题对比度是否满意？\nScreenshot: worktree/note.md | Swarm 面板草图',
+  }, { sessionsDir });
 }
 
 async function until(predicate, description) {
@@ -212,12 +252,13 @@ try {
   const { result: { tools } } = JSON.parse(execFileSync(process.execPath, [serverEntry], {
     input: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) + '\n', encoding: 'utf8', env,
   }));
-  assert.deepEqual(tools.map(({ name }) => name).sort(), ['gpt_ask', 'gpt_ctl', 'gpt_run']);
+  assert.deepEqual(tools.map(({ name }) => name).sort(), ['gpt_ask', 'gpt_board', 'gpt_ctl', 'gpt_run', 'gpt_swarm']);
   assert.deepEqual(tools.filter(({ _meta }) => _meta?.ui || _meta?.['com.google.antigravity/ui']), []);
   backend.listen(0, '127.0.0.1');
   await once(backend, 'listening');
   const url = 'http://127.0.0.1:' + backend.address().port;
   seed(url);
+  await seedSwarm();
   await updateHostContext(host, [cwd], { configPath });
   consoleServer = await startServer({ port: 0, configPath, sessionsDir, magpieConfigDir,
     antigravityPluginDir: join(root, 'client plugins', 'gempt'), agyBinDir: join(root, 'commands with spaces'),
@@ -306,7 +347,7 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
     }, target);
   }
   async function assertGeometry(name) {
-    const overflow = await evaluate(`return [document.documentElement, document.body, $('view-console'), $('live-panel')]
+    const overflow = await evaluate(`return [document.documentElement, document.body, $('view-console'), $('live-panel'), $('swarm-panel')]
       .filter(el => el && !el.hidden).map(el => [el.id || el.tagName, el.scrollWidth, el.clientWidth]);`);
     const outside = overflow.some(([, scroll, client]) => scroll > client) ? await evaluate(
       "return [...document.body.querySelectorAll('*')].filter(el => el.getBoundingClientRect().right > innerWidth + 1).map(el => [el.id || el.className || el.tagName, Math.round(el.getBoundingClientRect().right)]).slice(0, 18);") : [];
@@ -371,6 +412,24 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
   await until(() => evaluate("return !!document.querySelector('#sessions [data-activity-id]');"), 'Magpie session ledger');
   await evaluate(`document.querySelector('#sessions [data-activity-id="${sessionId}"]').parentElement.querySelector('.activity-link').click();`);
   await until(() => evaluate("return !$('live-panel').hidden && !$('detail-bar').hidden;"), 'Magpie session list to Live');
+  await click('tab-swarm');
+  await until(() => evaluate("return !$('swarm-panel').hidden && $('swarm-title').textContent === 'Swarm 工作台验收' && document.querySelectorAll('#swarm-threads .swarm-card').length === 2;"), 'Magpie Swarm Workbench overview');
+  assert.equal(await evaluate("return $('swarm-tab-badge').textContent;"), '1');
+  assert.equal(await evaluate("return document.querySelectorAll('#swarm-screenshots-list .swarm-shot-item').length;"), 1);
+  await shot('magpie-swarm-overview-dark');
+  await click('swarm-subtab-board');
+  await until(() => evaluate("return !$('swarm-view-board').hidden && document.querySelectorAll('#swarm-board-feed .swarm-msg').length === 2;"), 'Magpie Swarm board feed');
+  assert.ok(await evaluate("return document.querySelectorAll('#swarm-board-feed .swarm-mention').length >= 3;"));
+  await evaluate("document.querySelector('#swarm-board-feed .swarm-reply-btn').click();");
+  assert.equal(await evaluate("return $('swarm-composer-input').value;"), '@frontend ');
+  await evaluate("$('swarm-composer-input').value = '@frontend 对比度很清晰，继续！'; $('swarm-composer-input').dispatchEvent(new Event('input')); $('swarm-composer-send').click();");
+  await until(() => evaluate("return document.querySelectorAll('#swarm-board-feed .swarm-msg').length === 3 && $('swarm-composer-status').textContent.includes('已发送 #3');"), 'Magpie Swarm human post routes reply');
+  assert.match(JSON.parse(readFileSync(join(runDirectory(swarmWorkerRunId, sessionsDir), 'tool_replies', 'ask_swarm_1.json'), 'utf8')).answer, /对比度很清晰/);
+  await shot('magpie-swarm-board-dark');
+  await click('swarm-subtab-overview');
+  await until(() => evaluate("return document.querySelector('[data-worker=\"reviewer\"] [data-worker-action=\"stream\"]') !== null;"), 'Swarm worker stream button');
+  await evaluate("document.querySelector('[data-worker=\"reviewer\"] [data-worker-action=\"stream\"]').click();");
+  await until(() => evaluate("return !$('live-panel').hidden && $('detail-title').textContent === '较早轮次';"), 'Swarm worker jumps to Live stream');
   rmSync(join(runPath, 'tool_replies', 'ask_1.json'), { force: true });
   await open(standaloneUrl + '#live/' + runId, 360, 820, false);
   await until(() => evaluate("return !$('ask').hidden;"), 'Magpie hash restores Live detail');
@@ -497,7 +556,7 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
           && await evaluate("return !$('gateway-test').disabled;"), 'English settings save');
         await click('gateway-test');
         await until(() => evaluate("return $('gateway-result').textContent.includes('4 models');"), 'English probe result');
-        assert.equal(await evaluate("return [...document.querySelectorAll('.app-tabs button')].map(x => x.textContent).join('|');"), 'Live|Overview|Requests|Sessions');
+        assert.equal(await evaluate("return [...document.querySelectorAll('.app-tabs button')].map(x => (x.querySelector('.tab-label') || x).textContent).join('|');"), 'Live|Swarm|Overview|Requests|Sessions');
         assert.equal(await evaluate("return document.querySelector('#advanced-settings summary').textContent;"), 'Connection & Advanced Settings');
         assert.match(await evaluate("return $('work-detail').textContent;"), /GPT handles substantive tasks/);
       }
@@ -515,6 +574,12 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
     await until(() => evaluate("return !!document.querySelector('#requests [data-activity-id]');"), 'English native Requests');
     await click('tab-sessions');
     await until(() => evaluate("return !!document.querySelector('#sessions [data-activity-id]');"), 'English native Sessions');
+    await click('tab-swarm');
+    await until(() => evaluate("return !$('swarm-panel').hidden && document.querySelectorAll('#swarm-threads .swarm-card').length === 2;"), 'English native Swarm overview');
+    await shot('sidecar-en-swarm-overview-dark');
+    await click('swarm-subtab-board');
+    await until(() => evaluate("return !$('swarm-view-board').hidden && document.querySelectorAll('#swarm-board-feed .swarm-msg').length === 3;"), 'English native Swarm board');
+    await shot('sidecar-en-swarm-board-dark');
     await open(url + '/native-host?theme=light', 460, 820, true);
     await until(() => evaluate("return document.documentElement.lang === 'en' && !!document.querySelector('.session-card');"), 'native English Live applies saved language');
     assert.equal(await evaluate("return document.documentElement.dataset.theme;"), 'light');

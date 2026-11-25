@@ -1,7 +1,7 @@
 {
   "name": "gempt",
-  "version": "0.7.1",
-  "description": "Antigravity MCP orchestration with Gemini pairing with models from your Magpie gateway and Magpie direct routing groups for other clients.",
+  "version": "0.8.0",
+  "description": "Antigravity MCP orchestration that pairs Gemini with models from your Magpie gateway.",
   "author": {
     "name": "yizhang-dream",
     "url": "https://github.com/yizhang-dream"
@@ -22,7 +22,8 @@
   "scripts": {
     "build:mcp-app": "node mcp_app/build.mjs",
     "build:agy-plugin": "node scripts/build-agy-plugin.mjs",
-    "test": "node --test tests/test_core_node.mjs tests/test_magpie_plugin.mjs"
+    "sync:local": "node scripts/sync-local.mjs",
+    "test": "node --test tests/test_core_node.mjs tests/test_magpie_plugin.mjs tests/test_swarm_bus.mjs tests/test_runners.mjs"
   },
   "files": [
     "bin/gempt.mjs",
@@ -58,7 +59,7 @@
     "url": "git+https://github.com/yizhang-dream/gempt.git"
   },
   "engines": {
-    "node": ">=20.11.0",
+    "node": ">=22.13.0",
     "magpie": ">=0.1.1340"
   },
   "keywords": [
@@ -76,7 +77,7 @@
   "magpie": {
     "name": "GemPT",
     "summary": {
-      "en": "Gemini pairing with models from your Magpie gateway and MCP controls for Antigravity, plus direct Magpie routing groups for other clients.",
+      "en": "Pair Gemini with models from your Magpie gateway and manage MCP orchestration for Antigravity.",
       "zh": "让 Gemini 配对 Magpie 中的任意下属模型，在面板中启用 Antigravity 集成、查看和接管任务。"
     },
     "page": {

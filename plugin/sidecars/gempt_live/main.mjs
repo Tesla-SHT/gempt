@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -85,7 +85,7 @@ async function entryPage() {
     .replace("script-src 'self';", `script-src 'self' 'sha256-${entryHash}';`)
     .replace('<link rel="stylesheet" href="./styles.css">', `<meta name="referrer" content="no-referrer">\n  <script>${bootstrap}</script>`)
     .replace('<html ', '<html data-sidecar ')
-    .replace('<script type="module" src="./app.js"></script>', '');
+    .replace(/<script\s+(?:type="module"|defer)\s+src="\.\/app\.js"><\/script>/, '');
   return new Response(html, { contentType: type, headers: noStore });
 }
 app.page('/', entryPage);
@@ -138,5 +138,32 @@ app.api('/api', async ({ path, body, conversationId, workspaceUris }) => {
   }
 });
 const server = await app.run();
-server.once('close', () => { void appServer.stop(); });
+const watchedFiles = [
+  fileURLToPath(import.meta.url),
+  fileURLToPath(new URL('sidecar.json', import.meta.url)),
+  fileURLToPath(new URL('magpie_plugin/lib/page-api.mjs', runtime)),
+  fileURLToPath(new URL('core/assets/http-ui/app.js', runtime)),
+];
+const readStamp = () => watchedFiles.map((file) => {
+  try {
+    const st = statSync(file);
+    return `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return 'missing';
+  }
+}).join('|');
+const initialStamp = readStamp();
+let reloading = false;
+const watchTimer = setInterval(() => {
+  if (reloading || readStamp() === initialStamp) return;
+  reloading = true;
+  clearInterval(watchTimer);
+  try { server.close(() => process.exit(0)); } catch { process.exit(0); }
+  setTimeout(() => process.exit(0), 1500).unref();
+}, 2000);
+watchTimer.unref();
+server.once('close', () => {
+  clearInterval(watchTimer);
+  void appServer.stop();
+});
 warmPageTelemetry(options);

@@ -1,0 +1,887 @@
+import { createHash, randomBytes } from 'node:crypto';
+import { join } from 'node:path';
+import { resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
+import { openDatabase } from './sqlite.mjs';
+import { resolvePath } from './state.mjs';
+
+import {
+  ALL, MAIN, MAX_MESSAGE_BYTES, ROLE_WORKER_RE, activeAt, channelMentions, channelRegistry,
+  channelsAt, countsUnread, effectiveChannels, memberView, mentionsIn, mentionsOf, seesIn,
+  validateChannelName, validateTopic, visibleUnread,
+} from './swarm-channels.mjs';
+
+const WORKER_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,23}$/;
+const SWARM_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const RESERVED_WORKER_NAMES = new Set(['all', 'coordinator', 'human']);
+const MENTION_RE = /(?<![\p{L}\p{Nd}_-])@([a-z0-9][a-z0-9_-]{0,23})(?![\p{L}\p{Nd}_-])/giu;
+const SCREENSHOT_RE = /^Screenshot:\s*(.+?)\s*\|\s*(.+)$/gmi;
+
+const SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS swarms (
+  id TEXT PRIMARY KEY,
+  host_conversation_id TEXT,
+  cwd TEXT,
+  title TEXT,
+  goal_title TEXT,
+  goal_line TEXT,
+  threads_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS roster (
+  swarm_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  cli TEXT,
+  model TEXT,
+  tier TEXT,
+  access TEXT,
+  workspace TEXT,
+  worktree_path TEXT,
+  source_cwd TEXT,
+  state TEXT NOT NULL,
+  run_id TEXT,
+  session_id TEXT,
+  brief TEXT,
+  task_summary TEXT,
+  last_seq INTEGER DEFAULT 0,
+  parked_on TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (swarm_id, name),
+  FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS messages (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  swarm_id TEXT NOT NULL,
+  from_agent TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  text TEXT NOT NULL,
+  mentions_json TEXT NOT NULL,
+  screenshots_json TEXT NOT NULL,
+  reply_to_seq INTEGER,
+  meta_json TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS deliveries (
+  seq INTEGER NOT NULL,
+  swarm_id TEXT NOT NULL,
+  target_agent TEXT NOT NULL,
+  delivered_at TEXT NOT NULL,
+  PRIMARY KEY (seq, target_agent),
+  FOREIGN KEY (seq) REFERENCES messages(seq) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_messages_swarm_seq ON messages(swarm_id, seq);
+CREATE INDEX IF NOT EXISTS idx_roster_swarm_state ON roster(swarm_id, state);
+CREATE INDEX IF NOT EXISTS idx_swarms_host_conv ON swarms(host_conversation_id);
+`;
+
+const migrations = {
+  roster: {
+    role: "TEXT DEFAULT 'worker'", added_by: "TEXT DEFAULT 'coordinator'", channels_json: 'TEXT',
+    wake_mode: "TEXT DEFAULT 'mentions'", wait_since: 'INTEGER DEFAULT 0', last_read_seq: 'INTEGER DEFAULT 0',
+    last_nudged_seq: 'INTEGER DEFAULT 0', last_park_blocked_seq: 'INTEGER DEFAULT 0', quota_paused_seq: 'INTEGER DEFAULT 0',
+  },
+  messages: { channel: "TEXT DEFAULT 'main'", control_json: 'TEXT', request_id: 'TEXT' },
+};
+const nowIso = () => new Date().toISOString();
+
+function safeJsonParse(raw, fallback) {
+  if (typeof raw !== 'string' || !raw) return fallback;
+  try { return JSON.parse(raw); } catch { return fallback; }
+}
+
+function normalizeCwdKey(cwd) {
+  if (typeof cwd !== 'string' || !cwd.trim()) return null;
+  try {
+    const resolved = resolvePath(cwd.trim());
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  } catch {
+    return cwd.trim();
+  }
+}
+
+export function resolveSwarmDbPath(sessionsDir) {
+  return join(resolveSessionsDir(sessionsDir), 'swarm.sqlite');
+}
+
+export async function openSwarmDb(sessionsDir) {
+  const db = await openDatabase(resolveSwarmDbPath(sessionsDir));
+  try {
+    if (!db.get("SELECT 1 FROM sqlite_master WHERE name='idx_swarm_request_id'")) {
+      db.transaction(() => {
+        db.exec(SCHEMA_SQL);
+        for (const [table, columns] of Object.entries(migrations)) {
+          const existing = new Set(db.all(`PRAGMA table_info(${table})`).map((c) => c.name));
+          for (const [column, type] of Object.entries(columns)) {
+            if (!existing.has(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+          }
+        }
+        db.exec(`CREATE TABLE IF NOT EXISTS post_window (swarm_id TEXT, agent TEXT, posted_ms INTEGER);
+          CREATE INDEX IF NOT EXISTS idx_post_window ON post_window(swarm_id, agent, posted_ms);
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_swarm_request_id ON messages(swarm_id, request_id) WHERE request_id IS NOT NULL`);
+      });
+    }
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
+
+async function withDb(sessionsDir, fn, existingDb) {
+  if (existingDb) return fn(existingDb);
+  const db = await openSwarmDb(sessionsDir);
+  try {
+    return await fn(db);
+  } finally {
+    db.close();
+  }
+}
+
+export function validateWorkerName(name) {
+  if (typeof name !== 'string') {
+    throw new Error('Worker name must be a non-empty string.');
+  }
+  const trimmed = name.trim();
+  if (!WORKER_NAME_RE.test(trimmed)) {
+    throw new Error(`Invalid worker name '${name}': expected 1-24 lowercase alphanumeric, '-' or '_' starting with a-z or 0-9.`);
+  }
+  if (RESERVED_WORKER_NAMES.has(trimmed) || trimmed.startsWith('coordinator-')) {
+    throw new Error(`Reserved worker name '${trimmed}' is not allowed.`);
+  }
+  return trimmed;
+}
+
+export function validateSwarmId(id) {
+  if (typeof id !== 'string') throw new Error('swarm_id must be a non-empty string.');
+  const trimmed = id.trim();
+  if (!SWARM_ID_RE.test(trimmed) || trimmed.includes('..')) {
+    throw new Error(`Invalid swarm_id '${id}'.`);
+  }
+  return trimmed;
+}
+
+export function parseMentions(text) {
+  if (typeof text !== 'string' || !text) return [];
+  const seen = new Set();
+  const out = [];
+  for (const match of text.matchAll(MENTION_RE)) {
+    const target = match[1].toLowerCase();
+    if (!seen.has(target)) {
+      seen.add(target);
+      out.push(target);
+    }
+  }
+  return out;
+}
+
+export function parseScreenshots(text) {
+  if (typeof text !== 'string' || !text) return [];
+  const out = [];
+  for (const match of text.matchAll(SCREENSHOT_RE)) {
+    const path = match[1].trim();
+    const caption = match[2].trim();
+    if (path && caption) out.push({ path, caption });
+  }
+  return out;
+}
+
+function formatSwarm(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    host_conversation_id: row.host_conversation_id ?? null,
+    cwd: row.cwd ?? null,
+    title: row.title ?? null,
+    goal_title: row.goal_title ?? null,
+    goal_line: row.goal_line ?? null,
+    threads: safeJsonParse(row.threads_json, []),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+function formatWorker(row) {
+  if (!row) return null;
+  return {
+    swarm_id: row.swarm_id,
+    name: row.name,
+    cli: row.cli ?? 'codex',
+    model: row.model ?? null,
+    tier: row.tier ?? null,
+    access: row.access ?? 'change',
+    workspace: row.workspace ?? 'inherit',
+    worktree_path: row.worktree_path ?? null,
+    source_cwd: row.source_cwd ?? null,
+    role: row.role || 'worker',
+    added_by: row.added_by || 'coordinator',
+    channels: safeJsonParse(row.channels_json, null),
+    wake_mode: row.wake_mode || 'mentions',
+    wait_since: Number(row.wait_since || 0),
+    last_read_seq: Number(row.last_read_seq || 0),
+    last_nudged_seq: Number(row.last_nudged_seq || 0),
+    last_park_blocked_seq: Number(row.last_park_blocked_seq || 0),
+    quota_paused_seq: Number(row.quota_paused_seq || 0),
+    state: row.state,
+    run_id: row.run_id ?? null,
+    session_id: row.session_id ?? null,
+    brief: row.brief ?? null,
+    task_summary: row.task_summary ?? null,
+    last_seq: Number(row.last_seq ?? 0),
+    parked_on: row.parked_on ?? null,
+    error: row.error ?? null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+function formatMessage(row) {
+  if (!row) return null;
+  return {
+    seq: Number(row.seq),
+    swarm_id: row.swarm_id,
+    from_agent: row.from_agent,
+    channel: row.channel || MAIN,
+    channel_mentions: channelMentions(row.text),
+    control: safeJsonParse(row.control_json, null),
+    request_id: row.request_id ?? null,
+    kind: row.kind,
+    text: row.text,
+    mentions: safeJsonParse(row.mentions_json, []),
+    screenshots: safeJsonParse(row.screenshots_json, []),
+    reply_to_seq: row.reply_to_seq == null ? null : Number(row.reply_to_seq),
+    meta: safeJsonParse(row.meta_json, null),
+    created_at: row.created_at,
+  };
+}
+
+function deterministicId(prefix, seed) {
+  return `${prefix}-${createHash('sha256').update(seed).digest('hex').slice(0, 12)}`;
+}
+
+export async function resolveSwarmId({ swarmId, hostConversationId, cwd, sessionsDir, db } = {}) {
+  if (typeof swarmId === 'string' && swarmId.trim()) {
+    return validateSwarmId(swarmId);
+  }
+  return withDb(sessionsDir, (conn) => {
+    if (typeof hostConversationId === 'string' && hostConversationId.trim()) {
+      const conv = hostConversationId.trim();
+      const row = conn.get(
+        'SELECT id FROM swarms WHERE host_conversation_id = ? ORDER BY updated_at DESC LIMIT 1',
+        conv,
+      );
+      return row?.id || deterministicId('swarm', `conv:${conv}`);
+    }
+    const cwdKey = normalizeCwdKey(cwd);
+    if (cwdKey) {
+      const rows = conn.all('SELECT id, cwd FROM swarms WHERE cwd IS NOT NULL ORDER BY updated_at DESC LIMIT 100');
+      const match = rows.find((row) => normalizeCwdKey(row.cwd) === cwdKey);
+      return match?.id || deterministicId('swarm', `cwd:${cwdKey}`);
+    }
+    const latest = conn.get('SELECT id FROM swarms ORDER BY updated_at DESC LIMIT 1');
+    return latest?.id || `swarm-${randomBytes(6).toString('hex')}`;
+  }, db);
+}
+
+function ensureSwarmInDb(conn, { swarmId, hostConversationId = null, cwd = null, title = null, goalTitle = null, goalLine = null, threads } = {}) {
+  const id = validateSwarmId(swarmId);
+  const now = nowIso();
+  const existing = conn.get('SELECT * FROM swarms WHERE id = ?', id);
+  if (!existing) {
+    conn.run(
+      `INSERT INTO swarms (id, host_conversation_id, cwd, title, goal_title, goal_line, threads_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id,
+      hostConversationId ?? null,
+      cwd ?? null,
+      title ?? null,
+      goalTitle ?? null,
+      goalLine ?? null,
+      threads !== undefined ? JSON.stringify(threads) : null,
+      now,
+      now,
+    );
+  } else {
+    const nextConv = hostConversationId ?? existing.host_conversation_id;
+    const nextCwd = cwd ?? existing.cwd;
+    const nextTitle = title ?? existing.title;
+    const nextGoalTitle = goalTitle ?? existing.goal_title;
+    const nextGoalLine = goalLine ?? existing.goal_line;
+    const nextThreads = threads !== undefined ? JSON.stringify(threads) : existing.threads_json;
+    if (nextConv !== existing.host_conversation_id || nextCwd !== existing.cwd
+        || nextTitle !== existing.title || nextGoalTitle !== existing.goal_title
+        || nextGoalLine !== existing.goal_line || nextThreads !== existing.threads_json) {
+      conn.run(
+        `UPDATE swarms SET host_conversation_id = ?, cwd = ?, title = ?, goal_title = ?, goal_line = ?, threads_json = ?, updated_at = ?
+         WHERE id = ?`,
+        nextConv, nextCwd, nextTitle, nextGoalTitle, nextGoalLine, nextThreads, now, id,
+      );
+    }
+  }
+  return formatSwarm(conn.get('SELECT * FROM swarms WHERE id = ?', id));
+}
+
+export async function ensureSwarm({
+  swarmId, hostConversationId, cwd, title, goalTitle, goalLine, threads, sessionsDir, db,
+} = {}) {
+  return withDb(sessionsDir, async (conn) => {
+    const id = await resolveSwarmId({ swarmId, hostConversationId, cwd, sessionsDir, db: conn });
+    return ensureSwarmInDb(conn, { swarmId: id, hostConversationId, cwd, title, goalTitle, goalLine, threads });
+  }, db);
+}
+
+export async function setSwarmTitle(swarmId, title, { hostConversationId, cwd, sessionsDir, db } = {}) {
+  const cleanTitle = String(title || '').trim();
+  if (!cleanTitle) throw new Error('Swarm title must be a non-empty string.');
+  return withDb(sessionsDir, (conn) => {
+    const id = validateSwarmId(swarmId);
+    ensureSwarmInDb(conn, { swarmId: id, hostConversationId, cwd });
+    conn.run('UPDATE swarms SET title = ?, updated_at = ? WHERE id = ?', cleanTitle, nowIso(), id);
+    return formatSwarm(conn.get('SELECT * FROM swarms WHERE id = ?', id));
+  }, db);
+}
+
+export async function setSwarmPlan(swarmId, { goal, tasks, threads } = {}, { hostConversationId, cwd, sessionsDir, db } = {}) {
+  return withDb(sessionsDir, (conn) => conn.transaction(() => {
+    const id = validateSwarmId(swarmId);
+    const swarm = ensureSwarmInDb(conn, { swarmId: id, hostConversationId, cwd });
+    const now = nowIso();
+    const goalTitle = goal && typeof goal.title === 'string' ? goal.title.trim() : swarm.goal_title;
+    const goalLine = goal && typeof goal.line === 'string' ? goal.line.trim() : swarm.goal_line;
+    const threadsJson = threads !== undefined ? JSON.stringify(Array.isArray(threads) ? threads : []) : (
+      swarm.threads.length ? JSON.stringify(swarm.threads) : null
+    );
+    conn.run(
+      'UPDATE swarms SET goal_title = ?, goal_line = ?, threads_json = ?, updated_at = ? WHERE id = ?',
+      goalTitle ?? null,
+      goalLine ?? null,
+      threadsJson,
+      now,
+      id,
+    );
+    const updatedTasks = {};
+    if (tasks && typeof tasks === 'object' && !Array.isArray(tasks)) {
+      for (const [rawName, summary] of Object.entries(tasks)) {
+        const workerName = validateWorkerName(rawName);
+        const text = String(summary ?? '').trim();
+        const res = conn.run(
+          'UPDATE roster SET task_summary = ?, updated_at = ? WHERE swarm_id = ? AND name = ?',
+          text || null,
+          now,
+          id,
+          workerName,
+        );
+        if (res.changes > 0) updatedTasks[workerName] = text;
+      }
+    }
+    return {
+      swarm: formatSwarm(conn.get('SELECT * FROM swarms WHERE id = ?', id)),
+      updated_tasks: updatedTasks,
+    };
+  }), db);
+}
+
+export async function upsertWorker(swarmId, worker, { hostConversationId, cwd, sessionsDir, db } = {}) {
+  if (!worker || typeof worker !== 'object') throw new Error('Worker record is required.');
+  const name = validateWorkerName(worker.name);
+  return withDb(sessionsDir, (conn) => conn.transaction(() =>
+    saveWorker(conn, validateSwarmId(swarmId), name, worker, { hostConversationId, cwd })), db);
+}
+
+function saveWorker(conn, id, name, worker, { hostConversationId, cwd }) {
+  ensureSwarmInDb(conn, { swarmId: id, hostConversationId, cwd });
+  const now = nowIso();
+  const patch = serializeWorkerPatch(worker);
+  const supplied = WORKER_UPDATABLE_COLS.filter((key) => patch[key] !== undefined);
+  const initial = { cli: 'codex', access: 'change', workspace: 'inherit', state: 'working',
+    ...Object.fromEntries(supplied.map((key) => [key, patch[key]])) };
+  const columns = Object.keys(initial);
+  const updates = [...supplied, 'updated_at'].map((key) => `${key} = excluded.${key}`);
+  conn.run(`INSERT INTO roster (swarm_id, name, created_at, updated_at, ${columns.join(', ')})
+    VALUES (?, ?, ?, ?, ${columns.map(() => '?').join(', ')})
+    ON CONFLICT(swarm_id, name) DO UPDATE SET ${updates.join(', ')}`,
+    id, name, now, now, ...Object.values(initial));
+  return formatWorker(conn.get('SELECT * FROM roster WHERE swarm_id = ? AND name = ?', id, name));
+}
+
+function serializeWorkerPatch(worker) {
+  if (worker.channels === undefined) return worker;
+  return { ...worker, channels_json: worker.channels === null ? null : JSON.stringify(worker.channels) };
+}
+
+export async function addWorkerBriefs(swarmId, specs, options = {}) {
+  const id = validateSwarmId(swarmId);
+  return withDb(options.sessionsDir, (conn) => conn.transaction(() => {
+    const live = conn.all("SELECT name FROM roster WHERE swarm_id = ? AND state != 'killed'", id);
+    if (live.length + specs.length > 32) throw new Error('At most 32 live workers are supported.');
+    const registry = registryInDb(conn, id);
+    return specs.map(({ worker, channel }) => {
+      const name = validateWorkerName(worker.name);
+      if (live.some((w) => w.name === name)) throw new Error(`Worker '${name}' already exists.`);
+      for (const c of worker.channels || []) {
+        if (c !== ALL) requireActive(registry, c);
+      }
+      const message = appendMessage(conn, id, { from: worker.added_by, kind: 'brief', channel,
+        text: `@${name} ${worker.brief}`, meta: { worker: name } }, { skipRateLimit: true });
+      saveWorker(conn, id, name, { ...worker, run_id: null, session_id: null, worktree_path: null,
+        last_seq: message.seq, last_read_seq: message.seq, wait_since: 0, last_nudged_seq: 0,
+        last_park_blocked_seq: 0, quota_paused_seq: 0, wake_mode: 'mentions' }, options);
+      conn.run('INSERT INTO deliveries VALUES (?, ?, ?, ?)', message.seq, id, name, nowIso());
+      return message;
+    });
+  }), options.db);
+}
+
+const WORKER_UPDATABLE_COLS = [
+  ...Object.keys(migrations.roster),
+  'cli', 'model', 'tier', 'access', 'workspace', 'worktree_path', 'source_cwd',
+  'state', 'run_id', 'session_id', 'brief', 'task_summary', 'last_seq', 'parked_on', 'error',
+];
+
+export async function updateWorker(swarmId, name, patch = {}, { sessionsDir, db, expectedState, expectedRun } = {}) {
+  const id = validateSwarmId(swarmId);
+  const workerName = validateWorkerName(name);
+  return withDb(sessionsDir, (conn) => {
+    const existing = conn.get('SELECT * FROM roster WHERE swarm_id = ? AND name = ?', id, workerName);
+    if (!existing) return null;
+    patch = serializeWorkerPatch(patch);
+    const sets = [];
+    const params = [];
+    for (const col of WORKER_UPDATABLE_COLS) {
+      if (Object.hasOwn(patch, col) && patch[col] !== undefined) {
+        sets.push(`${col} = ?`);
+        params.push(col === 'last_seq' ? Number(patch[col]) : patch[col]);
+      }
+    }
+    if (!sets.length) return formatWorker(existing);
+    sets.push('updated_at = ?');
+    params.push(nowIso(), id, workerName);
+    let where = 'swarm_id = ? AND name = ?';
+    if (expectedState !== undefined) { where += ' AND state = ?'; params.push(expectedState); }
+    if (expectedRun !== undefined) { where += ' AND run_id IS ?'; params.push(expectedRun); }
+    if (!conn.run(`UPDATE roster SET ${sets.join(', ')} WHERE ${where}`, ...params).changes) return null;
+    return formatWorker(conn.get('SELECT * FROM roster WHERE swarm_id = ? AND name = ?', id, workerName));
+  }, db);
+}
+
+export async function killWorkerRecord(swarmId, name, { error = null, sessionsDir, db } = {}) {
+  return updateWorker(swarmId, name, { state: 'killed', parked_on: null, error }, { sessionsDir, db });
+}
+
+export async function getWorker(swarmId, name, { sessionsDir, db } = {}) {
+  const id = validateSwarmId(swarmId);
+  const workerName = validateWorkerName(name);
+  return withDb(sessionsDir, (conn) =>
+    formatWorker(conn.get('SELECT * FROM roster WHERE swarm_id = ? AND name = ?', id, workerName)), db);
+}
+
+export async function listRoster(swarmId, { includeKilled = true, sessionsDir, db } = {}) {
+  const id = validateSwarmId(swarmId);
+  return withDb(sessionsDir, (conn) => {
+    const sql = includeKilled
+      ? 'SELECT * FROM roster WHERE swarm_id = ? ORDER BY created_at ASC, name ASC'
+      : "SELECT * FROM roster WHERE swarm_id = ? AND state != 'killed' ORDER BY created_at ASC, name ASC";
+    return conn.all(sql, id).map(formatWorker);
+  }, db);
+}
+
+export async function listSwarms({ hostConversationId, cwd, limit = 20, sessionsDir, db } = {}) {
+  const max = Math.max(1, Math.min(200, Number(limit) || 20));
+  return withDb(sessionsDir, (conn) => {
+    let rows;
+    if (hostConversationId) {
+      rows = conn.all(
+        'SELECT * FROM swarms WHERE host_conversation_id = ? ORDER BY updated_at DESC LIMIT ?',
+        String(hostConversationId).trim(),
+        max,
+      );
+    } else {
+      rows = conn.all('SELECT * FROM swarms ORDER BY updated_at DESC LIMIT ?', max);
+    }
+    const cwdKey = normalizeCwdKey(cwd);
+    if (cwdKey) {
+      rows = rows.filter((row) => normalizeCwdKey(row.cwd) === cwdKey);
+    }
+    return rows.map(formatSwarm);
+  }, db);
+}
+
+const rateDatabases = new Set();
+const resetPending = new Set();
+
+export function resetRateLimiter() {
+  for (const path of rateDatabases) resetPending.add(path);
+}
+
+function recordPost(conn, id, sender) {
+  const path = conn.get('PRAGMA database_list').file;
+  rateDatabases.add(path);
+  if (resetPending.delete(path)) conn.run('DELETE FROM post_window');
+  const now = Date.now();
+  conn.run('DELETE FROM post_window WHERE posted_ms <= ?', now - 60_000);
+  const { n } = conn.get('SELECT COUNT(*) AS n FROM post_window WHERE swarm_id = ? AND agent = ?', id, sender);
+  if (n >= 60) throw Object.assign(new Error('Rate limit exceeded (60 posts a minute).'), { status: 429 });
+  conn.run('INSERT INTO post_window VALUES (?, ?, ?)', id, sender, now);
+}
+
+function registryInDb(conn, id, throughSeq) {
+  const sql = 'SELECT seq, from_agent, control_json FROM messages WHERE swarm_id = ? AND control_json IS NOT NULL';
+  const controls = throughSeq === undefined ? conn.all(sql + ' ORDER BY seq', id)
+    : conn.all(sql + ' AND seq <= ? ORDER BY seq', id, throughSeq);
+  return channelRegistry(controls.map((r) => ({ agent: r.from_agent, control: safeJsonParse(r.control_json, null) })));
+}
+
+function requireActive(registry, channel) {
+  const entry = registry.find((r) => r.name === channel);
+  if (!entry || entry.archived) throw Object.assign(new Error(`Unknown or archived channel '#${channel}'.`), { status: 400 });
+  return entry;
+}
+
+function withWarnings(message, registry) {
+  const warnings = message.channel_mentions.flatMap((name) => {
+    const entry = registry.find((r) => r.name === name);
+    return entry && !entry.archived ? [] : [`@#${name} addressed nobody (${entry ? 'archived' : 'unknown'} channel)`];
+  });
+  if (warnings.length) message.warnings = warnings;
+  return message;
+}
+
+function appendMessage(conn, id, {
+  from = 'coordinator', kind = 'message', text, mentions, screenshots, replyToSeq = null,
+  meta = null, channel = MAIN, control = null, requestId = null,
+}, { skipRateLimit = false } = {}) {
+  if (requestId != null) {
+    const existing = conn.get('SELECT * FROM messages WHERE swarm_id = ? AND request_id = ?', id, requestId);
+    if (existing) {
+      const message = formatMessage(existing);
+      return withWarnings(message, message.channel_mentions.length ? registryInDb(conn, id, message.seq) : []);
+    }
+  }
+  if (Buffer.byteLength(String(text ?? '')) > MAX_MESSAGE_BYTES) throw Object.assign(new Error('Board message exceeds 65536 bytes.'), { status: 400 });
+  const body = String(text ?? '').trim();
+  if (!body) throw new Error('Board message text must be non-empty.');
+  const sender = String(from || 'coordinator').trim().toLowerCase();
+  if (channel == null || channel === '') channel = MAIN;
+  const addressed = channelMentions(body);
+  if (addressed.includes(MAIN)) throw Object.assign(new Error('@#main is everyone; write @all'), { status: 400 });
+  const registry = addressed.length || channel !== MAIN ? registryInDb(conn, id) : [];
+  if (channel !== MAIN && !control) requireActive(registry, validateChannelName(channel));
+  const allMentions = new Set(parseMentions(body));
+  for (const m of Array.isArray(mentions) ? mentions : []) {
+    const name = String(m || '').trim().toLowerCase().replace(/^@/, '');
+    if (name) allMentions.add(name);
+  }
+  const shots = parseScreenshots(body);
+  for (const shot of Array.isArray(screenshots) ? screenshots : []) {
+    if (typeof shot?.path !== 'string' || !shot.path.trim()) continue;
+    const path = shot.path.trim(), caption = String(shot.caption || '').trim();
+    if (!shots.some((s) => s.path === path && s.caption === caption)) shots.push({ path, caption });
+  }
+  if (!skipRateLimit) recordPost(conn, id, sender);
+  const now = nowIso();
+  const res = conn.run(`INSERT INTO messages
+    (swarm_id, from_agent, kind, text, mentions_json, screenshots_json, reply_to_seq, meta_json,
+     created_at, channel, control_json, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    id, sender, String(kind || 'message'), body, JSON.stringify([...allMentions]), JSON.stringify(shots),
+    replyToSeq, meta == null ? null : JSON.stringify(meta), now, channel, control && JSON.stringify(control), requestId);
+  conn.run('UPDATE swarms SET updated_at = ? WHERE id = ?', now, id);
+  return withWarnings(formatMessage(conn.get('SELECT * FROM messages WHERE seq = ?', res.lastInsertRowid)), registry);
+}
+
+export async function postBoardMessage(swarmId, input = {}, options = {}) {
+  const id = validateSwarmId(swarmId);
+  return withDb(options.sessionsDir, (conn) => conn.transaction(() => {
+    ensureSwarmInDb(conn, { ...options, swarmId: id });
+    return appendMessage(conn, id, { ...input, control: null, requestId: input.requestId ?? options.requestId }, options);
+  }), options.db);
+}
+
+function changeChannel(swarmId, options, prepare) {
+  const id = validateSwarmId(swarmId);
+  return withDb(options.sessionsDir, (conn) => conn.transaction(() => {
+    ensureSwarmInDb(conn, { ...options, swarmId: id });
+    const { actor, text, control } = prepare(conn, id, registryInDb(conn, id));
+    return appendMessage(conn, id, { from: actor, kind: 'system', text, control }, { skipRateLimit: true });
+  }), options.db);
+}
+
+export async function createChannel(id, { actor = 'coordinator', channel, topic = '' }, options = {}) {
+  validateChannelName(channel);
+  validateTopic(topic);
+  return changeChannel(id, options, (_conn, _id, registry) => {
+    if (registry.some((r) => r.name === channel)) throw Object.assign(new Error(`Channel #${channel} already exists.`), { status: 409 });
+    return { actor, text: `[channel] ${actor} created #${channel}${topic ? ': ' + topic : ''}`,
+      control: { op: 'create', channel, topic } };
+  });
+}
+
+export async function archiveChannel(id, { actor = 'coordinator', channel }, options = {}) {
+  return changeChannel(id, options, (_conn, _id, registry) => {
+    const entry = requireActive(registry, validateChannelName(channel));
+    if (actor !== 'coordinator' && entry.created_by !== actor) throw new Error(`Only coordinator or creator may archive #${channel}.`);
+    return { actor, text: `[channel] ${actor} archived #${channel}`, control: { op: 'archive', channel } };
+  });
+}
+
+export async function subscribeChannels(id, { actor = 'coordinator', op, channel, targets = [actor] }, options = {}) {
+  if (!['subscribe', 'unsubscribe'].includes(op)) throw new Error('Invalid subscription operation.');
+  if (!Array.isArray(targets) || !targets.length) throw new Error('Subscription targets must be a nonempty list.');
+  return changeChannel(id, options, (conn, swarmId, registry) => {
+    if (channel !== ALL) requireActive(registry, validateChannelName(channel));
+    const members = [...new Set(targets)];
+    const prev = Object.create(null), next = Object.create(null);
+    for (const name of members) {
+      const worker = formatWorker(conn.get('SELECT * FROM roster WHERE swarm_id = ? AND name = ?', swarmId, name));
+      if (!worker || worker.state === 'killed') throw new Error(`Unknown live member '${name}'.`);
+      if (actor !== 'coordinator' && name !== actor && worker.added_by !== actor) throw new Error(`Cannot manage '${name}'.`);
+      prev[name] = worker.channels;
+      const set = effectiveChannels(worker.role, worker.channels, name);
+      if (set.includes(ALL) && channel !== ALL) throw new Error(`Unsubscribe '${name}' from * first.`);
+      next[name] = op === 'unsubscribe' ? set.filter((c) => c !== channel)
+        : channel === ALL ? [ALL] : [...new Set([...set, channel])];
+      conn.run('UPDATE roster SET channels_json = ? WHERE swarm_id = ? AND name = ?', JSON.stringify(next[name]), swarmId, name);
+    }
+    return { actor, text: `[channel] ${actor} ${op}d ${members.join(', ')} ${op === 'subscribe' ? 'to' : 'from'} #${channel}`,
+      control: { op, channel, members, prev, next } };
+  });
+}
+
+function channelMembers(registry, roster) {
+  return registry.map((entry) => ({ ...entry, members: roster.filter((w) => {
+    const set = effectiveChannels(w.role, w.channels, w.name);
+    return w.state !== 'killed' && (set.includes(ALL) || set.includes(entry.name));
+  }).map((w) => w.name) }));
+}
+
+export async function listChannels(swarmId, { db, sessionsDir } = {}) {
+  const id = validateSwarmId(swarmId);
+  return withDb(sessionsDir, (conn) => channelMembers(registryInDb(conn, id),
+    conn.all('SELECT * FROM roster WHERE swarm_id = ? ORDER BY name', id).map(formatWorker)), db);
+}
+
+function advanceRead(conn, id, viewer, seq) {
+  conn.run('UPDATE roster SET last_read_seq = MAX(last_read_seq, ?) WHERE swarm_id = ? AND name = ?', seq, id, viewer);
+}
+
+export async function markRead(swarmId, name, seq, { db, sessionsDir } = {}) {
+  if (!Number.isSafeInteger(seq) || seq < 0) throw new Error('Invalid read sequence.');
+  return withDb(sessionsDir, (conn) => advanceRead(conn, validateSwarmId(swarmId), name, seq), db);
+}
+
+export async function parkWorker(swarmId, name, { since, mentionsOnly = true, channel, db, sessionsDir } = {}) {
+  if (!Number.isSafeInteger(since) || since < 0) throw new Error('Pass the highest sequence actually read as since.');
+  return updateWorker(swarmId, name, { wake_mode: mentionsOnly ? 'mentions' : 'anything', wait_since: since,
+    parked_on: channel ? 'board_wait:' + channel : 'board_wait' }, { db, sessionsDir });
+}
+
+export async function readBoardMessages(swarmId, {
+  since, seqs, limit = 20, channel, viewer, includeControl = true, sessionsDir, db,
+} = {}) {
+  const id = validateSwarmId(swarmId);
+  return withDb(sessionsDir, (conn) => {
+    const args = [id], conditions = ['swarm_id = ?'];
+    const worker = viewer && formatWorker(conn.get('SELECT * FROM roster WHERE swarm_id = ? AND name = ?', id, viewer));
+    const exact = Array.isArray(seqs) && seqs.length > 0;
+    const max = limit === Infinity ? Infinity : Math.max(1, Math.min(500, Number(limit) || 20));
+    const after = since == null ? null : Math.max(0, Math.trunc(Number(since) || 0));
+    if (channel && channel !== ALL) { conditions.push('channel = ?'); args.push(channel); }
+    if (after !== null && !exact) { conditions.push('seq > ?'); args.push(after); }
+    // Historical membership needs the contiguous suffix through the head, including its controls.
+    const history = worker && !channel;
+    if (!history && !includeControl) conditions.push('control_json IS NULL');
+    if (exact && !history) {
+      const wanted = seqs.filter(Number.isSafeInteger);
+      if (!wanted.length) return [];
+      conditions.push('seq IN (' + wanted.map(() => '?').join(',') + ')');
+      args.push(...wanted);
+    }
+    const descending = !history && !exact && after === null;
+    let sql = 'SELECT * FROM messages WHERE ' + conditions.join(' AND ') + ' ORDER BY seq ' + (descending ? 'DESC' : 'ASC');
+    if (!history && !exact && max !== Infinity) { sql += ' LIMIT ?'; args.push(max); }
+    let rows = conn.all(sql, ...args).map(formatMessage);
+    if (descending) rows.reverse();
+    if (history) {
+      const { visible } = memberView(viewer, worker.role, worker.channels, rows, registryInDb(conn, id));
+      const wanted = exact && new Set(seqs);
+      rows = rows.filter((m, i) => visible[i] && (includeControl || countsUnread(m)) && (!wanted || wanted.has(m.seq)));
+      if (!exact && max < Infinity) rows = after === null ? rows.slice(-max) : rows.slice(0, max);
+    }
+    if (worker && rows.length) advanceRead(conn, id, viewer, rows.at(-1).seq);
+    return rows;
+  }, db);
+}
+
+export async function getBoardHead(swarmId, { sessionsDir, db } = {}) {
+  const id = validateSwarmId(swarmId);
+  return withDb(sessionsDir, (conn) => {
+    const row = conn.get('SELECT COALESCE(MAX(seq), 0) AS head FROM messages WHERE swarm_id = ?', id);
+    return Number(row?.head ?? 0);
+  }, db);
+}
+
+export function mentionMatchesAgent(mentions, agentName) {
+  if (!Array.isArray(mentions) || !agentName) return false;
+  const target = String(agentName).toLowerCase();
+  const prefix = target.match(/^(.+)-\d+$/)?.[1];
+  return mentions.some((m) => m === target || m === 'all' || m === prefix);
+}
+
+export async function listUndeliveredForWorker(swarmId, workerName, { since = 0, channel, includeDelivered = false, sessionsDir, db } = {}) {
+  const id = validateSwarmId(swarmId);
+  const target = validateWorkerName(workerName);
+  return withDb(sessionsDir, (conn) => conn.transaction(() => {
+    const worker = formatWorker(conn.get('SELECT * FROM roster WHERE swarm_id = ? AND name = ?', id, target));
+    if (!worker || worker.state === 'killed') return [];
+    if (worker.quota_paused_seq) {
+      const { head } = conn.get('SELECT MAX(seq) AS head FROM messages WHERE swarm_id = ?', id);
+      if (head <= worker.quota_paused_seq) return [];
+      conn.run('UPDATE roster SET quota_paused_seq = 0 WHERE swarm_id = ? AND name = ?', id, target);
+    }
+    const after = Math.max(0, Number(since) || 0, worker.last_read_seq, worker.wait_since);
+    const rows = conn.all(`SELECT m.*, d.seq AS delivered FROM messages m
+      LEFT JOIN deliveries d ON d.seq = m.seq AND d.target_agent = ?
+      WHERE m.swarm_id = ? AND m.seq > ? ORDER BY m.seq`, target, id, after);
+    const messages = rows.map(formatMessage);
+    const sets = channelsAt(target, worker.channels, messages);
+    const active = activeAt(registryInDb(conn, id), messages);
+    const filter = channel || (worker.parked_on?.startsWith('board_wait:') ? worker.parked_on.slice(11) : null);
+    return messages.filter((m, i) => {
+      if ((!includeDelivered && rows[i].delivered) || !countsUnread(m) || m.from_agent === target || (filter && filter !== ALL && m.channel !== filter)) return false;
+      const set = effectiveChannels(worker.role, sets[i], target);
+      if (mentionMatchesAgent(m.mentions, target)) return true;
+      return worker.wake_mode === 'anything' ? seesIn(target, set, m, active[i]) : mentionsIn(m.text, target, set, active[i]);
+    });
+  }), db);
+}
+
+export const QUOTA_ERROR = /RESOURCE_EXHAUSTED|\b429\b|quota|rate.?limit/i;
+
+export function computeMentionEdges(messages, roster, channels) {
+  const edges = new Map();
+  const active = activeAt(channels, messages);
+  const participants = roster.some((w) => w.name === 'coordinator') ? roster : [{ name: 'coordinator', role: 'coordinator' }, ...roster];
+  const observers = new Set(roster.filter((w) => ['narrator', 'monitor'].includes(w.role) || ROLE_WORKER_RE.test(w.name)).map((w) => w.name));
+  for (const w of participants) {
+    if (observers.has(w.name)) continue;
+    const sets = channelsAt(w.name, w.channels, messages);
+    messages.forEach((m, i) => {
+      const from = m.from_agent ?? m.agent;
+      if (!countsUnread(m) || observers.has(from) || from === w.name) return;
+      const { mentions, all } = mentionsOf(m.text, [w.name]);
+      const direct = mentions.length || mentionMatchesAgent((m.mentions || []).filter((n) => n !== 'all'), w.name);
+      const set = effectiveChannels(w.role, sets[i], w.name);
+      const viaChannel = (m.channel_mentions || channelMentions(m.text)).some((c) =>
+        c !== MAIN && active[i]?.(c) && (set.includes(c) || set.includes(ALL)));
+      const field = direct ? 'direct' : viaChannel ? 'viaChannel' : all || m.mentions?.includes('all') ? 'viaAll' : null;
+      if (!field) return;
+      const key = JSON.stringify([from, w.name]);
+      const edge = edges.get(key) || { from, to: w.name, count: 0, direct: 0, viaAll: 0, viaChannel: 0 };
+      edge[field]++;
+      edge.count++;
+      edges.set(key, edge);
+    });
+  }
+  return [...edges.values()];
+}
+
+export function detectSystemAttention(swarm, roster, messages, channels, nowMs = Date.now()) {
+  const items = [];
+  const live = roster.filter((w) => w.state !== 'killed' && w.name !== 'coordinator');
+  const ordinary = live.filter((w) => !['monitor', 'narrator'].includes(w.role) && !ROLE_WORKER_RE.test(w.name));
+  const posts = messages.filter(countsUnread);
+  const sender = (m) => m?.from_agent ?? m?.agent;
+  for (const w of live) {
+    let kind, text;
+    if (w.quota_paused_seq > 0 || QUOTA_ERROR.test(w.error || '')) {
+      kind = 'quota'; text = w.error || `Quota paused at #${w.quota_paused_seq}.`;
+    } else if (w.state === 'stopped' && w.error) {
+      kind = 'error'; text = w.error;
+    } else if (w.state === 'working') {
+      const last = posts.findLast((m) => sender(m) === w.name);
+      const activity = Math.max(Date.parse(w.updated_at || w.created_at || swarm?.created_at) || 0,
+        Date.parse(last?.created_at || last?.time) || 0);
+      if (activity && nowMs - activity > 600_000) {
+        kind = 'stuck'; text = 'Working without a board or state update for over 10 minutes.';
+      }
+    }
+    if (kind) items.push({ kind, agent: w.name, text });
+  }
+  if (ordinary.length && ordinary.every((w) => ['waiting', 'stopped'].includes(w.state))) {
+    const last = posts.at(-1);
+    if (sender(last) !== 'coordinator' || !/\[done\]/i.test(last.text)) {
+      const member = ordinary.find((w) => {
+        const sets = channelsAt(w.name, w.channels, messages);
+        const active = activeAt(channels, messages);
+        const lastPost = posts.findLast((m) => sender(m) === w.name)?.seq || 0;
+        return messages.some((m, i) => countsUnread(m) && m.seq > lastPost && sender(m) !== w.name &&
+          mentionsIn(m.text, w.name, effectiveChannels(w.role, sets[i], w.name), active[i]));
+      });
+      const coordinatorSeq = posts.findLast((m) => sender(m) === 'coordinator')?.seq || 0;
+      const result = posts.findLast((m) => m.seq > coordinatorSeq && sender(m) !== 'coordinator'
+        && !(m.mentions || parseMentions(m.text)).length && !channelMentions(m.text).length);
+      const text = member ? `Unanswered mention for @${member.name} while all workers are parked.`
+        : result ? `Result #${result.seq} has no addressee and all workers are parked.`
+        : 'All workers are parked before the coordinator marked the task [done].';
+      items.push({ kind: 'stall', agent: member?.name || sender(result) || 'coordinator', text });
+    }
+  }
+  return items;
+}
+
+export async function markDelivered(swarmId, seqs, targetAgent, { sessionsDir, db } = {}) {
+  const id = validateSwarmId(swarmId);
+  const target = String(targetAgent || '').trim().toLowerCase();
+  if (!target) throw new Error('targetAgent is required.');
+  const list = [...new Set((Array.isArray(seqs) ? seqs : [seqs]).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  if (!list.length) return 0;
+  return withDb(sessionsDir, (conn) => conn.transaction(() => {
+    const now = nowIso();
+    let count = 0;
+    let maxSeq = 0;
+    for (const seq of list) {
+      const res = conn.run(
+        'INSERT OR IGNORE INTO deliveries (seq, swarm_id, target_agent, delivered_at) VALUES (?, ?, ?, ?)',
+        seq,
+        id,
+        target,
+        now,
+      );
+      count += res.changes;
+      if (seq > maxSeq) maxSeq = seq;
+    }
+    if (maxSeq > 0) {
+      conn.run(
+        'UPDATE roster SET last_seq = MAX(COALESCE(last_seq, 0), ?), last_nudged_seq = MAX(last_nudged_seq, ?), updated_at = ? WHERE swarm_id = ? AND name = ?',
+        maxSeq, maxSeq,
+        now,
+        id,
+        target,
+      );
+    }
+    return count;
+  }), db);
+}
+
+export async function getSwarmOverview(swarmId, { messageLimit = 20, analytics = false, sessionsDir, db } = {}) {
+  const id = validateSwarmId(swarmId);
+  return withDb(sessionsDir, async (conn) => {
+    const swarm = formatSwarm(conn.get('SELECT * FROM swarms WHERE id = ?', id));
+    if (!swarm) return null;
+    const roster = await listRoster(id, { includeKilled: true, db: conn });
+    const head = await getBoardHead(id, { db: conn });
+    const recent_messages = messageLimit > 0 ? await readBoardMessages(id, { limit: messageLimit, db: conn }) : [];
+    if (!analytics) return { swarm, roster, head, recent_messages };
+    const messages = await readBoardMessages(id, { limit: Infinity, db: conn });
+    const channels = channelMembers(channelRegistry(messages), roster);
+    const enriched = roster.map((w) => {
+      const posts = messages.filter((m) => countsUnread(m) && m.from_agent === w.name);
+      return { ...w, channels: effectiveChannels(w.role, w.channels, w.name), posts: posts.length,
+        unread: visibleUnread(w.name, w.role, w.channels, messages, w.last_read_seq, channels),
+        last_post_seq: posts.at(-1)?.seq || 0, last_post_time: posts.at(-1)?.created_at || null };
+    });
+    return { swarm, roster: enriched, head, recent_messages, channels,
+      edges: computeMentionEdges(messages, roster, channels), system_attention: detectSystemAttention(swarm, roster, messages, channels) };
+  }, db);
+}

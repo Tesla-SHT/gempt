@@ -84,17 +84,23 @@ function runSummary(record, compact = false) {
     : Math.round(Math.max(0, (finished ?? Date.now() / 1000) - started) * 10) / 10);
   const lastCommand = array(progress.recent_commands).at(-1);
   const remoteTurnUnconfirmed = Boolean(record.remote_turn_unconfirmed);
+  const cli = text(result.cli || record.cli || 'codex', 32) || 'codex';
+  const isNonCodex = cli !== 'codex';
+  const activeControllable = ['running', 'waiting_gemini'].includes(record.state);
   return {
     run_id: record.run_id, session_id: text(record.session_id, 128), state: text(record.state, 32),
+    cli,
     cwd: bounded(record.cwd, 8192), worktree_path: bounded(record.worktree_path, 8192) || null,
     source_cwd: bounded(record.source_cwd, 8192) || null,
     execution_timeout_sec: number(record.execution_timeout_sec),
     deadline: timestamp(record.deadline),
     title: record.title, workspace_name: bounded(workspaceName(record.source_cwd || record.cwd), 512),
     host_conversation_id: record.host_conversation_id ?? null,
-    can_control: Boolean(['running', 'waiting_gemini'].includes(record.state) && record.codex_thread_id && record.turn_id),
+    can_control: isNonCodex
+      ? Boolean(activeControllable && cli === 'opencode' && record.runner_meta?.server_url)
+      : Boolean(activeControllable && record.codex_thread_id && record.turn_id),
     can_interrupt: Boolean(remoteTurnUnconfirmed
-      || (['running', 'waiting_gemini'].includes(record.state) && record.codex_thread_id && record.turn_id)),
+      || (isNonCodex ? activeControllable : (activeControllable && record.codex_thread_id && record.turn_id))),
     remote_turn_unconfirmed: remoteTurnUnconfirmed,
     model: text(result.model || record.model, 128), tier: text(result.tier || record.tier, 64),
     goal: bounded(record.goal, compact ? 512 : GOAL_BYTES), last_message: text(progress.last_message || result.text, 200),

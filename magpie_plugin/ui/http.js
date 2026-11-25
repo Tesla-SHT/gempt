@@ -3,7 +3,6 @@ const actionPaths = {
   init: 'init',
   probe_gateway: 'probe-gateway',
   reset_settings: 'reset-settings',
-  native_groups: 'native-groups',
   tier: 'tier',
   restart_app_server: 'app-server/restart',
   interrupt_run: ({ run_id }) => `runs/${encodeURIComponent(run_id)}/interrupt`,
@@ -50,6 +49,17 @@ export function createHttpTransport(apiKey, fetchPage = fetch) {
         return request(`live/${operation}?${new URLSearchParams(args)}`, options);
       }
       return request(`live/${operation}`, { ...options, body: args });
+    },
+    swarm(operation, args = {}, options) {
+      if (operation === 'list' || operation === 'overview' || operation === 'board' || operation === 'raw') {
+        const query = new URLSearchParams();
+        for (const [key, value] of Object.entries(args || {})) {
+          if (value !== undefined && value !== null && value !== '') query.set(key, String(value));
+        }
+        const qs = query.toString();
+        return request(`swarm/${operation}${qs ? `?${qs}` : ''}`, options);
+      }
+      return request(`swarm/${operation}`, { ...options, body: args });
     },
     saveSettings(settings) {
       return request('settings', { body: settings });

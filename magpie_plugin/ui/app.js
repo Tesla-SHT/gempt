@@ -3,11 +3,10 @@ import { tr, locale, localizedFormat, errorText } from './i18n.js';
 
 // Shared Console controller. Host adapters provide transport and host integration.
 export function mountConsole(root, transport, {
-  queryViewMode = '', onState, navigate, showToast, copyText, onLanguage, refreshGateway,
+  onState, navigate, showToast, copyText, onLanguage, refreshGateway,
 } = {}) {
   const POLL_MS = 15000;
   const LIVE_POLL_MS = 2800;
-  const MODE_STORAGE_KEY = 'gempt_view_mode';
   const RATIO_RANGE_STORAGE_KEY = 'gempt-ratio-range';
   const RATIO_RANGE_TITLES = {
     '1h': '1 小时内实际 Token 占比',
@@ -36,16 +35,6 @@ export function mountConsole(root, transport, {
     xhigh: '思考：极高',
     max: '思考：最高',
     ultra: '思考：极限',
-  };
-
-  const NODE_ROLE_LABELS = {
-    primary: '首选',
-    escalate: '疑难升级',
-    fallback: '备用兜底',
-    exec: '执行',
-    planner: '对话规划',
-    coder: '代码执行',
-    utility: '压缩杂活',
   };
 
   const SANDBOX_HINTS = {
@@ -78,20 +67,13 @@ export function mountConsole(root, transport, {
   let stateFetch = null;
   let stateSyncedAt = null;
   let stateRefreshError = '';
-  let nativePreviewTier = '';
   let currentDefaultSandbox = 'workspace-write';
   let currentEffortChoice = 'high';
-  let currentViewMode = queryViewMode || readStoredMode();
   let ratioRange = readStoredRatioRange();
   let ratioFetch;
   let latestRatio;
   let runStateFetch;
   let locateWork = false;
-
-  function readStoredMode() {
-    const saved = consolePreference(MODE_STORAGE_KEY);
-    return saved === 'native' || saved === 'mcp' ? saved : '';
-  }
 
   function readStoredRatioRange() {
     const saved = consolePreference(RATIO_RANGE_STORAGE_KEY);
@@ -112,17 +94,8 @@ export function mountConsole(root, transport, {
     }
   }
 
-  function writeStoredMode(mode) {
-    consolePreference(MODE_STORAGE_KEY, mode);
-  }
-
   function syncHasFallbackClasses() {
     if (SUPPORTS_HAS) return;
-    for (const row of root.querySelectorAll('.tier-row')) {
-      const radio = row.querySelector('.tier-radio');
-      row.classList.toggle('is-checked', Boolean(radio?.checked));
-      row.classList.toggle('is-disabled', Boolean(radio?.disabled));
-    }
     for (const opt of root.querySelectorAll('.seg-option')) {
       const radio = opt.querySelector('.seg-radio');
       opt.classList.toggle('is-checked', Boolean(radio?.checked));
@@ -147,7 +120,6 @@ export function mountConsole(root, transport, {
   function humanizeModel(rawId) {
     const id = String(rawId || '').trim();
     if (!id) return tr('未知模型');
-    if (id.startsWith('group/')) return id.slice('group/'.length);
     const tail = id.includes('/') ? id.slice(id.indexOf('/') + 1) : id;
     return tail
       .replace(/^gpt-/i, 'GPT-')
@@ -165,71 +137,16 @@ export function mountConsole(root, transport, {
       .replace(/-v(\d)/gi, ' V$1');
   }
 
-  function resolveEffectiveViewMode(state) {
-    if (currentViewMode === 'mcp' || currentViewMode === 'native') {
-      return currentViewMode;
-    }
-    if (state?.native_groups?.complete && !state?.clients?.antigravity_installed) {
-      return 'native';
-    }
-    return 'mcp';
-  }
-
-  function buildNativeChain(nativeTier) {
-    const rawNodes = Array.isArray(nativeTier?.nodes) ? nativeTier.nodes : [];
-    return rawNodes
-      .filter((n) => n && n.id)
-      .map((n) => ({
-        id: String(n.id),
-        human: humanizeModel(n.id),
-        role: String(n.role || 'coder'),
-      }));
-  }
-
-  function formatNativeSummary(nativeTier) {
-    const chain = buildNativeChain(nativeTier);
-    if (!chain.length) return tr('尚未检测到 Gemini + Codex 订阅模型');
-    const planner = chain.find((n) => n.role === 'planner')?.human || '';
-    const coders = chain.filter((n) => n.role === 'coder' || n.role === 'escalate').map((n) => n.human);
-    const hasUtil = chain.some((n) => n.role === 'utility');
-    let text = planner && coders.length
-      ? `${planner} → ${coders.join(' / ')}`
-      : (coders.join(' / ') || planner);
-    if (hasUtil) text += tr(' · DeepSeek 压缩');
-    return text;
-  }
-
-  function formatNativeClientSubtitle(clients) {
-    const ext = clients?.external_clients || [];
-    if (!ext.length) return 'Claude Code · ZCode · OpenCode · Cursor';
-    const slice = ext.slice(0, 3);
-    return tr("{0} · 任意客户端", slice.join(' · '));
-  }
-
-  function renderSetupBanner(state, viewMode) {
+  function renderSetupBanner(state) {
     const banner = $('setup-banner');
     const textEl = $('setup-banner-text');
     const btn = $('init-sub-btn');
     if (!banner || !textEl || !btn) return;
 
     const reachable = Boolean(state.magpie?.reachable);
-    const subReady = Boolean(state.subscription?.connected);
     const configured = Boolean(state.configured);
 
     if (!reachable) {
-      banner.hidden = true;
-      btn.hidden = true;
-      return;
-    }
-
-    if (viewMode === 'native') {
-      if (!subReady && !state.native_groups?.complete) {
-        banner.hidden = false;
-        banner.dataset.tone = 'warn';
-        textEl.textContent = tr('尚未检测到 Codex 订阅 — 请先在 Magpie 左侧接入你的 ChatGPT / Codex 订阅账号，完成后点右上角刷新。');
-        btn.hidden = true;
-        return;
-      }
       banner.hidden = true;
       btn.hidden = true;
       return;
@@ -254,9 +171,7 @@ export function mountConsole(root, transport, {
     }
   }
 
-  function renderWorkSplit(state, viewMode) {
-    const controls = $('work-controls');
-    controls.hidden = viewMode !== 'mcp';
+  function renderWorkSplit(state) {
     const profiles = state.work_profiles;
     if (!profiles) return;
     const list = $('work-options');
@@ -407,9 +322,53 @@ export function mountConsole(root, transport, {
     }
   }
 
+  function renderExecutionCli(state) {
+    const select = $('execution-cli');
+    const hint = $('execution-cli-hint');
+    if (!select) return;
+    const runners = Array.isArray(state.runners) ? state.runners : [];
+    const current = state.execution?.default_cli || 'auto';
+    const installedCount = runners.filter((r) => r.available).length;
+    const autoLabel = installedCount > 0
+      ? tr('自动匹配（按模型亲和 · {0}/{1} 可用）', installedCount, runners.length)
+      : tr('自动匹配（尚未安装执行 CLI）');
+    const options = [new Option(autoLabel, 'auto')];
+    for (const r of runners) {
+      const badge = r.available ? tr('已安装') : tr('未安装');
+      options.push(new Option(`${r.label} (${r.id}) · ${badge}`, r.id));
+    }
+    const key = JSON.stringify([locale(), current, runners.map((r) => [r.id, r.available, r.path])]);
+    if (select.dataset.key !== key) {
+      select.dataset.key = key;
+      select.replaceChildren(...options);
+    }
+    select.value = current;
+    select.disabled = !state.configured || pendingSettings.has(select.name);
+    if (hint) {
+      if (current === 'auto') {
+        if (installedCount === 0) {
+          hint.textContent = tr('未检测到执行 CLI — 咨询（gpt_ask）仍可正常使用。安装任一受支持的 CLI 后即可自主执行。');
+        } else {
+          const names = runners.filter((r) => r.available).map((r) => r.id).join(', ');
+          hint.textContent = tr('按模型自动选择已安装 CLI（可用：{0}）', names);
+        }
+      } else {
+        const picked = runners.find((r) => r.id === current);
+        if (picked?.available) {
+          hint.textContent = tr('{0} 已就绪 · {1}', picked.label, picked.path);
+        } else if (picked) {
+          hint.textContent = tr('{0} 尚未安装 · 安装命令：{1}', picked.label, picked.install_hint);
+        } else {
+          hint.textContent = '';
+        }
+      }
+    }
+  }
+
   function renderExecutionSettings(state) {
+    renderExecutionCli(state);
     for (const radio of root.querySelectorAll('[name="native_swarm"]')) {
-      radio.checked = radio.value === String(state.native_swarm !== false);
+      radio.checked = radio.value === String(state.native_swarm === true);
       radio.disabled = !state.configured || pendingSettings.has(radio.name);
     }
     const model = $('swarm-shell-model');
@@ -432,12 +391,8 @@ export function mountConsole(root, transport, {
     }
   }
 
-  function renderControls(state, viewMode) {
-    renderWorkSplit(state, viewMode);
-    const mcpBar = $('mcp-controls-bar');
-    const nativeBar = $('native-controls-bar');
-    if (mcpBar) mcpBar.hidden = viewMode !== 'mcp';
-    if (nativeBar) nativeBar.hidden = viewMode !== 'native';
+  function renderControls(state) {
+    renderWorkSplit(state);
 
     const configured = Boolean(state.configured);
     currentDefaultSandbox = state.default_sandbox || 'workspace-write';
@@ -462,147 +417,15 @@ export function mountConsole(root, transport, {
     if (effHint) {
       effHint.textContent = tr(EFFORT_HINTS[currentEffortChoice]) || formatEffortLabel(currentEffortChoice);
     }
-
-    renderGatewayControls(state);
   }
 
-  function renderGatewayControls(state) {
-    const nativeCopy = $('native-status-copy');
-    const nativePills = $('native-ready-pills');
-    const createBtn = $('create-native-btn');
-    const ng = state.native_groups || {};
-    if (nativeCopy && nativePills && createBtn) {
-      const installedSet = new Set((ng.tiers || []).filter((t) => t.installed).map((t) => t.group_id));
-      for (const pill of nativePills.querySelectorAll('[data-copy]')) {
-        pill.hidden = !installedSet.has(pill.getAttribute('data-copy'));
-      }
-      if (ng.complete) {
-        nativeCopy.textContent = tr('已就绪（3/3）· 在任意接入 Magpie 的客户端模型栏直接选下方 ID：');
-        nativePills.hidden = false;
-        createBtn.hidden = true;
-      } else if (ng.can_create) {
-        const ready = Number(ng.ready_count || 0);
-        nativeCopy.textContent = ready > 0
-          ? tr("已创建 {0}/3 个路由组，点击可补齐剩余直连路由组（不会覆盖已有组）：", ready)
-          : tr('无需安装客户端插件 — 点击一键在 Magpie 创建 group/gempt-* 即可在任何客户端直选使用：');
-        nativePills.hidden = ready === 0;
-        createBtn.hidden = false;
-        createBtn.disabled = false;
-        createBtn.textContent = ready > 0 ? tr('补齐缺失路由组') : tr('一键创建直连路由组');
-      } else {
-        nativeCopy.textContent = tr(ng.missing_reason) || tr('需要 Magpie 中同时接入 Gemini 与 Codex 订阅模型后才能创建直连路由组。');
-        nativePills.hidden = true;
-        createBtn.hidden = false;
-        createBtn.disabled = true;
-        createBtn.textContent = tr('一键创建直连路由组');
-      }
-    }
-  }
-
-  function renderChainNodes(chainEl, nodes, emptyText) {
-    if (!chainEl) return;
-    chainEl.replaceChildren();
-    if (!nodes.length) {
-      const li = document.createElement('li');
-      li.className = 'route-node';
-      const left = document.createElement('span');
-      left.className = 'node-left';
-      const human = document.createElement('span');
-      human.className = 'node-human';
-      human.textContent = emptyText;
-      left.append(human);
-      li.append(left);
-      chainEl.appendChild(li);
-      return;
-    }
-
-    for (const node of nodes.slice(0, 4)) {
-      const isPrimaryLike = node.role === 'primary' || node.role === 'planner';
-      const isDashedLike = node.role === 'fallback' || node.role === 'utility';
-      const li = document.createElement('li');
-      li.className = `route-node${isPrimaryLike ? ' is-primary' : ''}${isDashedLike ? ' is-fallback' : ''}`;
-
-      const left = document.createElement('span');
-      left.className = 'node-left';
-      const dot = document.createElement('span');
-      dot.className = 'node-dot';
-      dot.setAttribute('aria-hidden', 'true');
-      const human = document.createElement('span');
-      human.className = 'node-human';
-      human.textContent = node.human;
-      const code = document.createElement('code');
-      code.className = 'pill-code';
-      code.textContent = node.id;
-      left.append(dot, human, code);
-
-      const role = document.createElement('span');
-      role.className = 'node-role';
-      role.textContent = tr(NODE_ROLE_LABELS[node.role]) || node.role;
-
-      li.append(left);
-      if (node.role) li.append(role);
-      chainEl.appendChild(li);
-    }
-  }
-
-  function renderActiveRoute(state, activeNativeTier, viewMode) {
-    const nameEl = $('active-tier-name');
-    const targetBtn = $('active-tier-target');
-    const readyBadge = $('active-tier-ready-badge');
-    const effortEl = $('active-tier-effort');
-    const sourceTitle = $('source-title');
-    const sourceActions = $('source-actions');
-    const nativeCaption = $('native-client-caption');
-    const slashBtn = $('active-slash-btn');
-    const hubModeText = $('hub-mode-text');
-    const chainEl = $('route-chain');
-    const isNative = viewMode === 'native';
-    sourceActions.hidden = isNative;
-    nativeCaption.hidden = chainEl.hidden = !isNative;
-
-    if (viewMode === 'native') {
-      const groupId = activeNativeTier?.group_id || `group/gempt-${nativePreviewTier}`;
-      const installed = Boolean(activeNativeTier?.installed);
-      if (nameEl) nameEl.textContent = titleCaseTier(nativePreviewTier);
-      if (targetBtn) {
-        targetBtn.textContent = groupId;
-        targetBtn.setAttribute('data-copy', groupId);
-        targetBtn.title = tr("点击复制 {0}", groupId);
-        targetBtn.hidden = false;
-      }
-      if (readyBadge) {
-        readyBadge.hidden = false;
-        readyBadge.dataset.tone = installed ? 'ok' : 'warn';
-        readyBadge.textContent = installed ? tr('已就绪') : tr('未创建');
-      }
-      if (effortEl) effortEl.textContent = tr('按意图自动分流');
-      if (sourceTitle) sourceTitle.textContent = tr('外部客户端直连');
-      nativeCaption.textContent = formatNativeClientSubtitle(state.clients);
-      if (hubModeText) hubModeText.textContent = tr('意图路由分流');
-      renderChainNodes(chainEl, buildNativeChain(activeNativeTier), tr('需先在 Magpie 接入 Gemini 与 Codex 模型'));
-      return;
-    }
-
-    if (nameEl) nameEl.textContent = 'Antigravity MCP';
-    if (targetBtn) targetBtn.hidden = true;
-    if (readyBadge) readyBadge.hidden = true;
-    if (effortEl) effortEl.textContent = formatEffortLabel(state.mcp_effort, state.auto_effort);
-    if (sourceTitle) sourceTitle.textContent = 'Antigravity';
-    if (slashBtn) slashBtn.hidden = !state.clients?.antigravity_installed;
-    if (hubModeText) hubModeText.textContent = '';
+  function renderActiveRoute(state) {
+    $('active-tier-effort').textContent = formatEffortLabel(state.mcp_effort, state.auto_effort);
+    $('active-slash-btn').hidden = !state.clients?.antigravity_installed;
   }
 
   function renderReadiness(state) {
-    const ng = state.native_groups || {};
     const clients = state.clients || {};
-
-    const chipNative = $('chip-native');
-    const chipNativeVal = $('chip-native-val');
-    if (chipNative && chipNativeVal) {
-      const ready = Number(ng.ready_count || 0);
-      chipNative.dataset.tone = ng.complete ? 'ok' : (ready > 0 ? 'warn' : 'neutral');
-      chipNativeVal.textContent = ng.complete ? tr('3/3 已就绪') : (ready > 0 ? `${ready}/3` : tr('未创建'));
-    }
 
     const chipMcp = $('chip-mcp');
     const chipMcpVal = $('chip-mcp-val');
@@ -677,13 +500,6 @@ export function mountConsole(root, transport, {
     return run.state || tr('已记录');
   }
 
-  function formatGroupStatus(status) {
-    const code = Number(status || 0);
-    if (code >= 200 && code < 400) return tr('正常');
-    if (code >= 400) return `HTTP ${code}`;
-    return tr('已记录');
-  }
-
   function renderActivity(state) {
     const list = $('activity-list');
     const count = $('activity-count');
@@ -706,19 +522,7 @@ export function mountConsole(root, transport, {
         sessionId: sess.session_id, hasLive: sess.has_live_run,
       };
     });
-    const groupCalls = (state.recent_group_calls || []).map((call) => {
-      const status = Number(call.status || 0);
-      const tone = status >= 200 && status < 400 ? 'ok' : (status >= 400 ? 'err' : 'neutral');
-      const clientLabel = call.agent || tr('外部客户端');
-      const servedLabel = call.served_model ? ` (${humanizeModel(call.served_model)})` : '';
-      return {
-        tone,
-        text: tr("路由组 · {0} · {1}{2}", titleCaseTier(call.tier || 'sonnet'), clientLabel, servedLabel),
-        meta: formatGroupStatus(status),
-      };
-    });
-
-    const rows = [...runs, ...sessions, ...groupCalls].slice(0, 5);
+    const rows = [...runs, ...sessions].slice(0, 5);
     const totals = state.activity_totals;
     count.textContent = totals ? tr("{0} 个请求 · {1} 个会话 · {2} 次运行", number(totals.requests), number(totals.sessions), number(totals.runs)) : '—';
     list.replaceChildren();
@@ -726,7 +530,7 @@ export function mountConsole(root, transport, {
     if (!rows.length) {
       const li = document.createElement('li');
       li.className = 'recent-empty';
-      li.textContent = tr('暂无最近委派或路由组记录。');
+      li.textContent = tr('暂无最近委派记录。');
       list.appendChild(li);
       return;
     }
@@ -762,21 +566,12 @@ export function mountConsole(root, transport, {
     if (!state) return;
     latestState = state;
     onState?.(state);
-    if (locateWork) currentViewMode = 'mcp';
-    nativePreviewTier ||= state.default_tier || 'sonnet';
-    const viewMode = resolveEffectiveViewMode(state);
-    currentViewMode = viewMode;
-
-    for (const radio of root.querySelectorAll('input[name="view_mode"]')) {
-      radio.checked = radio.value === viewMode;
-    }
-
-    renderSetupBanner(state, viewMode);
-    renderControls(state, viewMode);
+    renderSetupBanner(state);
+    renderControls(state);
     advanced.render(state);
     renderReadiness(state);
 
-    renderTierRoutes(state, viewMode);
+    renderActiveRoute(state);
 
     const choreModel = $('chore-model');
     const choreSub = $('chore-sub');
@@ -784,17 +579,12 @@ export function mountConsole(root, transport, {
       if (choreModel) choreModel.textContent = state.utility.model;
       if (choreSub) {
         const parts = [tr('仅咨询')];
-        if (state.utility.use_for_magpie_compact) parts.push(tr('自动压缩上下文'));
         if (state.utility.fallback_models?.length) parts.push(tr("+{0} 备用", state.utility.fallback_models.length));
         choreSub.textContent = parts.join(' · ');
       }
     }
 
-    const stripNative = $('strip-native-ids');
-    const stripAgy = $('strip-agy-slash');
-    const hasAgy = Boolean(state.clients?.antigravity_installed);
-    if (stripNative) stripNative.hidden = viewMode !== 'native';
-    if (stripAgy) stripAgy.hidden = viewMode !== 'mcp' || !hasAgy;
+    $('strip-agy-slash').hidden = !state.clients?.antigravity_installed;
 
     renderActivity(state);
     if (locateWork && visible && activeTab === 'overview') {
@@ -810,28 +600,6 @@ export function mountConsole(root, transport, {
     markUiReady();
   }
 
-  function renderTierRoutes(state, viewMode) {
-    const tiersSection = $('tiers-section');
-    tiersSection.hidden = viewMode !== 'native';
-    const nativeById = new Map((state.native_groups?.tiers || []).map((t) => [t.id, t]));
-    if (viewMode === 'native') {
-      for (const row of tiersSection.querySelectorAll('.tier-row')) {
-        const tierId = row.dataset.tier;
-        const nativeInfo = nativeById.get(tierId);
-        const radio = row.querySelector('.tier-radio');
-        const pillEl = row.querySelector('[data-field="target_pill"]');
-        const subEl = row.querySelector('[data-field="chain_summary"]');
-        const effortEl = row.querySelector('[data-field="effort_tag"]');
-        if (radio) radio.checked = tierId === nativePreviewTier;
-        if (pillEl) pillEl.textContent = nativeInfo?.group_id || `group/gempt-${tierId}`;
-        if (subEl) subEl.textContent = formatNativeSummary(nativeInfo);
-        if (effortEl) effortEl.textContent = nativeInfo?.installed ? tr('已就绪') : tr('未创建');
-      }
-    }
-
-    renderActiveRoute(state, nativeById.get(nativePreviewTier), viewMode);
-  }
-
   let gatewayStatus;
 
   function patchGatewayStatus({ overview, ui, ...magpie }) {
@@ -839,12 +607,11 @@ export function mountConsole(root, transport, {
     if (!latestState || latestState.magpie.url !== magpie.url) return;
     latestState = { ...latestState, ...gatewayStatus };
     if (!visible || activeTab !== 'overview') return;
-    renderSetupBanner(latestState, currentViewMode);
+    renderSetupBanner(latestState);
     renderPairings(latestState);
     advanced.render(latestState);
-    renderGatewayControls(latestState);
     renderReadiness(latestState);
-    renderTierRoutes(latestState, currentViewMode);
+    renderActiveRoute(latestState);
     for (const field of root.querySelectorAll('[name]')) {
       if (pendingSettings.has(field.name)) field.disabled = true;
     }
@@ -988,28 +755,6 @@ export function mountConsole(root, transport, {
       showToast(tr('已启用全客户端共享配置'));
     } catch (err) {
       showToast(tr("启用失败: {0}", errorText(err.message)), 'error');
-    } finally {
-      if (btn) btn.disabled = false;
-      await refreshState();
-    }
-  }
-
-  async function createNativeGroupsAction() {
-    const btn = $('create-native-btn');
-    if (btn) btn.disabled = true;
-    try {
-      const payload = await transport.runAction('native_groups');
-      const createdCount = Array.isArray(payload.created) ? payload.created.length : 0;
-      const skippedCount = Array.isArray(payload.skipped) ? payload.skipped.length : 0;
-      if (createdCount > 0 && skippedCount > 0) {
-        showToast(tr("已补齐 {0} 个路由组（保留已有 {1} 个）", createdCount, skippedCount));
-      } else if (createdCount > 0) {
-        showToast(tr("已创建 {0} 个直连路由组", createdCount));
-      } else {
-        showToast(tr('直连路由组已就绪'));
-      }
-    } catch (err) {
-      showToast(tr("创建失败: {0}", errorText(err.message)), 'error');
     } finally {
       if (btn) btn.disabled = false;
       await refreshState();
@@ -1923,15 +1668,34 @@ export function mountConsole(root, transport, {
 
   function renderLiveOverview(state) {
     const server = state.app_server;
+    const runners = Array.isArray(state.runners) ? state.runners : [];
+    const hasAnyRunner = state.has_any_runner ?? runners.some((r) => r.available);
+    const codexMissing = state.codex_cli_available === false;
+    const isMissingCodexMsg = Boolean(server?.error && /未找到\s*Codex\s*CLI|Codex CLI not found/i.test(server.error));
     const unavailable = embedded && !server?.pid;
-    $('chip-app-server').disabled = unavailable || restartInFlight;
-    $('chip-app-server').dataset.tone = server?.error ? 'warn' : server?.running ? 'ok' : 'neutral';
+    $('chip-app-server').disabled = unavailable || restartInFlight || (codexMissing && !server?.running);
+    $('chip-app-server').dataset.tone = (server?.error && !isMissingCodexMsg) ? 'warn' : server?.running ? 'ok' : 'neutral';
     if (!restartInFlight && !restartConfirmPending) {
-      $('chip-app-server-val').textContent = unavailable ? tr('未运行 · 在 Magpie 启动') : server?.error ? tr('异常 · 点此重启') : server?.running ? tr('运行中 · 重启') : tr('未运行 · 启动');
+      $('chip-app-server-val').textContent = codexMissing && !server?.running
+        ? tr('未安装 Codex')
+        : unavailable ? tr('未运行 · 在 Magpie 启动')
+        : server?.error ? tr('异常 · 点此重启')
+        : server?.running ? tr('运行中 · 重启')
+        : tr('未运行 · 启动');
     }
     const error = $('app-server-error');
-    error.textContent = errorText(server?.error || '');
-    error.hidden = !server?.error;
+    const showRealError = Boolean(server?.error && !isMissingCodexMsg);
+    error.textContent = showRealError ? errorText(server.error) : '';
+    error.hidden = !showRealError;
+
+    const zeroGuide = $('zero-cli-guide');
+    if (zeroGuide) {
+      const showZeroGuide = runners.length > 0 && !hasAnyRunner;
+      zeroGuide.hidden = !showZeroGuide;
+      if (showZeroGuide) {
+        zeroGuide.textContent = tr('尚未检测到执行 CLI — 咨询（gpt_ask）仍可正常使用。安装任一受支持 CLI（如 npm install -g @openai/codex 或 npm install -g opencode-ai）即可启用自主执行与 Swarm。');
+      }
+    }
 
     const runs = state.active_runs || [];
     const list = $('active-run-list');
@@ -2738,15 +2502,10 @@ export function mountConsole(root, transport, {
   root.addEventListener('change', (ev) => {
     const target = ev.target;
     if (!(target instanceof HTMLInputElement || target instanceof HTMLSelectElement)) return;
-    if (target.name === 'view_mode') {
-      currentViewMode = target.value === 'native' ? 'native' : 'mcp';
-      writeStoredMode(currentViewMode);
-      renderState(latestState);
-    } else if (target.name === 'native_preview_tier') {
-      nativePreviewTier = target.value;
-      renderState(latestState);
-    } else if (target.name === 'work_split' || target.name === 'swarm_split') {
+    if (target.name === 'work_split' || target.name === 'swarm_split') {
       updateSetting(target.name, { [target.name]: target.value }, latestState[target.name], tr('工作分工已保存，下次派单生效'));
+    } else if (target.name === 'default_cli') {
+      void updateSetting('default_cli', { default_cli: target.value }, latestState?.execution?.default_cli || 'auto', tr('执行 CLI 已保存，下次派单生效'));
     } else if (target.name === 'native_swarm' || target.name === 'swarm_shell_model') {
       const value = target.name === 'native_swarm' ? target.value === 'true' : target.value;
       void updateSetting(target.name, { [target.name]: value }, latestState[target.name], tr('Swarm 派单设置已保存'));
@@ -2807,10 +2566,6 @@ export function mountConsole(root, transport, {
       copyText(transport.installPage);
       return;
     }
-    if (btn.id === 'create-native-btn') {
-      createNativeGroupsAction();
-      return;
-    }
     if (btn.id === 'copy-mcp-btn' || btn.id === 'chip-mcp') {
       copyMcpConfig();
       return;
@@ -2821,12 +2576,6 @@ export function mountConsole(root, transport, {
     }
     if (btn.id === 'chip-app-server') {
       restartAppServerAction();
-      return;
-    }
-    if (btn.id === 'chip-native') {
-      currentViewMode = 'native';
-      writeStoredMode('native');
-      renderState(latestState);
       return;
     }
     const copyVal = btn.getAttribute('data-copy');

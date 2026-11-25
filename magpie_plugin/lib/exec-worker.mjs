@@ -36,4 +36,24 @@ if (outcome) {
   }
   if (finished.progress) Object.assign(finished.progress, { phase: outcome.state, updated_at: finished.finished_at });
   saveRun(file, finished);
+  const swarmId = record.swarm_id || host.swarmId;
+  const swarmAgent = record.swarm_agent || host.swarmAgent;
+  if (swarmId && swarmAgent) {
+    try {
+      const { onWorkerTurnFinished } = await import('../../core/swarm-engine.mjs');
+      await onWorkerTurnFinished({
+        swarmId,
+        swarmAgent,
+        runId: record.run_id,
+        sessionId: finished.result?.session_id || record.session_id,
+        startedAt: running.started_at,
+        outcome,
+        result: finished.result,
+        error: finished.error,
+        sessionsDir: host.sessionsDir,
+        configPath: host.configPath,
+        env: process.env,
+      });
+    } catch { /* Best-effort swarm bus sync so run state is never lost. */ }
+  }
 }

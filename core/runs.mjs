@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { accessSync, constants, mkdirSync, readFileSync, readdirSync, rmdirSync, statSync } from 'node:fs';
-import { delimiter, join } from 'node:path';
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, readdirSync, rmdirSync, statSync } from 'node:fs';
+import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { connectAppServer, readAppServerState, textInput, UNAVAILABLE } from '../magpie_plugin/lib/app-server-client.mjs';
@@ -106,10 +106,21 @@ export function reconcileRunState(record, modifiedAt) {
       pending_tool_call: null });
   }
   let expired = record.state !== 'waiting_gemini' && now() > (record.deadline ?? Infinity);
+  let deadPid = false;
   if (!expired && record.source === 'magpie_exec' && hasPid) {
-    try { process.kill(record.pid, 0); } catch (error) { expired = error.code === 'ESRCH'; }
+    try { process.kill(record.pid, 0); } catch (error) { deadPid = error.code === 'ESRCH'; }
   }
-  if (expired) {
+  if (deadPid && record.progress?.phase === 'connecting'
+      && !record.progress?.thread_id && !record.progress?.turn_id
+      && !record.codex_thread_id && !record.turn_id) {
+    Object.assign(record, {
+      state: 'failed',
+      pending_tool_call: null,
+      error: 'Worker process exited before connecting to Codex app-server (phase: connecting).',
+    });
+    return record;
+  }
+  if (expired || deadPid) {
     Object.assign(record, { state: 'outcome_unknown', pending_tool_call: null });
     if (record.turn_id) {
       record.remote_turn_unconfirmed = true;
@@ -137,9 +148,7 @@ function executable(path) {
   }
 }
 
-export function buildWaitCommand(runIds, { waitAll = false, env = process.env } = {}) {
-  const ids = normalizeRunIds(Array.isArray(runIds) ? runIds : String(runIds));
-  const args = `${waitAll ? '--all ' : ''}${ids.join(',')}`;
+function formatWaitInvocation(args, env = process.env) {
   const shims = process.platform === 'win32' ? ['gempt-wait.cmd', 'gempt-wait.exe', 'gempt-wait'] : ['gempt-wait'];
   const onPath = (env.PATH || env.Path || '').split(delimiter).filter(Boolean).some((dir) =>
     shims.some((shim) => executable(join(dir, shim))));
@@ -156,6 +165,24 @@ export function buildWaitCommand(runIds, { waitAll = false, env = process.env } 
   }
   const quote = (text) => `'${text.replaceAll("'", "'\\''")}'`;
   return `${quote(nodeBin)} ${quote(waitPath)} ${args}`;
+}
+
+export function buildWaitCommand(runIds, { waitAll = false, env = process.env } = {}) {
+  const ids = normalizeRunIds(Array.isArray(runIds) ? runIds : String(runIds));
+  const args = `${waitAll ? '--all ' : ''}${ids.join(',')}`;
+  return formatWaitInvocation(args, env);
+}
+
+export function buildBoardWaitCommand(swarmId, { since = 0, mentionsOnly = true, env = process.env } = {}) {
+  const cleanId = String(swarmId || '').trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(cleanId)) {
+    throw new Error(`Invalid swarm_id '${swarmId}'.`);
+  }
+  const parts = ['--board', cleanId];
+  const after = Math.max(0, Math.trunc(Number(since) || 0));
+  if (after > 0) parts.push('--since', String(after));
+  if (mentionsOnly === false) parts.push('--all-messages');
+  return formatWaitInvocation(parts.join(' '), env);
 }
 
 export async function waitForRuns(runIds, { waitAll = false, timeoutSec, sessionsDir, pollInterval = 0.25 } = {}) {
@@ -192,6 +219,24 @@ async function controlRun(runId, method, message, {
   const isInterrupt = method === 'turn/interrupt';
   const isActive = ['running', 'waiting_gemini'].includes(record.state);
   const isUnconfirmed = Boolean(record.remote_turn_unconfirmed);
+  const cli = String(record.cli || 'codex').trim().toLowerCase() || 'codex';
+  if (cli !== 'codex') {
+    const { getRunner } = await import('./runners/registry.mjs');
+    const runner = getRunner(cli);
+    const runDir = runDirectory(runId, sessionsDir);
+    if (isInterrupt) {
+      if (!isActive && !isUnconfirmed) throw runError(`Run ${runId} has no active ${cli} turn.`, 409);
+      if (runner?.interrupt) {
+        return runner.interrupt(record, { runDir, configPath, sessionsDir, env });
+      }
+      throw runError(`Runner '${cli}' does not support interrupt.`, 409);
+    }
+    if (!isActive) throw runError(`Run ${runId} has no active ${cli} turn.`, 409);
+    if (runner?.steer) {
+      return runner.steer(record, message, { runDir, configPath, sessionsDir, env });
+    }
+    throw runError(`CLI '${cli}' does not support mid-turn steer; message will be delivered on the next turn.`, 409);
+  }
   if (isInterrupt && isUnconfirmed && (!threadId || !turnId)) {
     const file = join(runDirectory(runId, sessionsDir), 'state.json');
     const updated = { ...record, interrupt_confirmed_at: new Date().toISOString() };
@@ -437,6 +482,10 @@ export async function dispatchRun(args, {
         title: normalizeTitle(args.title, args.goal, sourceCwd), tier: args.tier, agent,
         host_conversation_id: hostId, session_id: sessionId, config_path: config, progress: null,
         verification: args.verification, execution_timeout_sec: executionTimeout, deadline: now() + executionTimeout,
+        ...(args.swarm_id ? { swarm_id: String(args.swarm_id) } : {}),
+        ...(args.swarm_agent ? { swarm_agent: String(args.swarm_agent) } : {}),
+        ...(args.cli ? { cli: String(args.cli) } : {}),
+        ...(args.model ? { model: String(args.model) } : {}),
       };
       saveRun(file, record);
     }, { attempts: 80, delayMs: 25 });
@@ -445,13 +494,21 @@ export async function dispatchRun(args, {
     throw error;
   }
   const host = { configPath: config, sessionsDir: sessions, magpieConfigDir, options: { exec: true },
-    probeTimeoutMs, allowSandboxUpgrade: !legacyNative, worktreePath, sourceCwd };
+    probeTimeoutMs, allowSandboxUpgrade: !legacyNative, worktreePath, sourceCwd,
+    ...(args.swarm_id ? { swarmId: String(args.swarm_id) } : {}),
+    ...(args.swarm_agent ? { swarmAgent: String(args.swarm_agent) } : {}) };
   const request = { ...args, cwd, session_id: args.session_id ? sessionId : undefined,
     ...(timeoutSec !== undefined ? { timeout_sec: timeoutSec } : {}),
     host_conversation_id: hostId, gemini_family: args.gemini_family || hostContext.gemini_family };
+  const childEnv = args.swarm_id ? {
+    ...env,
+    GEMPT_SWARM_ID: String(args.swarm_id),
+    ...(args.swarm_agent ? { GEMPT_AGENT_NAME: String(args.swarm_agent) } : {}),
+    GEMPT_SESSIONS_DIR: sessions,
+  } : env;
   try {
     const child = spawn(resolveNodeExecutable({ env }), [workerPath], {
-      env, windowsHide: true, detached: true, stdio: ['pipe', 'ignore', 'ignore'],
+      env: childEnv, windowsHide: true, detached: true, stdio: ['pipe', 'ignore', 'ignore'],
     });
     const packet = JSON.stringify({ file, record, args: request, host, agent });
     await new Promise((resolve, reject) => {
@@ -469,4 +526,79 @@ export async function dispatchRun(args, {
   if (legacyNative || ACTIVE_STATES.has(result.state) || result.state === 'interrupted') return result;
   if (!result.result) throw new Error(`${id}: ${result.error || result.state}`);
   return { ...result.result, run_id: id, state: 'finished', execution_timeout_sec: result.execution_timeout_sec };
+}
+
+function pidAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }
+}
+
+export async function tryDelegateDispatch(args, {
+  env = process.env, configPath = args?.config_path, sessionsDir, magpieConfigDir, agent, waitSec = args?.wait_sec,
+} = {}) {
+  if (String(env?.GEMPT_DISABLE_IPC_DISPATCH || '').trim() === '1') return null;
+  const resolvedConfig = resolveConfigPath(configPath || env?.GEMPT_CONFIG);
+  const configDir = dirname(resolvedConfig);
+  if (!existsSync(configDir)) return null;
+  let candidates = [];
+  try {
+    candidates = readdirSync(configDir)
+      .filter((name) => /^page-server-\d+\.ipc$/.test(name))
+      .map((name) => {
+        const full = join(configDir, name);
+        const st = statSync(full, { throwIfNoEntry: false });
+        return { full, mtimeMs: st?.mtimeMs || 0 };
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  } catch {
+    return null;
+  }
+  const timeoutMs = Math.max(5000, ((Number(waitSec) || 0) + 15) * 1000);
+  const resolvedSessions = sessionsDir || env?.GEMPT_SESSIONS_DIR
+    ? resolveSessionsDir(sessionsDir || env?.GEMPT_SESSIONS_DIR) : undefined;
+  for (const { full } of candidates) {
+    const rec = readJsonSafe(full);
+    if (!rec || rec.service !== 'gempt-magpie-plugin'
+        || !Number.isInteger(rec.port) || rec.port < 1 || rec.port > 65535
+        || typeof rec.token !== 'string' || !rec.token
+        || !pidAlive(rec.pid)) {
+      continue;
+    }
+    try {
+      const response = await fetch(`http://127.0.0.1:${rec.port}/api/internal/dispatch`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-gempt-ipc-token': rec.token,
+        },
+        body: JSON.stringify({
+          args,
+          options: {
+            configPath: resolvedConfig,
+            ...(resolvedSessions ? { sessionsDir: resolvedSessions } : {}),
+            ...(magpieConfigDir ? { magpieConfigDir } : {}),
+            ...(agent ? { agent } : {}),
+            ...(waitSec !== undefined ? { waitSec } : {}),
+          },
+        }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (response.ok) {
+        const payload = await response.json();
+        if (payload?.ok && payload.run) return payload.run;
+        continue;
+      }
+      if ([400, 409, 422].includes(response.status)) {
+        let message = `Resident dispatch failed with HTTP ${response.status}`;
+        try {
+          const errBody = await response.json();
+          if (errBody?.error) message = String(errBody.error);
+        } catch { /* ignore */ }
+        throw runError(message, response.status);
+      }
+    } catch (error) {
+      if (error?.status && [400, 409, 422].includes(error.status)) throw error;
+    }
+  }
+  return null;
 }

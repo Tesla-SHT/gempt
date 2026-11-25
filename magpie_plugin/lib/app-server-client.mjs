@@ -7,6 +7,7 @@ export const UNAVAILABLE = '未检测到 Magpie 插件托管的共享 codex app-
 export const PROVIDER = 'gempt_gateway';
 export const SANDBOX_TYPES = { 'read-only': 'readOnly', 'workspace-write': 'workspaceWrite', 'danger-full-access': 'dangerFullAccess' };
 export const DEVELOPER_INSTRUCTIONS = 'Use ask_gemini for visual checks, clarifications, decisions, or blockers that require the coordinating Gemini. Provide a specific question and include the relevant context and local media paths when appropriate.';
+export const SWARM_DEVELOPER_INSTRUCTIONS = 'You are a worker on a shared GemPT Swarm message board. Use board_post to coordinate with peers (@peer-name) and report final results (@coordinator [done] ...), board_read to read board messages, and board_roster to inspect teammates.';
 export const ASK_GEMINI = {
   type: 'function',
   name: 'ask_gemini',
@@ -23,6 +24,46 @@ export const ASK_GEMINI = {
     additionalProperties: false,
   },
 };
+export const BOARD_POST = {
+  type: 'function',
+  name: 'board_post',
+  description: 'Post a message to the shared Swarm message board. Mention peers with @name or @coordinator to wake/notify them.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      text: { type: 'string', description: 'Message text. Use @name or @coordinator to address recipients.' },
+      kind: { type: 'string', enum: ['message', 'summary', 'question', 'system'], description: 'Optional message kind (default: message).' },
+      reply_to_seq: { type: 'integer', description: 'Optional board message sequence number being replied to.' },
+    },
+    required: ['text'],
+    additionalProperties: false,
+  },
+};
+export const BOARD_READ = {
+  type: 'function',
+  name: 'board_read',
+  description: 'Read messages from the shared Swarm message board, oldest first.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      since: { type: 'integer', description: 'Return messages with seq > since.' },
+      seqs: { type: 'array', items: { type: 'integer' }, description: 'Return specific messages by sequence number.' },
+      limit: { type: 'integer', description: 'Maximum messages to return (default 20).' },
+    },
+    additionalProperties: false,
+  },
+};
+export const BOARD_ROSTER = {
+  type: 'function',
+  name: 'board_roster',
+  description: 'List all workers in the current Swarm along with their states and board head.',
+  inputSchema: {
+    type: 'object',
+    properties: {},
+    additionalProperties: false,
+  },
+};
+export const SWARM_TOOLS = [BOARD_POST, BOARD_READ, BOARD_ROSTER];
 
 export const textInput = (text) => [{ type: 'text', text }];
 

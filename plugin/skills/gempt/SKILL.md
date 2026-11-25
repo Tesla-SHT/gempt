@@ -9,11 +9,11 @@ description: >-
 
 # gempt — Gemini × GPT 协作编排手册
 
-GemPT v0.7.1 使用 Node.js（`>= 20.11.0`）。Antigravity 的 `gempt_gempt` MCP 提供 `gpt_run`、`gpt_ask`、`gpt_ctl`，按 Hydrogen、Neon、Carbon 家族配对 Magpie 提供的下属模型。Magpie HTTP MCP 对应 `gempt_run`、`gempt_ask`、`gempt_ctl`。其他 Agent 可在模型栏直接选 `group/gempt-{sonnet,opus,fable}`。
+GemPT v0.8.0 使用 Node.js（`>= 22.13.0`）。Antigravity 的 `gempt_gempt` MCP 提供 `gpt_swarm`、`gpt_board`、`gpt_run`、`gpt_ask`、`gpt_ctl`，支持 11 种可插拔执行 CLI（`codex` / `opencode` / `claude` / `gemini` / `pi` / `cursor` / `kimi` / `grok` / `kilo` / `copilot` / `qoder`）以及按 Hydrogen、Neon、Carbon 家族配对 Magpie 模型。
 
 > 启用本插件时，`rules/AGENTS.md` 会常驻生效；按 Magpie 面板的 5 档工作分工（0% / 15% / 35% / 60% / 80%）决定何时委派。
 
-现成材料用 `gpt_ask`。需要查仓库、运行检查或修改代码时，默认由 AGY 原生 Swarm 工位通过 `gempt run` 执行。只读任务用 `--access inspect`，隔离写入由 Swarm 创建 worktree。Gemini 核对返回的证据并向用户汇报。
+现成材料用 `gpt_ask`。需要查仓库、运行检查或修改代码时，**默认采用无壳 GemPT Swarm（`gpt_swarm` + `gpt_board`）** 或单任务 `gpt_run` 执行。只读任务用 `access="inspect"`，多路并发写入用 `workspace="share"` 自动隔离 git worktree。Gemini 核对返回的证据并向用户汇报。
 
 ---
 
@@ -29,7 +29,7 @@ GemPT v0.7.1 使用 Node.js（`>= 20.11.0`）。Antigravity 的 `gempt_gempt` MC
    - **免费打杂 / 压缩通道（`chore` / `utility`）**：从 `utility_candidates` 推荐免费高速模型（如 `auto/deepseek-v4.1-flash`），用于 `gpt_ask(tier="chore")` 与 Magpie `compact` 规则。
    - **容灾策略（`failover_mode`）**：
      1. `subscription_only`（推荐默认）：仅用 Codex 订阅号（不自动切按量 API，防意外扣费）；多订阅号由 Magpie 自动轮转。
-     2. `api_fallback` 启用后，咨询遇到限流或可重试的网关错误时可使用匹配的按量 `openai/*` 模型。由 Magpie 路由组托管的执行按组内规则容灾。
+     2. `api_fallback` 启用后，咨询遇到限流或可重试的网关错误时可使用匹配的按量 `openai/*` 模型。
    - **思考强度**可固定设置，也可在面板选 **智能** 启用 `auto_effort`。
    - **默认 Codex 沙箱（`default_sandbox`）**：推荐 `workspace-write`（只在目标工作区可写），并可通过环境变量 `GEMPT_WORKSPACE_ROOT` 限定可访问根目录。
 4. **落盘并验收**：
@@ -58,7 +58,7 @@ GemPT v0.7.1 使用 Node.js（`>= 20.11.0`）。Antigravity 的 `gempt_gempt` MC
   2. **失败升级必开新线程**：首轮失败、超时或未验证通过时，省略 `session_id` 重开线程。
   3. **禁用 `ultra` 与高强度子代理扇出**：默认配置与自动定档最高止步 `xhigh`，避免并发高思考导致配额雪崩。
 
-固定强度保存在 `routing_policy.mcp_effort`。Astra 至少用 `medium`。在 `Plugins → GemPT → 路由组直连` 可为其他 Agent 预览、创建并复制直连组 ID。
+固定强度保存在 `routing_policy.mcp_effort`。Astra 至少用 `medium`。
 
 ---
 
@@ -68,21 +68,18 @@ GemPT v0.7.1 使用 Node.js（`>= 20.11.0`）。Antigravity 的 `gempt_gempt` MC
 
 给出已核实的路径、符号和报错，明确哪些接口必须保留。执行任务可在目标中给出独立的测试命令，例如 `node --test tests/test_core_node.mjs`，并要求回报实际结果和剩余风险。
 
-详细好坏示例见 [task-packet-examples.md](./references/task-packet-examples.md)，Magpie 路由组命令模板见 [magpie-routing.md](./references/magpie-routing.md)。
+详细好坏示例见 [task-packet-examples.md](./references/task-packet-examples.md)。
 
 ---
 
-### 原生 Swarm 执行
+### 无壳 GemPT Swarm（默认）与原生 Swarm 混编
 
-默认开启 `routing_policy.native_swarm`，Coordinator 用 `swarm(action="title")` 命名，再用 `swarm(action="add")` 创建工位。模型取 `routing_policy.swarm_shell_model`（默认 `gemini-4-hydrogen-low`）。写入用原生 `workspace="share"`，检查用 `"inherit"`。按 `swarm_pane` 在 `plan.json` 登记工位任务，内层 GemPT 用 `--workspace inherit`。快速 `gpt_ask`（含 `tier="chore"`）和 `gpt_ctl` 保持直调。用户明确说「不用 swarm」、关闭开关或执行服务不健康时，可以使用直接执行路径。
+默认关闭 `routing_policy.native_swarm`（`false`），Coordinator 直接使用无壳 GemPT Swarm：
+- 用 `gpt_swarm(action="title"|"plan"|"add"|"status"|"model"|"kill", cli?, ...)` 规划与拉起多 CLI 工位（不消耗 AGY 原生外壳 token），并行写入用 `workspace="share"` 自动创建 worktree。
+- 用 `gpt_board(action="post"|"read"|"wait"|"roster")` 在共享 SQLite 消息板上协同与自动唤醒；通过 `run_command(WaitMsBeforeAsync=500)` 执行返回的 `gempt-wait --board <swarm_id>` 零轮询等待。
+- 可通过 `cli` 参数或控制台 `execution.default_cli` 选择 `auto`（按模型亲和匹配已安装 CLI）或任意 11 种受支持 CLI。
 
-Codex 默认执行预算为 3600 秒，等待 `ask_gemini` 回复期间暂停计时。单次执行可用 `--timeout 30–7200` 或 MCP 的 `timeout_sec` 指定预算。
-
-工位 brief 示例：
-
-> 你是 GPT 工位 <name>，Coordinator ID 是 <coordinator_id>。本工位没有插件 MCP 或 Hook。用 `gempt run --cwd "$PWD" --workspace inherit --tier <tier> --host <coordinator_id> --title <name> --goal -`，从 stdin 传入任务 <目标、范围、约束、验收命令>。只读任务加 `--access inspect`。保存回执的 run_id 和 session_id，原样通过 `run_command(WaitMsBeforeAsync=500)` 跑 wait_command。把改动、验证和卡点发到看板。
->
-> 当前回合收到看板新指示时用 `gempt steer <run_id> "<message>"`；后续回合可加 `--session <session_id>`。如果等待返回 `waiting_gemini`，把 `pending_tool_call` 的问题发到看板，收到答复后用 `gempt reply-tool <run_id> <call_id> "<text>"` 回复，再执行原 wait_command。
+当需要与 AGY 原生 Gemini / Claude Swarm 工位混编时，可在控制台显式开启 `routing_policy.native_swarm: true`：Coordinator 用 `swarm(action="title")` / `swarm(action="add", model=routing_policy.swarm_shell_model)` 创建工位，工位内通过 `gempt run --cwd "$PWD" --workspace inherit --host <coordinator_id> --title <name> --goal -` 执行任务并运行 `wait_command`。默认执行预算为 3600 秒，等待 `ask_gemini` 回复期间暂停计时。
 
 ## 4. AI-to-AI Steering & Review Loop（内部纠偏闭环）
 

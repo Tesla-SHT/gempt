@@ -12,12 +12,14 @@
  *   and file attachments enforce realpath containment + secret-file filtering.
  */
 import { readNativeRun, startNativeRun, waitForNativeRun } from './native-runs.mjs';
+import { readAppServerState } from './app-server-client.mjs';
 import { findCodexCli } from './app-server-manager.mjs';
-import { runAppServer, TurnInterrupted } from './app-server-run.mjs';
+import { TurnInterrupted } from './app-server-run.mjs';
+import { detectAvailableRunners, getRunner, resolveRunnerId } from '../../core/runners/registry.mjs';
 import { listActiveRoster } from '../../core/runs.mjs';
 import { validateSessionId } from '../../core/state.mjs';
 import { TOOLS } from '../../core/tool-schemas.mjs';
-import { codexAppServerExtraArgs, getMcpEffort, getPairing, hasRuntimeConfig, isPairingModelId } from '../../core/config.mjs';
+import { CLI_CHOICES, codexAppServerExtraArgs, getMcpEffort, getPairing, hasRuntimeConfig, isPairingModelId } from '../../core/config.mjs';
 import { pickDelegatePlan } from '../../core/magpie.mjs';
 import { randomBytes } from 'node:crypto';
 import { existsSync, openSync, readSync, realpathSync, rmSync, statSync, closeSync } from 'node:fs';
@@ -37,8 +39,6 @@ import {
   defaultGatewayFromEnv,
   expandUser,
   explicitTitle,
-  isCodexModelId,
-  isHarnessGroup,
   normalizeDefaultTier,
   normalizeTitle,
   pickSubscriptionPlan,
@@ -51,7 +51,6 @@ import {
   resolveMagpieConfigDir,
   resolveSessionsDir,
   sessionGoal,
-  verifySubscriptionGroup,
   writeConfigAtomic,
 } from './backend.mjs';
 import {
@@ -579,11 +578,6 @@ async function resolveRuntimeConfig({ configPath, tierForProbe, allowUtilityOnly
   };
 }
 
-function isAllowedFallbackTarget(modelId) {
-  const m = String(modelId || '').trim();
-  return isCodexModelId(m) || m.startsWith('openai/') || m.startsWith('group/gempt-harness-');
-}
-
 function shouldRetryFallback(err) {
   const code = err?.statusCode;
   if (code === 429) return true;
@@ -650,20 +644,12 @@ function resolveTierTarget(cfg, requestedTier, { allowChore, escalate, effortOve
 
   let escalated = false;
   const meetsThreshold = (EFFORT_RANK[effort] ?? 3) >= threshRank;
-  if ((escalate || meetsThreshold) && tierCfg.escalate_model) {
-    if (!model.startsWith('group/') && !model.startsWith('auto/')) {
-      model = String(tierCfg.escalate_model).trim();
-      escalated = true;
-    } else if (model.startsWith('group/gempt-harness-')) {
-      escalated = true;
-    }
+  if ((escalate || meetsThreshold) && tierCfg.escalate_model && !model.startsWith('auto/')) {
+    model = String(tierCfg.escalate_model).trim();
+    escalated = true;
   }
 
-  if (failoverMode === 'subscription_only') {
-    if (!isCodexModelId(model) && !isHarnessGroup(model)) {
-      throw new Error(`Subscription-only mode requires a codex/* model for tier '${effectiveTier}', got '${model}'.`);
-    }
-  } else if (!(failoverMode === 'paired' ? isPairingModelId(model) : isAllowedFallbackTarget(model))) {
+  if (!isPairingModelId(model)) {
     throw new Error(`Unsupported target model '${model}' for tier '${effectiveTier}'.`);
   }
 
@@ -696,6 +682,29 @@ async function resolveGptTarget(runtime, args, priorSession, { allowChore = fals
   const explicitEffort = args.reasoning_effort || '';
   if (explicitEffort && !VALID_EFFORTS_SET.has(explicitEffort)) {
     throw new Error(`Invalid reasoning_effort '${explicitEffort}'.`);
+  }
+  const explicitModel = typeof args.model === 'string' && args.model.trim() ? args.model.trim() : '';
+  if (explicitModel) {
+    if (!isPairingModelId(explicitModel)) {
+      throw new Error(`Invalid explicit model ID '${explicitModel}'.`);
+    }
+    const effort = explicitEffort || String(priorSession?.reasoning_effort || '').trim() || getMcpEffort(cfg.routing_policy);
+    const hasAstraFloor = isAstraModel(explicitModel);
+    return {
+      resolved: {
+        model: explicitModel,
+        execModel: explicitModel,
+        tier: args.tier || priorSession?.tier || 'paired',
+        failoverMode: 'paired',
+        fallbackModels: [],
+        effort: hasAstraFloor && EFFORT_RANK[effort] < EFFORT_RANK.medium ? 'medium' : effort,
+        apiMode: 'responses',
+        maxOutputTokens: 16384,
+        escalated: false,
+      },
+      autoEffortInfo: null,
+      paired: explicitModel,
+    };
   }
   const paired = await pairedModel(runtime, args, priorSession, probeTimeoutMs);
   const policy = cfg.routing_policy;
@@ -739,6 +748,9 @@ export function createGemptTools({ options = {}, env = process.env, ...host } = 
         if (key === 'run' && args.access !== 'inspect' && !isExecEnabled(options, env)) {
           throw new Error('Writable gempt_run is disabled. Enable the GemPT plugin option `exec: true`.');
         }
+        if (key === 'swarm' && args.action === 'add' && args.access !== 'inspect' && !isExecEnabled(options, env)) {
+          throw new Error('Writable gempt_swarm add is disabled. Enable the GemPT plugin option `exec: true`.');
+        }
         const overrides = { ...host, configPath: resolveConfigPath(host.configPath || env.GEMPT_CONFIG),
           sessionsDir: resolveSessionsDir(host.sessionsDir || env.GEMPT_SESSIONS_DIR) };
         const { handleTool } = await import('../../core/mcp-server.mjs');
@@ -762,6 +774,8 @@ export function createExecutionTools({
   allowSandboxUpgrade,
   worktreePath,
   sourceCwd,
+  swarmId,
+  swarmAgent,
   env = process.env,
   probeTimeoutMs = 2000,
 } = {}) {
@@ -771,7 +785,7 @@ export function createExecutionTools({
   const tools = {
     discover: {
       description:
-        'Scan local Magpie gateway for available Codex subscription models, Gemini/utility models, native group/gempt-* routing groups, Codex CLI readiness, and active GemPT config.',
+        'Scan the Magpie gateway for available models, execution CLI readiness, and active GemPT config.',
       args: {
         type: 'object',
         properties: {
@@ -787,6 +801,7 @@ export function createExecutionTools({
         const probe = await probeMagpie(baseUrl, apiKey, probeTimeoutMs, resolveExcludedTokens(rawCfg || {}));
         const subPlan = pickSubscriptionPlan(probe);
         const codexPath = findCodexCli(codexCliPath || rawCfg?.codex?.cli_path || '', env);
+        const runners = detectAvailableRunners(rawCfg || {}, env);
         return {
           configured: Boolean(rawCfg),
           config_path: resolveConfigPath(configPath),
@@ -797,24 +812,25 @@ export function createExecutionTools({
             reachable: probe.reachable,
             url: probe.url,
             total_models: probe.total_models,
+            models: probe.models,
             codex_models: probe.codex_models,
             openai_models: probe.openai_models || [],
             gemini_models: probe.gemini_models,
             utility_candidates: probe.utility_candidates,
-            native_groups: probe.native_groups,
             error: probe.error,
           },
           codex_cli: {
             found: Boolean(codexPath),
             path: codexPath,
           },
+          runners,
           recommended_subscription_plan: subPlan,
         };
       },
     },
 
     status: {
-      description: 'Show redacted GemPT configuration, connected Magpie clients/native groups/tools readiness, and recent sessions/runs.',
+      description: 'Show redacted GemPT configuration, connected Magpie clients, tool readiness, and recent sessions/runs.',
       args: {
         type: 'object',
         properties: {
@@ -895,9 +911,6 @@ export function createExecutionTools({
 
         const fileList = Array.isArray(args?.file_paths) ? args.file_paths : [];
         const effort = resolved.effort;
-        if (!paired && resolved.failoverMode === 'subscription_only' && resolved.tier !== 'chore' && isHarnessGroup(resolved.model)) {
-          await verifySubscriptionGroup(runtime.cfg, resolved.model);
-        }
         const apiMode = args?.api_mode
           ? (VALID_API_MODES.has(args.api_mode) ? args.api_mode : (() => { throw new Error(`Invalid api_mode '${args.api_mode}'.`); })())
           : resolved.apiMode;
@@ -1054,6 +1067,7 @@ export function createExecutionTools({
           verification: { type: 'string', description: 'Exact tests/commands Codex should run to verify completion.' },
           expected_report: { type: 'string', description: 'Structure for Codex final report.' },
           session_id: { type: 'string', description: 'Optional exec session_id to resume.' },
+          cli: { type: 'string', enum: [...CLI_CHOICES], description: "Optional execution CLI backend ('auto' or specific CLI)." },
           sandbox: { type: 'string', enum: VALID_SANDBOXES },
           reasoning_effort: { type: 'string', enum: [...VALID_EFFORTS_SET] },
           background: { type: 'boolean', description: 'Return a run_id immediately. Use gempt-wait to await completion or gempt_ctl for a status snapshot.' },
@@ -1127,7 +1141,7 @@ export function createExecutionTools({
           if (!priorSession.sandbox || !VALID_SANDBOXES.includes(priorSession.sandbox)) {
             throw new Error(`Exec session '${args.session_id}' is missing a valid recorded sandbox.`);
           }
-          if (!priorSession.codex_thread_id) {
+          if ((!priorSession.cli || priorSession.cli === 'codex') && !priorSession.codex_thread_id) {
             throw new Error(`Exec session '${args.session_id}' is missing codex_thread_id.`);
           }
           if (priorSession.gateway && String(priorSession.gateway).replace(/\/+$/, '') !== runtime.baseUrl) {
@@ -1155,15 +1169,46 @@ export function createExecutionTools({
         const { resolved, autoEffortInfo, paired } = await resolveGptTarget(runtime, args, priorSession, { probeTimeoutMs });
 
         const targetModel = resolved.execModel || resolved.model;
-        if (!paired && resolved.failoverMode === 'subscription_only') {
-          if (isHarnessGroup(targetModel)) {
-            await verifySubscriptionGroup(runtime.cfg, targetModel);
-          } else if (!isCodexModelId(targetModel)) {
-            throw new Error(`Subscription-only exec requires a codex/* model, got '${targetModel}'.`);
-          }
-        } else if (!paired && !(resolved.failoverMode === 'paired' ? isPairingModelId(targetModel) : isAllowedFallbackTarget(targetModel))) {
+        if (!isPairingModelId(targetModel)) {
           throw new Error(`Unsupported exec model '${targetModel}' for tier '${resolved.tier}'.`);
         }
+
+        const requestedCli = String(args.cli || priorSession?.cli || '').trim().toLowerCase();
+        const cfgForDetect = codexCliPath
+          ? {
+              ...runtime.cfg,
+              codex: { ...(runtime.cfg?.codex || {}), cli_path: codexCliPath },
+              execution: {
+                ...(runtime.cfg?.execution || {}),
+                cli_paths: { ...(runtime.cfg?.execution?.cli_paths || {}), codex: codexCliPath },
+              },
+            }
+          : runtime.cfg;
+        let resolvedRunner = resolveRunnerId({
+          requested: requestedCli,
+          model: targetModel,
+          cfg: cfgForDetect,
+          env,
+        });
+        if (!resolvedRunner.ok && (!requestedCli || requestedCli === 'auto' || requestedCli === 'codex')) {
+          try {
+            const appState = readAppServerState(configPath, env);
+            if (appState?.status === 'running' && appState?.ws_url) {
+              resolvedRunner = {
+                ok: true,
+                cli: 'codex',
+                runner: getRunner('codex'),
+                path: '',
+                reason: 'running_app_server',
+              };
+            }
+          } catch { /* No running app-server; fall through to structured zero-CLI error. */ }
+        }
+        if (!resolvedRunner.ok) {
+          throw new Error(resolvedRunner.error);
+        }
+        const resolvedCli = resolvedRunner.cli;
+        const runner = resolvedRunner.runner;
 
         const effort = resolved.effort;
 
@@ -1174,13 +1219,21 @@ export function createExecutionTools({
         });
 
         const priorTurns = Array.isArray(priorSession?.turns) ? priorSession.turns : [];
+        const needsCarryover = Boolean(
+          priorSession && (sandboxUpgraded || (resolvedCli !== 'codex' && (!runner.capabilities.resume || priorSession.cli !== resolvedCli))),
+        );
         let carryover = '';
-        if (sandboxUpgraded) {
+        if (needsCarryover) {
           const latest = priorTurns.slice(-2).flatMap((entry) => {
             if (typeof entry?.content === 'string') return [`${entry.role || 'Prior turn'}: ${entry.content.slice(0, 1200)}`];
             return [entry?.goal, entry?.reply ?? entry?.text].filter((text) => typeof text === 'string').map((text) => text.slice(0, 1200));
           });
-          carryover = ['Carryover from the prior read-only Codex thread (for context):', ...latest].join('\n');
+          carryover = [
+            sandboxUpgraded
+              ? 'Carryover from the prior read-only Codex thread (for context):'
+              : 'Carryover from the prior execution thread (for context):',
+            ...latest,
+          ].join('\n');
         }
         const prompt = buildExecPrompt({
           goal,
@@ -1189,13 +1242,17 @@ export function createExecutionTools({
           constraints: args?.constraints || '',
           verification: args?.verification || '',
           expectedReport: args?.expected_report || '',
-          isResume: Boolean(priorSession) && !sandboxUpgraded,
+          isResume: Boolean(priorSession) && !needsCarryover,
         });
 
         const timeoutSec = resolveExecTimeoutSec({ codex: runtime.cfg?.codex, timeoutSec: args.timeout_sec, effort });
 
-        const extraArgs = runtime.cfg?.codex?.extra_args;
-        if (extraArgs?.length && codexAppServerExtraArgs(extraArgs).length !== extraArgs.length) throw new Error('Unrestricted Codex extra_args conflict with gateway and sandbox enforcement.');
+        if (resolvedCli === 'codex') {
+          const extraArgs = runtime.cfg?.codex?.extra_args;
+          if (extraArgs?.length && codexAppServerExtraArgs(extraArgs).length !== extraArgs.length) {
+            throw new Error('Unrestricted Codex extra_args conflict with gateway and sandbox enforcement.');
+          }
+        }
         const sessionId = priorSession?.session_id || newExecSession;
         const agent = callingAgent(callCtx) || priorSession?.agent || '';
         const title = normalizeTitle(args.title, goal, workdir);
@@ -1204,21 +1261,39 @@ export function createExecutionTools({
           ...(priorSession || {}),
           title: explicitTitle(args.title) || (priorSession ? normalizeTitle(priorSession.title, sessionGoal(priorSession), workdir) : title),
           host_conversation_id: hostId,
-          paired_model: paired, session_id: sessionId, mode: 'exec', tier: resolved.tier, model: targetModel,
+          paired_model: paired, session_id: sessionId, mode: 'exec', cli: resolvedCli, tier: resolved.tier, model: targetModel,
           reasoning_effort: effort, cwd: workdir, sandbox: effectiveSandbox, gateway: runtime.baseUrl, agent,
           ...(worktreePath ? { worktree_path: worktreePath, source_cwd: sourceCwd, worktree_pruned_at: null, pruned_worktree_path: null } : {}),
           ...(sandboxUpgraded ? { sandbox_upgraded: true } : {}),
         };
+        const canResumeRunner = Boolean(priorSession && !sandboxUpgraded && (priorSession.cli || 'codex') === resolvedCli);
         let res;
         try {
-          res = await runAppServer({
-            configPath, env, runFile: execRunFile, sessionId, prompt, cwd: workdir, model: targetModel, effort,
-            sandbox: effectiveSandbox, threadId: sandboxUpgraded ? undefined : priorSession?.codex_thread_id,
-            sandboxUpgraded, gatewayUrl: runtime.baseUrl,
+          res = await runner.runTurn({
+            cliPath: resolvedRunner.path,
+            configPath,
+            env,
+            runFile: execRunFile,
+            sessionId,
+            prompt,
+            cwd: workdir,
+            model: targetModel,
+            effort,
+            sandbox: effectiveSandbox,
+            threadId: canResumeRunner ? priorSession?.codex_thread_id : undefined,
+            runnerSessionId: canResumeRunner ? (priorSession?.runner_session_id || priorSession?.codex_thread_id) : undefined,
+            sandboxUpgraded,
+            gatewayUrl: runtime.baseUrl,
+            apiKey: runtime.apiKey,
             approvalPolicy: effectiveSandbox === 'danger-full-access' ? runtime.cfg?.codex?.approval_policy || 'never' : 'never',
             timeoutSec,
-            onIdentity(threadId, turnId, observedSandbox) {
+            sessionsDir: resolvedSessionsDir,
+            swarmId: args.swarm_id || swarmId || env?.GEMPT_SWARM_ID || null,
+            swarmAgent: args.swarm_agent || swarmAgent || env?.GEMPT_AGENT_NAME || null,
+            onIdentity(threadId, turnId, observedSandbox, runnerSid) {
+              session.cli = resolvedCli;
               session.codex_thread_id = threadId;
+              if (runnerSid) session.runner_session_id = runnerSid;
               session.turn_id = turnId;
               session.sandbox = observedSandbox;
               saveSession(resolvedSessionsDir, session);
@@ -1243,12 +1318,17 @@ export function createExecutionTools({
         const turn = priorTurns.filter((entry) => !entry.role || entry.role === 'user').length + 1;
         const timestamp = nowIso();
         saveSession(resolvedSessionsDir, {
-          ...session, sandbox: res.sandbox, codex_thread_id: res.threadId, turn_id: res.turnId,
+          ...session,
+          cli: resolvedCli,
+          sandbox: res.sandbox,
+          codex_thread_id: res.threadId,
+          ...(res.runnerSessionId ? { runner_session_id: res.runnerSessionId } : {}),
+          turn_id: res.turnId,
           turns: [...priorTurns, { role: 'user', content: prompt }, { role: 'assistant', content: res.text }],
           turn_details: {
             ...priorSession?.turn_details,
             [turn]: {
-              goal, title, host_conversation_id: hostId, timestamp, cwd: workdir, agent, tier: resolved.tier, model: targetModel,
+              goal, title, host_conversation_id: hostId, timestamp, cwd: workdir, agent, cli: resolvedCli, tier: resolved.tier, model: targetModel,
               reasoning_effort: effort, codex_thread_id: res.threadId, run_id: args.run_id,
               elapsed_sec: res.elapsedSec, usage: res.usage, verification: args.verification, commands: res.commands,
             },
@@ -1264,6 +1344,7 @@ export function createExecutionTools({
           elapsedSec: res.elapsedSec,
           usage: res.usage,
           extra: {
+            ...(resolvedCli !== 'codex' ? { cli: resolvedCli } : {}),
             sandbox: res.sandbox,
             codex_thread: res.threadId,
             escalated: resolved.escalated ? 'yes' : '',
@@ -1274,11 +1355,13 @@ export function createExecutionTools({
           summary,
           text: `${summary}\n\n${res.text}`,
           session_id: sessionId,
+          cli: resolvedCli,
           title,
           host_conversation_id: hostId,
           turns: turn,
           timestamp,
           codex_thread_id: res.threadId,
+          ...(res.runnerSessionId ? { runner_session_id: res.runnerSessionId } : {}),
           turn_id: res.turnId,
           tier: resolved.tier,
           model: targetModel,

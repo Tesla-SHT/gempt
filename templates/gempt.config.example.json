@@ -14,15 +14,18 @@
     "extra_args": [],
     "timeout_sec": 3600
   },
+  "execution": {
+    "default_cli": "auto",
+    "cli_paths": {}
+  },
   "routing_policy": {
     "work_split": "balanced",
     "swarm_split": "inherit",
-    "native_swarm": true,
+    "native_swarm": false,
     "swarm_shell_model": "gemini-4-hydrogen-low",
     "default_tier": "sonnet",
     "failover_mode": "subscription_only",
     "auto_effort": false,
-    "magpie_group_strategy": "order",
     "excluded_models": []
   },
   "tiers": {
@@ -34,10 +37,7 @@
       "reasoning_effort": "medium",
       "api_mode": "responses",
       "max_output_tokens": 16384,
-      "fallback_models": [],
-      "magpie_group_members": [
-        "codex/gpt-6.2-sol"
-      ]
+      "fallback_models": []
     },
     "opus": {
       "label": "Opus · 复杂工程",
@@ -49,11 +49,7 @@
       "reasoning_effort": "high",
       "api_mode": "responses",
       "max_output_tokens": 24576,
-      "fallback_models": [],
-      "magpie_group_members": [
-        "codex/gpt-6.2-sol",
-        "codex/gpt-6.2-astra"
-      ]
+      "fallback_models": []
     },
     "fable": {
       "label": "Fable · 顶配攻坚",
@@ -63,10 +59,7 @@
       "reasoning_effort": "xhigh",
       "api_mode": "responses",
       "max_output_tokens": 32768,
-      "fallback_models": [],
-      "magpie_group_members": [
-        "codex/gpt-6.2-astra"
-      ]
+      "fallback_models": []
     }
   },
   "utility": {
@@ -76,7 +69,6 @@
     "api_mode": "chat",
     "max_output_tokens": 4096,
     "fallback_models": [],
-    "use_for_magpie_compact": true,
     "use_as_classifier": false
   },
   "ui": {

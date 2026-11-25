@@ -2,7 +2,6 @@ import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
 
 const ledgers = new Map();
 const WINDOW_MARGIN_MS = 1000; // Older GemPT receipts round timestamps to seconds.
-const directGroup = /^(?:group\/)?gempt-(?:sonnet|opus|fable)(?::|#|$)/i;
 const count = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 const string = (value) => typeof value === 'string' ? value : '';
 const identity = (row) => row.route_id == null ? '' : `${row.route_id}|${row.t ?? row.timestamp ?? row.ts}`;
@@ -17,7 +16,7 @@ function gatewayRow(row) {
   const time = row.t ?? row.timestamp ?? row.ts;
   const at = typeof time === 'number' ? time * (time < 1e12 ? 1000 : 1) : Date.parse(time);
   const requested = string(row.req ?? row.requested_model);
-  if (!Number.isFinite(at) || Math.abs(at) > 8.64e15 || directGroup.test(requested)) return null;
+  if (!Number.isFinite(at) || Math.abs(at) > 8.64e15) return null;
   const threads = [...new Set([row.native_session, row.session, row.session_id, row.thread_id, row.codex_thread_id].filter(string))];
   const response = string(row.response_id);
   const agent = string(row.agent);

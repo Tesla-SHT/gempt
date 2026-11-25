@@ -36,48 +36,28 @@
       <section class="section" aria-labelledby="route-section-label">
         <div class="section-head">
           <span id="route-section-label" class="section-eyebrow">当前路由</span>
-          <fieldset class="mode-fieldset">
-            <legend class="sr-only">接入方式</legend>
-            <div class="seg-control seg-compact">
-              <span class="seg-option">
-                <input id="mode-mcp" class="seg-radio sr-only" type="radio" name="view_mode" value="mcp">
-                <label class="seg-label" for="mode-mcp">MCP 编排</label>
-              </span>
-              <span class="seg-option">
-                <input id="mode-native" class="seg-radio sr-only" type="radio" name="view_mode" value="native">
-                <label class="seg-label" for="mode-native">路由组直连</label>
-              </span>
-            </div>
-          </fieldset>
         </div>
 
         <article class="surface route-card">
           <div class="route-title-row">
-            <div class="route-title-group">
-              <strong id="active-tier-name" class="route-tier-name">Antigravity MCP</strong>
-              <button id="active-tier-target" type="button" class="pill-copy-btn" data-copy="group/gempt-sonnet" hidden>group/gempt-sonnet</button>
-              <span id="active-tier-ready-badge" class="inline-state-badge" hidden>未创建</span>
-            </div>
+            <strong class="route-tier-name">Antigravity MCP</strong>
             <span id="active-tier-effort" class="effort-tag"></span>
           </div>
 
           <div class="route-strip">
             <span class="route-path">
-              <strong id="source-title">Antigravity</strong>
+              <strong>Antigravity</strong>
               <span aria-hidden="true">→</span>
               <strong>Magpie</strong>
-              <span id="hub-mode-text"></span>
             </span>
-            <div id="source-actions" class="source-actions">
+            <div class="source-actions">
               <button id="copy-mcp-btn" type="button" class="pill-copy-btn">复制 MCP 配置</button>
               <button id="copy-rules-btn" type="button" class="pill-copy-btn">复制协作规则</button>
               <button id="active-slash-btn" type="button" class="pill-copy-btn" data-copy="/gempt " hidden>/gempt</button>
             </div>
-            <span id="native-client-caption" hidden></span>
           </div>
-          <ul id="route-chain" class="route-chain" aria-label="直连路由组成员" hidden></ul>
 
-          <section id="work-controls" class="work-controls" tabindex="-1" aria-labelledby="work-label" hidden>
+          <section id="work-controls" class="work-controls" tabindex="-1" aria-labelledby="work-label">
             <fieldset class="control-fieldset">
               <legend id="work-label" class="control-legend">普通对话 · 工作分工</legend>
               <div id="work-options" class="work-options"></div>
@@ -113,37 +93,43 @@
               </div>
             </fieldset>
             <fieldset class="control-fieldset">
-              <legend class="control-legend">原生 Swarm 派单</legend>
+              <legend class="control-legend">Swarm 协作模式</legend>
               <div class="seg-control swarm-dispatch">
                 <span class="seg-option">
-                  <input id="dispatch-swarm" class="seg-radio sr-only" type="radio" name="native_swarm" value="true" disabled>
-                  <label class="seg-label" for="dispatch-swarm">强制 Swarm（原生 worktree）</label>
+                  <input id="dispatch-direct" class="seg-radio sr-only" type="radio" name="native_swarm" value="false" disabled>
+                  <label class="seg-label" for="dispatch-direct">无壳 GemPT Swarm（默认）</label>
                 </span>
                 <span class="seg-option">
-                  <input id="dispatch-direct" class="seg-radio sr-only" type="radio" name="native_swarm" value="false" disabled>
-                  <label class="seg-label" for="dispatch-direct">直调 gpt_run</label>
+                  <input id="dispatch-swarm" class="seg-radio sr-only" type="radio" name="native_swarm" value="true" disabled>
+                  <label class="seg-label" for="dispatch-swarm">AGY 原生 Swarm（混编）</label>
                 </span>
               </div>
+              <span class="control-hint">默认使用无壳 GemPT Swarm（gpt_swarm / gpt_board）；需与 AGY 原生 Gemini/Claude 工位混编时可切到原生 Swarm。</span>
             </fieldset>
             <div class="swarm-settings">
               <div class="swarm-choice">
-                <label for="swarm-shell-model" class="control-legend">Swarm 工位模型</label>
-                <input id="swarm-shell-model" name="swarm_shell_model" list="swarm-shell-presets" maxlength="128" disabled>
-                <datalist id="swarm-shell-presets"></datalist>
+                <label for="execution-cli" class="control-legend">执行 CLI</label>
+                <select id="execution-cli" name="default_cli" aria-describedby="execution-cli-hint"></select>
+                <span id="execution-cli-hint" class="control-hint"></span>
               </div>
               <div class="swarm-choice">
                 <label for="swarm-split" class="control-legend">Swarm 工作分工</label>
                 <select id="swarm-split" name="swarm_split" aria-describedby="swarm-detail"></select>
                 <span id="swarm-detail" class="control-hint"></span>
               </div>
+              <div class="swarm-choice">
+                <label for="swarm-shell-model" class="control-legend">原生 Swarm 工位模型</label>
+                <input id="swarm-shell-model" name="swarm_shell_model" list="swarm-shell-presets" maxlength="128" disabled>
+                <datalist id="swarm-shell-presets"></datalist>
+              </div>
             </div>
             <fieldset id="pairing-controls" class="control-fieldset">
               <legend class="control-legend">Gemini 下属模型</legend>
               <div class="pairing-options" id="pairing-options"></div>
-              <span class="control-hint">从 Magpie 选择下属模型或路由组。Swarm 跟随协调者的配对。</span>
+              <span class="control-hint">从 Magpie 选择下属模型。Swarm 跟随协调者的配对。</span>
             </fieldset>
           </section>
-          <div id="mcp-controls-bar" class="route-controls">
+          <div class="route-controls">
             <fieldset id="sandbox-control-group" class="control-fieldset">
               <legend class="control-legend">Codex 执行权限</legend>
               <div class="seg-control">
@@ -213,8 +199,12 @@
                 <label class="advanced-field">排除模型<textarea id="excluded-models" rows="2" placeholder="用逗号或换行分隔"></textarea></label>
               </fieldset>
               <fieldset>
-                <legend>Codex 运行时与超时</legend>
+                <legend>执行 CLI 与超时</legend>
                 <label class="advanced-field">Codex CLI 路径<input id="codex-cli-path" spellcheck="false"></label>
+                <div class="runner-catalog">
+                  <span class="control-legend">已支持的 11 种执行 CLI</span>
+                  <ul id="runner-cli-list" class="runner-cli-list"></ul>
+                </div>
                 <label class="advanced-field">咨询超时（秒）<input id="consult-timeout" type="number" min="15" max="1800" step="1" required></label>
             <div class="control-fieldset timeout-form">
               <label for="codex-timeout" class="control-legend">执行超时（秒）</label>
@@ -254,87 +244,7 @@
               </fieldset>
             </form>
           </details>
-
-          <div id="native-controls-bar" class="native-controls" hidden>
-            <p class="control-hint">直连组按回合选模型。需要 Gemini 解说 GPT 的工作结果时，请使用 MCP 编排与工作分工。</p>
-            <p id="native-status-copy" class="native-copy">尚未在 Magpie 创建直连路由组，创建后可在任意客户端直接选 group/gempt-* 使用。</p>
-            <div id="native-ready-pills" class="native-ready-pills" hidden>
-              <button type="button" class="pill-copy-btn" data-copy="group/gempt-sonnet">group/gempt-sonnet</button>
-              <button type="button" class="pill-copy-btn" data-copy="group/gempt-opus">group/gempt-opus</button>
-              <button type="button" class="pill-copy-btn" data-copy="group/gempt-fable">group/gempt-fable</button>
-            </div>
-            <button id="create-native-btn" type="button" class="primary-btn" hidden>一键创建直连路由组</button>
-          </div>
         </article>
-      </section>
-
-      <section id="tiers-section" class="section" aria-labelledby="tiers-section-label" hidden>
-        <div class="section-head">
-          <span id="tiers-section-label" class="section-eyebrow">直连路由组档位</span>
-          <span class="section-meta">供其他 Agent / 客户端选用 · 点击切换预览</span>
-        </div>
-
-        <fieldset class="tier-fieldset">
-          <legend class="sr-only">预览直连路由组</legend>
-          <div id="tier-list" class="tier-list">
-            <label class="card tier-row" for="tier-sonnet" data-tier="sonnet">
-              <input id="tier-sonnet" class="tier-radio sr-only" type="radio" name="native_preview_tier" value="sonnet">
-              <span class="tier-bullet" aria-hidden="true"></span>
-              <span class="tier-body">
-                <span class="tier-line-top">
-                  <strong class="tier-title" data-field="short_name">Sonnet</strong>
-                  <code class="pill-code" data-field="target_pill">group/gempt-sonnet</code>
-                </span>
-                <span class="tier-line-sub" data-field="chain_summary">GPT-6.2-Sol</span>
-              </span>
-              <span class="tier-tail">
-                <span class="tier-when" data-field="role_desc">日常高频 · ~75%</span>
-                <span class="tier-effort-chip" data-field="effort_tag">未创建</span>
-                <svg class="tier-check" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                  <path d="M3.5 8.5L6.5 11.5L12.5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-              </span>
-            </label>
-
-            <label class="card tier-row" for="tier-opus" data-tier="opus">
-              <input id="tier-opus" class="tier-radio sr-only" type="radio" name="native_preview_tier" value="opus">
-              <span class="tier-bullet" aria-hidden="true"></span>
-              <span class="tier-body">
-                <span class="tier-line-top">
-                  <strong class="tier-title" data-field="short_name">Opus</strong>
-                  <code class="pill-code" data-field="target_pill">group/gempt-opus</code>
-                </span>
-                <span class="tier-line-sub" data-field="chain_summary">GPT-6.2-Sol ↗ 升级 GPT-6.2-Astra</span>
-              </span>
-              <span class="tier-tail">
-                <span class="tier-when" data-field="role_desc">复杂工程 · ~20%</span>
-                <span class="tier-effort-chip" data-field="effort_tag">未创建</span>
-                <svg class="tier-check" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                  <path d="M3.5 8.5L6.5 11.5L12.5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-              </span>
-            </label>
-
-            <label class="card tier-row" for="tier-fable" data-tier="fable">
-              <input id="tier-fable" class="tier-radio sr-only" type="radio" name="native_preview_tier" value="fable">
-              <span class="tier-bullet" aria-hidden="true"></span>
-              <span class="tier-body">
-                <span class="tier-line-top">
-                  <strong class="tier-title" data-field="short_name">Fable</strong>
-                  <code class="pill-code" data-field="target_pill">group/gempt-fable</code>
-                </span>
-                <span class="tier-line-sub" data-field="chain_summary">GPT-6.2-Astra</span>
-              </span>
-              <span class="tier-tail">
-                <span class="tier-when" data-field="role_desc">顶配攻坚 · ~5%</span>
-                <span class="tier-effort-chip" data-field="effort_tag">未创建</span>
-                <svg class="tier-check" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                  <path d="M3.5 8.5L6.5 11.5L12.5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-              </span>
-            </label>
-          </div>
-        </fieldset>
       </section>
 
       <div class="bottom-grid">
@@ -347,11 +257,6 @@
           </header>
 
           <div class="readiness-row" aria-label="各客户端就绪状态">
-            <button id="chip-native" type="button" class="status-chip" title="切换到路由组直连视图">
-              <span class="chip-dot" aria-hidden="true"></span>
-              <span class="chip-name">路由组直连</span>
-              <span id="chip-native-val" class="chip-val">0/3</span>
-            </button>
             <button id="chip-mcp" type="button" class="status-chip" title="点击复制独立 MCP JSON 配置">
               <span class="chip-dot" aria-hidden="true"></span>
               <span class="chip-name">内置 MCP 工具</span>
@@ -369,6 +274,7 @@
             </button>
           </div>
           <p id="app-server-error" class="app-server-error" hidden></p>
+          <p id="zero-cli-guide" class="zero-cli-guide control-hint" hidden></p>
           <details id="agy-setup" class="advanced-settings" hidden>
             <summary id="agy-setup-title">启用 Antigravity 集成</summary>
             <p class="control-hint">安装在运行 Magpie 的机器上。如果 Antigravity 在另一台机器，请在那台机器运行安装器。</p>
@@ -389,7 +295,7 @@
                   <strong>Chore</strong>
                   <code id="chore-model" class="pill-code">auto/deepseek-v4.1-flash</code>
                 </div>
-                <span id="chore-sub" class="utility-sub">仅咨询 · 自动压缩上下文</span>
+                <span id="chore-sub" class="utility-sub">仅咨询</span>
               </div>
             </div>
             <button type="button" class="icon-btn" data-copy="/gempt-chore " aria-label="复制 /gempt-chore" title="复制 /gempt-chore">
@@ -401,15 +307,6 @@
           </div>
 
           <div class="shortcut-stack">
-            <div id="strip-native-ids" class="slash-strip" aria-label="外部客户端直连模型 ID" hidden>
-              <span class="slash-label">直连模型 ID</span>
-              <div class="slash-buttons">
-                <button type="button" class="slash-btn" data-copy="group/gempt-sonnet">group/gempt-sonnet</button>
-                <button type="button" class="slash-btn" data-copy="group/gempt-opus">group/gempt-opus</button>
-                <button type="button" class="slash-btn" data-copy="group/gempt-fable">group/gempt-fable</button>
-              </div>
-            </div>
-
             <div id="strip-agy-slash" class="slash-strip" aria-label="Antigravity 单轮快捷指令" hidden>
               <span class="slash-label">Antigravity 单轮</span>
               <div class="slash-buttons">

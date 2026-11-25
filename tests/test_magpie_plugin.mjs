@@ -50,7 +50,7 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files, version }] = JSON.parse(stdout);
-  assert.equal(version, '0.7.1');
+  assert.equal(version, '0.8.0');
   const paths = files.map((file) => file.path);
   assert.deepEqual(paths.filter((path) => /^plugin\/skills\/[^/]+\/SKILL\.md$/.test(path)).sort(),
     ['plugin/skills/gempt-chore/SKILL.md', 'plugin/skills/gempt/SKILL.md']);
@@ -169,50 +169,40 @@ test('UI token-ratio card offers all ranges, shows observation states and has no
   }
 });
 
-test('UI shows tiers only for direct routing and offers exactly two Antigravity shortcuts', () => {
+test('UI shows a single MCP configuration and offers exactly two Antigravity shortcuts', () => {
   const html = readFileSync(join(REPO_ROOT, 'magpie_plugin', 'ui', 'index.html'), 'utf-8');
   const script = readFileSync(join(REPO_ROOT, 'magpie_plugin', 'ui', 'app.js'), 'utf-8');
-  assert.match(html, /<section id="tiers-section"[^>]*\bhidden>/);
+  assert.doesNotMatch(html, /name="view_mode"/);
+  assert.match(html, /<section id="work-controls"[^>]*aria-labelledby="work-label">/);
   const slashStrip = html.match(/<div id="strip-agy-slash"[\s\S]+?<\/div>/)?.[0];
   assert.ok(slashStrip);
   assert.deepEqual([...slashStrip.matchAll(/data-copy="([^"]+)"/g)].map((match) => match[1].trim()), ['/gempt', '/gempt-chore']);
   assert.match(html, /id="active-slash-btn"[^>]*data-copy="\/gempt\s*"/);
-  assert.doesNotMatch(html + script, /(?<!group)\/gempt-(?:sonnet|opus|fable)\b/);
+  assert.doesNotMatch(html + script, /\/gempt-(?:sonnet|opus|fable)\b/);
 
   const renderSource = script.match(/  function renderState\([\s\S]+?\r?\n  }/)?.[0];
   assert.ok(renderSource);
-  const elements = {
-    'tiers-section': { querySelectorAll: () => [] },
-    'strip-native-ids': {},
-    'strip-agy-slash': {},
-  };
-  const routeModes = [];
+  const shortcutStrip = {};
+  const renderedRoutes = [];
   const noop = () => {};
-  const renderTierRoutes = script.match(/  function renderTierRoutes\([\s\S]+?\r?\n  }/)?.[0];
-  assert.ok(renderTierRoutes);
-  const renderState = runInNewContext(`let latestState, currentViewMode, nativePreviewTier, onState, locateWork;\nconst pendingSettings = new Set();\n${renderSource}\n${renderTierRoutes}\nrenderState`, {
-    $: (id) => elements[id],
-    tr: (str, ...args) => args.length ? str.replace(/\{(\d+)\}/g, (_, i) => args[i]) : str,
+  const renderState = runInNewContext(`let latestState, onState, locateWork;\nconst pendingSettings = new Set();\n${renderSource}\nrenderState`, {
+    $: (id) => id === 'strip-agy-slash' ? shortcutStrip : null,
     root: { querySelectorAll: () => [] },
-    resolveEffectiveViewMode: (state) => state.mode,
     renderSetupBanner: noop,
     renderControls: noop,
     advanced: { render: noop },
     renderReadiness: noop,
-    renderActiveRoute: (_state, tier, mode) => routeModes.push([tier?.group_id, mode]),
+    renderActiveRoute: (state) => renderedRoutes.push(state),
     renderActivity: noop,
     syncHasFallbackClasses: noop,
     markUiReady: noop,
   });
-  const state = { default_tier: 'fable', clients: { antigravity_installed: true },
-    native_groups: { tiers: [{ id: 'fable', group_id: 'group/gempt-fable' }] } };
-  for (const mode of ['mcp', 'native', 'mcp']) {
-    renderState({ ...state, mode });
-    assert.equal(elements['tiers-section'].hidden, mode === 'mcp');
-    assert.equal(elements['strip-native-ids'].hidden, mode === 'mcp');
-    assert.equal(elements['strip-agy-slash'].hidden, mode === 'native');
+  for (const installed of [false, true]) {
+    const state = { clients: { antigravity_installed: installed } };
+    renderState(state);
+    assert.equal(shortcutStrip.hidden, !installed);
+    assert.equal(renderedRoutes.at(-1), state);
   }
-  assert.deepEqual(routeModes[1], ['group/gempt-fable', 'native']);
 });
 
 function startMockMagpie(modelsData, { onRequest } = {}) {
@@ -225,8 +215,8 @@ function startMockMagpie(modelsData, { onRequest } = {}) {
     { id: 'agy-cli/gemini-4-neon', owned_by: 'agy-cli' },
     { id: 'agy-cli/gemini-4-argon', owned_by: 'agy-cli' },
     { id: 'auto/deepseek-v4.1-flash', owned_by: 'magpie', magpie_label: 'DeepSeek · routing group' },
-    { id: 'group/gempt-harness-sonnet', owned_by: 'magpie' },
-    { id: 'group/gempt-sonnet', owned_by: 'magpie' },
+    { id: 'group/custom-worker', owned_by: 'magpie' },
+    { id: 'group/custom-consult', owned_by: 'magpie' },
     { id: 'opencode-go/gemini-4-argon', owned_by: 'opencode-go' },
   ];
 
@@ -306,38 +296,6 @@ function rawHttpGet({ port, path, headers = {} }) {
     req.on('error', rejectReq);
     req.end();
   });
-}
-
-function createMockMagpieCli(dir, logFile) {
-  const jsPath = join(dir, 'mock-magpie-cli.mjs');
-  writeFileSync(
-    jsPath,
-    `
-import { appendFileSync } from 'node:fs';
-const args = process.argv.slice(2);
-appendFileSync(${JSON.stringify(logFile)}, JSON.stringify(args) + '\\n', 'utf8');
-if (args[0] === 'group' && args[1] === 'show' && args[2] === 'gempt-sonnet') {
-  console.log('gempt-sonnet group/gempt-sonnet');
-  process.exit(0);
-}
-if (args[0] === 'group' && args[1] === 'show') {
-  console.error('magpie: no group "' + args[2] + '"');
-  process.exit(1);
-}
-process.exit(0);
-`,
-    'utf-8',
-  );
-
-  if (process.platform === 'win32') {
-    const cmdPath = join(dir, 'mock-magpie.cmd');
-    writeFileSync(cmdPath, `@echo off\r\n"${process.execPath}" "${jsPath}" %*\r\n`, 'utf-8');
-    return cmdPath;
-  }
-  const shPath = join(dir, 'mock-magpie.sh');
-  writeFileSync(shPath, `#!/usr/bin/env sh\nexec "${process.execPath}" "${jsPath}" "$@"\n`, 'utf-8');
-  chmodSync(shPath, 0o755);
-  return shPath;
 }
 
 const MOCK_THREAD = '01900000-0000-7000-8000-000000000001';
@@ -492,7 +450,7 @@ test('package.json Magpie manifest fields and single plugin factory export exist
     timeout: 10000,
     windowsHide: true,
   });
-  assert.deepEqual(JSON.parse(stdout.trim()), ['ask', 'ctl', 'run']);
+  assert.deepEqual(JSON.parse(stdout.trim()), ['ask', 'board', 'ctl', 'run', 'swarm']);
 });
 
 test('token-ratio scopes Antigravity usage to conversations with recent GemPT activity', async (t) => {
@@ -667,7 +625,7 @@ test('installed MCP snippets redact unlisted env values without modifying the co
   assert.equal(readFileSync(path, 'utf-8'), installed);
 });
 
-test('backend readState exposes multi-client state, native groups, MCP snippet, usage tail, and api_fallback', async () => {
+test('backend readState exposes multi-client state, gateway models, MCP snippet, and api_fallback', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'gempt-magpie-backend-'));
   const magpie = await startMockMagpie();
   try {
@@ -713,22 +671,6 @@ test('backend readState exposes multi-client state, native groups, MCP snippet, 
       JSON.stringify({ gempt: ['run', 'ask', 'ctl'] }),
       'utf-8',
     );
-    writeFileSync(
-      join(magpieDir, 'providers.json'),
-      JSON.stringify({
-        groups: [
-          { id: 'gempt-sonnet', members: ['agy-cli/gemini-4-hydrogen', 'codex/gpt-6.2-sol', 'auto/deepseek-v4.1-flash'], routing: 'order', rules: [] },
-        ],
-      }),
-      'utf-8',
-    );
-    writeFileSync(
-      join(magpieDir, 'usage.jsonl'),
-      `${JSON.stringify({ t: '2026-11-20T12:00:00Z', agent: 'Python-urllib', req: 'auto/deepseek-v4.1-flash', status: 200 })}\n`
-      + `${JSON.stringify({ t: '2026-11-20T12:01:00Z', agent: 'zcode', req: 'group/gempt-opus', provider: 'codex', model: 'gpt-6.2-sol', served: 'gpt-6.2-sol', status: 200 })}\n`,
-      'utf-8',
-    );
-
     writeFileSync(
       join(sessDir, 'consult-20261119-demo.json'),
       JSON.stringify({
@@ -778,22 +720,12 @@ test('backend readState exposes multi-client state, native groups, MCP snippet, 
     assert.match(state.rules_snippet, /gpt_ctl/);
     assert.ok(state.rules_snippet.trim().split(/\r?\n/).length <= 8);
 
-    assert.equal(state.native_groups.ready_count, 1);
-    assert.equal(state.native_groups.complete, false);
-    assert.equal(state.native_groups.can_create, true);
-    const fablePreview = state.native_groups.tiers.find((t) => t.id === 'fable');
-    assert.equal(fablePreview.installed, false);
-    assert.equal(fablePreview.members.some((m) => m.includes('gemini-4-argon')), false);
-
     assert.equal(state.mcp_snippet.config.mcpServers.gempt.args[0], join(REPO_ROOT, 'core', 'mcp-server.mjs'));
-    assert.equal(state.recent_group_calls.length, 1);
-    assert.equal(state.recent_group_calls[0].tier, 'opus');
-    assert.equal(state.recent_group_calls[0].agent, 'zcode');
     assert.equal(state.default_tier, 'opus');
     assert.equal(state.failover_mode, 'api_fallback');
     assert.equal(state.magpie.reachable, true);
     assert.equal(state.magpie.total_models, 9);
-    assert.deepEqual(state.magpie.harness_groups, ['group/gempt-harness-sonnet']);
+    assert.ok(state.magpie.models.includes('group/custom-worker'));
     assert.equal(state.recent_sessions.length, 1);
     assert.equal(state.recent_runs.length, 1);
     assert.equal(JSON.stringify(state).includes('sk-super-secret-value'), false);
@@ -817,14 +749,12 @@ test('backend readState exposes multi-client state, native groups, MCP snippet, 
   }
 });
 
-test('page server supports native groups and lossless failover round-trip with a unified MCP consultation', async () => {
+test('page server preserves custom tier model IDs through failover and forwards them in MCP consultations', async () => {
   const dir = resolvePath(mkdtempSync(join(tmpdir(), 'gempt-magpie-srv-')));
   const magpie = await startMockMagpie();
   const cfgPath = join(dir, 'config.json');
   const magpieDir = join(dir, 'magpie-cfg');
   mkdirSync(magpieDir, { recursive: true });
-  const cliLog = join(dir, 'cli-calls.jsonl');
-  const mockCli = createMockMagpieCli(dir, cliLog);
 
   const initialConfig = {
     version: 1,
@@ -833,35 +763,31 @@ test('page server supports native groups and lossless failover round-trip with a
     routing_policy: {
       default_tier: 'opus',
       failover_mode: 'api_fallback',
-      magpie_group_strategy: 'order',
       excluded_models: ['gemini-4-argon'],
     },
     tiers: {
       sonnet: {
-        consult_model: 'group/gempt-harness-sonnet',
-        exec_model: 'group/gempt-harness-sonnet',
+        consult_model: 'group/custom-consult',
+        exec_model: 'group/custom-worker',
         reasoning_effort: 'medium',
         api_mode: 'responses',
         fallback_models: ['openai/gpt-6.1-sol'],
-        magpie_group_members: ['codex/gpt-6.2-sol', 'openai/gpt-6.1-sol'],
       },
       opus: {
-        consult_model: 'group/gempt-harness-opus',
-        exec_model: 'group/gempt-harness-opus',
+        consult_model: 'group/custom-consult',
+        exec_model: 'group/custom-worker',
         escalate_model: 'codex/gpt-6.2-astra',
         escalate_effort_threshold: 'high',
         reasoning_effort: 'medium',
         api_mode: 'responses',
         fallback_models: ['openai/gpt-6.1-sol'],
-        magpie_group_members: ['codex/gpt-6.2-sol', 'codex/gpt-6.2-astra', 'openai/gpt-6.1-sol', 'openai/gpt-6-astra'],
       },
       fable: {
-        consult_model: 'group/gempt-harness-fable',
-        exec_model: 'group/gempt-harness-fable',
+        consult_model: 'codex/gpt-6.2-astra',
+        exec_model: 'codex/gpt-6.2-astra',
         reasoning_effort: 'high',
         api_mode: 'responses',
         fallback_models: ['openai/gpt-6-astra'],
-        magpie_group_members: ['codex/gpt-6.2-astra', 'openai/gpt-6-astra'],
       },
     },
     utility: { model: 'auto/deepseek-v4.1-flash', api_mode: 'chat' },
@@ -875,7 +801,6 @@ test('page server supports native groups and lossless failover round-trip with a
     magpieConfigDir: magpieDir,
     antigravityPluginDir: join(dir, 'missing-agy'),
     agyBinDir: join(dir, 'bin'),
-    magpieCliPath: mockCli,
     mcpToolsEnabled: false,
   });
   const origin = `http://127.0.0.1:${svc.port}`;
@@ -910,7 +835,6 @@ test('page server supports native groups and lossless failover round-trip with a
     const pageRes = await rawHttpGet({ port: svc.port, path: '/', headers: { 'sec-fetch-mode': 'navigate' } });
     assert.equal(pageRes.status, 200);
     assert.match(pageRes.text, /<meta name="color-scheme" content="light dark">/);
-    assert.match(pageRes.text, /id="create-native-btn"/);
     assert.match(pageRes.text, /id="effort-control-group"/);
     const key = pageRes.text.match(/<meta name="gempt-key" content="([^"]+)">/)[1];
     const installUrl = `${origin}/api/install-agy`;
@@ -932,18 +856,6 @@ test('page server supports native groups and lossless failover round-trip with a
     const directState = await readState({ configPath: cfgPath, sessionsDir: join(dir, 'sessions'),
       magpieConfigDir: magpieDir, antigravityPluginDir: join(dir, 'missing-agy') });
     assert.equal(directState.tools.enabled, false);
-
-    // Native groups idempotent creation
-    const nativeRes = await fetch(`${origin}/api/native-groups`, {
-      method: 'POST',
-      headers: { Origin: 'null', 'x-gempt-key': key },
-    });
-    assert.equal(nativeRes.status, 200);
-    const nativeJson = await nativeRes.json();
-    assert.equal(nativeJson.ok, true);
-    assert.deepEqual(nativeJson.skipped, ['group/gempt-sonnet']);
-    assert.deepEqual(nativeJson.created, ['group/gempt-opus', 'group/gempt-fable']);
-    assert.equal(nativeJson.models.argon.includes('gemini-4-argon'), false);
 
     // Switch api_fallback -> subscription_only
     const toSubRes = await fetch(`${origin}/api/settings`, {
@@ -981,10 +893,12 @@ test('page server supports native groups and lossless failover round-trip with a
     const restored = JSON.parse(readFileSync(cfgPath, 'utf-8'));
     assert.equal(restored.routing_policy.failover_mode, 'api_fallback');
     assert.equal(restored.routing_policy.api_fallback_snapshot, undefined);
-    assert.equal(restored.tiers.opus.consult_model, 'group/gempt-harness-opus');
+    assert.equal(restored.tiers.opus.consult_model, 'group/custom-consult');
+    assert.equal(restored.tiers.opus.exec_model, 'group/custom-worker');
     assert.deepEqual(restored.tiers.opus.fallback_models, ['openai/gpt-6.1-sol']);
-    assert.deepEqual(restored.tiers.opus.magpie_group_members, initialConfig.tiers.opus.magpie_group_members);
     assert.equal(restored.magpie.api_key, 'sk-keep-me');
+    await ask.execute({ goal: 'Check the custom consult model.', tier: 'sonnet' });
+    assert.equal(magpie.requests.at(-1).body.model, 'group/custom-consult');
 
     const postAutoOn = await fetch(`${origin}/api/settings`, {
       method: 'POST',
@@ -1275,7 +1189,7 @@ test('history API paginates GemPT dispatches, correlates exec receipts and retur
   saveSession('consult-invalid', { mode: 'exec', turns: [{ goal: 'invalid mode' }] });
   writeFileSync(join(sessionsDir, 'exec-broken.json'), '{');
   writeFileSync(join(magpieConfigDir, 'usage.jsonl'), JSON.stringify({
-    req: 'group/gempt-sonnet', served: 'codex/direct-marker', status: 200, t: stamp(18), session: consult,
+    req: 'group/custom-consult', served: 'codex/unrelated-model', status: 200, t: stamp(18), session: consult,
   }) + '\n');
 
   const svc = await startServer({ port: 0, configPath, sessionsDir, magpieConfigDir,
@@ -1320,8 +1234,8 @@ test('history API paginates GemPT dispatches, correlates exec receipts and retur
   assert.deepEqual(filtered.facets.workspace, [{ value: beta, count: 1 }]);
   assert.equal(filtered.summary.cache_read_tokens, 30);
   assert.equal((await json('/api/requests?status=retried')).total, 1);
-  assert.equal((await json('/api/requests?q=direct-marker')).total, 0);
-  assert.equal((await json('/api/sessions?q=direct-marker')).total, 0);
+  assert.equal((await json('/api/requests?q=unrelated-model')).total, 0);
+  assert.equal((await json('/api/sessions?q=unrelated-model')).total, 0);
   const legacy = await json('/api/requests/consult-legacy%3A1');
   assert.equal(legacy.timestamp, stamp(8));
   assert.equal(legacy.elapsed_sec, null);
@@ -1372,7 +1286,6 @@ test('history API paginates GemPT dispatches, correlates exec receipts and retur
 
   const state = await json('/api/state');
   assert.deepEqual(state.activity_totals, { requests: 19, sessions: 11, runs: 9 });
-  assert.equal(state.recent_group_calls[0].req, 'group/gempt-sonnet');
   assert.equal(state.recent_runs.length, 6);
   assert.ok(state.recent_sessions.length <= 6);
 });
@@ -1420,7 +1333,7 @@ async function activityFixture(t) {
 test('gateway calls enrich GemPT turns one-to-many, isolate routes and reuse a growing ledger', async (t) => {
   const f = await activityFixture(t);
   const stamp = (second) => new Date(Date.UTC(2026, 9, 15, 12, 0, second)).toISOString();
-  const model = 'codex/original';
+  const model = 'group/custom-worker';
   const thread = 'codex-thread-test';
   f.session('exec-gateway', { mode: 'exec', model, codex_thread_id: thread, turns: [
     { goal: 'first turn', timestamp: stamp(20), elapsed_sec: 10 },
@@ -1440,7 +1353,7 @@ test('gateway calls enrich GemPT turns one-to-many, isolate routes and reuse a g
   f.ledger([first, second,
     row(1003, 31, { session_id: thread, cache_write: 0, cost_usd: .5, tokens_per_sec: 9 }),
     row(1004, 13, { session: 'other-thread', cost: 44 }),
-    row(1005, 17, { session: thread, req: 'group/gempt-sonnet', cost: 44 }),
+    row(1005, 17, { session: thread, req: 'group/unrelated-worker', cost: 44 }),
     row(1006, 43, { session: thread, cost: 44 }),
     row(1007, 17, { session: thread, agent: 'codex', ep: '/backend-api/codex/responses', cost: 44 }),
     row(1008, 48, { status: 429, cost: .01 }),
@@ -1888,18 +1801,21 @@ test('native Magpie tools: discover, status, consult (zero-config + resume + sec
     const host = { configPath: cfgPath, sessionsDir: sessDir, magpieConfigDir: magpieDir,
       env: { ...env, GEMPT_MAGPIE_TOOLS_EXEC: '0', GEMPT_GPT_RUN_SYNC_SEC: '0' } };
     const unified = createGemptTools(host);
-    assert.deepEqual(Object.keys(unified).sort(), ['ask', 'ctl', 'run']);
-    for (const { name, inputSchema } of TOOLS.slice(0, 3)) {
+    assert.deepEqual(Object.keys(unified).sort(), ['ask', 'board', 'ctl', 'run', 'swarm']);
+    for (const { name, inputSchema } of TOOLS) {
       assert.deepEqual(unified[name.slice(4)].args, inputSchema);
     }
     for (const access of [undefined, 'change']) {
       await assert.rejects(unified.run.execute({ access, goal: 'Edit', cwd: repoDir }), /disabled/);
     }
-    const inspection = await unified.run.execute({ access: 'inspect', goal: 'Inspect the project', cwd: repoDir });
+    config.tiers.sonnet.exec_model = 'group/custom-worker';
+    writeFileSync(cfgPath, JSON.stringify(config));
+    const inspection = await unified.run.execute({ access: 'inspect', goal: 'Inspect the project', cwd: repoDir, tier: 'sonnet' });
     assert.ok(inspection.wait_command);
     const inspected = await waitForRun(inspection.run_id, { sessionsDir: sessDir, timeoutSec: 5 });
     assert.equal(inspected.state, 'finished', inspected.error);
     assert.equal(inspected.sandbox, 'read-only');
+    assert.equal(app.packets.findLast((p) => p.method === 'turn/start').params.model, 'group/custom-worker');
     const ask = await unified.ask.execute({ goal: 'Review the project', cwd: repoDir, tier: 'sonnet' });
     assert.ok(ask.text && ask.session_id);
     const status = await unified.ctl.execute({ action: 'status', run_id: inspection.run_id });
@@ -2518,7 +2434,7 @@ test('mcpTools false disables duplicate Magpie GemPT tool registration', async (
 
 test('Magpie marketplace check shape and inspect+share guard hold', async () => {
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '0.7.1');
+  assert.equal(pkg.version, '0.8.0');
   assert.ok(pkg.keywords.includes('magpie-plugin'));
   assert.ok(pkg.files.includes('THIRD_PARTY_LICENSES.txt'));
   assert.ok(pkg.magpie?.summary?.en && pkg.magpie?.summary?.zh);

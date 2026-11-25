@@ -61,6 +61,33 @@ export function mountAdvancedSettings($, { transport, showToast, refresh, refres
     $('codex-cli-status').textContent = state.codex_cli_available
       ? tr('Codex CLI 可用 · {0}', state.codex_cli_resolved_path)
       : tr('未找到 Codex CLI');
+    const runnerList = $('runner-cli-list');
+    if (runnerList && Array.isArray(state.runners)) {
+      runnerList.replaceChildren(...state.runners.map((runner) => {
+        const li = document.createElement('li');
+        li.className = 'runner-cli-item';
+        li.dataset.cli = runner.id;
+        li.dataset.available = String(Boolean(runner.available));
+        const head = document.createElement('div');
+        head.className = 'runner-cli-head';
+        const title = document.createElement('strong');
+        title.textContent = `${runner.label}`;
+        const idCode = document.createElement('code');
+        idCode.className = 'pill-code';
+        idCode.textContent = runner.id;
+        const badge = document.createElement('span');
+        badge.className = 'inline-state-badge';
+        badge.dataset.tone = runner.available ? 'ok' : 'neutral';
+        badge.textContent = runner.available ? tr('已安装') : tr('未安装');
+        head.append(title, idCode, badge);
+        const detail = document.createElement('span');
+        detail.className = 'control-hint runner-cli-detail';
+        detail.textContent = runner.available ? runner.path : runner.install_hint;
+        detail.title = detail.textContent;
+        li.append(head, detail);
+        return li;
+      }));
+    }
     renderModels(probe?.reachable ? probe.models : state.magpie.models || []);
     renderProbe();
     updateButtons();

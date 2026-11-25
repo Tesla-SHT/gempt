@@ -9,88 +9,30 @@ import { readActiveRuns } from './activity.mjs';
 import { defaultGatewayFromEnv, resolveMagpieApiKey } from '../../core/magpie.mjs';
 import { appServerStatePath, connectAppServer } from './app-server-client.mjs';
 import { launchAppServer, matchesAppServerProcess, pidAlive, terminateAppServer, waitForProcessExit } from './app-server-process.mjs';
-import { codexAppServerExtraArgs, expandUser, readJsonSafe, resolveConfigPath } from '../../core/config.mjs';
+import { codexAppServerExtraArgs, readJsonSafe, resolveConfigPath } from '../../core/config.mjs';
+import { findExecutable, resolveExecutableInvocation } from '../../core/runners/detect.mjs';
 import { interruptRun as interruptCoreRun } from '../../core/runs.mjs';
 
 const STRIPPED_ENV = ['CODEX_WINDOWS_REGISTERED_CORE', 'CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY', 'CODEX_APP_TOOLS_PIPE_PATH',
   'CODEX_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_TOOL_CALL_ID', 'GEMPT_APP_SERVER_GATEWAY_TOKEN'];
 
-function executable(candidates) {
-  return candidates.find((candidate) => {
-    try {
-      accessSync(candidate, constants.X_OK);
-      return statSync(candidate).isFile();
-    } catch { return false; }
-  });
-}
-
-function nvmNodeBinDirs(home) {
-  const root = join(home, '.nvm', 'versions', 'node');
-  try {
-    return readdirSync(root, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => entry.name)
-      .sort((a, b) => b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' }))
-      .map((name) => join(root, name, 'bin'));
-  } catch {
-    return [];
-  }
-}
-
 export function findCodexCli(configuredPath = '', env = process.env, { platform = process.platform, home = homedir() } = {}) {
-  const dirs = String(env.PATH || env.Path || '').split(delimiter).filter(Boolean);
-  const candidates = [configuredPath, env.CODEX_CLI_PATH, env.CODEX_BIN].filter(Boolean).flatMap((entry) => {
-    const path = expandUser(entry);
-    return [path, ...(basename(path) === path ? dirs.map((dir) => join(dir, path)) : [])];
+  return findExecutable({
+    configuredPath,
+    envVars: ['CODEX_CLI_PATH', 'CODEX_BIN'],
+    binaryNames: ['codex'],
+    env,
+    platform,
+    home,
   });
-  const names = platform === 'win32' ? ['codex.exe', 'codex.cmd', 'codex.ps1', 'codex'] : ['codex'];
-  dirs.push(join(home, '.local', 'bin'));
-  if (platform !== 'win32') {
-    dirs.push(
-      '/opt/homebrew/bin',
-      '/usr/local/bin',
-      join(home, '.volta', 'bin'),
-      join(home, '.npm-global', 'bin'),
-      join(home, '.fnm', 'current', 'bin'),
-      ...nvmNodeBinDirs(home),
-    );
-  }
-  if (env.APPDATA) dirs.push(join(env.APPDATA, 'npm'));
-  const found = executable([...candidates, ...dirs.flatMap((dir) => names.map((name) => join(dir, name)))]);
-  return found ? resolve(found) : '';
 }
 
 export function resolveCodexInvocation(cli, env = process.env, platform = process.platform) {
-  if (platform !== 'win32' || !/\.(cmd|ps1|bat)$/i.test(cli)) return [cli];
-  const directory = dirname(cli);
-  const findNode = () => executable([join(directory, 'node.exe'), ...(env.PATH || env.Path || '').split(delimiter)
-    .filter(Boolean).map((dir) => join(dir, 'node.exe'))]);
-  const npmEntry = join(directory, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
-  if (existsSync(npmEntry)) {
-    const node = findNode();
-    if (node) return [node, npmEntry];
-  }
-  try {
-    const shim = readFileSync(cli, 'utf8');
-    const match = shim.match(/(?:%~dp0|%dp0%|\$basedir)[\\/]+([^\r\n"']+?\.(?:js|mjs|cjs|exe))/i);
-    if (match?.[1]) {
-      const target = resolve(directory, match[1].replaceAll('\\', '/'));
-      if (existsSync(target)) {
-        if (/\.exe$/i.test(target)) return [target];
-        const node = findNode();
-        if (node) return [node, target];
-      }
-    }
-  } catch { /* Fall through to shell launcher. */ }
-  if (/\.ps1$/i.test(cli)) {
-    const ps = executable([join(env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')]);
-    if (ps) return [ps, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', cli];
-  }
-  const comspec = env.ComSpec || join(env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe');
-  if (/\.(cmd|bat)$/i.test(cli) && existsSync(comspec)) {
-    return [comspec, '/d', '/s', '/c', cli];
-  }
-  throw new Error(`Cannot resolve the Windows Codex shim (${cli}) to Node, @openai/codex, or a shell launcher.`);
+  return resolveExecutableInvocation(cli, {
+    env,
+    platform,
+    npmEntryRelative: join('node_modules', '@openai', 'codex', 'bin', 'codex.js'),
+  });
 }
 
 function invocation(cli, env) {
@@ -351,9 +293,9 @@ export function createAppServerManager({
       }
       clearPublished('stopped');
     }
-    const cli = findCodexCli(raw.codex?.cli_path, env);
+    const cli = findCodexCli(raw.execution?.cli_paths?.codex || raw.codex?.cli_path, env);
     if (!cli) {
-      error = '未找到 Codex CLI，共享 app-server 未启动。gempt_ask 与 Magpie 原生路由组仍可使用。';
+      error = '未找到 Codex CLI，共享 app-server 未启动。gempt_ask 仍可使用。';
       cleanup();
       return;
     }
