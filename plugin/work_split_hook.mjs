@@ -3,7 +3,7 @@ import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, 
 import { basename, dirname, extname, join } from 'node:path';
 
 const runtime = existsSync(new URL('./runtime/core/host-context.mjs', import.meta.url)) ? './runtime/' : '../';
-const [{ WORKLOAD }, { readHostContext, updateHostContext }, { atomicJson, resolvePath, withLock }, backend, { getNativeSwarmPolicy }] = await Promise.all([
+const [{ WORKLOAD }, { readHostContext, updateHostContext }, { atomicJson, resolvePath, withLock }, backend, { GEMPT_VERSION, getNativeSwarmPolicy }] = await Promise.all([
   import(`${runtime}core/assets.mjs`), import(`${runtime}core/host-context.mjs`),
   import(`${runtime}core/state.mjs`), import(`${runtime}magpie_plugin/lib/backend.mjs`), import(`${runtime}core/config.mjs`),
 ]);
@@ -262,7 +262,9 @@ async function handle(payload) {
     }
     if (name === 'call_mcp_tool') {
       if (input.ServerName !== 'gempt_gempt') return allow;
-      if (input.ToolName === 'gpt_run' && nativeSwarm) {
+      const dispatchesSwarm = input.ToolName === 'gpt_swarm'
+        && ['add', 'title', 'plan'].includes(String(input.Arguments?.action || '').trim());
+      if (nativeSwarm && (input.ToolName === 'gpt_run' || dispatchesSwarm)) {
         return { decision: 'deny', reason: swarmDispatch };
       }
       if (['gpt_run', 'gpt_ask', 'gpt_swarm', 'gpt_board'].includes(input.ToolName)) {
@@ -307,7 +309,7 @@ async function handle(payload) {
   if (hookEventName === 'SessionStart') {
     if (pct <= 0 && !nativeSwarm) return {};
     if (!await updateState(conversationId, rememberRouting)) return {};
-    return { injectSteps: [step(`GemPT v2 active: ${ordinary} (${pct}% GPT${family ? `, family=${family}` : ''}${isSwarm ? ', swarm' : ''}).\n`
+    return { injectSteps: [step(`GemPT v${GEMPT_VERSION} active: ${ordinary} (${pct}% GPT${family ? `, family=${family}` : ''}${isSwarm ? ', swarm' : ''}).\n`
       + (nativeSwarm ? `Delegate via native Swarm (model=${routing.swarm_shell_model}).`
         : 'Use gpt_swarm and gpt_board for workers, gpt_run for single tasks, and the returned gempt-wait command.'))] };
   }

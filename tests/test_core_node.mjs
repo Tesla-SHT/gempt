@@ -16,7 +16,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { installAgy, resolveNodeExecutable, stagePluginBundle, syncInPlace, validatePluginBundle } from '../core/agy-install.mjs';
-import { buildTierView, setEffortSettings } from '../core/config.mjs';
+import { buildTierView, GEMPT_VERSION, setEffortSettings } from '../core/config.mjs';
 import { assertSafeOutDir } from '../scripts/build-agy-plugin.mjs';
 import { contextPath, readHostContext, updateHostContext } from '../core/host-context.mjs';
 import { handleSwarmAction, handleBoardAction } from '../core/swarm-engine.mjs';
@@ -239,7 +239,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const bridge = join(target, 'work_split_hook.py');
   assert.equal(readFileSync(bridge, 'utf8').trimEnd().split('\n').length, 7);
   assert.ok(!existsSync(join(target, 'runtime', 'gempt')));
-  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.8.1' });
+  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.9.0' });
   const bundledSkills = new URL('../plugin/skills/', import.meta.url);
   assert.deepEqual(readdirSync(bundledSkills).sort(), ['gempt', 'gempt-chore']);
   assert.deepEqual(readdirSync(join(target, 'skills')).sort(), ['gempt', 'gempt-chore']);
@@ -259,7 +259,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const initialized = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' },
   }) });
-  assert.equal(initialized.result.serverInfo.version, '0.8.1');
+  assert.equal(initialized.result.serverInfo.version, '0.9.0');
   assert.equal(initialized.result.capabilities.resources, undefined);
   const listedResources = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'resources/list',
@@ -285,7 +285,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const hookResult = process.platform === 'win32'
     ? jsonProcess(command, [join(target, 'work_split_hook.mjs')], { cwd: f.root, env, input: '{"hookEventName":"SessionStart"}' })
     : jsonProcess('sh', ['-c', hook], { cwd: f.root, env, input: '{"hookEventName":"SessionStart"}' });
-  assert.match(hookResult.injectSteps[0].systemMessage.systemMessage, /GemPT v2 active/);
+  assert.ok(hookResult.injectSteps[0].systemMessage.systemMessage.startsWith(`GemPT v${GEMPT_VERSION} active:`));
   await t.test('cached Python hook forwards SessionStart to Node', (t) => {
     const python = [process.env.PYTHON_BIN, 'python3', 'python'].filter(Boolean)
       .find((candidate) => spawnSync(candidate, ['-I', '-c', 'import sys'], { windowsHide: true }).status === 0);
@@ -1360,13 +1360,13 @@ test('Live run list defaults to an empty unbound session and can list all worksp
   assert.equal(scoped.scope, 'session');
   assert.equal(scoped.unbound_session, true);
   assert.deepEqual(scoped.runs, []);
-  assert.equal(scoped.app_server.version, '0.8.1');
+  assert.equal(scoped.app_server.version, '0.9.0');
 
   const all = await runLiveOperation('runs', { scope: 'all' }, opts);
   assert.equal(all.scope, 'all');
   assert.equal(all.unbound_session, false);
   assert.deepEqual(all.runs.map(({ run_id }) => run_id).sort(), [first, second]);
-  assert.equal(all.app_server.version, '0.8.1');
+  assert.equal(all.app_server.version, '0.9.0');
 });
 
 test('Live binds normalized workspaces and never selects another run for a filtered explicit ID', async (t) => {
@@ -1529,7 +1529,7 @@ test('standalone NDJSON MCP exposes only core tools without legacy MCP App resou
   const started = await request('initialize', { protocolVersion: '2026-test' });
   assert.equal(started.result.protocolVersion, '2026-test');
   assert.equal(started.result.serverInfo.name, 'gempt');
-  assert.equal(started.result.serverInfo.version, '0.8.1');
+  assert.equal(started.result.serverInfo.version, '0.9.0');
   assert.deepEqual(started.result.capabilities, { tools: { listChanged: false } });
   send({ method: 'notifications/initialized' });
   assert.deepEqual((await request('ping')).result, {});
@@ -2096,6 +2096,16 @@ test('Coordinator detects Swarm tools without a host flag and inherits the coord
   const denied = mcp('gpt_run');
   assert.equal(denied.decision, 'deny');
   assert.match(denied.reason, /workspace="share".*"inherit".*plan.json.*--host coordinator --title <name> --goal -/);
+  const shellFreeSwarm = (args, fields) => tool('call_mcp_tool', {
+    ServerName: 'gempt_gempt', ToolName: 'gpt_swarm', Arguments: args,
+  }, fields);
+  for (const action of ['add', 'title', 'plan']) {
+    assert.deepEqual(shellFreeSwarm({ action }), denied, action);
+  }
+  for (const args of [{}, ...['status', 'kill', 'model', 'channel'].map((action) => ({ action }))]) {
+    assert.equal(shellFreeSwarm(args).decision, 'allow', args.action ?? 'omitted action');
+  }
+  assert.equal(shellFreeSwarm({ action: 'add' }, { lastUserInput: '不用 swarm' }).decision, 'allow');
   assert.equal(mcp('gpt_ask').decision, 'allow');
   assert.equal(mcp('gpt_ctl').decision, 'allow');
   assert.equal(mcp('gpt_run', { lastUserInput: '不用 swarm' }).decision, 'allow');

@@ -286,7 +286,7 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files, version }] = JSON.parse(stdout);
-  assert.equal(version, '0.8.1');
+  assert.equal(version, '0.9.0');
   const paths = files.map((file) => file.path);
   assert.deepEqual(paths.filter((path) => /^plugin\/skills\/[^/]+\/SKILL\.md$/.test(path)).sort(),
     ['plugin/skills/gempt-chore/SKILL.md', 'plugin/skills/gempt/SKILL.md']);
@@ -2678,7 +2678,7 @@ test('mcpTools false disables duplicate Magpie GemPT tool registration', async (
 
 test('Magpie marketplace check shape and inspect+share guard hold', async () => {
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '0.8.1');
+  assert.equal(pkg.version, '0.9.0');
   assert.ok(pkg.keywords.includes('magpie-plugin'));
   assert.ok(pkg.files.includes('THIRD_PARTY_LICENSES.txt'));
   assert.ok(pkg.magpie?.summary?.en && pkg.magpie?.summary?.zh);

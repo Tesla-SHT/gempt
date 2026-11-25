@@ -1,4 +1,4 @@
-# GemPT — Antigravity Plugin (v0.8.1)
+# GemPT — Antigravity Plugin (v0.9.0)
 
 GemPT lets Gemini in Antigravity consult GPT models (`gpt_ask`), delegate repository inspection and coding tasks to Codex (`gpt_run`), and monitor or steer live runs in the **GemPT** side pane (`gpt_ctl`), routed through your local [Magpie](https://github.com/yetone/magpie) gateway.
 
@@ -8,13 +8,13 @@ Use **Plugins → GemPT** in Magpie to pair Hydrogen, Neon, and Carbon with any 
 
 1. **Node.js `>= 20.11.0`** available on `PATH`.
 2. **Magpie `>= 0.1.1340`** running locally (default `http://127.0.0.1:3425`) with a signed-in ChatGPT/Codex subscription (or API fallback configured).
-3. **Magpie-side GemPT plugin** installed — search for **GemPT** in the Magpie Plugin Marketplace or run `magpie plugin add github:yizhang-dream/gempt#v0.8.1` (`gempt` is not yet published on the npm registry) — and **Codex CLI** (`@openai/codex`) installed if you use `gpt_run` for repository execution.
+3. **Magpie-side GemPT plugin** installed — search for **GemPT** in the Magpie Plugin Marketplace or run `magpie plugin add github:yizhang-dream/gempt#v0.9.0` (`gempt` is not yet published on the npm registry) — and **Codex CLI** (`@openai/codex`) installed if you use `gpt_run` for repository execution.
 4. **Git** on `PATH` if you use `workspace="share"` for parallel isolated worktrees.
 
 ## Install & Upgrade
 
-- **Magpie side**: install or update **GemPT** from the Magpie Plugin Marketplace, or run `magpie plugin add github:yizhang-dream/gempt#v0.8.1`.
-- **Antigravity side**: run `npx --yes github:yizhang-dream/gempt#v0.8.1 install-agy` (or build a portable bundle locally with `npm run build:agy-plugin`).
+- **Magpie side**: install or update **GemPT** from the Magpie Plugin Marketplace, or run `magpie plugin add github:yizhang-dream/gempt#v0.9.0`.
+- **Antigravity side**: run `npx --yes github:yizhang-dream/gempt#v0.9.0 install-agy` (or build a portable bundle locally with `npm run build:agy-plugin`).
 
 ## What This Bundle Includes
 
