@@ -37,6 +37,21 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
   const remaining = () => Math.max(1, deadline - (pausedAt ?? Date.now()));
   const directory = dirname(runFile);
   const record = JSON.parse(readFileSync(runFile, 'utf8'));
+  const cacheSwarmId = swarmId || record.swarm_id;
+  async function registerCache(threadId, parentThreadId, resume) {
+    if (!state.proxy_port || !(parentThreadId || resume || cacheSwarmId)) return;
+    const port = state.proxy_port;
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid Codex proxy port.');
+    const ipc = readJsonSafe(join(dirname(resolveConfigPath(configPath)), `page-server-${port}.ipc`));
+    if (!ipc?.token || ipc.port !== port) throw new Error('Codex proxy registration unavailable.');
+    const response = await fetch(`http://127.0.0.1:${port}/api/internal/cache-key`, {
+      method: 'POST', redirect: 'error', signal: AbortSignal.timeout(Math.min(5000, remaining())),
+      headers: { 'content-type': 'application/json', 'x-gempt-ipc-token': ipc.token },
+      body: JSON.stringify({ threadId, parentThreadId, resume, runId: record.run_id, swarmId: cacheSwarmId, model }),
+    });
+    await response.arrayBuffer();
+    if (!response.ok) throw new Error(`Codex proxy registration failed (HTTP ${response.status}).`);
+  }
   record.cli = 'codex';
   record.execution_timeout_sec = timeoutSec;
   record.deadline = deadline / 1000;
@@ -345,19 +360,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     if (threadId && thread.thread.id !== threadId) throw new Error('Codex returned a different thread on resume.');
     const actual = confirmedSandbox(thread);
     const parentThreadId = nativeFork && record.fork_mode === 'native' ? nativeFork.id : null;
-    if (state.proxy_port && (parentThreadId || (!threadId && swarmId))) {
-      const port = state.proxy_port;
-      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid Codex proxy port.');
-      const ipc = readJsonSafe(join(dirname(resolveConfigPath(configPath)), `page-server-${port}.ipc`));
-      if (!ipc?.token || ipc.port !== port) throw new Error('Codex proxy registration unavailable.');
-      const response = await fetch(`http://127.0.0.1:${port}/api/internal/cache-key`, {
-        method: 'POST', redirect: 'error', signal: AbortSignal.timeout(Math.min(5000, remaining())),
-        headers: { 'content-type': 'application/json', 'x-gempt-ipc-token': ipc.token },
-        body: JSON.stringify({ threadId: thread.thread.id, parentThreadId, swarmId, model }),
-      });
-      await response.arrayBuffer();
-      if (!response.ok) throw new Error(`Codex proxy registration failed (HTTP ${response.status}).`);
-    }
+    await registerCache(thread.thread.id, parentThreadId, Boolean(threadId));
     record.sandbox = Object.keys(SANDBOX_TYPES)[actual];
     record.model = model;
     if (sandboxUpgraded) record.sandbox_upgraded = true;
@@ -416,6 +419,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
           const resumed = await client.request('thread/resume', { ...common, threadId: progress.thread_id });
           if (resumed.thread?.id !== progress.thread_id) throw new Error('Codex returned a different thread on rejoin.');
           confirmedSandbox(resumed);
+          await registerCache(progress.thread_id, null, true);
           turn = resumed.thread.turns?.find((entry) => entry.id === progress.turn_id);
           if (!terminalTurn(turn)) turn = await completion;
         }

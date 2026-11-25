@@ -17,6 +17,7 @@ import { findCodexCli } from './app-server-manager.mjs';
 import { TurnInterrupted } from './app-server-run.mjs';
 import { detectAvailableRunners, getRunner, resolveRunnerId } from '../../core/runners/registry.mjs';
 import { listActiveRoster } from '../../core/runs.mjs';
+import { upsertRunLineage } from '../../core/swarm-bus.mjs';
 import { validateSessionId } from '../../core/state.mjs';
 import { TOOLS } from '../../core/tool-schemas.mjs';
 import { CLI_CHOICES, codexAppServerExtraArgs, getMcpEffort, getPairing, hasRuntimeConfig, isPairingModelId } from '../../core/config.mjs';
@@ -1307,6 +1308,9 @@ export function createExecutionTools({
           }, { sessionsDir: resolvedSessionsDir, expectedRun: args.run_id });
         }
         const source = swarmFork?.source;
+        const recordIdentity = (patch) => upsertRunLineage({ run_id: args.run_id, session_id: sessionId,
+          cli: resolvedCli, model: targetModel, ...patch }, { sessionsDir: resolvedSessionsDir });
+        recordIdentity({});
         const nativeFork = !priorSession && source?.cli === resolvedCli && source.model === targetModel
           ? { id: source.id, prompt: swarmFork.prompt } : null;
         let res;
@@ -1320,6 +1324,7 @@ export function createExecutionTools({
               return prompt;
             },
             async onForkMode(mode) {
+              recordIdentity({ fork_mode: mode });
               if (resolvedCli === 'codex') session.codex_dynamic_board_tools = mode === 'native'
                 ? source.dynamic_board_tools ?? explicitWorker : explicitWorker;
               if (!swarmId || !swarmAgent) return;
@@ -1347,6 +1352,7 @@ export function createExecutionTools({
             swarmId: boardId,
             swarmAgent: boardAgent,
             onIdentity(threadId, turnId, observedSandbox, runnerSid) {
+              recordIdentity({ native_session_id: resolvedCli === 'codex' ? threadId : runnerSid });
               session.cli = resolvedCli;
               session.codex_thread_id = threadId;
               session.runner_session_id = runnerSid || null;

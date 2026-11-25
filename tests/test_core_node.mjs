@@ -20,7 +20,7 @@ import { buildTierView, GEMPT_VERSION, setEffortSettings } from '../core/config.
 import { assertSafeOutDir } from '../scripts/build-agy-plugin.mjs';
 import { contextPath, readHostContext, updateHostContext } from '../core/host-context.mjs';
 import { handleSwarmAction, handleBoardAction } from '../core/swarm-engine.mjs';
-import { ensureSwarm, getWorker, readBoardMessages, upsertWorker } from '../core/swarm-bus.mjs';
+import { ensureSwarm, getRunLineage, getWorker, readBoardMessages, upsertWorker } from '../core/swarm-bus.mjs';
 import { runLiveOperation, workspaceRun } from '../core/live-service.mjs';
 import { handleTool, TOOLS } from '../core/mcp-server.mjs';
 import { buildWaitCommand, dispatchRun, interruptRun, isRecentUnconfirmedRun, listActiveRoster, readRun,
@@ -84,7 +84,8 @@ test('Live builds the split pane and preserves host scope, safe link routes and 
 
 function fixture(t) {
   const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'gempt-node-')));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  // Detached workers can still be closing the SQLite WAL or their diagnostic log.
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }));
   const configPath = join(root, 'config', 'config.json');
   const sessionsDir = join(root, 'sessions');
   const cwd = join(root, 'repo');
@@ -2341,7 +2342,12 @@ test('solo gpt_run keeps its receipt and Codex tools, resumes one row and forks 
   assert.equal(head, 0);
   assert.deepEqual(new Set(roster.map((w) => w.session_id)), new Set([a.session_id, b.session_id]));
   assert.ok(roster.every((w) => w.state === 'working'));
-  await until(() => packets.filter((p) => p.method === 'turn/start').length === 2);
+  await until(() => [a, b].every((r) => readRun(r.run_id, f.sessionsDir).turn_id));
+  for (const run of [a, b]) {
+    const active = getRunLineage(run.run_id, f);
+    assert.equal(active.swarm_id, swarm_id);
+    assert.equal(active.native_session_id, readRun(run.run_id, f.sessionsDir).codex_thread_id);
+  }
   for (const { params } of packets.filter((p) => p.method === 'thread/start')) {
     assert.deepEqual(params.dynamicTools.map((tool) => tool.name), ['ask_gemini']);
   }
@@ -2367,6 +2373,11 @@ test('solo gpt_run keeps its receipt and Codex tools, resumes one row and forks 
   assert.equal(add.swarm_id, swarm_id);
   const child = await waitForRun(add.workers[0].run_id, { ...f, timeoutSec: 10 });
   assert.equal(child.fork_mode, 'native', child.error);
+  const lineage = getRunLineage(child.run_id, f);
+  assert.deepEqual([lineage.parent_run_id, lineage.root_run_id, lineage.parent_worker,
+    lineage.parent_native_session_id, lineage.protocol, lineage.fork_mode],
+  [resume.run_id, a.run_id, source, done.codex_thread_id, 'openai-responses', 'native']);
+  assert.equal(lineage.cache_group_key, getRunLineage(a.run_id, f).cache_group_key);
   assert.equal(packets.find((p) => p.method === 'thread/fork').params.threadId, done.codex_thread_id);
   await until(async () => (await getWorker(swarm_id, 'reviewer', f)).state === 'waiting');
   const childMcp = packets.find((p) => p.method === 'thread/fork').params.config.mcp_servers.gempt_board;
@@ -2425,6 +2436,7 @@ test('Codex swarm fork, fallback and warm wake use the right identities, prefixe
   const wake = await handleBoardAction({ action: 'post', swarm_id, text: '@bravo check the final diff' }, f);
   const resumed = await waitForRun(wake.deliveries[0].run_id, { ...f, timeoutSec: 10 });
   assert.equal(resumed.codex_thread_id, child.codex_thread_id);
+  assert.ok(controls.registrations.some((r) => r.resume && r.threadId === child.codex_thread_id && r.runId === resumed.run_id));
   assert.match(lastPrompt(), /^\[Board #\d+ from @coordinator[\s\S]*board_post/);
   assert.doesNotMatch(lastPrompt(), /## Goal|Required Report/);
   controls.rejectFork = true;
@@ -2433,6 +2445,7 @@ test('Codex swarm fork, fallback and warm wake use the right identities, prefixe
     [threadId, parentThreadId, swarmId, model]), [
     [parent.codex_thread_id, null, swarm_id, parent.model],
     [child.codex_thread_id, parent.codex_thread_id, swarm_id, child.model],
+    [resumed.codex_thread_id, null, swarm_id, resumed.model],
     [fallback.codex_thread_id, null, swarm_id, fallback.model],
   ]);
   assert.equal(fallback.fork_mode, 'summary_fallback');

@@ -3,7 +3,7 @@ import { pidAlive } from '../magpie_plugin/lib/app-server-process.mjs';
 import { createHash, randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
-import { openDatabase } from './sqlite.mjs';
+import { openDatabaseSync } from './sqlite.mjs';
 import { resolvePath } from './state.mjs';
 
 import {
@@ -20,8 +20,19 @@ const RESERVED_WORKER_NAMES = new Set(['all', 'coordinator', 'human']);
 const MENTION_RE = /(?<![\p{L}\p{Nd}_-])@([a-z0-9][a-z0-9_-]{0,23})(?![\p{L}\p{Nd}_-])/giu;
 const SCREENSHOT_RE = /^Screenshot:\s*(.+?)\s*\|\s*(.+)$/gmi;
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS run_lineage (
+  run_id TEXT PRIMARY KEY, swarm_id TEXT, worker_name TEXT, session_id TEXT,
+  parent_run_id TEXT, root_run_id TEXT, parent_worker TEXT, cli TEXT NOT NULL,
+  model TEXT, protocol TEXT, native_session_id TEXT, parent_native_session_id TEXT,
+  fork_mode TEXT, cache_group_key TEXT, worktree_path TEXT, source_cwd TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lineage_native ON run_lineage(native_session_id);
+CREATE INDEX IF NOT EXISTS idx_lineage_session ON run_lineage(session_id);
+CREATE INDEX IF NOT EXISTS idx_lineage_worker ON run_lineage(swarm_id, worker_name);
+CREATE INDEX IF NOT EXISTS idx_lineage_cache ON run_lineage(cache_group_key);
 CREATE TABLE IF NOT EXISTS swarms (
   id TEXT PRIMARY KEY,
   host_conversation_id TEXT,
@@ -113,7 +124,11 @@ export function resolveSwarmDbPath(sessionsDir) {
 }
 
 export async function openSwarmDb(sessionsDir) {
-  const db = await openDatabase(resolveSwarmDbPath(sessionsDir));
+  return openSwarmDbSync(sessionsDir);
+}
+
+function openSwarmDbSync(sessionsDir) {
+  const db = openDatabaseSync(resolveSwarmDbPath(sessionsDir));
   try {
     const { user_version } = db.get('PRAGMA user_version');
     if (user_version < SCHEMA_VERSION || !db.get("SELECT 1 FROM sqlite_master WHERE name='idx_swarm_request_id'")) {
@@ -146,6 +161,87 @@ async function withDb(sessionsDir, fn, existingDb) {
   } finally {
     db.close();
   }
+}
+
+function withLineageDb(sessionsDir, fn, existingDb) {
+  if (existingDb) return fn(existingDb);
+  const db = openSwarmDbSync(sessionsDir);
+  try { return fn(db); }
+  finally { db.close(); }
+}
+
+export function lineageProtocol(cli) {
+  return ({ codex: 'openai-responses', claude: 'anthropic-messages', gemini: 'gemini',
+    opencode: 'openai-chat' })[cli] || (cli && cli !== 'auto' ? 'cli:' + cli : null);
+}
+
+function groupHash(parts) {
+  const hex = createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+export function resolveLineageCacheKey(row, parent) {
+  if (parent?.cache_group_key && parent.cli === row.cli && parent.model === row.model && parent.protocol === row.protocol)
+    return parent.cache_group_key;
+  if (row.swarm_id && row.model && row.protocol) {
+    const parts = [row.swarm_id, row.model];
+    if (row.protocol !== 'openai-responses') parts.push(row.protocol);
+    return groupHash(parts);
+  }
+  const id = row.native_session_id;
+  if (row.protocol && row.protocol !== 'openai-responses') return groupHash([row.protocol, row.model, id || row.run_id]);
+  return id && id.length > 64 ? groupHash([row.protocol, id]) : id || null;
+}
+
+export function getRunLineage(runId, { sessionsDir, db } = {}) {
+  return withLineageDb(sessionsDir, (conn) => conn.get('SELECT * FROM run_lineage WHERE run_id=?', runId), db);
+}
+
+// Only a Codex Responses registration can authorize a proxy rewrite.
+export function findCacheKeyByNativeSession(id, { sessionsDir, db, model } = {}) {
+  if (!id || typeof id !== 'string') return null;
+  return withLineageDb(sessionsDir, (conn) => conn.get(`SELECT r.*, COALESCE(root.parent_native_session_id, root.native_session_id) AS root_thread_id
+    FROM run_lineage r LEFT JOIN run_lineage root ON root.run_id=r.root_run_id AND root.cli=r.cli
+    WHERE r.native_session_id=? AND r.cli='codex' AND r.protocol='openai-responses' AND r.cache_group_key IS NOT NULL
+    AND (? IS NULL OR r.model IS NULL OR r.model=?) ORDER BY r.updated_at DESC, r.rowid DESC LIMIT 1`,
+    id, model ?? null, model ?? null), db);
+}
+
+const lineageColumns = ['run_id', 'swarm_id', 'worker_name', 'session_id', 'parent_run_id', 'root_run_id',
+  'parent_worker', 'cli', 'model', 'protocol', 'native_session_id', 'parent_native_session_id', 'fork_mode',
+  'cache_group_key', 'worktree_path', 'source_cwd', 'created_at', 'updated_at'];
+
+export function upsertRunLineage(patch, { sessionsDir, db } = {}) {
+  if (!patch.run_id) throw new Error('Lineage requires a run_id.');
+  return withLineageDb(sessionsDir, (conn) => conn.transaction(() => {
+    const old = getRunLineage(patch.run_id, { db: conn });
+    const row = { ...old };
+    for (const key of lineageColumns) if (patch[key] != null) row[key] = patch[key];
+    row.parent_run_id = old?.parent_run_id || row.parent_run_id;
+    let parent = row.parent_run_id && getRunLineage(row.parent_run_id, { db: conn });
+    if (!row.parent_run_id && row.parent_native_session_id && patch.parent_cli) {
+      parent = conn.get(`SELECT * FROM run_lineage WHERE native_session_id=? AND cli=?
+        ORDER BY updated_at DESC, rowid DESC LIMIT 1`, row.parent_native_session_id, patch.parent_cli);
+    }
+    if (!old && !parent && !row.parent_run_id && row.session_id) {
+      parent = conn.get('SELECT * FROM run_lineage WHERE session_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1', row.session_id);
+    }
+    row.parent_run_id ??= parent?.run_id;
+    row.root_run_id = parent?.root_run_id || row.root_run_id || row.parent_run_id || row.run_id;
+    row.parent_worker ??= parent?.worker_name;
+    row.parent_native_session_id ??= parent?.native_session_id;
+    row.cli ??= 'auto';
+    row.protocol = patch.protocol ?? (old?.cli === row.cli ? old.protocol : null) ?? lineageProtocol(row.cli);
+    const sameScope = old && old.cli === row.cli && old.model === row.model && old.protocol === row.protocol;
+    row.cache_group_key = patch.cache_group_key || (sameScope && old.cache_group_key) || resolveLineageCacheKey(row, parent);
+    if (row.cache_group_key?.length > 64) throw new Error('Cache group key exceeds 64 characters.');
+    row.updated_at = nowIso();
+    row.created_at ??= row.updated_at;
+    conn.run(`INSERT INTO run_lineage (${lineageColumns.join(',')}) VALUES (${lineageColumns.map(() => '?')})
+      ON CONFLICT(run_id) DO UPDATE SET ${lineageColumns.slice(1).map((k) => k + '=excluded.' + k)}`,
+      ...lineageColumns.map((key) => row[key] ?? null));
+    return row;
+  }), db);
 }
 
 export function validateWorkerName(name) {

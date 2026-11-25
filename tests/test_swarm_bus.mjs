@@ -16,7 +16,7 @@ import {
   ensureSwarm, getBoardHead, getSwarmOverview, getWorker, killWorkerRecord, listRoster, listSwarms,
   listUndeliveredForWorker, markDelivered, parseMentions, parseScreenshots, postBoardMessage,
   readBoardMessages, resolveSwarmDbPath, resolveSwarmId, setSwarmPlan, setSwarmTitle, updateWorker,
-  upsertWorker, validateWorkerName,
+  findCacheKeyByNativeSession, upsertRunLineage, upsertWorker, validateWorkerName,
 } from '../core/swarm-bus.mjs';
 import {
   activeAt, channelMentions, channelRegistry, channelsAt, countsUnread, currentChannels, effectiveChannels,
@@ -1127,11 +1127,48 @@ test('migration adds fork_mode to a v0.8.0 database with the request index', asy
   const db = await openSwarmDb(sessionsDir);
   try {
     await upsertWorker('legacy', { name: 'child', fork_mode: 'summary_fallback' }, { db });
-    assert.equal(db.get('PRAGMA user_version').user_version, 2);
+    assert.equal(db.get('PRAGMA user_version').user_version, 3);
   } finally {
     db.close();
   }
   assert.equal((await getWorker('legacy', 'child', { sessionsDir })).fork_mode, 'summary_fallback');
+});
+
+test('v2 to v3 preserves board data and creates the indexed lineage table once', async (t) => {
+  const sessionsDir = makeTmp(t);
+  const old = await openSwarmDb(sessionsDir);
+  await upsertWorker('migration', { name: 'scout', brief: 'read the code' }, { db: old });
+  await postBoardMessage('migration', { from: 'scout', text: 'found the entry point' }, { db: old });
+  old.exec('DROP TABLE run_lineage; PRAGMA user_version=2');
+  old.close();
+  for (let i = 0; i < 2; i++) {
+    const db = await openSwarmDb(sessionsDir);
+    try {
+      assert.equal(db.get('PRAGMA user_version').user_version, 3);
+      assert.equal(db.get('SELECT brief FROM roster').brief, 'read the code');
+      assert.equal(db.get('SELECT text FROM messages').text, 'found the entry point');
+      assert.deepEqual(db.all("PRAGMA index_list(run_lineage)").filter((idx) => !idx.unique)
+        .map((idx) => db.all(`PRAGMA index_info(${idx.name})`).map((c) => c.name).join(',')).sort(),
+      ['cache_group_key', 'native_session_id', 'session_id', 'swarm_id,worker_name']);
+    } finally { db.close(); }
+  }
+});
+
+test('forks retain the logical root while cache keys follow the model and wire protocol', (t) => {
+  const sessionsDir = makeTmp(t);
+  const add = (run_id, patch) => upsertRunLineage({ cli: 'codex', model: 'm', swarm_id: 's', run_id, ...patch }, { sessionsDir });
+  const root = add('root', { worker_name: 'scout', cache_group_key: 'persisted-parent-key' });
+  const child = add('child', { parent_run_id: root.run_id });
+  const chat = add('chat', { parent_run_id: child.run_id, protocol: 'openai-chat', native_session_id: 'chat-thread' });
+  const sibling = add('sibling', { protocol: 'openai-chat' });
+  const otherModel = add('other-model', { parent_run_id: root.run_id, model: 'other' });
+  assert.equal(child.cache_group_key, root.cache_group_key);
+  assert.equal(child.parent_worker, 'scout');
+  assert.equal(chat.root_run_id, root.run_id);
+  assert.equal(chat.cache_group_key, sibling.cache_group_key);
+  assert.equal(new Set([root, chat, otherModel].map((r) => r.cache_group_key)).size, 3);
+  assert.equal(findCacheKeyByNativeSession('chat-thread', { sessionsDir }), null);
+  for (const row of [root, child, chat, sibling, otherModel]) assert.ok(row.cache_group_key.length <= 64);
 });
 
 test('posts enforce byte and channel limits, idempotency and shared sliding rate windows', async (t) => {

@@ -537,7 +537,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
       }
       if (session) {
         const cli = session.cli || 'codex';
-        const id = cli === 'codex' ? session?.codex_thread_id : cli === 'claude' ? session?.runner_session_id : null;
+        const id = cli === 'codex' ? session.codex_thread_id : session.runner_session_id;
         if (id && session.model) forkSource = { cli, model: session.model, id,
           ...(cli === 'codex' ? { dynamic_board_tools: session.codex_dynamic_board_tools ?? !session.implicit_swarm_worker } : {}) };
       }
@@ -581,7 +581,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
           swarm_agent: spec.name,
           expected_report: `Post your final result via board_post mentioning @${owner} with [done] prefix, listing changed files and verification results.`,
         }, {
-          swarmFork: args.fork ? { source: forkSource,
+          swarmFork: args.fork ? { source: forkSource, parentRunId: forkWorker?.run_id, parentWorker: args.fork,
             prompt: buildWorkerInstructions({ ...instructions, nativeParent: args.fork }) } : undefined,
           configPath: ctx.configPath,
           sessionsDir: ctx.sessionsDir,

@@ -21,6 +21,7 @@ import { startServer } from '../magpie_plugin/lib/server.mjs';
 import { createExecutionTools, createGemptTools } from '../magpie_plugin/lib/tools.mjs';
 import { TOOLS } from '../core/mcp-server.mjs';
 import { waitForRun } from '../core/runs.mjs';
+import { getRunLineage, upsertRunLineage } from '../core/swarm-bus.mjs';
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -53,6 +54,9 @@ test('thread cache keys expire after inactivity and evict least recently used ma
   assert.equal(keys.lookup('a').cacheKey, 'root');
   time = 21;
   assert.equal(keys.lookup('a'), undefined);
+  keys.register({ threadId: 'legacy-fork', parentThreadId: 'unrecorded-parent', model: 'm', swarmId: 's' });
+  assert.equal(keys.lookup('legacy-fork', 'other'), undefined);
+  assert.equal(keys.lookup('legacy-fork', 'm').cacheKey, 'unrecorded-parent');
 });
 
 test('resident Codex proxy authenticates IPC and bearer separately and streams mapped responses', async (t) => {
@@ -60,6 +64,11 @@ test('resident Codex proxy authenticates IPC and bearer separately and streams m
   const seen = [];
   let finishStream;
   const gateway = http.createServer(async (req, res) => {
+    if (req.url.endsWith('?large')) {
+      const hash = createHash('sha256');
+      for await (const chunk of req) hash.update(chunk);
+      return res.end(hash.digest('hex'));
+    }
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     seen.push({ path: req.url, headers: req.headers, body: Buffer.concat(chunks).toString() });
@@ -141,6 +150,27 @@ test('resident Codex proxy authenticates IPC and bearer separately and streams m
   }
   assert.equal(new Set(shared.slice(0, 3)).size, 1);
   assert.equal(new Set(shared).size, 3);
+  const aliasBody = JSON.stringify({ model: 'm', prompt_cache_key: 'a' });
+  await (await fetch(base + '/v1/cache-proxy/responses', { method: 'POST', body: aliasBody,
+    headers: { authorization: 'Bearer ' + bearer, session_id: 'a' } })).text();
+  assert.equal(JSON.parse(seen.at(-1).body).prompt_cache_key, shared[0]);
+  const wrongModel = JSON.stringify({ model: 'incompatible', prompt_cache_key: 'a' });
+  await (await post(wrongModel, { session_id: 'a' })).text();
+  assert.equal(seen.at(-1).body, wrongModel);
+  assert.equal(seen.at(-1).headers.session_id, 'a');
+  const digest = createHash('sha256');
+  async function* largeBody() {
+    const chunk = Buffer.alloc(1024 * 1024, 'x');
+    for (let i = 0; i < 65; i++) {
+      digest.update(chunk);
+      yield chunk;
+    }
+    digest.update('tail');
+    yield 'tail';
+  }
+  const large = await fetch(base + '/v1/cache-proxy/responses?large', { method: 'POST', body: largeBody(),
+    duplex: 'half', headers: { authorization: 'Bearer ' + bearer }, signal: AbortSignal.timeout(10000) });
+  assert.equal(await large.text(), digest.digest('hex'));
   await (await post('{}', { conversation_id: 'child' })).text();
   assert.deepEqual(JSON.parse(seen.at(-1).body), { prompt_cache_key: 'grandparent' });
   const solo = '{ "prompt_cache_key" : "solo" }';
@@ -150,6 +180,22 @@ test('resident Codex proxy authenticates IPC and bearer separately and streams m
   assert.equal(await failure.text(), 'rate limited');
   assert.equal(seen.at(-1).body, solo);
   assert.equal(seen.at(-1).headers.session_id, 'solo');
+  for (const [path, cli, auth] of [['/messages', 'claude', { 'x-api-key': 'anthropic-test' }],
+    ['/models/demo:generateContent', 'gemini', { 'x-goog-api-key': 'gemini-test' }],
+    ['/responses', 'pi', {}]]) {
+    upsertRunLineage({ run_id: cli, cli, native_session_id: cli, model: 'm', swarm_id: 's' },
+      { sessionsDir: join(root, 'sessions') });
+    const body = JSON.stringify({ prompt_cache_key: cli, cache_control: { type: 'ephemeral' } });
+    const reply = await fetch(base + '/v1/cache-proxy' + path, { method: 'POST', body,
+      headers: { 'x-gempt-proxy-token': bearer, authorization: 'Bearer native-auth', session_id: cli, ...auth } });
+    assert.equal(reply.status, 200);
+    const received = seen.at(-1);
+    assert.equal(received.body, body);
+    assert.equal(received.headers.session_id, cli);
+    assert.equal(received.headers.authorization, 'Bearer native-auth');
+    assert.equal(received.headers['x-gempt-proxy-token'], undefined);
+    for (const [name, value] of Object.entries(auth)) assert.equal(received.headers[name], value);
+  }
   const precise = '{"prompt_cache_key":"child","tools":[{"maximum":9007199254740993}]}';
   await (await post(precise, { conversation_id: 'unregistered-header' })).text();
   assert.equal(seen.at(-1).body, precise.replace('"child"', '"grandparent"'));
@@ -173,8 +219,9 @@ for (const active of [false, true]) {
     const statePath = join(dir, 'app-server.json');
     const seen = [];
     const upstream = http.createServer(async (req, res) => {
-      for await (const _ of req) { /* Drain the proxy request. */ }
-      seen.push({ path: req.url, authorization: req.headers.authorization });
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      seen.push({ path: req.url, authorization: req.headers.authorization, body });
       res.end('upstream ready');
     });
     let page;
@@ -211,6 +258,8 @@ for (const active of [false, true]) {
             return { pid: process.pid, detachedOutOfJob: !active };
           }, terminateProcess() { throw new Error('unexpected termination'); } } });
       const status = await page.appServer.ensureRunning();
+      const { createThreadCacheKeys } = await import(${JSON.stringify(new URL('../magpie_plugin/lib/codex-proxy.mjs', import.meta.url).href)});
+      createThreadCacheKeys({ sessionsDir }).register({ threadId: 'before-reload', swarmId: 'scope', model: 'm' });
       parentPort.postMessage({ ...childConfig, port: page.port, status });
       process.exit(0);
     `;
@@ -231,7 +280,7 @@ for (const active of [false, true]) {
     assert.equal(JSON.stringify(before).includes(token), false);
     const gatewayKey = active ? 'rotated-key' : 'initial-key';
     configure(gatewayKey);
-    const post = (bearer) => fetch(initial.base + '/responses', { method: 'POST', body: '{}',
+    const post = (bearer, id = 'before-reload') => fetch(initial.base + '/responses', { method: 'POST', body: JSON.stringify({ prompt_cache_key: id }),
       headers: bearer ? { authorization: 'Bearer ' + bearer } : {}, signal: AbortSignal.timeout(5000) });
     const opts = { port: initial.port, configPath, sessionsDir };
     // A host serving only HTTP must know the upstream before any manager callback.
@@ -261,8 +310,17 @@ for (const active of [false, true]) {
     const ok = await post(token);
     assert.equal(ok.status, 200);
     assert.equal(await ok.text(), 'upstream ready');
-    const expected = { path: '/v1/responses', authorization: 'Bearer ' + gatewayKey };
-    assert.deepEqual(seen.filter((r) => r.path === expected.path), [expected, expected]);
+    const keys = createThreadCacheKeys({ sessionsDir });
+    const original = keys.lookup('before-reload').cacheKey;
+    for (const data of [{ threadId: 'after-reload', parentThreadId: 'before-reload', model: 'm' },
+      { threadId: 'after-reload', resume: true, swarmId: 'another-swarm', model: 'm' }]) keys.register(data);
+    await (await post(token, 'after-reload')).text();
+    assert.equal(getRunLineage('codex-thread:after-reload', { sessionsDir }).cache_group_key, original);
+    const expected = { path: '/v1/responses', authorization: 'Bearer ' + gatewayKey, body: JSON.stringify({ prompt_cache_key: original }) };
+    assert.deepEqual(seen.filter((r) => r.path === expected.path), [expected, expected, expected]);
+    const long = 'x'.repeat(512);
+    keys.register({ threadId: 'legacy-child', parentThreadId: long });
+    assert.ok(keys.lookup('legacy-child').cacheKey.length <= 64);
     const { text: html } = await rawHttpGet({ port: page.port, path: '/' });
     const headers = { 'x-gempt-key': html.match(/name="gempt-key" content="([^"]+)"/)[1] };
     for (const path of ['/api/overview', '/api/summary']) {

@@ -1,5 +1,5 @@
 import { createExecutionTools } from './tools.mjs';
-import { readRun, saveRun } from '../../core/runs.mjs';
+import { readRun, saveCompletedRun, saveRun } from '../../core/runs.mjs';
 import { TurnInterrupted } from './app-server-run.mjs';
 import { closeSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -39,7 +39,7 @@ function fatal(error, origin) {
         failed.remote_turn_unconfirmed = true;
         failed.unconfirmed_at = outcome?.unconfirmed_at || latest.unconfirmed_at || new Date().toISOString();
       }
-      saveRun(packet.file, terminalRecord({ ...latest, progress: latest.progress || {} }, failed));
+      saveCompletedRun(packet.file, terminalRecord({ ...latest, progress: latest.progress || {} }, failed), packet.host.sessionsDir);
     } catch (saveError) {
       diagnose(`Failed to persist worker failure: ${saveError.stack || saveError}`);
     }
@@ -84,16 +84,14 @@ try {
 if (outcome) {
   const latest = readRun(record.run_id, host.sessionsDir);
   const finished = terminalRecord(latest, outcome);
-  saveRun(file, finished);
+  saveCompletedRun(file, finished, host.sessionsDir);
   saved = true;
-  const swarmId = record.swarm_id || host.swarmId;
-  const swarmAgent = record.swarm_agent || host.swarmAgent;
-  if (swarmId && swarmAgent) {
+  if (record.swarm_id || host.swarmId) {
     try {
       const { onWorkerTurnFinished } = await import('../../core/swarm-engine.mjs');
       await onWorkerTurnFinished({
-        swarmId,
-        swarmAgent,
+        swarmId: record.swarm_id || host.swarmId,
+        swarmAgent: record.swarm_agent || host.swarmAgent,
         runId: record.run_id,
         sessionId: finished.result?.session_id || record.session_id,
         startedAt: running.started_at,
@@ -104,7 +102,7 @@ if (outcome) {
         configPath: host.configPath,
         env: process.env,
       });
-    } catch { /* Best-effort swarm bus sync so run state is never lost. */ }
+    } catch (error) { diagnose(`Failed to sync completed run: ${error.message}`); }
   }
 }
 

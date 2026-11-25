@@ -18,7 +18,7 @@ import {
 } from '../core/runners/registry.mjs';
 import { dispatchRun, interruptRun, readRun, steerRun, waitForRun } from '../core/runs.mjs';
 import { handleBoardAction, handleSwarmAction } from '../core/swarm-engine.mjs';
-import { getSwarmOverview, readBoardMessages } from '../core/swarm-bus.mjs';
+import { getRunLineage, getSwarmOverview, readBoardMessages } from '../core/swarm-bus.mjs';
 import { waitForBoard } from '../core/wait.mjs';
 import { readOverview, readState, updateSettings } from '../magpie_plugin/lib/backend.mjs';
 import { dispatchPageApi } from '../magpie_plugin/lib/page-api.mjs';
@@ -261,6 +261,9 @@ console.log(JSON.stringify({
   assert.equal(done1.result.cli, 'claude');
   assert.match(done1.result.text, /First turn complete/);
   assert.equal(done1.runner_session_id, 'claude-sess-777');
+  const lineage = getRunLineage(r1.run_id, { sessionsDir });
+  assert.equal(lineage.protocol, 'anthropic-messages');
+  assert.equal(lineage.native_session_id, done1.runner_session_id);
 
   // Verify Live stream parses Claude's journaled events.
   const liveStream = await runLiveOperation('stream', { run_id: r1.run_id }, { configPath, sessionsDir, env });
@@ -295,6 +298,7 @@ console.log(JSON.stringify({
   } });
   assert.equal(fork.fork_mode, 'native');
   assert.equal(fork.runner_session_id, 'new-child-id');
+  assert.equal(getRunLineage(fork.run_id, { sessionsDir }).cache_group_key, lineage.cache_group_key);
   const child = JSON.parse(readFileSync(captureFile, 'utf8').trim().split('\n').at(-1));
   assert.deepEqual(child.args.slice(child.args.indexOf('--resume'), child.args.indexOf('--resume') + 3),
     ['--resume', 'claude-sess-777', '--fork-session']);
@@ -479,6 +483,9 @@ if (sub === 'serve') {
   const resumed = await dispatchRun({ session_id: done1.session_id, cwd, goal: 'Continue in the same session' },
     { configPath, sessionsDir, env });
   assert.equal(resumed.runner_session_id, 'oc-srv-1');
+  const lineage = getRunLineage(resumed.run_id, { sessionsDir });
+  assert.deepEqual([lineage.parent_run_id, lineage.protocol, lineage.native_session_id],
+    [r1.run_id, 'openai-chat', 'oc-srv-1']);
   const log = readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
   assert.deepEqual(log.filter((e) => e.action === 'lookup').map((e) => e.attempt), [1, 2]);
   assert.equal(log.filter((e) => e.action === 'create_session').length, 1);
@@ -601,6 +608,10 @@ if (id === 'gemini') {
     assert.equal(done.state, 'finished', `${id} failed: ${done.error}`);
     assert.equal(done.cli, id);
     assert.equal(done.result.cli, id);
+    const lineage = getRunLineage(run.run_id, { sessionsDir });
+    assert.equal(lineage.protocol, id === 'gemini' ? 'gemini' : 'cli:' + id);
+    assert.equal(lineage.native_session_id, done.result.runner_session_id || null);
+    assert.ok(lineage.cache_group_key.length <= 64);
     const match = done.result.text.match(/(?:GEMINI|PLAIN|JSON)_OK:(\{.*\})/);
     assert.ok(match, `${id} output missing structured payload: ${done.result.text}`);
     const payload = JSON.parse(match[1]);
@@ -652,6 +663,14 @@ if (id === 'gemini') {
       const forked = JSON.parse(child.result.text.match(/GEMINI_OK:(\{.*\})/)[1]);
       assert.match(forked.prompt, /GEMINI_OK:/);
       assert.equal(forked.agent, 'child');
+      const branch = await handleSwarmAction({ action: 'add', cli: 'pi', model: solo.model,
+        fork: board.roster[0].name, name: 'cross-cli', brief: 'Verify the answer', host_conversation_id, cwd }, { configPath, sessionsDir, env });
+      const done = await waitForRun(branch.workers[0].run_id, { sessionsDir, timeoutSec: 15 });
+      assert.equal(done.state, 'finished', done.error);
+      const cross = getRunLineage(done.run_id, { sessionsDir });
+      assert.deepEqual([cross.parent_run_id, cross.root_run_id, cross.parent_native_session_id, cross.parent_worker, cross.fork_mode],
+        [solo.run_id, solo.run_id, solo.runner_session_id, board.roster[0].name, 'summary_fallback']);
+      assert.notEqual(cross.cache_group_key, getRunLineage(solo.run_id, { sessionsDir }).cache_group_key);
     }
   }
 });

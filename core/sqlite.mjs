@@ -1,32 +1,24 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { createRequire } from 'node:module';
 
-let driverPromise = null;
-
-async function loadDriver() {
-  if (!driverPromise) {
-    driverPromise = (async () => {
-      if (typeof Bun !== 'undefined') {
-        const mod = await import('bun:sqlite');
-        return { runtime: 'bun', Database: mod.Database };
-      }
-      const mod = await import('node:sqlite');
-      return { runtime: 'node', Database: mod.DatabaseSync };
-    })();
-  }
-  return driverPromise;
-}
+const require = createRequire(import.meta.url);
 
 const cloneRow = (row) => (row && typeof row === 'object' ? { ...row } : null);
 
 export async function openDatabase(filePath) {
+  return openDatabaseSync(filePath);
+}
+
+export function openDatabaseSync(filePath) {
   if (typeof filePath !== 'string' || !filePath.trim()) {
     throw new Error('SQLite database filePath is required.');
   }
   if (filePath !== ':memory:') {
     mkdirSync(dirname(filePath), { recursive: true });
   }
-  const { runtime, Database } = await loadDriver();
+  const runtime = typeof Bun !== 'undefined' ? 'bun' : 'node';
+  const Database = runtime === 'bun' ? require('bun:sqlite').Database : require('node:sqlite').DatabaseSync;
   const raw = runtime === 'bun' ? new Database(filePath, { create: true }) : new Database(filePath);
 
   let txDepth = 0;

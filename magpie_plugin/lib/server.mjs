@@ -18,9 +18,9 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { gzip } from 'node:zlib';
 import { withLockSync } from '../../core/state.mjs';
-import { readJsonSafe, resolveConfigPath, warmPageTelemetry } from './backend.mjs';
+import { readJsonSafe, resolveConfigPath, resolveSessionsDir, warmPageTelemetry } from './backend.mjs';
 import { createAppServerManager, resolveProxyTarget } from './app-server-manager.mjs';
-import { createThreadCacheKeys, PROXY_PATH, proxyCodexRequest } from './codex-proxy.mjs';
+import { CACHE_PROXY_PATH, createThreadCacheKeys, PROXY_PATH, proxyCodexRequest } from './codex-proxy.mjs';
 import { dispatchPageApi } from './page-api.mjs';
 import { readPageAsset } from './page-assets.mjs';
 
@@ -125,7 +125,7 @@ export async function startServer({
   const KEY = randomBytes(24).toString('base64url');
   const IPC_TOKEN = randomBytes(24).toString('base64url');
   const proxyToken = loadOrCreateProxyToken(configPath);
-  const threadCacheKeys = createThreadCacheKeys();
+  const threadCacheKeys = createThreadCacheKeys({ sessionsDir: resolveSessionsDir(sessionsDir) });
   let proxyTarget = resolveProxyTarget(readJsonSafe(resolveConfigPath(configPath)) || {});
   const INSTANCE_ID = randomBytes(16).toString('hex');
   const resolvedConfigDir = dirname(resolveConfigPath(configPath));
@@ -311,14 +311,16 @@ export async function startServer({
     try {
       const url = new URL(req.url || '/', `http://127.0.0.1:${actualPort || DEFAULT_PORT}`);
       const pathname = url.pathname;
-      if (pathname.startsWith(PROXY_PATH + '/')) {
-        const got = Buffer.from(req.headers.authorization || '');
+      const proxyPrefix = [PROXY_PATH, CACHE_PROXY_PATH].find((prefix) => pathname.startsWith(prefix + '/'));
+      if (proxyPrefix) {
+        const got = Buffer.from(req.headers['x-gempt-proxy-token']
+          ? 'Bearer ' + req.headers['x-gempt-proxy-token'] : req.headers.authorization || '');
         const want = Buffer.from('Bearer ' + proxyToken);
         if (got.length !== want.length || !timingSafeEqual(got, want)) {
           return send(req, res, 401, { error: 'invalid proxy token' }, undefined, false);
         }
         if (!proxyTarget) return send(req, res, 503, { error: 'gateway unavailable' }, undefined, false);
-        return await proxyCodexRequest(req, res, url, proxyTarget, threadCacheKeys);
+        return await proxyCodexRequest(req, res, url, proxyTarget, threadCacheKeys, proxyPrefix);
       }
       if (pathname === '/api/ping') {
         return send(req, res, 200, {

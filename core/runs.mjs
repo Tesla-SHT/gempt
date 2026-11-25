@@ -15,6 +15,7 @@ import { atomicJson, resolvePath, validateSessionId, withLock, withLockSync, wit
 import { ensureShareWorktree, recordInWorkspace, recordSourceCwd, resolveExternalWorktreeSourceCwd, samePath } from './worktrees.mjs';
 
 import { turnEvidence } from './run-journal.mjs';
+import { resolveImplicitSwarmId, soloWorkerName, upsertWorker, upsertRunLineage } from './swarm-bus.mjs';
 
 const threadOf = (r) => r.codex_thread_id || r.thread_id || r.progress?.thread_id;
 const turnOf = (r) => r.turn_id || r.progress?.turn_id;
@@ -63,6 +64,19 @@ export function saveRun(file, record) {
       Atomics.wait(readRetry, 0, 0, 20);
     }
   }
+}
+
+// Commit final identity before exposing a terminal receipt to waiters or recovery readers.
+export function saveCompletedRun(file, record, sessionsDir) {
+  const result = record.result;
+  const cli = result?.cli || record.cli || (record.codex_thread_id ? 'codex' : undefined);
+  upsertRunLineage({ run_id: record.run_id, session_id: record.session_id, swarm_id: record.swarm_id,
+    worker_name: record.swarm_agent, cli, model: result?.model || record.model,
+    native_session_id: cli === 'codex' ? result?.codex_thread_id || record.codex_thread_id
+      : result?.runner_session_id || record.runner_session_id,
+    fork_mode: result?.fork_mode || record.fork_mode, source_cwd: record.source_cwd || record.cwd,
+    worktree_path: record.worktree_path }, { sessionsDir });
+  saveRun(file, record);
 }
 
 const stateCache = new Map();
@@ -141,7 +155,7 @@ export function readRun(runId, sessionsDir, { stat, readonly = false, allowLegac
         }
         if (fresh.state !== 'outcome_unknown') fresh.finished_at ||= new Date().toISOString();
         fresh.waiting_since = null;
-        saveRun(path, fresh);
+        saveCompletedRun(path, fresh, sessionsDir);
       }
       return fresh;
     });
@@ -227,7 +241,7 @@ async function settleTurn(record, turn, options, evidence) {
     evidence ??= turn.id ? turnEvidence(join(directory, 'events.jsonl'), threadOf(record), turn.id) : {};
     applyTerminal(fresh, terminalTurn(evidence.terminal) ? { ...turn, ...evidence.terminal } : turn, evidence);
     if (options.interruptConfirmed) fresh.interrupt_confirmed_at = new Date().toISOString();
-    saveRun(path, fresh);
+    saveCompletedRun(path, fresh, options.sessionsDir);
     return fresh;
   });
   if (updated) await notifyRecovered(updated, options);
@@ -629,11 +643,18 @@ export async function dispatchRun(args, {
       };
       if (!legacyNative && hostId && !args.swarm_id && !args.swarm_agent
           && !getNativeSwarmPolicy(cfg?.routing_policy).native_swarm) {
-        const { resolveImplicitSwarmId, soloWorkerName, upsertWorker } = await import('./swarm-bus.mjs');
         record.swarm_id = resolveImplicitSwarmId(hostId);
         record.swarm_agent = soloWorkerName(sessionId);
         record.implicit_swarm_worker = true;
-        saveRun(file, record);
+      }
+      upsertRunLineage({ run_id: id, session_id: prior?.session_id || sessionId, swarm_id: record.swarm_id,
+        worker_name: record.swarm_agent, parent_run_id: swarmFork?.parentRunId,
+        parent_worker: swarmFork?.parentWorker, parent_native_session_id: swarmFork?.source?.id, parent_cli: swarmFork?.source?.cli,
+        cli: args.cli || prior?.cli || getExecutionConfig(cfg).default_cli,
+        model: args.model || prior?.model, worktree_path: worktreePath, source_cwd: sourceCwd,
+        created_at: record.created_at, fork_mode: record.fork_mode }, { sessionsDir: sessions });
+      saveRun(file, record);
+      if (record.implicit_swarm_worker) {
         await upsertWorker(record.swarm_id, {
           name: record.swarm_agent, run_id: id, session_id: sessionId, state: 'working',
           cli: args.cli || prior?.cli || getExecutionConfig(cfg).default_cli,
@@ -642,7 +663,7 @@ export async function dispatchRun(args, {
           worktree_path: worktreePath, source_cwd: sourceCwd, brief: args.goal, task_summary: args.goal.slice(0, 120),
           error: null, parked_on: null,
         }, { sessionsDir: sessions, hostConversationId: hostId.trim(), cwd: sourceCwd });
-      } else saveRun(file, record);
+      }
     }, { attempts: 80, delayMs: 25 });
   } catch (error) {
     if (record?.implicit_swarm_worker && existsSync(file)) {
