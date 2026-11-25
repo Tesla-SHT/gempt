@@ -136,6 +136,7 @@ function resolvePendingCallId(worker, sessionsDir, readRunImpl) {
     } catch { /* Fall back to parked_on. */ }
   }
   if (typeof worker.parked_on === 'string' && worker.parked_on.trim()) {
+    if (worker.parked_on.startsWith('board_ask:')) return null;
     return worker.parked_on.replace(/^ask_gemini:/, '').trim();
   }
   return null;
@@ -148,7 +149,7 @@ export async function routeBoardDeliveries(swarmId, options = {}) {
   const { swarm, roster } = overview;
   const deliveries = [];
 
-  for (const worker of roster) {
+  for (let worker of roster) {
     if (worker.state === 'killed' || (worker.state === 'working' && worker.parked_on?.startsWith('board_wait'))) continue;
     const unread = await listUndeliveredForWorker(swarmId, worker.name, { since: 0, sessionsDir: ctx.sessionsDir });
     if (!unread.length) continue;
@@ -174,6 +175,32 @@ export async function routeBoardDeliveries(swarmId, options = {}) {
           } catch (err) {
             deliveries.push({ worker: worker.name, mode: 'reply_failed', seqs, error: String(err?.message || err) });
             continue;
+          }
+        } else if (worker.parked_on?.startsWith('board_ask:')) {
+          // board_ask is non-blocking; deliver via steer if still active, or warm-wake below.
+          let stillActive = false;
+          if (worker.run_id) {
+            try {
+              const rec = ctx.readRunImpl(worker.run_id, ctx.sessionsDir);
+              stillActive = Boolean(rec && ACTIVE_STATES.has(rec.state));
+            } catch {
+              stillActive = false;
+            }
+          }
+          if (stillActive) {
+            const resumed = await updateWorker(swarmId, worker.name, { state: 'working', parked_on: null, error: null },
+              { sessionsDir: ctx.sessionsDir, expectedState: 'waiting_reply', expectedRun: worker.run_id });
+            if (resumed) {
+              worker = resumed;
+            } else {
+              worker = await getWorker(swarmId, worker.name, { sessionsDir: ctx.sessionsDir });
+              // A concurrent delivery may already own the active run.
+              if (worker?.state !== 'waiting' && worker?.state !== 'stopped') continue;
+              remainingUnread = await listUndeliveredForWorker(swarmId, worker.name, { since: 0, sessionsDir: ctx.sessionsDir });
+            }
+            currentState = worker.state;
+          } else {
+            currentState = 'waiting';
           }
         }
       }
@@ -508,7 +535,9 @@ export async function handleSwarmAction(args = {}, options = {}) {
     if (!CLI_CHOICES.includes(cli)) {
       throw new Error(`Invalid cli '${args.cli}'. Expected one of: ${CLI_CHOICES.join(', ')}.`);
     }
-    const inheritedModel = cli === forkWorker?.cli ? forkWorker.model : parent?.model;
+    const inheritedModel = (forkWorker && cli === forkWorker.cli)
+      ? forkWorker.model
+      : (parent && cli === parent.cli ? parent.model : null);
     const model = typeof args.model === 'string' && args.model.trim() ? args.model.trim() : inheritedModel || null;
     const tier = typeof args.tier === 'string' && args.tier.trim() ? args.tier.trim() : null;
 
@@ -636,28 +665,33 @@ export async function handleSwarmAction(args = {}, options = {}) {
     if (nextCli && !CLI_CHOICES.includes(nextCli)) {
       throw new Error(`Invalid cli '${args.cli}'. Expected one of: ${CLI_CHOICES.join(', ')}.`);
     }
-    const reason = typeof args.reason === 'string' && args.reason.trim() ? ` Reason: ${args.reason.trim()}.` : '';
-    const notice = await postBoardMessage(swarmId, {
-      from: actor,
-      kind: 'system',
-      text: `@${workerName} Switched runtime to ${nextModel || nextTier || nextCli}.${reason} Resume any unfinished work.`,
-      meta: { model_switch: { model: nextModel, tier: nextTier, cli: nextCli } },
-    }, { sessionsDir: ctx.sessionsDir });
-
-    await updateWorker(swarmId, workerName, {
+    const runId = randomUUID().replaceAll('-', '');
+    const claimed = await updateWorker(swarmId, workerName, {
       model: nextModel,
       tier: nextTier,
       cli: nextCli,
       state: 'working',
+      run_id: runId,
       parked_on: null,
       error: null,
-    }, { sessionsDir: ctx.sessionsDir });
-    await markDelivered(swarmId, [notice.seq], workerName, { sessionsDir: ctx.sessionsDir });
-
-    const resumeCwd = worker.worktree_path || worker.source_cwd || overview.swarm.cwd || ctx.cwd;
+    }, { sessionsDir: ctx.sessionsDir, expectedState: worker.state, expectedRun: worker.run_id });
+    if (!claimed) {
+      throw new Error(`Worker '${workerName}' state changed concurrently; retry model switch.`);
+    }
+    const reason = typeof args.reason === 'string' && args.reason.trim() ? ` Reason: ${args.reason.trim()}.` : '';
+    let notice;
     let run;
     try {
+      notice = await postBoardMessage(swarmId, {
+        from: actor,
+        kind: 'system',
+        text: `@${workerName} Switching runtime to ${nextModel || nextTier || nextCli}.${reason} Resume any unfinished work.`,
+        meta: { model_switch: { model: nextModel, tier: nextTier, cli: nextCli } },
+      }, { sessionsDir: ctx.sessionsDir });
+      await markDelivered(swarmId, [notice.seq], workerName, { sessionsDir: ctx.sessionsDir });
+      const resumeCwd = worker.worktree_path || worker.source_cwd || overview.swarm.cwd || ctx.cwd;
       run = await ctx.dispatchRunImpl({
+        run_id: runId,
         goal: `[Board #${notice.seq} from @${actor}]\n${notice.text}`,
         cwd: resumeCwd,
         access: worker.access || 'change',
@@ -688,17 +722,21 @@ export async function handleSwarmAction(args = {}, options = {}) {
       });
     } catch (err) {
       await updateWorker(swarmId, workerName, {
-        state: 'stopped',
+        state: worker.state,
+        run_id: worker.run_id,
+        model: worker.model,
+        tier: worker.tier,
+        cli: worker.cli,
+        parked_on: worker.parked_on,
         error: String(err?.message || err),
-      }, { sessionsDir: ctx.sessionsDir });
+      }, { sessionsDir: ctx.sessionsDir, expectedRun: runId, expectedState: 'working' });
       throw err;
     }
     const updated = await updateWorker(swarmId, workerName, {
       run_id: run.run_id,
       session_id: run.session_id || worker.session_id,
       worktree_path: run.worktree_path || worker.worktree_path,
-      last_seq: notice.seq,
-    }, { sessionsDir: ctx.sessionsDir });
+    }, { sessionsDir: ctx.sessionsDir, expectedRun: runId }) || await getWorker(swarmId, workerName, storage);
     return {
       ok: true,
       swarm_id: swarmId,

@@ -17,6 +17,7 @@ import {
 } from './backend.mjs';
 
 import { LIVE_OPERATIONS, runLiveOperation } from '../../core/live-service.mjs';
+import { interruptRun } from '../../core/runs.mjs';
 import { SWARM_OPERATIONS, runSwarmOperation } from '../../core/swarm-service.mjs';
 import { installAgy } from '../../core/agy-install.mjs';
 
@@ -101,8 +102,8 @@ export async function dispatchPageApi({ method, url, rawPath = url.pathname, rea
     if (opaqueOrigin) return reply(403, { error: 'invalid origin' });
     const id = interrupt[1];
     if (id.length !== 32 || !/^[a-f0-9]+$/.test(id)) return reply(400, { error: 'invalid run_id' });
-    if (!appServer) return reply(503, { error: 'shared Codex app-server management is disabled' });
-    return reply(200, await appServer.interruptRun(id, sessionsDir));
+    if (appServer) return reply(200, await appServer.interruptRun(id, sessionsDir));
+    return reply(200, await interruptRun(id, { configPath, sessionsDir, env: options.env, connect: options.connect }));
   }
   if (method === 'GET' && pathname === '/api/state') {
     const ratioRange = url.searchParams.get('ratio_range') ?? '24h';

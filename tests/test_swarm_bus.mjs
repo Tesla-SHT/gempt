@@ -1510,3 +1510,150 @@ test('worker identity and opening cursor follow the entire shared protocol and a
   assert.equal(alphaTail, ' @alpha\nSwarm: prefix-test\nOpening brief: #1');
   assert.equal(bravoTail, ' @bravo\nSwarm: prefix-test\nOpening brief: #2');
 });
+
+test('board_ask reply warm-wakes worker, model switch uses pre-allocated run_id, cross-CLI helper skips parent model, and idle interrupt returns 409', async (t) => {
+  const dir = makeTmp(t, 'gempt-regressions-');
+  const sessionsDir = join(dir, 'sessions');
+  const configPath = join(dir, 'config.json');
+  const dispatched = [];
+  const mocks = {
+    sessionsDir,
+    configPath,
+    dispatchRunImpl: async (args) => {
+      dispatched.push(args);
+      return { run_id: args.run_id || 'a'.repeat(32), session_id: args.session_id || `exec-${dispatched.length}`, cwd: args.cwd };
+    },
+    readRunImpl: () => ({ state: 'finished' }),
+    interruptRunImpl: async () => ({ ok: true }),
+  };
+
+  await ensureSwarm({ swarmId: 'sw-reg', cwd: dir, sessionsDir });
+  await upsertWorker('sw-reg', {
+    name: 'claude-w', cli: 'claude', model: 'claude-sonnet-4', state: 'working',
+    run_id: '1'.repeat(32), session_id: 'exec-claude-1', source_cwd: dir,
+  }, { sessionsDir });
+
+  // 1. board_ask sets waiting_reply + parked_on: board_ask:<seq>; coordinator reply must warm-wake (not reply_failed).
+  await handleBoardMcpTool('board_ask', { question: 'Which port?' }, {}, { swarmId: 'sw-reg', agentName: 'claude-w', sessionsDir });
+  assert.match((await getWorker('sw-reg', 'claude-w', { sessionsDir })).parked_on, /^board_ask:\d+$/);
+  const replyPost = await handleBoardAction({ action: 'post', swarm_id: 'sw-reg', from: 'coordinator', text: '@claude-w Use 3498' }, mocks);
+  assert.equal(replyPost.deliveries[0].mode, 'wake');
+  assert.equal(dispatched.at(-1).session_id, 'exec-claude-1');
+
+  // 2. Cross-CLI helper spawned by claude-w with cli='codex' must NOT inherit claude-sonnet-4.
+  await handleBoardMcpTool('board_swarm', { action: 'add', name: 'codex-helper', brief: 'Run tests', cli: 'codex' }, {}, {
+    ...mocks, swarmId: 'sw-reg', agentName: 'claude-w',
+  });
+  assert.equal(dispatched.at(-1).cli, 'codex');
+  assert.equal(dispatched.at(-1).model, undefined);
+
+  // 3. Model switch pre-allocates run_id so fast turn finish is not skipped as superseded.
+  await updateWorker('sw-reg', 'claude-w', { state: 'waiting' }, { sessionsDir });
+  const fastMocks = {
+    ...mocks,
+    dispatchRunImpl: async (args) => {
+      assert.match(args.run_id, /^[a-f0-9]{32}$/);
+      dispatched.push(args);
+      const [notice] = await readBoardMessages('sw-reg', { sessionsDir, limit: 1 });
+      assert.deepEqual(notice.meta.model_switch, { cli: 'codex', model: 'codex/gpt-5', tier: null });
+      assert.match(args.goal, new RegExp(`^\\[Board #${notice.seq} from @coordinator\\]`));
+      assert.deepEqual(await listUndeliveredForWorker('sw-reg', 'claude-w', { sessionsDir }), []);
+      const later = await postBoardMessage('sw-reg', { text: '@claude-w One more thing' }, { sessionsDir });
+      await markDelivered('sw-reg', [later.seq], 'claude-w', { sessionsDir });
+      await onWorkerTurnFinished({
+        swarmId: 'sw-reg', swarmAgent: 'claude-w', runId: args.run_id, sessionId: args.session_id,
+        outcome: { state: 'finished' }, result: { text: 'switched ok', session_id: args.session_id }, sessionsDir,
+      });
+      return { run_id: args.run_id, session_id: args.session_id, cwd: args.cwd };
+    },
+  };
+  const switched = await handleSwarmAction({ action: 'model', swarm_id: 'sw-reg', name: 'claude-w', cli: 'codex', model: 'codex/gpt-5' }, fastMocks);
+  assert.equal(switched.worker.state, 'waiting');
+  assert.ok(switched.worker.last_seq > switched.seq);
+
+  // 4. Interrupting an idle waiting worker via swarm-service returns 409.
+  await assert.rejects(
+    runSwarmOperation('action', { swarm_id: 'sw-reg', action: 'interrupt', name: 'claude-w' }, { sessionsDir }),
+    (err) => err.status === 409 && /not currently running/i.test(err.message),
+  );
+});
+
+test('board_ask reply rechecks the worker after a lost active claim', async (t) => {
+  const dir = makeTmp(t);
+  const sessionsDir = join(dir, 'sessions');
+  const swarmId = 'sw-ask-race';
+  const oldRun = '1'.repeat(32);
+  const sessionId = 'exec-ask-race';
+  await ensureSwarm({ swarmId, cwd: dir, sessionsDir });
+  await upsertWorker(swarmId, {
+    name: 'worker', state: 'waiting_reply', parked_on: 'board_ask:1', run_id: oldRun, session_id: sessionId,
+  }, { sessionsDir });
+
+  let finish;
+  const steered = [];
+  const woken = [];
+  const reply = await handleBoardAction({
+    action: 'post', swarm_id: swarmId, from: 'coordinator', text: '@worker Use 3498.',
+  }, {
+    sessionsDir,
+    readRunImpl: () => {
+      // Commit the finish after the liveness check, before the conditional claim.
+      finish ??= updateWorker(swarmId, 'worker', { state: 'waiting', parked_on: null }, { sessionsDir });
+      return { state: 'running' };
+    },
+    steerRunImpl: async (runId) => steered.push(runId),
+    dispatchRunImpl: async (args) => {
+      woken.push(args);
+      return { run_id: args.run_id, session_id: args.session_id };
+    },
+  });
+  await finish;
+  assert.deepEqual(steered, []);
+  assert.equal(woken.length, 1);
+  assert.equal(woken[0].session_id, sessionId);
+  assert.notEqual(woken[0].run_id, oldRun);
+  assert.equal(reply.deliveries[0].mode, 'wake');
+  assert.deepEqual(await listUndeliveredForWorker(swarmId, 'worker', { sessionsDir }), []);
+
+  // If the claim wins but the turn ends before steer, the warm wake uses the claimed state.
+  await updateWorker(swarmId, 'worker', { state: 'waiting_reply', parked_on: 'board_ask:2' }, { sessionsDir });
+  let finished = false;
+  const lateReply = await handleBoardAction({
+    action: 'post', swarm_id: swarmId, from: 'coordinator', text: '@worker Use 3499 instead.',
+  }, {
+    sessionsDir,
+    readRunImpl: () => ({ state: finished ? 'finished' : 'running' }),
+    steerRunImpl: async () => {
+      finished = true;
+      throw new Error('Run has already finished.');
+    },
+    dispatchRunImpl: async (args) => ({ run_id: args.run_id, session_id: args.session_id }),
+  });
+  assert.equal(lateReply.deliveries[0].mode, 'wake');
+  assert.notEqual(lateReply.deliveries[0].run_id, woken[0].run_id);
+});
+
+test('model switch dispatch failure restores the prior worker runtime and state', async (t) => {
+  const dir = makeTmp(t);
+  const sessionsDir = join(dir, 'sessions');
+  const swarmId = 'sw-switch-failure';
+  const previous = {
+    state: 'waiting', run_id: '1'.repeat(32), session_id: 'exec-old', parked_on: 'board_wait',
+    model: 'claude-sonnet-4', tier: 'sonnet', cli: 'claude',
+  };
+  await ensureSwarm({ swarmId, cwd: dir, sessionsDir });
+  await upsertWorker(swarmId, { name: 'worker', ...previous }, { sessionsDir });
+  const failure = new Error('dispatch failed');
+
+  await assert.rejects(handleSwarmAction({
+    action: 'model', swarm_id: swarmId, name: 'worker', model: 'codex/gpt-5', tier: '', cli: 'codex',
+  }, {
+    sessionsDir,
+    dispatchRunImpl: async () => { throw failure; },
+  }), (error) => error === failure);
+  const worker = await getWorker(swarmId, 'worker', { sessionsDir });
+  assert.deepEqual(Object.fromEntries(Object.keys(previous).map((key) => [key, worker[key]])), previous);
+  assert.equal(worker.error, failure.message);
+  const [notice] = await readBoardMessages(swarmId, { sessionsDir });
+  assert.match(notice.text, /Switching runtime/);
+});

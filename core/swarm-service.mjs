@@ -396,6 +396,9 @@ async function performSwarmAction(args, options) {
   if (worker.state === 'killed') {
     throw Object.assign(new Error(`Worker '${workerName}' has already been killed.`), { status: 409 });
   }
+  if (!['working', 'waiting_reply'].includes(worker.state)) {
+    throw Object.assign(new Error(`Worker '${workerName}' is not currently running (state: ${worker.state}).`), { status: 409 });
+  }
   if (!worker.run_id) {
     throw Object.assign(new Error(`Worker '${workerName}' has no active run to interrupt.`), { status: 409 });
   }

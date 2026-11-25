@@ -289,7 +289,11 @@ export const claudeRunner = {
       throw new Error(detail);
     }
 
-    if (fork && !journal.getRunnerSessionId()) throw new Error('Claude did not return a new forked session ID.');
+    if (fork && !journal.getRunnerSessionId()) {
+      const msg = 'Claude did not return a new forked session ID.';
+      journal.finish('failed', msg);
+      throw new Error(msg);
+    }
     const finalText = journal.getText() || resultText;
     if (!finalText) {
       journal.finish('failed', 'Claude finished without an assistant message.');

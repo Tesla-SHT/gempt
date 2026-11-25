@@ -132,6 +132,7 @@ export const geminiRunner = {
     let resultText = '';
     let resultError = '';
     let msgCounter = 0;
+    const toolNames = new Map();
 
     const timer = setTimeout(() => {
       timedOut = true;
@@ -159,6 +160,7 @@ export const geminiRunner = {
       if (ev.type === 'tool_use') {
         const toolId = String(ev.tool_id || ev.id || `tool-${++msgCounter}`);
         const name = String(ev.tool_name || ev.name || '');
+        toolNames.set(toolId, name);
         const params = ev.parameters || ev.input || {};
         if (/shell|bash|command/i.test(name)) {
           journal.recordCommand(toolId, String(params.command || params.cmd || ''), null, '');
@@ -170,7 +172,7 @@ export const geminiRunner = {
       }
       if (ev.type === 'tool_result') {
         const toolId = String(ev.tool_id || ev.id || '');
-        if (toolId) {
+        if (toolId && /shell|bash|command/i.test(toolNames.get(toolId) || '')) {
           const out = typeof ev.output === 'string' ? ev.output : JSON.stringify(ev.output || '');
           journal.recordCommand(toolId, undefined, ev.status === 'error' ? 1 : 0, out);
         }

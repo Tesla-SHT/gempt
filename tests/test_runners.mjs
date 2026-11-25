@@ -369,6 +369,7 @@ if (sub === 'run') {
 }
 
 if (sub === 'serve') {
+  if (process.env.MOCK_SERVE_UNAVAILABLE === '1') process.exit(18);
   const port = Number(args[args.indexOf('--port') + 1]);
   const sseClients = new Set();
   const broadcast = (payload) => {
@@ -386,6 +387,7 @@ if (sub === 'serve') {
     }
     if (url.pathname === '/event') {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      res.flushHeaders();
       sseClients.add(res);
       req.on('close', () => sseClients.delete(res));
       return;
@@ -420,6 +422,31 @@ if (sub === 'serve') {
     if (req.method === 'POST' && url.pathname === '/session/oc-srv-1/message') {
       const text = body?.parts?.[0]?.text || '';
       log({ mode: 'serve', action: 'message', text });
+      if (text === 'EXIT_DURING_MESSAGE') process.exit(17);
+      if (['SSE_EOF', 'SSE_DONE', 'SSE_DISCONNECT', 'POST_TEXT_AFTER_EOF', 'POST_BEFORE_IDLE'].includes(text)) {
+        while (!sseClients.size) await new Promise((r) => setTimeout(r, 10));
+        if (text === 'POST_BEFORE_IDLE') {
+          res.writeHead(204).end();
+          await new Promise((r) => setTimeout(r, 20));
+          broadcast({ type: 'message.part.updated', properties: { sessionID: 'oc-srv-1', part: { id: 'late', type: 'text', text: 'Late SSE reply.' } } });
+          broadcast({ type: 'session.idle', properties: { sessionID: 'oc-srv-1' } });
+        }
+        if (text === 'POST_TEXT_AFTER_EOF') {
+          broadcast({ type: 'message.part.updated', properties: { sessionID: 'oc-srv-1', part: { id: 'partial', type: 'text' }, delta: 'Incomplete SSE reply.' } });
+        }
+        for (const client of sseClients) {
+          if (text === 'SSE_DONE') client.write('data: [DONE]\\n\\n');
+          else if (text === 'SSE_DISCONNECT') client.destroy();
+          else client.end();
+        }
+        if (text === 'POST_TEXT_AFTER_EOF') {
+          await new Promise((r) => setTimeout(r, 50));
+          res.writeHead(200, { 'content-type': 'application/json' });
+          return res.end(JSON.stringify({ text: 'Complete HTTP reply.' }));
+        }
+        if (text !== 'POST_BEFORE_IDLE') res.writeHead(204).end();
+        return;
+      }
       broadcast({ type: 'message.part.updated', properties: { sessionID: 'oc-srv-1', part: { id: 'p1', type: 'text' }, delta: 'Serve streaming reply.' } });
       if (text.includes('HOLD_FOR_STEER')) {
         const deadline = Date.now() + 4000;
@@ -540,6 +567,50 @@ if (sub === 'serve') {
   assert.ok(events.some((e) => e.mode === 'serve' && e.action === 'steer'));
   assert.ok(events.some((e) => e.mode === 'serve' && e.action === 'abort'));
   assert.ok(events.some((e) => e.mode === 'run' && e.args.includes('--format') && e.args.includes('json')));
+
+  const runServeTurn = (prompt, extraEnv) => {
+    const turnDir = makeTmp(t, 'gempt-opencode-turn-');
+    const runFile = join(turnDir, 'state.json');
+    writeFileSync(runFile, '{}');
+    return getRunner('opencode').runTurn({
+      cwd, env: { ...env, ...extraEnv }, cliPath: mockOpenCode, runFile, prompt, timeoutSec: 5,
+    });
+  };
+
+  await t.test('SSE ending before idle fails turns without an HTTP reply', async () => {
+    for (const prompt of ['SSE_EOF', 'SSE_DONE', 'SSE_DISCONNECT']) {
+      await assert.rejects(runServeTurn(prompt), /OpenCode SSE stream (closed|disconnected) before session idle/);
+    }
+  });
+
+  await t.test('serve accepts complete HTTP text after EOF and SSE idle after an empty POST response', async () => {
+    assert.equal((await runServeTurn('POST_TEXT_AFTER_EOF')).text, 'Complete HTTP reply.');
+    assert.equal((await runServeTurn('POST_BEFORE_IDLE')).text, 'Late SSE reply.');
+  });
+
+  await t.test('unavailable serve falls back to run --format json before sending a prompt', async () => {
+    const result = await runServeTurn('Automatic fallback', { MOCK_SERVE_UNAVAILABLE: '1' });
+    assert.equal(result.text, 'Fallback run succeeded.');
+  });
+
+  await t.test('local serve exit aborts the outstanding HTTP request and SSE', async (t) => {
+    const originalFetch = globalThis.fetch;
+    let messageSignal;
+    let sseSignal;
+    t.mock.method(globalThis, 'fetch', (url, opts) => {
+      if (url.endsWith('/event')) sseSignal = opts.signal;
+      if (!url.endsWith('/message')) return originalFetch(url, opts);
+      messageSignal = opts.signal;
+      // Send the request that exits the child, but model a client still waiting on HTTP.
+      void originalFetch(url, opts).catch(() => {});
+      return new Promise((_resolve, reject) => {
+        messageSignal.addEventListener('abort', () => reject(messageSignal.reason), { once: true });
+      });
+    });
+    await assert.rejects(runServeTurn('EXIT_DURING_MESSAGE'), /OpenCode serve exited unexpectedly \(17\)/);
+    assert.match(messageSignal.reason.message, /serve exited unexpectedly/);
+    assert.equal(sseSignal.reason, messageSignal.reason);
+  });
 });
 
 test('gemini and all 7 declarative adapters wire Magpie + Swarm env and stream into Live journal', async (t) => {

@@ -625,7 +625,7 @@ export function mountConsole(root, transport, {
       announcement.textContent = message;
       $('sync-message').textContent = message;
     }
-    if (!message && document.activeElement === $('sync-retry')) document.getElementById('refresh-btn').focus();
+    if (!message && document.activeElement === $('sync-retry')) document.getElementById('refresh-btn')?.focus();
     banner.hidden = !message;
   }
 

@@ -66,21 +66,26 @@ function extractPartsText(parts) {
 async function waitForOpenCodeServer(baseUrl, child, startupMs = 6000) {
   const deadline = Date.now() + startupMs;
   let exited = false;
-  child.once('exit', () => { exited = true; });
-  while (!exited && Date.now() < deadline) {
-    for (const path of ['/global/health', '/health', '/session']) {
-      try {
-        const res = await fetch(`${baseUrl}${path}`, { signal: AbortSignal.timeout(600) });
-        if (res.ok || res.status === 200) {
+  const onExit = () => { exited = true; };
+  child.once('exit', onExit);
+  child.once('error', onExit);
+  try {
+    while (!exited && Date.now() < deadline) {
+      for (const path of ['/global/health', '/health', '/session']) {
+        if (exited) return false;
+        try {
+          const res = await fetch(`${baseUrl}${path}`, { signal: AbortSignal.timeout(600) });
           await res.body?.cancel();
-          return true;
-        }
-        await res.body?.cancel();
-      } catch { /* retry */ }
+          if (res.ok) return !exited;
+        } catch { /* retry */ }
+      }
+      await sleep(80);
     }
-    await sleep(80);
+    return false;
+  } finally {
+    child.off('exit', onExit);
+    child.off('error', onExit);
   }
-  return false;
 }
 
 async function consumeOpenCodeSse({ baseUrl, sessionId, journal, signal, onIdle, onError }) {
@@ -149,21 +154,16 @@ async function consumeOpenCodeSse({ baseUrl, sessionId, journal, signal, onIdle,
     }
   };
 
-  try {
-    for await (const chunk of res.body) {
-      buffer += decoder.decode(chunk, { stream: true });
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        if (line.startsWith('data:')) {
-          const data = line.slice(5).trim();
-          if (data && data !== '[DONE]') handlePayload(data);
-        }
+  for await (const chunk of res.body) {
+    buffer += decoder.decode(chunk, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? '';
+    for (const line of lines) {
+      if (line.startsWith('data:')) {
+        const data = line.slice(5).trim();
+        if (data === '[DONE]') return;
+        if (data) handlePayload(data);
       }
-    }
-  } catch (err) {
-    if (!signal?.aborted) {
-      /* SSE connection ended before abort; prompt response still resolves turn. */
     }
   }
 }
@@ -195,6 +195,15 @@ async function runViaServe({ cliPath, ctx, journal, childEnv }) {
   const timeoutTimer = setTimeout(() => {
     abortController.abort(new Error(`OpenCode turn timed out after ${ctx.timeoutSec}s.`));
   }, Math.max(1000, (ctx.timeoutSec || 3600) * 1000));
+  const onServerExit = (code, signal) => abortController.abort(
+    new Error(`OpenCode serve exited unexpectedly (${(signal || code) ?? 'unknown'}).`),
+  );
+  if (serverChild) {
+    serverChild.once('exit', onServerExit);
+    if (serverChild.exitCode !== null || serverChild.signalCode !== null) {
+      onServerExit(serverChild.exitCode, serverChild.signalCode);
+    }
+  }
 
   try {
     let ocSessionId = ctx.runnerSessionId || '';
@@ -223,7 +232,7 @@ async function runViaServe({ cliPath, ctx, journal, childEnv }) {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ title: ctx.sessionId || 'gempt-opencode' }),
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.any([abortController.signal, AbortSignal.timeout(5000)]),
       });
       if (!createRes.ok) {
         const body = await createRes.text().catch(() => '');
@@ -245,78 +254,90 @@ async function runViaServe({ cliPath, ctx, journal, childEnv }) {
     });
     idlePromise.catch(() => {});
 
-    const sseTask = consumeOpenCodeSse({
+    const onAbort = () => rejectStream(abortController.signal.reason instanceof Error
+      ? abortController.signal.reason
+      : new Error('OpenCode turn aborted.'));
+    if (abortController.signal.aborted) onAbort();
+    else abortController.signal.addEventListener('abort', onAbort, { once: true });
+
+    const streamClosed = consumeOpenCodeSse({
       baseUrl,
       sessionId: ocSessionId,
       journal,
       signal: abortController.signal,
       onIdle: resolveIdle,
       onError: rejectStream,
-    });
+    }).then(
+      () => new Error('OpenCode SSE stream closed before session idle.'),
+      (cause) => new Error('OpenCode SSE stream disconnected before session idle.', { cause }),
+    );
 
-    const messagePayload = {
-      parts: [{ type: 'text', text: String(prompt || '') }],
-      ...(ctx.model ? { model: { providerID: 'magpie', modelID: ctx.model } } : {}),
-    };
-    const msgRes = await fetch(`${baseUrl}/session/${encodeURIComponent(ocSessionId)}/message`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(messagePayload),
-      signal: abortController.signal,
-    });
-    if (!msgRes.ok) {
-      const errBody = await msgRes.text().catch(() => '');
-      throw new Error(`OpenCode POST /session/${ocSessionId}/message failed (${msgRes.status}): ${errBody.slice(0, 400)}`);
-    }
-
-    let responseText = '';
-    const ct = String(msgRes.headers.get('content-type') || '');
-    if (ct.includes('application/json')) {
-      const data = await msgRes.json().catch(() => null);
-      if (data?.info?.tokens) journal.recordUsage(data.info.tokens, data.info.id);
-      if (data?.usage) journal.recordUsage(data.usage);
-      responseText = extractPartsText(data?.parts) || String(data?.text || '');
-      if (responseText && !journal.getText()) {
-        journal.completeMessage(data?.info?.id || 'oc-reply', responseText);
+    try {
+      const messagePayload = {
+        parts: [{ type: 'text', text: String(prompt || '') }],
+        ...(ctx.model ? { model: { providerID: 'magpie', modelID: ctx.model } } : {}),
+      };
+      const msgRes = await fetch(`${baseUrl}/session/${encodeURIComponent(ocSessionId)}/message`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(messagePayload),
+        signal: abortController.signal,
+      });
+      if (!msgRes.ok) {
+        const errBody = await msgRes.text().catch(() => '');
+        throw new Error(`OpenCode POST /session/${ocSessionId}/message failed (${msgRes.status}): ${errBody.slice(0, 400)}`);
       }
-      // If the response already carried assistant text, give SSE a tiny tick to flush then settle.
-      if (responseText) {
-        await Promise.race([idlePromise, sleep(50)]);
+
+      let responseText = '';
+      const ct = String(msgRes.headers.get('content-type') || '');
+      if (ct.includes('application/json')) {
+        const data = await msgRes.json().catch(() => null);
+        if (data?.info?.tokens) journal.recordUsage(data.info.tokens, data.info.id);
+        if (data?.usage) journal.recordUsage(data.usage);
+        responseText = extractPartsText(data?.parts) || String(data?.text || '');
+        if (responseText && !journal.getText()) {
+          journal.completeMessage(data?.info?.id || 'oc-reply', responseText);
+        }
       } else {
-        await idlePromise;
+        await msgRes.body?.cancel();
       }
-    } else {
-      await msgRes.body?.cancel();
-      await idlePromise;
-    }
 
-    abortController.abort();
-    await sseTask.catch(() => {});
+      // A complete HTTP reply can finish the turn even if SSE has already closed.
+      const streamError = await Promise.race(responseText
+        ? [idlePromise, streamClosed, sleep(50)]
+        : [idlePromise, streamClosed]);
+      abortController.signal.throwIfAborted();
+      if (streamError && !responseText) throw streamError;
+      abortController.abort();
+      await streamClosed;
 
-    if (isRunInterruptRequested(journal.directory)) {
-      journal.finish('interrupted', 'OpenCode turn interrupted.');
-      throw new TurnInterrupted('OpenCode turn interrupted.');
-    }
+      if (isRunInterruptRequested(journal.directory)) {
+        journal.finish('interrupted', 'OpenCode turn interrupted.');
+        throw new TurnInterrupted('OpenCode turn interrupted.');
+      }
 
-    const finalText = journal.getText() || responseText;
-    if (!finalText) {
-      journal.finish('failed', 'OpenCode finished without an assistant message.');
-      throw new Error('OpenCode finished without an assistant message.');
+      const finalText = streamError ? responseText : (journal.getText() || responseText);
+      if (!finalText) {
+        journal.finish('failed', 'OpenCode finished without an assistant message.');
+        throw new Error('OpenCode finished without an assistant message.');
+      }
+      journal.finish('completed');
+      return {
+        fallback: false,
+        result: {
+          threadId: journal.getThreadId(),
+          runnerSessionId: ocSessionId,
+          turnId: journal.getTurnId(),
+          sandbox: ctx.sandbox,
+          text: finalText,
+          elapsedSec: journal.getElapsedSec(),
+          commands: journal.getCommands(),
+          usage: journal.getUsage(),
+        },
+      };
+    } finally {
+      abortController.signal.removeEventListener('abort', onAbort);
     }
-    journal.finish('completed');
-    return {
-      fallback: false,
-      result: {
-        threadId: journal.getThreadId(),
-        runnerSessionId: ocSessionId,
-        turnId: journal.getTurnId(),
-        sandbox: ctx.sandbox,
-        text: finalText,
-        elapsedSec: journal.getElapsedSec(),
-        commands: journal.getCommands(),
-        usage: journal.getUsage(),
-      },
-    };
   } catch (err) {
     if (isRunInterruptRequested(journal.directory)) {
       journal.finish('interrupted', 'OpenCode turn interrupted.');
@@ -330,6 +351,7 @@ async function runViaServe({ cliPath, ctx, journal, childEnv }) {
     throw err;
   } finally {
     clearTimeout(timeoutTimer);
+    serverChild?.off('exit', onServerExit);
     abortController.abort();
     if (serverChild) terminateProcessTree(serverChild);
   }
