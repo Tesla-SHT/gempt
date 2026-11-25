@@ -7,6 +7,8 @@ import { delimiter, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { getExecutionConfig, RUNNER_IDS } from '../core/config.mjs';
+import { runSwarmOperation } from '../core/swarm-service.mjs';
+import { handleTool } from '../core/mcp-server.mjs';
 import { runLiveOperation } from '../core/live-service.mjs';
 import {
   buildRunnerBaseEnv, findExecutable, getExecutableSearchDirs, resolveExecutableInvocation,
@@ -272,7 +274,7 @@ console.log(JSON.stringify({
 
   // Turn 2: resume same session with change access (upgrade -> fresh turn) vs same sandbox resume
   const r2 = await dispatchRun({
-    goal: 'Continue inspection',
+    goal: 'Continue inspection', host_conversation_id: 'claude-solo',
     cwd,
     access: 'inspect',
     sandbox: 'read-only',
@@ -307,6 +309,24 @@ console.log(JSON.stringify({
     assert.match(invocation.stdinText, /Fallback board summary/);
     assert.ok(!invocation.args.includes('--resume'));
   }
+  const solo = await runSwarmOperation('overview', { swarm_id: r2.swarm_id }, { sessionsDir, configPath });
+  assert.equal(solo.head, 0);
+  assert.equal(solo.counts.visible, 1);
+  assert.equal(solo.roster[0].session_id, r2.session_id);
+  assert.equal(solo.roster[0].cli, 'claude');
+  assert.equal(solo.roster[0].telemetry.cache_hit_ratio, 30 / 160);
+  assert.equal(solo.roster[0].telemetry.usage.input_tokens, 160);
+  const added = await handleSwarmAction({ action: 'add', name: 'claude-child', brief: 'Check the findings',
+    host_conversation_id: 'claude-solo', fork: solo.roster[0].name }, { configPath, sessionsDir, env });
+  assert.equal(added.swarm_id, r2.swarm_id);
+  const escalated = await waitForRun(added.workers[0].run_id, { sessionsDir, timeoutSec: 15 });
+  assert.equal(escalated.fork_mode, 'native', escalated.error);
+  const childCall = JSON.parse(readFileSync(captureFile, 'utf8').trim().split('\n').at(-1));
+  assert.equal(childCall.swarmAgent, 'claude-child');
+  assert.ok(childCall.mcpContent.mcpServers.gempt_board);
+  assert.equal(invocations[1].mcpContent, null);
+  assert.equal(invocations[1].swarmId, null);
+  assert.doesNotMatch(invocations[1].stdinText, /board_post|Shared message board protocol/);
   assert.equal(invocations.length, 2);
   assert.equal(invocations[0].anthropicBaseUrl, gatewayUrl);
   assert.equal(invocations[0].anthropicAuthToken, 'sk-test-magpie');
@@ -495,7 +515,7 @@ if (sub === 'serve') {
 
   // 3. Fallback `opencode run --format json`
   const r3 = await dispatchRun({
-    goal: 'Run fallback test',
+    goal: 'Run fallback test', host_conversation_id: 'opencode-solo',
     cwd,
     cli: 'opencode',
     model: 'deepseek/deepseek-r1',
@@ -504,6 +524,9 @@ if (sub === 'serve') {
   const done3 = await waitForRun(r3.run_id, { sessionsDir, timeoutSec: 15 });
   assert.equal(done3.state, 'finished', done3.error || 'opencode run fallback failed');
   assert.match(done3.result.text, /Fallback run succeeded/);
+  const ocBoard = await getSwarmOverview(r3.swarm_id, { sessionsDir });
+  assert.equal(ocBoard.head, 0);
+  assert.equal(ocBoard.roster[0].cli, 'opencode');
 
   const events = readFileSync(logFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
   assert.ok(events.some((e) => e.mode === 'serve' && e.action === 'create_session' && e.ocConfig?.mcp?.gempt_board));
@@ -603,6 +626,33 @@ if (id === 'gemini') {
     assert.equal(payload.swarmId, `sw-${id}`);
     assert.equal(payload.agent, `w-${id}`);
     assert.equal(payload.sessionsDir, sessionsDir);
+
+    const host_conversation_id = 'single-' + id;
+    const soloResult = await handleTool('gpt_run', { cwd, cli: id, goal: 'Inspect the project', host_conversation_id,
+      background: true }, env, { configPath, sessionsDir });
+    const receipt = JSON.parse(soloResult.content[0].text);
+    assert.ok(receipt.wait_command.includes(receipt.run_id));
+    const solo = await waitForRun(receipt.run_id, { sessionsDir, timeoutSec: 15 });
+    assert.equal(solo.state, 'finished', solo.error);
+    const board = await getSwarmOverview(solo.swarm_id, { sessionsDir });
+    assert.equal(board.head, 0);
+    assert.equal(board.roster.length, 1);
+    assert.equal(board.roster[0].cli, id);
+    assert.equal(board.roster[0].session_id, receipt.session_id);
+    const invocation = JSON.parse(solo.result.text.match(/(?:GEMINI|PLAIN|JSON)_OK:(\{.*\})/)[1]);
+    assert.equal(invocation.swarmId, '');
+    assert.equal(invocation.agent, '');
+    if (id === 'gemini') {
+      assert.doesNotMatch(invocation.prompt, /board_post|Shared message board protocol/);
+      const added = await handleSwarmAction({ action: 'add', fork: board.roster[0].name, name: 'child',
+        brief: 'Check the previous answer', host_conversation_id, cwd }, { configPath, sessionsDir, env });
+      assert.equal(added.swarm_id, solo.swarm_id);
+      const child = await waitForRun(added.workers[0].run_id, { sessionsDir, timeoutSec: 15 });
+      assert.equal(child.fork_mode, 'summary_fallback', child.error);
+      const forked = JSON.parse(child.result.text.match(/GEMINI_OK:(\{.*\})/)[1]);
+      assert.match(forked.prompt, /GEMINI_OK:/);
+      assert.equal(forked.agent, 'child');
+    }
   }
 });
 

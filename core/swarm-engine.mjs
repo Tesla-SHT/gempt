@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { isValidSessionId } from './state.mjs';
 import { readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
-import { CLI_CHOICES, getExecutionConfig } from './config.mjs';
+import { CLI_CHOICES, getExecutionConfig, getNativeSwarmPolicy } from './config.mjs';
 import { readHostContext } from './host-context.mjs';
 import {
   ACTIVE_STATES, buildBoardWaitCommand, dispatchRun, interruptRun, readRun, replyToolCall, steerRun, validateExecTimeoutSec,
@@ -31,8 +31,9 @@ function resolveEngineContext(args = {}, options = {}) {
   const hostConversationId = (typeof args.host_conversation_id === 'string' && args.host_conversation_id.trim())
     || hostCtx.conversation_id || null;
   const geminiFamily = args.gemini_family || hostCtx.gemini_family || undefined;
+  const nativeSwarm = !args.swarm_id && getNativeSwarmPolicy(readJsonSafe(configPath)?.routing_policy).native_swarm;
   return {
-    env,
+    nativeSwarm, env,
     configPath,
     sessionsDir,
     cwd,
@@ -307,7 +308,7 @@ export async function onWorkerTurnFinished({
   const errText = finishedOk ? null : String(error?.message || error || outcome?.error?.message || outcome?.error || outcome?.state || 'failed');
 
   // Check whether the worker already posted a board message during this turn.
-  const recent = await readBoardMessages(swarmId, { limit: 100, sessionsDir: resolvedSessions });
+  const recent = outcome?.implicit_swarm_worker ? [] : await readBoardMessages(swarmId, { limit: 100, sessionsDir: resolvedSessions });
   const startMs = startedAt ? Date.parse(startedAt) : NaN;
   const postedDuringTurn = recent.some((msg) => {
     if (msg.from_agent !== swarmAgent || (recovered && finishedOk && msg.meta?.auto_summary && msg.kind === 'error')) return false;
@@ -320,7 +321,7 @@ export async function onWorkerTurnFinished({
   });
 
   let autoPost = null;
-  if (!postedDuringTurn && !(finishedOk && worker.parked_on?.startsWith('board_wait'))) {
+  if (!outcome?.implicit_swarm_worker && !postedDuringTurn && !(finishedOk && worker.parked_on?.startsWith('board_wait'))) {
     const summaryText = finishedOk
       ? `@${worker.added_by} [done] ${truncateText(stripSummaryHeader(result?.text) || 'Turn finished.', 600)}`
       : `@coordinator [${outcome?.state || 'failed'}] ${truncateText(errText, 400)}`;
@@ -336,7 +337,7 @@ export async function onWorkerTurnFinished({
   const finished = await updateWorker(swarmId, swarmAgent, {
     state: nextState,
     ...(result?.fork_mode ? { fork_mode: result.fork_mode } : {}),
-    ...(result?.cli ? { cli: result.cli } : {}),
+    cli: result?.cli || outcome?.cli, model: result?.model || outcome?.model, tier: result?.tier || outcome?.tier,
     session_id: result?.session_id || sessionId || worker.session_id,
     parked_on: !recovered && finishedOk && worker.parked_on?.startsWith('board_wait') ? worker.parked_on : null,
     quota_paused_seq: QUOTA_ERROR.test(errText || '') ? await getBoardHead(swarmId, { sessionsDir: resolvedSessions }) : 0,
@@ -415,6 +416,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
   const ctx = resolveEngineContext(args, options);
   const swarmId = await resolveSwarmId({
     swarmId: args.swarm_id,
+    nativeSwarm: ctx.nativeSwarm,
     hostConversationId: ctx.hostConversationId,
     cwd: ctx.cwd,
     sessionsDir: ctx.sessionsDir,
@@ -492,7 +494,9 @@ export async function handleSwarmAction(args = {}, options = {}) {
   if (action === 'add') {
     const specs = expandWorkerSpecs(args);
     if (parent?.access === 'inspect' && args.access === 'change') throw new Error('An inspect-only worker can add only inspect helpers.');
-    const access = String(args.access || parent?.access || 'change').trim();
+    const forkWorker = args.fork && args.fork !== 'coordinator' ? await getWorker(swarmId, args.fork, storage) : null;
+    if (args.fork && args.fork !== 'coordinator' && !forkWorker) throw new Error(`Cannot fork unknown member '${args.fork}'.`);
+    const access = String(args.access || parent?.access || forkWorker?.access || 'change').trim();
     if (!['change', 'inspect'].includes(access)) throw new Error(`Invalid access '${access}'.`);
     const workspace = String(args.workspace || 'inherit').trim();
     if (!['inherit', 'share'].includes(workspace)) throw new Error(`Invalid workspace '${workspace}'.`);
@@ -502,11 +506,12 @@ export async function handleSwarmAction(args = {}, options = {}) {
     const timeoutSec = validateExecTimeoutSec(args.timeout_sec);
     const cfg = readJsonSafe(ctx.configPath) || {};
     const defaultCli = getExecutionConfig(cfg).default_cli;
-    const cli = String(args.cli || parent?.cli || defaultCli || 'auto').trim().toLowerCase() || 'auto';
+    const cli = String(args.cli || forkWorker?.cli || parent?.cli || defaultCli || 'auto').trim().toLowerCase() || 'auto';
     if (!CLI_CHOICES.includes(cli)) {
       throw new Error(`Invalid cli '${args.cli}'. Expected one of: ${CLI_CHOICES.join(', ')}.`);
     }
-    const model = typeof args.model === 'string' && args.model.trim() ? args.model.trim() : parent?.model || null;
+    const inheritedModel = cli === forkWorker?.cli ? forkWorker.model : parent?.model;
+    const model = typeof args.model === 'string' && args.model.trim() ? args.model.trim() : inheritedModel || null;
     const tier = typeof args.tier === 'string' && args.tier.trim() ? args.tier.trim() : null;
 
     await ensureSwarm({ swarmId, ...storage });
@@ -523,8 +528,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
     let forkContext;
     let forkSource;
     if (args.fork) {
-      const source = args.fork === 'coordinator' ? null : await getWorker(swarmId, args.fork, storage);
-      if (!source && args.fork !== 'coordinator') throw new Error(`Cannot fork unknown member '${args.fork}'.`);
+      const source = forkWorker;
       let session = isValidSessionId(source?.session_id)
         ? readJsonSafe(join(ctx.sessionsDir, `${source.session_id}.json`)) : null;
       if (!session && source?.run_id) {
@@ -534,11 +538,13 @@ export async function handleSwarmAction(args = {}, options = {}) {
       if (session) {
         const cli = session.cli || 'codex';
         const id = cli === 'codex' ? session?.codex_thread_id : cli === 'claude' ? session?.runner_session_id : null;
-        if (id && session.model) forkSource = { cli, model: session.model, id };
+        if (id && session.model) forkSource = { cli, model: session.model, id,
+          ...(cli === 'codex' ? { dynamic_board_tools: session.codex_dynamic_board_tools ?? !session.implicit_swarm_worker } : {}) };
       }
       const recent = await readBoardMessages(swarmId, { ...storage, limit: Infinity });
       const memory = recent.filter((m) => m.from_agent === args.fork || m.meta?.worker === args.fork).slice(-8);
-      forkContext = [source?.task_summary || source?.brief, ...memory.map((m) => `#${m.seq} ${truncateText(m.text)}`),
+      const lastReply = session?.turns?.findLast((turn) => turn.role === 'assistant')?.content || session?.result?.text;
+      forkContext = [source?.task_summary || source?.brief, !memory.length && truncateText(lastReply, 2000), ...memory.map((m) => `#${m.seq} ${truncateText(m.text)}`),
         `Everything before this turn is @${args.fork}'s memory. Do not redo its work or answer its old requests. Follow your own assignment.`].filter(Boolean).join('\n');
     }
     const runIds = specs.map(() => randomUUID().replaceAll('-', ''));
@@ -558,7 +564,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
       try {
         const run = await ctx.dispatchRunImpl({
           run_id: runIds[index], goal: buildWorkerInstructions({ ...instructions, forkContext }),
-          cwd: ctx.cwd,
+          cwd: ctx.cwd || forkWorker?.worktree_path || forkWorker?.source_cwd,
           access,
           workspace,
           cli,
@@ -594,7 +600,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
           session_id: run.session_id,
           cli: run.cli || cli,
           worktree_path: run.worktree_path || null,
-          source_cwd: run.source_cwd || ctx.cwd || null,
+          source_cwd: run.source_cwd || run.cwd || ctx.cwd || forkWorker?.source_cwd || null,
           model: run.model || model,
         }, { sessionsDir: ctx.sessionsDir, expectedRun: runIds[index] });
         spawned.push({ ...compactRosterItem(saved || await getWorker(swarmId, spec.name, storage)), brief_seq: msg.seq });
@@ -735,6 +741,7 @@ export async function handleBoardAction(args = {}, options = {}) {
   const ctx = resolveEngineContext(args, options);
   const swarmId = await resolveSwarmId({
     swarmId: args.swarm_id,
+    nativeSwarm: ctx.nativeSwarm,
     hostConversationId: ctx.hostConversationId,
     cwd: ctx.cwd,
     sessionsDir: ctx.sessionsDir,

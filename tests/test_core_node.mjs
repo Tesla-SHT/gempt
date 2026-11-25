@@ -611,7 +611,7 @@ async function appFixture(t, f, controls = {}) {
       if (method === 'initialized') return;
       let result = {};
       if (['thread/start', 'thread/resume', 'thread/fork'].includes(method)) {
-        if (method === 'thread/fork' && controls.rejectFork) {
+        if (method === 'thread/fork' && (controls.rejectFork || controls.rejectForkConfig && params.config)) {
           return send({ id, error: { code: -32601, message: 'Unknown method thread/fork' } });
         }
         result = openThread(method, params);
@@ -694,7 +694,7 @@ async function appFixture(t, f, controls = {}) {
 async function until(probe) {
   const end = performance.now() + 5000;
   while (performance.now() < end) {
-    const value = probe();
+    const value = await probe();
     if (value) return value;
     await sleep(20);
   }
@@ -2321,6 +2321,76 @@ test('Console API saves nested preferences and supports gateway actions', async 
   assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).magpie.api_key, secret);
   resetSettings({ keep_gateway: false }, f);
   assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).magpie.api_key, '');
+});
+
+test('solo gpt_run keeps its receipt and Codex tools, resumes one row and forks from the implicit board', async (t) => {
+  const f = fixture(t);
+  const controls = {};
+  const packets = await appFixture(t, f, controls);
+  const context = { cwd: f.cwd, host_conversation_id: 'conversation-A' };
+  const run = async (goal, session_id) => {
+    const res = await handleTool('gpt_run', { ...context, cli: 'codex', goal, session_id, background: true }, f.env, f);
+    const receipt = JSON.parse(res.content[0].text);
+    assert.equal(receipt.wait_command, buildWaitCommand(receipt.run_id, f));
+    assert.ok(receipt.session_id);
+    return receipt;
+  };
+  const [a, b] = await Promise.all([run('Hold this turn'), run('Hold this turn too')]);
+  const status = () => handleSwarmAction({ ...context, action: 'status' }, f);
+  const { swarm_id, roster, head } = await status();
+  assert.equal(head, 0);
+  assert.deepEqual(new Set(roster.map((w) => w.session_id)), new Set([a.session_id, b.session_id]));
+  assert.ok(roster.every((w) => w.state === 'working'));
+  await until(() => packets.filter((p) => p.method === 'turn/start').length === 2);
+  for (const { params } of packets.filter((p) => p.method === 'thread/start')) {
+    assert.deepEqual(params.dynamicTools.map((tool) => tool.name), ['ask_gemini']);
+  }
+  for (const { params } of packets.filter((p) => p.method === 'turn/start')) {
+    assert.doesNotMatch(params.input[0].text, /board_post|board_read|Shared message board protocol/);
+  }
+  await Promise.all([interruptRun(a.run_id, f), interruptRun(b.run_id, f)]);
+  const source = roster.find((w) => w.session_id === a.session_id).name;
+  await until(async () => (await status()).roster.every((w) => w.state === 'stopped'));
+  const resume = await run('Finish inspection', a.session_id);
+  const done = await waitForRun(resume.run_id, { ...f, timeoutSec: 10 });
+  assert.equal(done.state, 'finished', done.error);
+  const worker = await until(async () => {
+    const w = await getWorker(swarm_id, source, f);
+    return w.state === 'waiting' && w;
+  });
+  assert.equal(worker.run_id, resume.run_id);
+  assert.equal(worker.model, done.result.model);
+  assert.equal(worker.source_cwd, f.cwd);
+  assert.equal((await status()).roster.length, 2);
+  assert.equal((await status()).head, 0);
+  const add = await handleSwarmAction({ ...context, action: 'add', name: 'reviewer', brief: 'Review findings', fork: source }, f);
+  assert.equal(add.swarm_id, swarm_id);
+  const child = await waitForRun(add.workers[0].run_id, { ...f, timeoutSec: 10 });
+  assert.equal(child.fork_mode, 'native', child.error);
+  assert.equal(packets.find((p) => p.method === 'thread/fork').params.threadId, done.codex_thread_id);
+  await until(async () => (await getWorker(swarm_id, 'reviewer', f)).state === 'waiting');
+  const childMcp = packets.find((p) => p.method === 'thread/fork').params.config.mcp_servers.gempt_board;
+  assert.equal(childMcp.env.GEMPT_SWARM_ID, swarm_id);
+  assert.equal(childMcp.env.GEMPT_AGENT_NAME, 'reviewer');
+  assert.equal(childMcp.env.GEMPT_SESSIONS_DIR, f.sessionsDir);
+  assert.match(childMcp.args[0], /board-mcp\.mjs$/);
+  const wake = await handleBoardAction({ ...context, action: 'post', text: '@reviewer verify the board' }, f);
+  const woke = await waitForRun(wake.deliveries[0].run_id, { ...f, timeoutSec: 10 });
+  assert.equal(woke.state, 'finished', woke.error);
+  assert.deepEqual(packets.filter((p) => p.method === 'thread/resume').at(-1).params.config.mcp_servers.gempt_board, childMcp);
+  controls.rejectForkConfig = true;
+  const fallback = await handleSwarmAction({ ...context, action: 'add', name: 'fallback', brief: 'Review', fork: source }, f);
+  const fresh = await waitForRun(fallback.workers[0].run_id, { ...f, timeoutSec: 10 });
+  assert.equal(fresh.fork_mode, 'summary_fallback', fresh.error);
+  assert.ok(packets.filter((p) => p.method === 'thread/start').at(-1).params.dynamicTools.some((tool) => tool.name === 'board_post'));
+  assert.match(packets.filter((p) => p.method === 'turn/start').at(-1).params.input[0].text, /Prior finding: verify the result/);
+  const unbound = await dispatchRun({ cwd: f.cwd, goal: 'No host' }, f);
+  assert.equal(readRun(unbound.run_id, f.sessionsDir).swarm_id, undefined);
+  const cfg = JSON.parse(readFileSync(f.configPath));
+  cfg.routing_policy.native_swarm = true;
+  writeFileSync(f.configPath, JSON.stringify(cfg));
+  const native = await dispatchRun({ ...context, goal: 'Native mode' }, f);
+  assert.equal(readRun(native.run_id, f.sessionsDir).swarm_id, undefined);
 });
 
 test('Codex swarm fork, fallback and warm wake use the right identities, prefixes and turn-local cache usage', async (t) => {

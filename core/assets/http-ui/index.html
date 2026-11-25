@@ -74,6 +74,7 @@
           <span id="detail-worktree" class="run-kind" hidden>独立 worktree</span>
           <span id="unconfirmed-badge" class="unconfirmed-badge" hidden>远端终态未确认</span>
           <div class="top-actions">
+            <button id="open-run-swarm" class="btn-ghost" type="button" hidden>查看协作</button>
             <button id="info-toggle" class="icon-btn" type="button" aria-expanded="false" aria-controls="meta-drawer" title="任务信息" aria-label="任务信息" data-icon="info"></button>
           </div>
         </div>
@@ -168,6 +169,7 @@
             <button id="swarm-scope-session" type="button" aria-pressed="true">当前会话</button>
             <button id="swarm-scope-all" type="button" aria-pressed="false">全部</button>
           </div>
+          <button id="swarm-toggle-full" class="btn-ghost" type="button" aria-controls="swarm-subtabs" aria-expanded="false" hidden>完整工作台</button>
           <button id="swarm-refresh" class="icon-btn" type="button" title="刷新 Swarm" aria-label="刷新 Swarm" data-icon="refresh"></button>
         </div>
       </div>
@@ -206,9 +208,19 @@
     <div id="swarm-empty" class="empty swarm-empty" hidden>
       <span class="empty-icon" data-icon="users"></span>
       <p id="swarm-empty-title" class="empty-title">暂无协作 Swarm</p>
-      <p id="swarm-empty-message">通过 gpt_swarm 或 gempt swarm 启动协作后，工位与消息板会显示在这里。</p>
+      <p id="swarm-empty-message">在当前会话发起任务后，工位会显示在这里。</p>
       <button id="swarm-empty-show-all" class="btn-ghost" type="button" hidden>查看全部 Swarm</button>
     </div>
+    <section id="swarm-single" class="swarm-body" aria-label="单工位" hidden>
+      <div class="reading-column swarm-single-col">
+        <ul id="swarm-single-worker" class="swarm-worker-list"></ul>
+        <p id="swarm-single-empty" class="swarm-card-empty" hidden>暂无工位</p>
+        <form id="swarm-single-steer" class="sw-tool-row" hidden>
+          <input id="swarm-single-input" class="steer-input" aria-label="补充执行指令" placeholder="补充执行指令…" required>
+          <button id="swarm-single-send" type="submit" class="btn-primary">发送</button>
+        </form>
+      </div>
+    </section>
     <section id="swarm-sub-overview" class="swarm-body" role="tabpanel" aria-labelledby="swarm-subtab-overview" hidden>
       <div id="swarm-view-overview" class="reading-column swarm-overview-col" hidden>
         <section id="swarm-attention" aria-label="需要关注" hidden></section>

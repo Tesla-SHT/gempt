@@ -12,6 +12,8 @@ import {
   validateChannelName, validateTopic, visibleUnread,
 } from './swarm-channels.mjs';
 
+const IMPLICIT_ID_GLOB = 'conversation-' + '[0-9a-f]'.repeat(64);
+const isImplicitSwarmId = (id) => /^conversation-[a-f0-9]{64}$/.test(id);
 const WORKER_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,23}$/;
 const SWARM_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const RESERVED_WORKER_NAMES = new Set(['all', 'coordinator', 'human']);
@@ -275,26 +277,37 @@ function deterministicId(prefix, seed) {
   return `${prefix}-${createHash('sha256').update(seed).digest('hex').slice(0, 12)}`;
 }
 
-export async function resolveSwarmId({ swarmId, hostConversationId, cwd, sessionsDir, db } = {}) {
+export function resolveImplicitSwarmId(hostConversationId) {
+  const conversation = typeof hostConversationId === 'string' && hostConversationId.trim();
+  return conversation ? 'conversation-' + createHash('sha256').update(conversation).digest('hex') : null;
+}
+
+export function soloWorkerName(sessionId) {
+  return deterministicId('solo', sessionId);
+}
+
+export async function resolveSwarmId({ swarmId, hostConversationId, cwd, sessionsDir, db, nativeSwarm = false } = {}) {
   if (typeof swarmId === 'string' && swarmId.trim()) {
     return validateSwarmId(swarmId);
   }
+  const implicit = !nativeSwarm && resolveImplicitSwarmId(hostConversationId);
+  if (implicit) return implicit;
   return withDb(sessionsDir, (conn) => {
     if (typeof hostConversationId === 'string' && hostConversationId.trim()) {
       const conv = hostConversationId.trim();
       const row = conn.get(
-        'SELECT id FROM swarms WHERE host_conversation_id = ? ORDER BY updated_at DESC LIMIT 1',
-        conv,
+        'SELECT id FROM swarms WHERE host_conversation_id = ? AND id NOT GLOB ? ORDER BY updated_at DESC LIMIT 1',
+        conv, IMPLICIT_ID_GLOB,
       );
       return row?.id || deterministicId('swarm', `conv:${conv}`);
     }
     const cwdKey = normalizeCwdKey(cwd);
     if (cwdKey) {
-      const rows = conn.all('SELECT id, cwd FROM swarms WHERE cwd IS NOT NULL ORDER BY updated_at DESC LIMIT 100');
+      const rows = conn.all('SELECT id, cwd FROM swarms WHERE cwd IS NOT NULL AND id NOT GLOB ? ORDER BY updated_at DESC LIMIT 100', IMPLICIT_ID_GLOB);
       const match = rows.find((row) => normalizeCwdKey(row.cwd) === cwdKey);
       return match?.id || deterministicId('swarm', `cwd:${cwdKey}`);
     }
-    const latest = conn.get('SELECT id FROM swarms ORDER BY updated_at DESC LIMIT 1');
+    const latest = conn.get('SELECT id FROM swarms WHERE id NOT GLOB ? ORDER BY updated_at DESC LIMIT 1', IMPLICIT_ID_GLOB);
     return latest?.id || `swarm-${randomBytes(6).toString('hex')}`;
   }, db);
 }
@@ -303,6 +316,14 @@ function ensureSwarmInDb(conn, { swarmId, hostConversationId = null, cwd = null,
   const id = validateSwarmId(swarmId);
   const now = nowIso();
   const existing = conn.get('SELECT * FROM swarms WHERE id = ?', id);
+  if (isImplicitSwarmId(id)) {
+    // An explicit reference may reopen this board, but cannot create or rebind its namespace.
+    if (resolveImplicitSwarmId(existing ? existing.host_conversation_id : hostConversationId) !== id) throw new Error('Reserved conversation swarm ID.');
+    if (existing) {
+      hostConversationId = existing.host_conversation_id;
+      cwd = existing.cwd || cwd;
+    }
+  }
   if (!existing) {
     conn.run(
       `INSERT INTO swarms (id, host_conversation_id, cwd, title, goal_title, goal_line, threads_json, created_at, updated_at)
@@ -409,6 +430,7 @@ function saveWorker(conn, id, name, worker, { hostConversationId, cwd }) {
   const now = nowIso();
   const patch = serializeWorkerPatch(worker);
   const supplied = WORKER_UPDATABLE_COLS.filter((key) => patch[key] !== undefined);
+  conn.run('UPDATE swarms SET updated_at = ? WHERE id = ?', now, id);
   const initial = { cli: 'codex', access: 'change', workspace: 'inherit', state: 'working',
     ...Object.fromEntries(supplied.map((key) => [key, patch[key]])) };
   const columns = Object.keys(initial);
@@ -433,6 +455,7 @@ export async function addWorkerBriefs(swarmId, specs, options = {}) {
     const registry = registryInDb(conn, id);
     const briefs = specs.map(({ worker, channel }) => {
       const name = validateWorkerName(worker.name);
+      if (isImplicitSwarmId(id) && /^solo-[a-f0-9]{12}$/.test(name)) throw new Error('Reserved solo worker name.');
       if (live.some((w) => w.name === name)) throw new Error(`Worker '${name}' already exists.`);
       for (const c of worker.channels || []) {
         if (c !== ALL) requireActive(registry, c);

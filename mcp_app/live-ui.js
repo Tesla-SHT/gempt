@@ -641,7 +641,7 @@ export function mountLive({ transport, host, sidecar }) {
     $("steer").setAttribute("aria-label", instruction);
     $("steer").disabled = !usable;
     $("send-steer").disabled = !usable || !$("steer").value.trim();
-    $("interrupt").disabled = !usable;
+    $("interrupt").disabled = !supportsTools || !run?.can_interrupt || Boolean(control);
     $("cancel-interrupt").hidden = !confirming;
     put("interrupt", confirming ? tr("确认中止") : tr("中止"));
     const canConfirmInterrupt = Boolean(supportsTools && run?.remote_turn_unconfirmed && (run?.can_interrupt ?? run?.can_control));
@@ -746,6 +746,7 @@ export function mountLive({ transport, host, sidecar }) {
     const title = runTitle(run);
     put("detail-title", title);
     $("detail-title").title = title;
+    $("open-run-swarm").hidden = !run.swarm_id || !transport.swarm;
     const dot = $("dot");
     if (dot.dataset.state !== run.state || !dot.firstChild) {
       dot.dataset.state = run.state || "";
@@ -1120,6 +1121,10 @@ export function mountLive({ transport, host, sidecar }) {
     tabs[next]?.click();
   });
 
+  $("open-run-swarm").onclick = () => {
+    const id = currentRun()?.swarm_id;
+    if (id) navigate("swarm", { id, focus: true });
+  };
   $("back-btn").addEventListener("click", backToList);
   $("info-toggle").addEventListener("click", () => {
     const drawer = $("meta-drawer");

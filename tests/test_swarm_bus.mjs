@@ -32,8 +32,19 @@ import { dispatchPageApi } from '../magpie_plugin/lib/page-api.mjs';
 import { createGemptTools } from '../magpie_plugin/lib/tools.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
 import { runAppServer } from '../magpie_plugin/lib/app-server-run.mjs';
-import { groupWorkersByThreads, tokenizeBoardText } from '../mcp_app/swarm-ui.js';
+import { compactSwarmView, groupWorkersByThreads, tokenizeBoardText } from '../mcp_app/swarm-ui.js';
 import { serveAppServerSocket } from './app-server-fixture.mjs';
+
+test('compact Swarm follows visible workers, board participants and the manual override', () => {
+  const overview = { swarm: { id: 'board' }, roster: [{ state: 'waiting' }, { state: 'killed' }] };
+  assert.equal(compactSwarmView(overview), true);
+  assert.equal(compactSwarmView({ ...overview, counts: { visible: 0 } }), true);
+  assert.equal(compactSwarmView({ ...overview, counts: { active: 0, visible: 2 } }), false);
+  assert.equal(compactSwarmView(overview, [], true), false);
+  assert.equal(compactSwarmView(overview, [{ from_agent: 'alice' }]), true);
+  assert.equal(compactSwarmView(overview, [{ from_agent: 'alice' }, { from_agent: 'bob' }]), false);
+  assert.equal(compactSwarmView(overview, [{ from_agent: 'alice', mentions: ['bob'] }]), false);
+});
 
 const REPO_ROOT = fileURLToPath(new URL('../', import.meta.url));
 
@@ -229,12 +240,17 @@ test('swarm-bus validates worker names, parses mentions & screenshots, and manag
   );
 
   const swarmId = await resolveSwarmId({ hostConversationId: 'conv-42', cwd: dir, sessionsDir });
-  assert.match(swarmId, /^swarm-[0-9a-f]{12}$/);
+  assert.match(swarmId, /^conversation-[0-9a-f]{64}$/);
+  await ensureSwarm({ swarmId: 'explicit', hostConversationId: 'conv-42', sessionsDir });
+  assert.notEqual(await resolveSwarmId({ hostConversationId: 'other', cwd: dir, sessionsDir }), swarmId);
+  await assert.rejects(ensureSwarm({ swarmId, hostConversationId: 'other', sessionsDir }), /Reserved/);
 
   const sw = await ensureSwarm({ swarmId, hostConversationId: 'conv-42', cwd: dir, title: 'Alpha Swarm', sessionsDir });
   assert.equal(sw.title, 'Alpha Swarm');
   assert.equal(await resolveSwarmId({ hostConversationId: 'conv-42', sessionsDir }), swarmId);
 
+  const unbound = await resolveSwarmId({ cwd: dir, sessionsDir });
+  assert.notEqual(unbound, swarmId);
   const renamed = await setSwarmTitle(swarmId, 'Beta Swarm', { sessionsDir });
   assert.equal(renamed.title, 'Beta Swarm');
 
@@ -282,7 +298,7 @@ test('swarm-bus validates worker names, parses mentions & screenshots, and manag
   await killWorkerRecord(swarmId, 'worker-1', { sessionsDir });
   assert.equal((await listRoster(swarmId, { includeKilled: false, sessionsDir })).length, 0);
   assert.equal((await listRoster(swarmId, { includeKilled: true, sessionsDir })).length, 1);
-  assert.equal((await listSwarms({ hostConversationId: 'conv-42', sessionsDir })).length, 1);
+  assert.deepEqual(new Set((await listSwarms({ hostConversationId: 'conv-42', sessionsDir })).map((s) => s.id)), new Set([swarmId, 'explicit']));
   const overview = await getSwarmOverview(swarmId, { sessionsDir });
   assert.equal(overview.head, m3.seq);
   assert.equal(overview.recent_messages.length, 3);
@@ -848,6 +864,7 @@ test('Swarm HTTP API serves list/overview/board/post/action and enforces key + o
   const listData = await opaqueListRes.json();
   assert.equal(listData.swarms.length, 1);
   assert.equal(listData.swarms[0].id, 'sw-http');
+  assert.equal(listData.swarms[0].counts.visible, 2);
   assert.equal(listData.swarms[0].counts.waiting_reply, 1);
   assert.equal(listData.swarms[0].counts.waiting, 1);
   assert.equal(listData.swarms[0].head, m1.seq);

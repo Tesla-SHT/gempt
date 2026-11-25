@@ -56,6 +56,7 @@ export const codexRunner = {
       approvalPolicy: ctx.approvalPolicy,
       threadId: ctx.threadId,
       nativeFork: ctx.nativeFork,
+      useBoardMcp: ctx.useBoardMcp,
       onForkMode: ctx.onForkMode,
       gatewayUrl: ctx.gatewayUrl,
       timeoutSec: ctx.timeoutSec,

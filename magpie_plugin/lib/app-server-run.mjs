@@ -1,3 +1,4 @@
+import { getBoardMcpSpec } from '../../core/runners/journal.mjs';
 import { cacheHitRatio, normalizeUsage } from '../../core/token-usage.mjs';
 import { appendFileSync, readFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -13,7 +14,7 @@ export class TurnInterrupted extends Error {}
 
 export async function runAppServer({ configPath, env, runFile, sessionId, onIdentity, prompt, cwd, model,
   effort, sandbox, approvalPolicy, threadId, gatewayUrl, timeoutSec, sandboxUpgraded, interruptConfirmMs = 3000,
-  sessionsDir, swarmId, swarmAgent, nativeFork, onForkMode }) {
+  sessionsDir, swarmId, swarmAgent, nativeFork, onForkMode, useBoardMcp }) {
   const isSwarm = Boolean(swarmId && swarmAgent);
   const board = isSwarm ? await import('../../core/board-mcp.mjs') : null;
   const swarmTools = board?.BOARD_TOOLS.filter((tool) => tool.name !== 'board_ask').map((t) => ({ type: 'function', ...t })) || [];
@@ -304,6 +305,11 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
       : DEVELOPER_INSTRUCTIONS;
     const dynamicTools = isSwarm ? [ASK_GEMINI, ...swarmTools] : [ASK_GEMINI];
     const common = { cwd, model, modelProvider: PROVIDER, sandbox, approvalPolicy, developerInstructions };
+    // Fork and resume inherit dynamic tools. A child of a solo thread needs its own board MCP identity.
+    const spec = useBoardMcp && getBoardMcpSpec({ swarmId, swarmAgent, sessionsDir, configPath, env });
+    const inherited = spec ? { ...common, config: { mcp_servers: { gempt_board: {
+      command: spec.command[0], args: spec.command.slice(1), env: spec.environment,
+    } } } } : common;
     const sandboxTypes = Object.values(SANDBOX_TYPES);
     const fold = (path) => process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path);
     function confirmedSandbox(thread) {
@@ -319,7 +325,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     if (nativeFork) {
       try {
         // Dynamic tools are persisted with the parent. ThreadForkParams does not accept dynamicTools.
-        thread = await client.request('thread/fork', { ...common, threadId: nativeFork.id, excludeTurns: true }, remaining());
+        thread = await client.request('thread/fork', { ...inherited, threadId: nativeFork.id, excludeTurns: true }, remaining());
         if (!thread?.thread?.id || thread.thread.id === nativeFork.id) throw new Error('Missing child thread identity.');
         confirmedSandbox(thread);
         if (thread.model && thread.model !== model) throw new Error('Fork model mismatch.');
@@ -333,7 +339,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     if (nativeFork) await onForkMode?.(record.fork_mode);
     if (!thread) {
       thread = threadId
-        ? await client.request('thread/resume', { ...common, threadId, excludeTurns: true }, remaining())
+        ? await client.request('thread/resume', { ...inherited, threadId, excludeTurns: true }, remaining())
         : await client.request('thread/start', { ...common, dynamicTools, allowProviderModelFallback: false }, remaining());
     }
     if (threadId && thread.thread.id !== threadId) throw new Error('Codex returned a different thread on resume.');

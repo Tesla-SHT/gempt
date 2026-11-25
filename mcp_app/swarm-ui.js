@@ -49,6 +49,19 @@ function senderDisplayName(name) {
   return String(name || "");
 }
 
+export function compactSwarmView(overview, messages = [], expanded = false) {
+  if (expanded || !overview?.swarm) return false;
+  const visible = overview.counts?.visible ?? overview.roster.filter((worker) => worker.state !== "killed").length;
+  if (visible > 1) return false;
+  const senders = new Set();
+  for (const msg of messages) {
+    if (msg.kind === "system") continue;
+    if (msg.from_agent) senders.add(msg.from_agent);
+    if (senders.size > 1 || msg.mentions?.some((name) => name !== msg.from_agent)) return false;
+  }
+  return true;
+}
+
 export function groupWorkersByThreads(threads, roster = []) {
   const list = Array.isArray(roster) ? roster : [];
   if (!Array.isArray(threads) || !threads.length) {
@@ -144,12 +157,14 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     if (el && el.textContent !== value) el.textContent = value;
   };
   const timeFmt = localizedFormat(Intl.DateTimeFormat, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const pctFmt = localizedFormat(Intl.NumberFormat, { style: "percent", maximumFractionDigits: 1 });
   const dateFmt = localizedFormat(Intl.DateTimeFormat, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 
   let active = false;
   let scope = sidecar ? "session" : "all";
   const tabs = ["overview", "board", "graph", "raw"];
   let subtab = "overview";
+  let expanded = false, compact = false, steeringRun = null;
   let channel = "*", channelBusy = false;
   let rawKind = "members", rawRevision = "", rawRequest = 0;
   let graphMode = "hive", step = null, replayTimer, playing = false, exporting = false;
@@ -161,7 +176,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
   let allCount = 0;
   let activeWorkersTotal = 0;
   let selectedSwarmId = null;
-  let pendingSwarmId = null;
+  let linkedSwarmId = null;
   let overview = null;
   let boardHead = 0;
   const boardBySeq = new Map();
@@ -231,6 +246,8 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
 
   function resetBoardCache() {
     selectionVersion++;
+    expanded = false;
+    $("swarm-single-input").value = "";
     stopReplay();
     rawRequest++; rawRevision = graphKey = graphDrawKey = "";
     $("swarm-gif-modal")?.close();
@@ -303,7 +320,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     }
 
     const swarm = overview?.swarm;
-    const displayTitle = swarm ? (swarm.title || swarm.goal_title || swarm.id) : tr("Swarm 协作");
+    const displayTitle = swarm ? (swarm.title || swarm.goal_title || (swarm.id.startsWith("conversation-") ? tr("会话协作") : swarm.id)) : tr("Swarm 协作");
     put("swarm-title", displayTitle);
     $("swarm-title").title = swarm ? `${displayTitle} (${swarm.id})` : displayTitle;
     $("swarm-edit-title").hidden = !hasSwarm || opaqueWriteBlocked || editingTitle;
@@ -322,7 +339,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     }
 
     const pills = $("swarm-pills");
-    if (hasSwarm && overview?.counts) {
+    if (hasSwarm && !compact && overview?.counts) {
       pills.hidden = false;
       const c = overview.counts;
       const items = [];
@@ -350,7 +367,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     }
 
     const subtabs = $("swarm-subtabs");
-    subtabs.hidden = !hasSwarm;
+    subtabs.hidden = !hasSwarm || compact;
     for (const name of tabs) {
       const tab = $(`swarm-subtab-${name}`);
       tab.setAttribute("aria-selected", String(subtab === name));
@@ -372,7 +389,8 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     dot.dataset.state = worker.state || "";
     const nameEl = node("span", worker.name, "swarm-worker-name mono");
     nameEl.dataset.palette = agentPaletteIndex(worker.name);
-    const stateLabel = node("span", tr(WORKER_STATUS_LABELS[worker.state] || "未知"), "swarm-worker-state");
+    const state = worker.telemetry?.state === "waiting_gemini" ? "waiting_reply" : worker.state;
+    const stateLabel = node("span", tr(WORKER_STATUS_LABELS[state] || "未知"), "swarm-worker-state");
     stateLabel.dataset.state = worker.state || "";
 
     top.append(createBeeAvatar(worker.name, worker.state), dot, nameEl, stateLabel);
@@ -392,6 +410,8 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       top.append(rt);
     }
 
+    const ratio = worker.telemetry?.cache_hit_ratio;
+    if (Number.isFinite(ratio)) top.append(node("span", tr("缓存命中率") + " " + pctFmt.format(ratio), "sw-meta-pill"));
     if (worker.workspace === "share" || worker.worktree_path) {
       const wt = node("span", "Worktree", "run-kind");
       if (worker.worktree_path) wt.title = worker.worktree_path;
@@ -404,7 +424,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     if (worker.wake_mode) details.append(node("span", tr(worker.wake_mode === "anything" ? "任意消息唤醒" : "提及时唤醒")));
     if (worker.added_by) details.append(node("span", tr("由 @{0} 添加", worker.added_by)));
     if (worker.worktree_path) details.append(node("span", worker.worktree_path, "mono"));
-    if (details.childNodes.length) main.append(details);
+    if (!compact && details.childNodes.length) main.append(details);
     if (worker.quota_paused_seq) {
       const note = node("p", tr("配额暂停于"), "swarm-worker-wait");
       note.append(citation(worker.quota_paused_seq));
@@ -430,6 +450,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       main.append(errEl);
     }
 
+    if (compact && worker.telemetry?.last_message) main.append(node("p", worker.telemetry.last_message, "swarm-single-preview"));
     const actions = node("div", "", "swarm-worker-actions");
     if (worker.run_id) {
       const streamBtn = node("button", tr("看流"), "btn-ghost swarm-action-btn");
@@ -443,7 +464,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     }
 
     const canInterrupt = !opaqueWriteBlocked && Boolean(worker.run_id)
-      && (worker.state === "working" || worker.state === "waiting_reply");
+      && (worker.telemetry?.can_interrupt ?? (worker.state === "working" || worker.state === "waiting_reply"));
     const canKill = !opaqueWriteBlocked && worker.state !== "killed";
 
     if (canInterrupt) {
@@ -457,7 +478,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       btn.addEventListener("click", () => {
         if (!isConfirm) {
           pendingConfirm = { action: "interrupt", name: worker.name };
-          renderOverview();
+          render();
           return;
         }
         if (!busy) void runWorkerAction("interrupt", worker.name);
@@ -465,7 +486,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       actions.append(btn);
     }
 
-    if (canKill) {
+    if (!compact && canKill) {
       const isConfirm = pendingConfirm?.action === "kill" && pendingConfirm?.name === worker.name;
       const busy = busyWorkerAction === `kill:${worker.name}`;
       const btn = node("button", isConfirm ? tr("确认终止") : tr("终止"), "btn-danger swarm-action-btn");
@@ -476,7 +497,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       btn.addEventListener("click", () => {
         if (!isConfirm) {
           pendingConfirm = { action: "kill", name: worker.name };
-          renderOverview();
+          render();
           return;
         }
         if (!busy) void runWorkerAction("kill", worker.name);
@@ -726,25 +747,50 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
 
   function render() {
     updateStandaloneLink();
+    const canCompact = compactSwarmView(overview, boardBySeq.values());
+    compact = canCompact && !expanded;
+    if (compact && subtab !== "overview") { stopReplay(); subtab = "overview"; }
     renderHeader();
+    $("swarm-toggle-full").hidden = !canCompact;
+    $("swarm-toggle-full").setAttribute("aria-expanded", String(!compact));
+    put("swarm-toggle-full", tr(compact ? "完整工作台" : "单工位"));
+    $("swarm-single").hidden = !compact;
+    if (compact) {
+      const worker = overview.roster.find((member) => member.state !== "killed");
+      const list = $("swarm-single-worker");
+      const key = JSON.stringify([locale(), worker, pendingConfirm, busyWorkerAction, opaqueWriteBlocked]);
+      if (key !== list.dataset.key) {
+        list.dataset.key = key;
+        list.replaceChildren(...(worker ? [renderWorkerRow(worker)] : []));
+      }
+      $("swarm-single-empty").hidden = Boolean(worker);
+      const input = $("swarm-single-input");
+      if (input.dataset.run !== (worker?.run_id || "")) {
+        input.dataset.run = worker?.run_id || "";
+        input.value = "";
+      }
+      $("swarm-single-steer").hidden = !worker?.telemetry?.can_control || opaqueWriteBlocked;
+      input.disabled = Boolean(steeringRun);
+      $("swarm-single-send").disabled = input.disabled || !input.value.trim();
+    }
     const hasSwarm = Boolean(selectedSwarmId && overview?.swarm);
     const showLoading = !listLoaded && loading && !hasSwarm;
     $("swarm-loading").hidden = !showLoading;
     $("swarm-empty").hidden = showLoading || hasSwarm;
-    for (const name of tabs) $("swarm-sub-" + name).hidden = !hasSwarm || subtab !== name;
-    $("swarm-view-overview").hidden = !hasSwarm || subtab !== "overview";
-    $("swarm-view-board").hidden = !hasSwarm || subtab !== "board";
+    for (const name of tabs) $("swarm-sub-" + name).hidden = !hasSwarm || compact || subtab !== name;
+    $("swarm-view-overview").hidden = !hasSwarm || compact || subtab !== "overview";
+    $("swarm-view-board").hidden = !hasSwarm || compact || subtab !== "board";
 
     if (!hasSwarm && !showLoading) {
       const inSessionEmpty = sidecar && scope === "session" && allCount > 0;
       put("swarm-empty-title", inSessionEmpty ? tr("当前会话暂无 Swarm") : tr("暂无协作 Swarm"));
       put("swarm-empty-message", inSessionEmpty
         ? tr("当前会话尚无 Swarm，可切换到「全部」查看其他工作区协作。")
-        : tr("通过 gpt_swarm 或 gempt swarm 启动协作后，工位与消息板会显示在这里。"));
+        : tr("在当前会话发起任务后，工位会显示在这里。"));
       $("swarm-empty-show-all").hidden = !inSessionEmpty;
     }
 
-    if (hasSwarm) {
+    if (hasSwarm && !compact) {
       if (subtab === "overview") renderOverview();
       if (subtab === "board") renderBoard();
       if (subtab === "graph") renderGraph();
@@ -778,13 +824,12 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       activeWorkersTotal = Number(listRes.active_workers_total ?? 0);
       updateTabBadge(activeWorkersTotal);
 
-      let nextId = pendingSwarmId || selectedSwarmId;
-      pendingSwarmId = null;
-      if (nextId && !swarms.some((s) => s.id === nextId)) {
-        nextId = null;
-      }
+      let nextId = linkedSwarmId || selectedSwarmId;
+      // A run deep link can point outside the first page of the picker. The overview API checks workspace scope.
+      if (nextId && !swarms.some((s) => s.id === nextId) && nextId !== linkedSwarmId) nextId = null;
       if (!nextId && swarms.length) {
-        nextId = swarms[0].id;
+        nextId = (swarms.find((sw) => sw.host_conversation_id === listRes.active_conversation_id && sw.counts.active)
+          || swarms[0]).id;
       }
 
       if (nextId !== selectedSwarmId) {
@@ -809,6 +854,10 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
           rows.push(...slice.messages);
         }
         overview = ovRes;
+        if (id === linkedSwarmId && !swarms.some((sw) => sw.id === id)) {
+          if (scope === "session" && ovRes.swarm.host_conversation_id !== listRes.bound_conversation_id) scope = "all";
+          swarms.unshift({ ...ovRes.swarm, counts: ovRes.counts, head: ovRes.head });
+        }
         if (forceBoard) boardBySeq.clear();
         if (forceBoard || rows.length) boardRevision++;
         for (const msg of rows) boardBySeq.set(msg.seq, msg);
@@ -892,7 +941,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     if (!selectedSwarmId || busyWorkerAction || opaqueWriteBlocked) return;
     busyWorkerAction = `${action}:${name}`;
     pendingConfirm = null;
-    renderOverview();
+    render();
     try {
       await transport.swarm("action", { swarm_id: selectedSwarmId, action, name });
       showToast?.(action === "kill" ? tr("已终止工位 {0}", name) : tr("已中断 {0}", name));
@@ -901,7 +950,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       handleWriteError(error);
     } finally {
       busyWorkerAction = null;
-      renderOverview();
+      render();
     }
   }
 
@@ -939,6 +988,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
   function changeScope(next) {
     if (next === scope) return;
     scope = next;
+    linkedSwarmId = null;
     listLoaded = false;
     selectedSwarmId = null;
     overview = null;
@@ -1170,9 +1220,29 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
   }
 
   // Event bindings
+  $("swarm-toggle-full").onclick = () => { expanded = !expanded; render(); };
+  $("swarm-single-input").oninput = () => {
+    $("swarm-single-send").disabled = !$("swarm-single-input").value.trim() || $("swarm-single-input").disabled;
+  };
+  $("swarm-single-steer").onsubmit = async (event) => {
+    event.preventDefault();
+    const input = $("swarm-single-input");
+    const runId = input.dataset.run;
+    const message = input.value.trim();
+    if (!runId || !message || steeringRun || !compact || opaqueWriteBlocked) return;
+    steeringRun = runId;
+    render();
+    try {
+      await transport.live("steer", { run_id: runId, message });
+      if (input.dataset.run === runId) input.value = "";
+      showToast?.(tr("已发送纠偏指令"));
+    } catch (error) { handleWriteError(error); }
+    finally { steeringRun = null; render(); }
+  };
   $("swarm-picker")?.addEventListener("change", (event) => {
     const next = event.target.value || null;
     if (next && next !== selectedSwarmId) {
+      linkedSwarmId = null;
       selectedSwarmId = next;
       overview = null;
       editingTitle = false;
@@ -1281,7 +1351,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     setActive(isActive, { swarmId } = {}) {
       active = Boolean(isActive);
       if (!active) stopReplay();
-      if (swarmId) pendingSwarmId = swarmId;
+      if (swarmId) linkedSwarmId = swarmId;
       clearTimeout(pollTimer);
       if (active) {
         render();
@@ -1296,6 +1366,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       render();
     },
     onWorkspaceChange() {
+      linkedSwarmId = null;
       listLoaded = false;
       selectedSwarmId = null;
       overview = null;

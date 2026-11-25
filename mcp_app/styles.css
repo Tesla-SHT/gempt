@@ -1164,3 +1164,9 @@ body:has(#swarm-view-board:not([hidden])):has(#swarm-panel:not([hidden])) #toast
 #swarm-export { border:1px solid var(--panel-border); background:var(--bg); border-radius:6px; padding:3px 9px; color:var(--fg); }
 .sw-board-bar { padding:8px var(--reading-pad) 0; }
 .sw-board-bar .sw-board-tools { margin-bottom:0; }
+
+.swarm-single-col { padding-block: 1rem; }
+.swarm-single-col .swarm-worker-row { flex-wrap: wrap; }
+.swarm-single-preview { margin: .5rem 0 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+#swarm-single-steer { margin-top: .75rem; }
+#swarm-single-input { flex: 1; min-width: 8rem; }

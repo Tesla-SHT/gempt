@@ -67,7 +67,7 @@ function pending(value, compact = false) {
   };
 }
 
-function runSummary(record, compact = false) {
+export function runSummary(record, compact = false) {
   const result = object(record.result);
   const progress = object(record.progress);
   const started = timestamp(record.started_at);
@@ -81,7 +81,7 @@ function runSummary(record, compact = false) {
   const activeControllable = ['running', 'waiting_gemini'].includes(record.state);
   return {
     run_id: record.run_id, session_id: text(record.session_id, 128), state: text(record.state, 32),
-    cli,
+    cli, swarm_id: record.swarm_id ?? null,
     cwd: bounded(record.cwd, 8192), worktree_path: bounded(record.worktree_path, 8192) || null,
     source_cwd: bounded(record.source_cwd, 8192) || null,
     execution_timeout_sec: number(record.execution_timeout_sec),

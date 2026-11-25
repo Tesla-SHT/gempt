@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { connectAppServer, readAppServerState, readServerTurn, terminalTurn, TERMINAL_INTERRUPT_ERR, textInput, UNAVAILABLE } from '../magpie_plugin/lib/app-server-client.mjs';
 import { normalizeTitle, readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
-import { getMcpEffort } from './config.mjs';
+import { getExecutionConfig, getMcpEffort, getNativeSwarmPolicy } from './config.mjs';
 import { resolveExecTimeoutSec, validateExecTimeoutSec } from '../magpie_plugin/lib/routing.mjs';
 import { resolveNodeExecutable } from './node-executable.mjs';
 import { readHostContext } from './host-context.mjs';
@@ -612,7 +612,7 @@ export async function dispatchRun(args, {
         sourceCwd = resolveExternalWorktreeSourceCwd(cwd) || cwd;
       }
       hostContext = readHostContext(config, sourceCwd);
-      hostId = args.host_conversation_id || prior?.host_conversation_id || hostContext.conversation_id || null;
+      hostId = args.host_conversation_id?.trim() || prior?.host_conversation_id || hostContext.conversation_id || null;
       const cfg = readJsonSafe(config);
       const executionTimeout = resolveExecTimeoutSec({ codex: cfg?.codex, timeoutSec, effort: getMcpEffort(cfg?.routing_policy) });
       record = {
@@ -627,9 +627,27 @@ export async function dispatchRun(args, {
         ...(args.cli ? { cli: String(args.cli) } : {}),
         ...(args.model ? { model: String(args.model) } : {}),
       };
-      saveRun(file, record);
+      if (!legacyNative && hostId && !args.swarm_id && !args.swarm_agent
+          && !getNativeSwarmPolicy(cfg?.routing_policy).native_swarm) {
+        const { resolveImplicitSwarmId, soloWorkerName, upsertWorker } = await import('./swarm-bus.mjs');
+        record.swarm_id = resolveImplicitSwarmId(hostId);
+        record.swarm_agent = soloWorkerName(sessionId);
+        record.implicit_swarm_worker = true;
+        saveRun(file, record);
+        await upsertWorker(record.swarm_id, {
+          name: record.swarm_agent, run_id: id, session_id: sessionId, state: 'working',
+          cli: args.cli || prior?.cli || getExecutionConfig(cfg).default_cli,
+          model: args.model || prior?.model || null, tier: args.tier || prior?.tier || null,
+          access: isReadOnly ? 'inspect' : 'change', workspace: worktreePath ? 'share' : workspace,
+          worktree_path: worktreePath, source_cwd: sourceCwd, brief: args.goal, task_summary: args.goal.slice(0, 120),
+          error: null, parked_on: null,
+        }, { sessionsDir: sessions, hostConversationId: hostId.trim(), cwd: sourceCwd });
+      } else saveRun(file, record);
     }, { attempts: 80, delayMs: 25 });
   } catch (error) {
+    if (record?.implicit_swarm_worker && existsSync(file)) {
+      saveRun(file, { ...record, state: 'failed', error: error.message, finished_at: new Date().toISOString() });
+    }
     try { rmdirSync(directory); } catch { /* The claim may already contain state. */ }
     throw error;
   }
@@ -640,17 +658,20 @@ export async function dispatchRun(args, {
   const request = { ...args, cwd, session_id: args.session_id ? sessionId : undefined,
     ...(timeoutSec !== undefined ? { timeout_sec: timeoutSec } : {}),
     host_conversation_id: hostId, gemini_family: args.gemini_family || hostContext.gemini_family };
-  const childEnv = args.swarm_id ? {
-    ...env,
-    GEMPT_SWARM_ID: String(args.swarm_id),
-    ...(args.swarm_agent ? { GEMPT_AGENT_NAME: String(args.swarm_agent) } : {}),
-    GEMPT_SESSIONS_DIR: sessions,
-  } : env;
+  const launchEnv = { ...env };
+  if (args.swarm_id) {
+    launchEnv.GEMPT_SWARM_ID = String(args.swarm_id);
+    if (args.swarm_agent) launchEnv.GEMPT_AGENT_NAME = String(args.swarm_agent);
+    launchEnv.GEMPT_SESSIONS_DIR = sessions;
+  } else if (record.implicit_swarm_worker) {
+    delete launchEnv.GEMPT_SWARM_ID;
+    delete launchEnv.GEMPT_AGENT_NAME;
+  }
   const packetPath = join(directory, 'dispatch.json');
   try {
     atomicJson(packetPath, { file, record, args: request, host, agent });
     const child = await launchDetached(resolveNodeExecutable({ env }), [workerPath, '--packet', packetPath], {
-      cwd: process.cwd(), env: childEnv, windowsHide: true, detached: true, stdio: 'ignore',
+      cwd: process.cwd(), env: launchEnv, windowsHide: true, detached: true, stdio: 'ignore',
     });
     if (!child.pid) await once(child, 'spawn');
     child.unref?.();
@@ -664,7 +685,9 @@ export async function dispatchRun(args, {
   } catch (error) {
     if (record.pid) throw error;
     rmSync(packetPath, { force: true });
-    saveRun(file, { ...record, state: 'failed', error: error.message, finished_at: new Date().toISOString() });
+    const failed = { ...record, state: 'failed', error: error.message, finished_at: new Date().toISOString() };
+    saveRun(file, failed);
+    if (record.implicit_swarm_worker) await notifyRecovered(failed, { sessionsDir: sessions });
     throw error;
   }
   if (args.background === true) return record;

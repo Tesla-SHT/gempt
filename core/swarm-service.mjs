@@ -3,8 +3,9 @@ import { isAbsolute, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
 import { readHostContext } from './host-context.mjs';
-import { checkArgs } from './live-service.mjs';
-import { interruptRun } from './runs.mjs';
+import { cacheHitRatio } from './token-usage.mjs';
+import { checkArgs, runSummary } from './live-service.mjs';
+import { interruptRun, readRun } from './runs.mjs';
 import { resolvePath, withinPath } from './state.mjs';
 import { recordInWorkspace, workspaceFileRoots } from './worktrees.mjs';
 import {
@@ -106,6 +107,7 @@ export function countRosterStates(roster) {
     else if (state === 'stopped') counts.stopped += 1;
     else if (state === 'killed') counts.killed += 1;
   }
+  counts.visible = counts.total - counts.killed;
   counts.active = counts.working + counts.waiting_reply;
   return counts;
 }
@@ -269,11 +271,23 @@ async function getOverview(args, options) {
   try {
     const overview = await assertExistingScopedSwarm(swarmId, sessionsDir, roots, { db, analytics: true });
     const counts = countRosterStates(overview.roster);
+    const roster = overview.roster.map((worker) => {
+      if (!worker.run_id) return worker;
+      let record;
+      try { record = readRun(worker.run_id, sessionsDir, { readonly: true }); }
+      catch (err) { if (err.status === 400 || err.status === 404) return worker; throw err; }
+      if (!recordInWorkspace(record, roots) || (record.swarm_id && record.swarm_id !== swarmId)
+          || (record.swarm_agent && record.swarm_agent !== worker.name)) return worker;
+      const run = runSummary(record, true);
+      return { ...worker, cli: record.result?.cli || record.cli || worker.cli, model: run.model || worker.model,
+        telemetry: { state: run.state, usage: run.usage, cache_hit_ratio: cacheHitRatio(run.usage),
+          last_message: run.last_message, can_control: run.can_control, can_interrupt: run.can_interrupt } };
+    });
     const screenshots = collectScreenshots(db, overview.swarm, overview.roster, roots);
     return {
       ok: true,
       swarm: overview.swarm,
-      roster: overview.roster,
+      roster,
       head: overview.head,
       screenshots, counts, channels: overview.channels, edges: overview.edges, system_attention: overview.system_attention,
     };
@@ -395,7 +409,7 @@ async function performSwarmAction(args, options) {
   const updated = await updateWorker(swarmId, workerName, {
     state: 'stopped',
     parked_on: null,
-  }, { sessionsDir });
+  }, { sessionsDir, expectedRun: worker.run_id, expectedState: worker.state });
   return {
     ok: true,
     swarm_id: swarmId,

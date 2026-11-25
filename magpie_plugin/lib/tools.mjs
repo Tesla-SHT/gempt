@@ -793,6 +793,7 @@ export function createExecutionTools({
   options = {},
   execRunFile,
   newExecSession,
+  projection,
   allowSandboxUpgrade,
   worktreePath,
   sourceCwd,
@@ -1285,8 +1286,13 @@ export function createExecutionTools({
         const agent = callingAgent(callCtx) || priorSession?.agent || '';
         const title = normalizeTitle(args.title, goal, workdir);
         const hostId = args.host_conversation_id || priorSession?.host_conversation_id || null;
+        const boardId = args.swarm_id || swarmId || env?.GEMPT_SWARM_ID || null;
+        const boardAgent = args.swarm_agent || swarmAgent || env?.GEMPT_AGENT_NAME || null;
+        const explicitWorker = Boolean(boardId && boardAgent);
         const session = {
           ...(priorSession || {}),
+          ...(resolvedCli === 'codex' ? { codex_dynamic_board_tools:
+            canResumeRunner ? priorSession.codex_dynamic_board_tools ?? explicitWorker : explicitWorker } : {}),
           title: explicitTitle(args.title) || (priorSession ? normalizeTitle(priorSession.title, sessionGoal(priorSession), workdir) : title),
           host_conversation_id: hostId,
           paired_model: paired, session_id: sessionId, mode: 'exec', cli: resolvedCli, tier: resolved.tier, model: targetModel,
@@ -1294,6 +1300,12 @@ export function createExecutionTools({
           ...(worktreePath ? { worktree_path: worktreePath, source_cwd: sourceCwd, worktree_pruned_at: null, pruned_worktree_path: null } : {}),
           ...(sandboxUpgraded ? { sandbox_upgraded: true } : {}),
         };
+        if (projection) {
+          const { updateWorker } = await import('../../core/swarm-bus.mjs');
+          await updateWorker(projection.swarm_id, projection.swarm_agent, {
+            cli: resolvedCli, model: targetModel, tier: resolved.tier, access: effectiveSandbox === 'read-only' ? 'inspect' : 'change',
+          }, { sessionsDir: resolvedSessionsDir, expectedRun: args.run_id });
+        }
         const source = swarmFork?.source;
         const nativeFork = !priorSession && source?.cli === resolvedCli && source.model === targetModel
           ? { id: source.id, prompt: swarmFork.prompt } : null;
@@ -1301,11 +1313,15 @@ export function createExecutionTools({
         try {
           res = await runner.runTurn({
             nativeFork,
+            useBoardMcp: resolvedCli === 'codex' && explicitWorker && (nativeFork
+              ? source.dynamic_board_tools === false : canResumeRunner && !session.codex_dynamic_board_tools),
             onSessionMissing() {
               prompt = promptForTurn(false);
               return prompt;
             },
             async onForkMode(mode) {
+              if (resolvedCli === 'codex') session.codex_dynamic_board_tools = mode === 'native'
+                ? source.dynamic_board_tools ?? explicitWorker : explicitWorker;
               if (!swarmId || !swarmAgent) return;
               const { updateWorker } = await import('../../core/swarm-bus.mjs');
               await updateWorker(swarmId, swarmAgent, { fork_mode: mode }, { sessionsDir: resolvedSessionsDir, expectedRun: args.run_id });
@@ -1328,8 +1344,8 @@ export function createExecutionTools({
             approvalPolicy: effectiveSandbox === 'danger-full-access' ? runtime.cfg?.codex?.approval_policy || 'never' : 'never',
             timeoutSec,
             sessionsDir: resolvedSessionsDir,
-            swarmId: args.swarm_id || swarmId || env?.GEMPT_SWARM_ID || null,
-            swarmAgent: args.swarm_agent || swarmAgent || env?.GEMPT_AGENT_NAME || null,
+            swarmId: boardId,
+            swarmAgent: boardAgent,
             onIdentity(threadId, turnId, observedSandbox, runnerSid) {
               session.cli = resolvedCli;
               session.codex_thread_id = threadId;

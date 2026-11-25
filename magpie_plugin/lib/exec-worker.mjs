@@ -69,7 +69,7 @@ try {
     return true;
   }, { attempts: 80, delayMs: 25 });
   if (started) {
-    const tools = createExecutionTools({ ...host, execRunFile: file, newExecSession: record.session_id });
+    const tools = createExecutionTools({ ...host, projection: record.implicit_swarm_worker ? record : null, execRunFile: file, newExecSession: record.session_id });
     const result = await withLock(join(host.sessionsDir, `${record.session_id}.node.lock`),
       () => tools.exec.execute({ ...args, run_id: record.run_id }, { agent }),
       { attempts: 240, delayMs: 25, staleMs: lockStaleMsForBudget(record.execution_timeout_sec) });
@@ -97,7 +97,7 @@ if (outcome) {
         runId: record.run_id,
         sessionId: finished.result?.session_id || record.session_id,
         startedAt: running.started_at,
-        outcome,
+        outcome: finished,
         result: finished.result,
         error: finished.error,
         sessionsDir: host.sessionsDir,
