@@ -51,7 +51,7 @@ export function createHttpTransport(apiKey, fetchPage = fetch) {
       return request(`live/${operation}`, { ...options, body: args });
     },
     swarm(operation, args = {}, options) {
-      if (operation === 'list' || operation === 'overview' || operation === 'board' || operation === 'raw') {
+      if (operation === 'list' || operation === 'overview' || operation === 'board') {
         const query = new URLSearchParams();
         for (const [key, value] of Object.entries(args || {})) {
           if (value !== undefined && value !== null && value !== '') query.set(key, String(value));

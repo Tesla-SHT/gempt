@@ -382,21 +382,13 @@ export function soloWorkerName(sessionId) {
   return deterministicId('solo', sessionId);
 }
 
-export async function resolveSwarmId({ swarmId, hostConversationId, cwd, sessionsDir, db, nativeSwarm = false } = {}) {
+export async function resolveSwarmId({ swarmId, hostConversationId, cwd, sessionsDir, db } = {}) {
   if (typeof swarmId === 'string' && swarmId.trim()) {
     return validateSwarmId(swarmId);
   }
-  const implicit = !nativeSwarm && resolveImplicitSwarmId(hostConversationId);
+  const implicit = resolveImplicitSwarmId(hostConversationId);
   if (implicit) return implicit;
   return withDb(sessionsDir, (conn) => {
-    if (typeof hostConversationId === 'string' && hostConversationId.trim()) {
-      const conv = hostConversationId.trim();
-      const row = conn.get(
-        'SELECT id FROM swarms WHERE host_conversation_id = ? AND id NOT GLOB ? ORDER BY updated_at DESC LIMIT 1',
-        conv, IMPLICIT_ID_GLOB,
-      );
-      return row?.id || deterministicId('swarm', `conv:${conv}`);
-    }
     const cwdKey = normalizeCwdKey(cwd);
     if (cwdKey) {
       const rows = conn.all('SELECT id, cwd FROM swarms WHERE cwd IS NOT NULL AND id NOT GLOB ? ORDER BY updated_at DESC LIMIT 100', IMPLICIT_ID_GLOB);

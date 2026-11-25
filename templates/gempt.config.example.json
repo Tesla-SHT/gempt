@@ -20,9 +20,6 @@
   },
   "routing_policy": {
     "work_split": "balanced",
-    "swarm_split": "inherit",
-    "native_swarm": false,
-    "swarm_shell_model": "gemini-4-hydrogen-low",
     "default_tier": "sonnet",
     "failover_mode": "subscription_only",
     "auto_effort": false,

@@ -72,7 +72,6 @@ export function mountConsole(root, transport, {
   let ratioFetch;
   let latestRatio;
   let runStateFetch;
-  let locateWork = false;
 
   function readStoredRatioRange() {
     const saved = consolePreference(RATIO_RANGE_STORAGE_KEY);
@@ -174,10 +173,7 @@ export function mountConsole(root, transport, {
     const profiles = state.work_profiles;
     if (!profiles) return;
     const list = $('work-options');
-    const swarm = $('swarm-split');
     if (!list.children.length) {
-      swarm.replaceChildren();
-      swarm.add(new Option(tr('跟随普通对话'), 'inherit'));
       for (const [id, profile] of Object.entries(profiles)) {
         const isOff = profile.gpt_share === 0;
         const label = document.createElement('label');
@@ -193,28 +189,17 @@ export function mountConsole(root, transport, {
         weight.textContent = isOff ? tr('纯 Gemini · 不派单') : tr('GPT 约 {0}%', profile.gpt_share);
         label.append(radio, title, weight);
         list.append(label);
-        swarm.add(new Option(isOff ? tr(profile.label) + tr(' · 纯 Gemini') : tr(profile.label) + ' · ' + weight.textContent, id));
       }
     }
     for (const radio of list.querySelectorAll('input')) {
       radio.checked = radio.value === state.work_split;
       radio.disabled = !state.configured;
     }
-    swarm.disabled = !state.configured;
-    const validSwarm = state.swarm_split === 'inherit' || Object.hasOwn(profiles, state.swarm_split);
-    swarm.value = validSwarm ? state.swarm_split : 'inherit';
-    renderExecutionSettings(state);
+    renderExecutionCli(state);
     renderPairings(state);
     const ordinary = profiles[state.work_split];
-    const team = profiles[swarm.value] || ordinary;
     const workDetail = $('work-detail');
     workDetail.textContent = tr(ordinary?.detail || '');
-    if (ordinary?.gpt_share !== 0 && state.tools?.exec_enabled === false) {
-      workDetail.textContent += tr(' Magpie 的 gempt_run 当前允许只读调查。要允许写入，请在 GemPT 插件选项开启 exec。');
-    }
-    $('swarm-detail').textContent = team?.gpt_share === 0
-      ? tr(team.detail)
-      : tr(team?.label || '') + tr(' · 协调者拆单和解说，成员按各自职责派单，核验者独立检查。');
   }
 
   function formatCompactTokens(n) {
@@ -364,32 +349,6 @@ export function mountConsole(root, transport, {
     }
   }
 
-  function renderExecutionSettings(state) {
-    renderExecutionCli(state);
-    for (const radio of root.querySelectorAll('[name="native_swarm"]')) {
-      radio.checked = radio.value === String(state.native_swarm === true);
-      radio.disabled = !state.configured || pendingSettings.has(radio.name);
-    }
-    const model = $('swarm-shell-model');
-    const models = state.swarm_shell_models || [];
-    const presets = $('swarm-shell-presets');
-    if (Array.from(presets.options, (option) => option.value).join() !== models.join()) {
-      presets.replaceChildren(...models.map((name) => new Option(name, name)));
-    }
-    if (document.activeElement !== model || pendingSettings.has(model.name)) model.value = state.swarm_shell_model;
-    model.disabled = !state.configured || pendingSettings.has(model.name);
-    const timeout = $('codex-timeout');
-    if (document.activeElement !== timeout) timeout.value = state.codex_timeout_sec ?? 3600;
-    const disabled = !state.configured || pendingSettings.has(timeout.name);
-    timeout.disabled = disabled;
-    for (const control of root.querySelectorAll('[data-timeout], [data-timeout-save]')) {
-      control.disabled = disabled;
-      if (control.dataset.timeout) {
-        control.setAttribute('aria-pressed', String(Number(control.dataset.timeout) === state.codex_timeout_sec));
-      }
-    }
-  }
-
   function renderControls(state) {
     renderWorkSplit(state);
 
@@ -400,12 +359,8 @@ export function mountConsole(root, transport, {
       radio.disabled = !configured;
     }
     const sbxHint = $('sandbox-hint');
-    if (sbxHint) {
-      const baseHint = tr(SANDBOX_HINTS[currentDefaultSandbox]) || currentDefaultSandbox;
-      sbxHint.textContent = state.tools?.exec_enabled === false
-        ? tr("{0} · gempt_run 仅限只读（插件选项设 exec: true 后可写）", baseHint)
-        : baseHint;
-    }
+    sbxHint.textContent = tr(SANDBOX_HINTS[currentDefaultSandbox]) || currentDefaultSandbox;
+    $('exec-diagnostic').hidden = state.tools?.exec_enabled !== false;
 
     currentEffortChoice = state.auto_effort ? 'auto' : state.mcp_effort || 'medium';
     for (const radio of root.querySelectorAll('input[name="active_effort"]')) {
@@ -614,12 +569,6 @@ export function mountConsole(root, transport, {
     $('strip-agy-slash').hidden = !state.clients?.antigravity_installed;
 
     renderActivity(state);
-    if (locateWork && visible && activeTab === 'overview') {
-      locateWork = false;
-      const work = $('work-controls');
-      work.scrollIntoView({ block: 'start' });
-      work.focus({ preventScroll: true });
-    }
     for (const field of root.querySelectorAll('[name]')) {
       if (pendingSettings.has(field.name)) field.disabled = true;
     }
@@ -793,7 +742,6 @@ export function mountConsole(root, transport, {
     const controls = [...root.querySelectorAll(`[name="${groupName}"]`)];
     pendingSettings.add(groupName);
     for (const control of controls) control.disabled = true;
-    if (groupName === 'codex_timeout_sec') renderExecutionSettings(latestState);
     syncHasFallbackClasses();
     try {
       const state = await transport.saveSettings(payload);
@@ -816,14 +764,7 @@ export function mountConsole(root, transport, {
       for (const control of controls) control.disabled = !latestState?.configured;
       syncHasFallbackClasses();
       await refreshState();
-      if (groupName === 'codex_timeout_sec') renderExecutionSettings(latestState);
     }
-  }
-
-  function saveTimeout(seconds) {
-    if (!latestState?.configured || typeof seconds !== 'number' || seconds < 30 || seconds > 7200 || !Number.isFinite(seconds)) return;
-    $('codex-timeout').value = seconds;
-    void updateSetting('codex_timeout_sec', { codex_timeout_sec: seconds }, latestState.codex_timeout_sec, tr('Codex 执行超时预算已保存'));
   }
 
   function copyMcpConfig() {
@@ -2374,7 +2315,7 @@ export function mountConsole(root, transport, {
     }
   }
 
-  function setTab(tab, { id, work = false } = {}) {
+  function setTab(tab, { id } = {}) {
     const previous = activeTab;
     const wasVisible = visible;
     visible = tab !== 'live';
@@ -2405,8 +2346,6 @@ export function mountConsole(root, transport, {
       closeActivityDetail(view, tab === previous);
       if (!view.loaded || hadDetail) void refreshActivityView(view);
     } else {
-      locateWork = work;
-      if (work && latestState) renderState(latestState);
       if (!latestState || !wasVisible || previous !== tab) {
         void refreshState();
         void refreshRatio();
@@ -2529,13 +2468,10 @@ export function mountConsole(root, transport, {
   root.addEventListener('change', (ev) => {
     const target = ev.target;
     if (!(target instanceof HTMLInputElement || target instanceof HTMLSelectElement)) return;
-    if (target.name === 'work_split' || target.name === 'swarm_split') {
+    if (target.name === 'work_split') {
       updateSetting(target.name, { [target.name]: target.value }, latestState[target.name], tr('工作分工已保存，下次派单生效'));
     } else if (target.name === 'default_cli') {
       void updateSetting('default_cli', { default_cli: target.value }, latestState?.execution?.default_cli || 'auto', tr('执行 CLI 已保存，下次派单生效'));
-    } else if (target.name === 'native_swarm' || target.name === 'swarm_shell_model') {
-      const value = target.name === 'native_swarm' ? target.value === 'true' : target.value;
-      void updateSetting(target.name, { [target.name]: value }, latestState[target.name], tr('Swarm 派单设置已保存'));
     } else if (target.dataset.family) {
       const family = target.dataset.family;
       updateSetting(target.name, { pairing: { family, model: target.value } }, latestState.pairings[family], tr('配对已保存，下个新任务生效'));
@@ -2554,25 +2490,9 @@ export function mountConsole(root, transport, {
     }
   });
 
-  const timeoutInput = $('codex-timeout');
-  timeoutInput.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' && !event.isComposing && timeoutInput.reportValidity()) {
-      event.preventDefault();
-      saveTimeout(timeoutInput.valueAsNumber);
-    }
-  });
-
   root.addEventListener('click', (ev) => {
     const btn = ev.target instanceof Element ? ev.target.closest('button') : null;
     if (!btn) return;
-    if (btn.hasAttribute('data-timeout-save')) {
-      if (timeoutInput.reportValidity()) saveTimeout(timeoutInput.valueAsNumber);
-      return;
-    }
-    if (btn.dataset.timeout) {
-      saveTimeout(Number(btn.dataset.timeout));
-      return;
-    }
     if (btn.dataset.ratioRange) {
       selectRatioRange(btn.dataset.ratioRange);
       return;

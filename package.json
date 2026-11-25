@@ -1,6 +1,6 @@
 {
   "name": "gempt",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "Antigravity MCP orchestration that pairs Gemini with models from your Magpie gateway.",
   "author": {
     "name": "yizhang-dream",
@@ -42,7 +42,6 @@
     "plugin/assets/**/*",
     "plugin/sidecars/**/*",
     "plugin/rules/AGENTS.md",
-    "plugin/agents/*.md",
     "plugin/skills/*/SKILL.md",
     "plugin/skills/*/references/*.md",
     "scripts/build-agy-plugin.mjs",

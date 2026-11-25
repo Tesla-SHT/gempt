@@ -49,15 +49,12 @@ function senderDisplayName(name) {
   return String(name || "");
 }
 
-export function compactSwarmView(overview, messages = [], expanded = false) {
-  if (expanded || !overview?.swarm) return false;
-  const visible = overview.counts?.visible ?? overview.roster.filter((worker) => worker.state !== "killed").length;
-  if (visible > 1) return false;
-  const senders = new Set();
-  for (const msg of messages) {
-    if (msg.kind === "system") continue;
-    if (msg.from_agent) senders.add(msg.from_agent);
-    if (senders.size > 1 || msg.mentions?.some((name) => name !== msg.from_agent)) return false;
+export function compactSwarmView(overview, messages = []) {
+  if (!overview?.swarm) return false;
+  const visible = overview.roster.filter(worker => worker.state !== "killed");
+  if (visible.length !== 1 || visible.some(worker => worker.state === "waiting_reply" || worker.telemetry?.state === "waiting_gemini")) return false;
+  for (const message of messages) {
+    if (message.kind !== "system" && !message.control) return false;
   }
   return true;
 }
@@ -162,11 +159,10 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
 
   let active = false;
   let scope = sidecar ? "session" : "all";
-  const tabs = ["overview", "board", "graph", "raw"];
+  const tabs = ["overview", "board", "graph"];
   let subtab = "overview";
-  let expanded = false, compact = false, steeringRun = null;
+  let compact = false, steeringRun = null;
   let channel = "*", channelBusy = false;
-  let rawKind = "members", rawRevision = "", rawRequest = 0;
   let graphMode = "hive", step = null, replayTimer, playing = false, exporting = false;
   let graphKey = "", graphDrawKey = "", snapshot, hive, boardRevision = 0;
   let selectionVersion = 0;
@@ -246,15 +242,14 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
 
   function resetBoardCache() {
     selectionVersion++;
-    expanded = false;
+    openMetadata.clear();
     $("swarm-single-input").value = "";
     stopReplay();
-    rawRequest++; rawRevision = graphKey = graphDrawKey = "";
+    graphKey = graphDrawKey = "";
     $("swarm-gif-modal")?.close();
     channel = "*"; step = null; snapshot = null; hive?.reset();
     $("swarm-search").value = ""; $("swarm-from").value = ""; $("swarm-mentioned").value = "";
-    $("swarm-target").value = "main"; $("swarm-channel-form").hidden = true;
-    $("swarm-new-channel").setAttribute("aria-expanded", "false");
+    $("swarm-target").value = "main"; $("swarm-channel-actions").open = false;
     boardRevision++;
     $("swarm-composer-input").value = "";
     setComposerStatus();
@@ -323,8 +318,8 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     const displayTitle = swarm ? (swarm.title || swarm.goal_title || (swarm.id.startsWith("conversation-") ? tr("会话协作") : swarm.id)) : tr("Swarm 协作");
     put("swarm-title", displayTitle);
     $("swarm-title").title = swarm ? `${displayTitle} (${swarm.id})` : displayTitle;
-    $("swarm-edit-title").hidden = !hasSwarm || opaqueWriteBlocked || editingTitle;
-    $("swarm-title-form").hidden = !hasSwarm || !editingTitle;
+    $("swarm-edit-title").hidden = !hasSwarm || (overview?.counts?.visible ?? 0) < 2 || opaqueWriteBlocked || editingTitle;
+    $("swarm-title-form").hidden = !hasSwarm || compact || !editingTitle;
 
     const goalEl = $("swarm-goal");
     const goalParts = [swarm?.goal_title, swarm?.goal_line].filter(Boolean);
@@ -349,7 +344,6 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       if (c.stopped > 0) items.push({ state: "stopped", label: tr("已停止 {0}", c.stopped) });
       if (c.killed > 0) items.push({ state: "killed", label: tr("已终止 {0}", c.killed) });
       if (!items.length) items.push({ state: "idle", label: tr("共 {0} 个工位", c.total) });
-      items.push({ state: "head", label: `#${overview.head ?? boardHead ?? 0}` });
 
       const key = JSON.stringify(items);
       if (pills.dataset.key !== key) {
@@ -357,7 +351,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
         pills.replaceChildren(...items.map((item) => {
           const pill = node("span", "", "swarm-pill");
           pill.dataset.state = item.state;
-          if (item.state !== "head") pill.append(node("span", "", "swarm-dot"));
+          pill.append(node("span", "", "swarm-dot"));
           pill.append(node("span", item.label));
           return pill;
         }));
@@ -373,9 +367,9 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       tab.setAttribute("aria-selected", String(subtab === name));
       tab.tabIndex = subtab === name ? 0 : -1;
     }
-    const headCount = overview?.head ?? boardHead ?? 0;
-    put("swarm-subtab-board", headCount > 0 ? `${tr("消息板")} (${headCount})` : tr("消息板"));
   }
+
+  const openMetadata = new Set();
 
   function renderWorkerRow(worker) {
     const li = node("li", "", "swarm-worker-row");
@@ -386,45 +380,44 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     const top = node("div", "", "swarm-worker-top");
 
     const dot = node("span", "", "swarm-dot");
-    dot.dataset.state = worker.state || "";
     const nameEl = node("span", worker.name, "swarm-worker-name mono");
     nameEl.dataset.palette = agentPaletteIndex(worker.name);
     const state = worker.telemetry?.state === "waiting_gemini" ? "waiting_reply" : worker.state;
+    dot.dataset.state = state;
     const stateLabel = node("span", tr(WORKER_STATUS_LABELS[state] || "未知"), "swarm-worker-state");
-    stateLabel.dataset.state = worker.state || "";
+    stateLabel.dataset.state = state || "";
 
     top.append(createBeeAvatar(worker.name, worker.state), dot, nameEl, stateLabel);
     if (["monitor", "narrator"].includes(worker.role)) top.append(node("span", tr(worker.role === "monitor" ? "监控员" : "记录员"), "sw-meta-pill"));
     if (worker.unread) top.append(node("span", tr("{0} 条未读", worker.unread), "sw-unread"));
 
+    const details = node("div", "", "sw-worker-details");
     if (worker.cli) {
       const cliPill = node("span", worker.cli, "swarm-cli-pill mono");
       cliPill.dataset.cli = worker.cli;
       cliPill.title = tr("执行 CLI：{0}", worker.cli);
-      top.append(cliPill);
+      details.append(cliPill);
     }
 
     if (worker.model) {
       const rt = node("span", worker.model, "swarm-worker-runtime mono");
       rt.title = worker.model;
-      top.append(rt);
+      details.append(rt);
     }
 
     const ratio = worker.telemetry?.cache_hit_ratio;
-    if (Number.isFinite(ratio)) top.append(node("span", tr("缓存命中率") + " " + pctFmt.format(ratio), "sw-meta-pill"));
+    if (Number.isFinite(ratio)) details.append(node("span", tr("缓存命中率") + " " + pctFmt.format(ratio), "sw-meta-pill"));
     if (worker.workspace === "share" || worker.worktree_path) {
       const wt = node("span", "Worktree", "run-kind");
       if (worker.worktree_path) wt.title = worker.worktree_path;
-      top.append(wt);
+      details.append(wt);
     }
 
     main.append(top);
-    const details = node("div", "", "sw-worker-details");
     for (const ch of worker.channels || []) details.append(node("span", ch === "*" ? tr("全部频道") : "#" + ch, "sw-meta-pill"));
     if (worker.wake_mode) details.append(node("span", tr(worker.wake_mode === "anything" ? "任意消息唤醒" : "提及时唤醒")));
     if (worker.added_by) details.append(node("span", tr("由 @{0} 添加", worker.added_by)));
     if (worker.worktree_path) details.append(node("span", worker.worktree_path, "mono"));
-    if (!compact && details.childNodes.length) main.append(details);
     if (worker.quota_paused_seq) {
       const note = node("p", tr("配额暂停于"), "swarm-worker-wait");
       note.append(citation(worker.quota_paused_seq));
@@ -438,18 +431,20 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       summaryEl.title = summary;
       main.append(summaryEl);
     }
-    if (worker.state === "waiting_reply") {
-      const waitNote = node("p", worker.parked_on
-        ? tr("等待回复（{0}）", worker.parked_on)
-        : tr("工位 {0} 正在等待回复", worker.name), "swarm-worker-wait");
-      main.append(waitNote);
-    }
     if (worker.error) {
       const errEl = node("p", errorText(worker.error), "swarm-worker-error");
       errEl.title = worker.error;
       main.append(errEl);
     }
 
+    if (!compact && details.childNodes.length) {
+      const key = selectedSwarmId + "/" + worker.name;
+      const more = node("details");
+      more.open = openMetadata.has(key);
+      more.ontoggle = () => more.open ? openMetadata.add(key) : openMetadata.delete(key);
+      more.append(node("summary", tr("详情")), details);
+      main.append(more);
+    }
     if (compact && worker.telemetry?.last_message) main.append(node("p", worker.telemetry.last_message, "swarm-single-preview"));
     const actions = node("div", "", "swarm-worker-actions");
     if (worker.run_id) {
@@ -522,7 +517,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     const overviewKey = JSON.stringify([locale(), selectedSwarmId, overview.roster, overview.swarm.threads, overview.screenshots, overview.system_attention, pendingConfirm, busyWorkerAction, opaqueWriteBlocked]);
     if (container.dataset.key === overviewKey) return;
     container.dataset.key = overviewKey;
-    renderTeam();
+    renderAttention();
     const groups = groupWorkersByThreads(overview.swarm.threads, overview.roster);
     container.replaceChildren(...groups.map((group) => {
       const card = node("section", "", "swarm-card");
@@ -535,7 +530,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
           : group.title;
       head.append(node("h2", titleText, "swarm-card-title"));
       if (group.workers.length) {
-        head.append(node("span", tr("共 {0} 个工位", group.workers.length), "swarm-card-meta"));
+        head.append(node("span", tr(group.workers.length === 1 ? "1 个工位" : "共 {0} 个工位", group.workers.length), "swarm-card-meta"));
       }
       card.append(head);
 
@@ -561,7 +556,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     const shots = Array.isArray(overview.screenshots) ? overview.screenshots : [];
     shotsCard.hidden = shots.length === 0;
     if (shots.length) {
-      put("swarm-screenshots-count", tr("{0} 张截图", shots.length));
+      put("swarm-screenshots-count", tr(shots.length === 1 ? "1 张截图" : "{0} 张截图", shots.length));
       shotsList.replaceChildren(...shots.map((item) => {
         const li = node("li", "", "swarm-shot-item");
         const meta = node("div", "", "swarm-shot-meta");
@@ -648,8 +643,8 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     const input = $("swarm-composer-input");
     const send = $("swarm-composer-send");
     if (!input || !send) return;
-    const disabled = opaqueWriteBlocked || !selectedSwarmId || posting;
-    input.disabled = opaqueWriteBlocked || !selectedSwarmId;
+    input.disabled = opaqueWriteBlocked || !selectedSwarmId || registry().some(c => c.name === channel && c.archived);
+    const disabled = input.disabled || posting;
     send.disabled = disabled || !input.value.trim();
   }
 
@@ -747,13 +742,9 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
 
   function render() {
     updateStandaloneLink();
-    const canCompact = compactSwarmView(overview, boardBySeq.values());
-    compact = canCompact && !expanded;
+    compact = compactSwarmView(overview, boardBySeq.values());
     if (compact && subtab !== "overview") { stopReplay(); subtab = "overview"; }
     renderHeader();
-    $("swarm-toggle-full").hidden = !canCompact;
-    $("swarm-toggle-full").setAttribute("aria-expanded", String(!compact));
-    put("swarm-toggle-full", tr(compact ? "完整工作台" : "单工位"));
     $("swarm-single").hidden = !compact;
     if (compact) {
       const worker = overview.roster.find((member) => member.state !== "killed");
@@ -794,7 +785,6 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       if (subtab === "overview") renderOverview();
       if (subtab === "board") renderBoard();
       if (subtab === "graph") renderGraph();
-      if (subtab === "raw") void renderRaw();
     }
   }
 
@@ -903,7 +893,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
   async function submitPost() {
     const input = $("swarm-composer-input");
     const text = input?.value.trim();
-    if (!selectedSwarmId || !text || posting || opaqueWriteBlocked) return;
+    if (!selectedSwarmId || !text || posting || input.disabled) return;
     const version = selectionVersion;
     posting = true;
     syncComposerControls();
@@ -912,7 +902,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       const payload = {
         swarm_id: selectedSwarmId,
         text,
-        ...($("swarm-target").value ? { channel: $("swarm-target").value } : {}),
+        channel: channel === "*" ? $("swarm-target").value : channel,
         ...(replyTo?.seq ? { reply_to_seq: replyTo.seq } : {}),
       };
       const res = await transport.swarm("post", payload);
@@ -923,7 +913,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
         boardBySeq.set(res.message.seq, res.message);
         boardRevision++;
       }
-      const delivered = (res?.deliveries || []).map((d) => `${d.worker} (${d.mode})`);
+      const delivered = (res?.deliveries || []).filter(d => ["reply", "steer", "wake"].includes(d.mode)).map(d => "@" + d.worker);
       setComposerStatus(delivered.length
         ? tr("已发送 #{0} · 已传达 {1}", res.head, delivered.join(", "))
         : tr("已发送 #{0}", res.head));
@@ -1023,15 +1013,8 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     el.classList.remove("sw-jump"); void el.offsetWidth; el.classList.add("sw-jump");
   }
 
-  function renderTeam() {
-    const team = $("swarm-team");
+  function renderAttention() {
     const roster = overview.roster || [];
-    team.replaceChildren(...[{name:"coordinator",state:"working"},...roster.filter(w=>w.name!=="coordinator")].map(w => {
-      const member = node("span", "", "sw-team-member");
-      member.title = "@" + w.name + " · " + tr(WORKER_STATUS_LABELS[w.state] || "未知");
-      member.append(createBeeAvatar(w.name,w.state), node("span",senderDisplayName(w.name)));
-      return member;
-    }));
     const attention = $("swarm-attention");
     const alerts = overview.system_attention || [];
     const labels = { error:"错误", quota:"配额暂停", stuck:"工位无更新", stall:"协作停滞" };
@@ -1065,19 +1048,9 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     selectOptions("swarm-mentioned",[["",tr("全部")],...[...targets].sort().map(n=>[n,n])]);
     selectOptions("swarm-channel-filter",choices);
     $("swarm-channel-filter").value=channel;
-    const bar=$("swarm-channel-tabs"), key=JSON.stringify([choices,channel]);
-    if (bar.dataset.key!==key) {
-      bar.dataset.key=key;
-      bar.replaceChildren(...choices.map(([value,label])=>{
-        const btn=node("button",label,"btn-ghost"); btn.type="button";
-        btn.dataset.channel=value; btn.setAttribute("aria-pressed", String(channel===value));
-        btn.onclick=()=>{channel=value;renderBoard();};return btn;
-      }));
-    }
     selectOptions("swarm-target",[["main","#main"],...channels.filter(c=>!c.archived).map(c=>[c.name,"#"+c.name])]);
-    $("swarm-target-label").hidden=!channels.length || opaqueWriteBlocked;
-    $("swarm-new-channel").hidden=opaqueWriteBlocked;
-    if (opaqueWriteBlocked) $("swarm-channel-form").hidden=true;
+    $("swarm-target-label").hidden = channel !== "*" || !channels.some(c => !c.archived) || opaqueWriteBlocked;
+    $("swarm-channel-actions").hidden = opaqueWriteBlocked;
     $("swarm-archive").hidden=opaqueWriteBlocked || !channels.some(c=>c.name===channel && !c.archived);
     $("swarm-archive").disabled=channelBusy;
   }
@@ -1091,31 +1064,15 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     try {
       await transport.swarm("action",{swarm_id:selectedSwarmId, action:"channel", op, channel:name, ...(op==="create" ? {topic:$("swarm-channel-topic").value.trim()} : {})});
       if(version!==selectionVersion) return;
-      form.reset();form.hidden=true;$("swarm-new-channel").setAttribute("aria-expanded","false");
+      form.reset(); $("swarm-channel-actions").open = false;
       channel=op==="create" ? name : "*";
       await refresh({silent:true});
     } catch(e) {handleWriteError(e);}
     finally {channelBusy=false;form.querySelector("button").disabled=false;$("swarm-archive").disabled=false;}
   }
 
-  async function renderRaw() {
-    const key=JSON.stringify([selectedSwarmId,rawKind,locale(),rawKind==="board" ? boardRevision : rawKind==="plan" ? [overview.swarm,overview.roster.map(w=>w.task_summary)] : [overview.swarm.title,overview.roster]]);
-    if (key===rawRevision) return;
-    rawRevision=key;
-    const token=++rawRequest, pre=$("swarm-raw-content"), copyBtn=$("swarm-raw-copy");
-    pre.textContent="";copyBtn.disabled=true;put("swarm-raw-meta",tr("加载中…"));
-    for (const b of document.querySelectorAll("[data-raw]")) b.setAttribute("aria-pressed",String(b.dataset.raw===rawKind));
-    try {
-      const result=await transport.swarm("raw",{swarm_id:selectedSwarmId,kind:rawKind});
-      if(token!==rawRequest) return;
-      const content=result.content || "";
-      pre.textContent=content;copyBtn.disabled=false;
-      put("swarm-raw-meta",tr("{0} 字节 · {1} 行",new TextEncoder().encode(content).length,content ? content.split("\n").length-Number(content.endsWith("\n")) : 0));
-    } catch(e) {if(token===rawRequest) {rawRevision="";put("swarm-raw-meta",errorText(e.message));}}
-  }
-
   function graphData() {
-    const key=JSON.stringify([selectedSwarmId,boardRevision,overview.roster,overview.channels,overview.swarm]);
+    const key=JSON.stringify([selectedSwarmId,boardRevision,overview.roster,overview.channels,overview.system_attention,overview.swarm]);
     if(key!==graphKey) {snapshot=graphSnapshot(overview,messages());graphKey=key;graphDrawKey="";}
     return snapshot;
   }
@@ -1156,6 +1113,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     if (step!==null) step=Math.min(step,n);
     const current=step===null ? null : posts[step-1];
     const options=graphOptions(), isHive=graphMode==="hive";
+    $("swarm-export").hidden = isHive;
     $("swarm-hive-view").hidden=!isHive;$("swarm-mentions-wrap").hidden=isHive;
     for(const btn of document.querySelectorAll("[data-graph-mode]")) btn.setAttribute("aria-pressed",String(btn.dataset.graphMode===graphMode));
     $("swarm-hide-label").hidden=$("swarm-expand-label").hidden=isHive;
@@ -1194,13 +1152,13 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     replayTimer=setTimeout(()=>{step++;renderGraph();scheduleStep();},replayDelay(posts,step,real,speed));
   }
   async function exportReplay() {
-    if(exporting || !overview) return;
+    if(exporting || !overview || graphMode !== "mentions") return;
     const version=selectionVersion, btn=$("swarm-export");
     exporting=true;btn.disabled=true;btn.textContent=tr("导出中…");
     try {
       const {dataUrl,filename}=await exportGraphGif(graphData(),{...graphOptions(),width:$("swarm-sub-graph").clientWidth,
         onProgress:n=>{btn.textContent=tr("导出中 {0}%",n);}});
-      if(version!==selectionVersion || !active || subtab!=="graph") return;
+      if(version!==selectionVersion || !active || subtab!=="graph" || graphMode !== "mentions") return;
       const dialog = node("dialog");
       dialog.id = "swarm-gif-modal";
       dialog.setAttribute("aria-labelledby", "swarm-gif-title");
@@ -1216,11 +1174,10 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       btn.disabled = false; btn.focus({ preventScroll: true });
       dialog.showModal();
     } catch(e) {showToast?.(errorText(e.message));}
-    finally {exporting=false;btn.disabled=false;btn.textContent=tr("导出 GIF");}
+    finally {exporting=false;btn.disabled=false;btn.textContent=tr("导出提及 GIF");}
   }
 
   // Event bindings
-  $("swarm-toggle-full").onclick = () => { expanded = !expanded; render(); };
   $("swarm-single-input").oninput = () => {
     $("swarm-single-send").disabled = !$("swarm-single-input").value.trim() || $("swarm-single-input").disabled;
   };
@@ -1254,13 +1211,6 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
   $("swarm-scope-session")?.addEventListener("click", () => changeScope("session"));
   $("swarm-scope-all")?.addEventListener("click", () => changeScope("all"));
   $("swarm-empty-show-all")?.addEventListener("click", () => changeScope("all"));
-  $("swarm-refresh")?.addEventListener("click", async () => {
-    const btn = $("swarm-refresh");
-    btn.disabled = true;
-    btn.classList.add("is-spinning");
-    try { await refresh({ forceBoard: true }); }
-    finally { btn.disabled = false; btn.classList.remove("is-spinning"); }
-  });
   $("swarm-edit-title")?.addEventListener("click", () => {
     editingTitle = true;
     const input = $("swarm-title-input");
@@ -1282,7 +1232,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
         event.preventDefault();
         const next = event.key === "Home" ? "overview"
-          : event.key === "End" ? "raw"
+          : event.key === "End" ? tabs.at(-1)
             : tabs[(tabs.indexOf(name) + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length];
         setSubtab(next, { focus: true });
       }
@@ -1311,16 +1261,11 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     const filters=$("swarm-filters");filters.hidden=!filters.hidden;
     e.currentTarget.setAttribute("aria-expanded",String(!filters.hidden));
   };
-  $("swarm-new-channel").onclick = e => {
-    const form=$("swarm-channel-form");form.hidden=!form.hidden;
-    e.currentTarget.setAttribute("aria-expanded",String(!form.hidden));
-    if(!form.hidden) $("swarm-channel-name").focus();
-  };
   $("swarm-channel-form").onsubmit = e => {e.preventDefault();void writeChannel("create");};
   $("swarm-archive").onclick = () => void writeChannel("archive");
   $("swarm-search").oninput = renderBoard;
   $("swarm-from").onchange = $("swarm-mentioned").onchange = renderBoard;
-  $("swarm-channel-filter").onchange = e => {channel=e.target.value;renderBoard();};
+  $("swarm-channel-filter").onchange = e => {channel=e.target.value;replyTo=null;renderReplyBanner();renderBoard();};
   for(const btn of document.querySelectorAll("[data-graph-mode]")) btn.onclick=()=>{graphMode=btn.dataset.graphMode;renderGraph();};
   $("swarm-hide-inactive").onchange=$("swarm-expand").onchange=renderGraph;
   $("swarm-scrubber").oninput=e=>seek(Number(e.target.value));
@@ -1339,8 +1284,6 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
   $("swarm-speed").onchange=$("swarm-pace").onchange=()=>{if(playing){clearTimeout(replayTimer);scheduleStep();}};
   new ResizeObserver(()=>{if(active && overview && subtab==="graph" && graphMode==="mentions") renderGraph();}).observe($("swarm-mentions-wrap"));
   $("swarm-export").onclick=()=>void exportReplay();
-  for(const btn of document.querySelectorAll("[data-raw]")) btn.onclick=()=>{rawKind=btn.dataset.raw;void renderRaw();};
-  $("swarm-raw-copy").onclick=()=>void copy($("swarm-raw-content").textContent);
 
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) { clearTimeout(pollTimer); stopReplay(); }

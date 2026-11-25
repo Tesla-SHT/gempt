@@ -18,7 +18,7 @@ import { updateSettings } from '../magpie_plugin/lib/backend.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
 
 const narrow = process.argv.includes('--narrow');
-const output = process.env.GEMPT_VERIFY_DIR || '/tmp/gempt-v060-verify';
+const output = process.env.GEMPT_VERIFY_DIR || join(tmpdir(), 'gempt-v0101-verify');
 const root = mkdtempSync(join(tmpdir(), 'gempt-verify-'));
 const configPath = join(root, 'config.json');
 const sessionsDir = join(root, 'sessions');
@@ -141,7 +141,7 @@ function seed(url) {
   writeFileSync(configPath, JSON.stringify({
     version: 1, magpie: { base_url: url }, ui: { language: 'zh' },
     codex: { default_sandbox: 'workspace-write', timeout_sec: 3600 },
-    routing_policy: { work_split: 'gpt_first', swarm_split: 'inherit', native_swarm: true, mcp_effort: 'high' },
+    routing_policy: { work_split: 'gpt_first', mcp_effort: 'high' },
     tiers: { sonnet: { consult_model: model, exec_model: model, reasoning_effort: 'medium' },
       opus: { consult_model: model, exec_model: model, reasoning_effort: 'high' } },
   }));
@@ -179,7 +179,7 @@ function seed(url) {
     source: 'magpie_exec', run_id: runId, session_id: sessionId, title: '核对双端控制台与迁移',
     cwd: join(cwd, 'worktree'), worktree_path: join(cwd, 'worktree'), source_cwd: cwd,
     host_conversation_id: host, state: 'waiting_gemini', started_at: started,
-    created_at: started, pid: process.pid, model, tier: 'opus', turn_id: turnId, codex_thread_id: threadId,
+    created_at: started, pid: process.pid, model, tier: 'opus', codex_thread_id: threadId, turn_id: turnId, turn_id: turnId, codex_thread_id: threadId,
     deadline: Date.now() / 1000 + 3060, execution_timeout_sec: 3600,
     goal: '核对共享控制台、活动查看与在 Live 中直接回复。',
     pending_tool_call: { call_id: 'ask_1', tool: 'ask_gemini', requested_at: stamp(1), arguments: args },
@@ -202,22 +202,22 @@ function seed(url) {
     JSON.stringify({ method, params: { threadId, turnId, ...params } })).join('\n') + '\n');
   saveRun(join(runDirectory(swarmWorkerRunId, sessionsDir), 'state.json'), {
     source: 'magpie_exec', run_id: swarmWorkerRunId, session_id: 'exec-swarm-designer', title: '核对暗黑主题对比度',
-    cwd, host_conversation_id: host, state: 'waiting_gemini', started_at: stamp(5), created_at: stamp(5),
-    pid: process.pid, model, tier: 'opus',
+    cwd, host_conversation_id: host, state: narrow ? 'running' : 'waiting_gemini', started_at: stamp(5), created_at: stamp(5),
+    pid: process.pid, model, tier: 'opus', codex_thread_id: threadId, turn_id: turnId,
     pending_tool_call: { call_id: 'ask_swarm_1', tool: 'ask_gemini', requested_at: stamp(1),
       arguments: { question: 'Swarm 面板在浅色和深色主题下的层级是否清晰？' } },
   });
 }
 
-async function seedSwarm() {
+async function seedSwarm(compact) {
   await ensureSwarm({ swarmId, hostConversationId: host, cwd, title: 'Swarm 工作台验收', sessionsDir });
   await upsertWorker(swarmId, {
     name: 'frontend', cli: 'codex', model, workspace: 'share',
-    worktree_path: join(cwd, 'worktree'), source_cwd: cwd, state: 'waiting_reply',
-    run_id: swarmWorkerRunId, session_id: 'exec-swarm-designer', parked_on: 'ask_swarm_1',
+    worktree_path: join(cwd, 'worktree'), source_cwd: cwd, state: compact ? 'working' : 'waiting_reply',
+    run_id: swarmWorkerRunId, session_id: 'exec-swarm-designer', parked_on: compact ? null : 'ask_swarm_1',
     task_summary: '实现总览线程卡片、截图时间线与消息板发送器',
   }, { sessionsDir });
-  if (narrow) return;
+  if (compact) return;
   await upsertWorker(swarmId, {
     name: 'reviewer', cli: 'codex', model, workspace: 'inherit',
     source_cwd: cwd, state: 'waiting', run_id: priorRunId, session_id: sessionId,
@@ -260,7 +260,7 @@ async function verify() {
   await once(backend, 'listening');
   const url = 'http://127.0.0.1:' + backend.address().port;
   seed(url);
-  await seedSwarm();
+  await seedSwarm(narrow);
   await updateHostContext(host, [cwd], { configPath });
   consoleServer = await startServer({ port: 0, configPath, sessionsDir, magpieConfigDir,
     antigravityPluginDir: join(root, 'client plugins', 'gempt'), agyBinDir: join(root, 'commands with spaces'),
@@ -279,7 +279,7 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
 `, { mode: 0o755 });
     // Launch the source sidecar without --import to exercise its installed SDK lookup.
     const entry = fileURLToPath(new URL('../plugin/sidecars/gempt_live/main.mjs', import.meta.url));
-    sidecarChild = spawn(process.execPath, [entry], { cwd: dirname(entry), env: { ...env,
+    sidecarChild = spawn(process.execPath, [entry], { windowsHide: true, cwd: dirname(entry), env: { ...env,
       GEMPT_MAGPIE_PLUGIN_PORT: String(consoleServer.port),
       GEMPT_AGY_PLUGIN_DIR: join(root, 'client plugins', 'gempt'), GEMPT_BIN_DIR: join(root, 'commands with spaces'),
       ANTIGRAVITY_LS_ADDRESS: '127.0.0.1:0', ANTIGRAVITY_CSRF_TOKEN: 'fixture', ANTIGRAVITY_CONVERSATION_ID: host,
@@ -289,9 +289,9 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
     sidecarOrigin = 'http://' + line.match(/listening on (127[.]0[.]0[.]1:[0-9]+)/)[1];
   }
 
-  chrome = spawn(process.env.CHROME || 'google-chrome', ['--headless=new', '--no-sandbox', '--disable-gpu',
+  chrome = spawn(process.env.CHROME || (process.platform === 'win32' ? join(process.env.ProgramFiles, 'Google', 'Chrome', 'Application', 'chrome.exe') : 'google-chrome'), ['--headless=new', '--no-sandbox', '--disable-gpu',
     '--disable-site-isolation-trials', '--remote-debugging-port=0', '--user-data-dir=' + join(root, 'chrome'), 'about:blank'],
-  { stdio: 'ignore' });
+  { stdio: 'ignore', windowsHide: true });
   const exited = once(chrome, 'exit');
   const port = await until(() => {
     try { return readFileSync(join(root, 'chrome', 'DevToolsActivePort'), 'utf8').split('\n')[0]; } catch { return null; }
@@ -376,6 +376,18 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
   }
   const click = (id) => evaluate(`$(${JSON.stringify(id)}).click();`);
 
+  const fill = (id, value) => evaluate(`const field = $(${JSON.stringify(id)});
+    field.value = ${JSON.stringify(value)}; field.dispatchEvent(new Event('input', { bubbles: true }));`);
+
+  async function saveTimeout(seconds) {
+    await evaluate("$('advanced-settings').open = true;");
+    await fill('codex-timeout', String(seconds));
+    assert.notEqual(JSON.parse(readFileSync(configPath)).codex.timeout_sec, seconds);
+    await click('advanced-save');
+    await until(() => JSON.parse(readFileSync(configPath)).codex.timeout_sec === seconds, 'advanced timeout save');
+    assert.equal(JSON.parse(readFileSync(configPath)).codex.timeout_sec_customized, true);
+  }
+
   if (narrow) {
     await open(url + '/native-host', 540, 920, true);
     await until(() => evaluate("return !$('language-toggle')?.disabled;"), 'Sidecar header');
@@ -388,13 +400,46 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
       }
       await assertTopbar(language + ' Overview');
       await evaluate("$('token-ratio-card').scrollIntoView({block:'center'});");
+      await until(() => evaluate("return $('toast').hidden;"), 'language feedback cleared');
       await shot('overview-540-' + language);
     }
     await click('tab-swarm');
     await until(() => evaluate("return !$('swarm-single').hidden && $('swarm-single-worker').children.length === 1;"), 'compact Swarm');
     await assertTopbar('compact Swarm');
+    assert.equal(await evaluate("return !$('swarm-edit-title').hidden || !$('swarm-subtabs').hidden;"), false);
+    assert.equal(await evaluate("return !$('swarm-single-steer').hidden;"), true);
     await shot('swarm-540-en');
-    console.log('Chrome OK · 540px native Sidecar, bilingual Overview and single-worker Swarm');
+    await seedSwarm(false);
+    await click('refresh-btn');
+    await until(() => evaluate("return !$('swarm-subtabs').hidden && $('swarm-threads').children.length === 2;"), 'expanded Swarm');
+    assert.deepEqual(await evaluate("return [...$('swarm-subtabs').children].map(b => b.id);"),
+      ['swarm-subtab-overview', 'swarm-subtab-board', 'swarm-subtab-graph']);
+    await shot('swarm-540-overview');
+    await click('swarm-subtab-board');
+    await shot('swarm-540-board');
+    await evaluate("$('swarm-channel-actions').open = true; $('swarm-channel-name').value = 'build'; $('swarm-channel-form').requestSubmit();");
+    await until(() => evaluate("return $('swarm-channel-filter').value === 'build';"), 'new channel selected');
+    assert.equal(await evaluate("return $('swarm-target-label').hidden;"), true);
+    await fill('swarm-composer-input', 'Build verified');
+    await click('swarm-composer-send');
+    await until(() => evaluate("return $('swarm-board-feed').textContent.includes('Build verified');"), 'post delivered in filtered channel');
+    await evaluate("$('swarm-channel-filter').value = '*'; $('swarm-channel-filter').dispatchEvent(new Event('change'));");
+    assert.equal(await evaluate("return $('swarm-target-label').hidden;"), false);
+    await click('swarm-subtab-graph');
+    await until(() => evaluate("return !!document.querySelector('.sw-hive-map [data-cell]');"), 'Hive rendered');
+    assert.equal(await evaluate("return $('swarm-export').hidden;"), true);
+    assert.match(await evaluate("return $('swarm-hive-view').textContent;"), /Needs you/);
+    await shot('swarm-540-graph');
+    // Retired workers must never contribute to completed work, even after the coordinator finishes.
+    await upsertWorker(swarmId, { name: 'reviewer', state: 'killed' }, { sessionsDir });
+    await postBoardMessage(swarmId, { from: 'coordinator', text: '[done]' }, { sessionsDir });
+    await click('refresh-btn');
+    await until(() => evaluate("return document.querySelector('[data-cell=hub] .sw-hex-meta')?.textContent === '1/2 done';"), 'killed worker excluded from completion');
+    await evaluate("document.querySelector('[data-graph-mode=mentions]').click();");
+    assert.equal(await evaluate("return !$('swarm-export').hidden && $('swarm-export').textContent;"), 'Export Mentions GIF');
+    assert.deepEqual(errors, []);
+    assert.deepEqual(notFound, []);
+    console.log('Chrome OK · 540px native Sidecar, bilingual Overview, compact and expanded Swarm, channel posting, Hive and Mentions');
     return;
   }
   gatewayDelay = 400;
@@ -436,9 +481,7 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
   await until(repairReady, 'ready card on fresh Overview');
   await shot('gempt-agy-btn-qa');
   assert.equal(requests.some(path => /^\/api\/(sessions|requests)/.test(path)), false);
-  await evaluate("document.querySelector('[data-timeout=\"7200\"]').click();");
-  await until(() => evaluate("return document.querySelector('[data-timeout=\"7200\"]').getAttribute('aria-pressed') === 'true';"), 'Magpie timeout update over HTTP');
-  assert.equal(JSON.parse(readFileSync(configPath)).codex.timeout_sec, 7200);
+  await saveTimeout(7200);
   assert.ok(requests.some(path => path === '/api/settings'));
   await evaluate(`document.querySelector('#active-run-list [data-run-id="${runId}"] [data-run-action="detail"]').click();`);
   await until(() => evaluate("return !$('ask').hidden && $('turn-strip').children.length === 2;"), 'Magpie Overview to Live');
@@ -534,9 +577,7 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
     assert.equal(await evaluate("return $('agy-install-link').href;"), new URL(standaloneUrl).origin + '/');
     await evaluate("document.querySelector('[data-ratio-range=\"7d\"]').click();");
     await until(() => evaluate("return $('token-ratio-title').textContent.includes('7 天') && !$('token-ratio-card').hidden;"), 'native token range change');
-    await evaluate("$('advanced-settings').open = true; document.querySelector('[data-timeout=\"1800\"]').click();");
-    await until(() => evaluate("return document.querySelector('[data-timeout=\"1800\"]').getAttribute('aria-pressed') === 'true';"), 'native Settings via sidecar auth');
-    assert.equal(JSON.parse(readFileSync(configPath)).codex.timeout_sec, 1800);
+    await saveTimeout(1800);
     await shot('agy-native-console-dark');
     for (const tab of ['requests', 'sessions']) {
       await click('tab-' + tab);
@@ -561,8 +602,6 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
     await evaluate("document.querySelector('#advanced-settings summary').click();");
     assert.equal(await evaluate("return $('advanced-settings').open && $('tab-overview').textContent;"), '概览');
 
-    const fill = (id, value) => evaluate(`const field = $(${JSON.stringify(id)});
-      field.value = ${JSON.stringify(value)}; field.dispatchEvent(new Event('input', { bubbles: true }));`);
     await fill('gateway-url', url + '/');
     await fill('gateway-key', 'sidecar-draft-key-1234');
     await fill('gateway-key-env', 'GEMPT_BROWSER_TOKEN');
@@ -586,9 +625,6 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
     assert.equal(settings.limits.consult_timeout_sec, 240);
     assert.deepEqual(settings.codex.extra_args, ['--strict-config', '--analytics-default-enabled']);
 
-    await evaluate("const model = $('swarm-shell-model'); model.value = 'vendor/custom-shell:v2'; model.dispatchEvent(new Event('change', { bubbles: true }));");
-    await until(() => JSON.parse(readFileSync(configPath)).routing_policy.swarm_shell_model === 'vendor/custom-shell:v2', 'native custom Swarm model');
-    await until(() => evaluate("return !$('swarm-shell-model').disabled;"), 'native custom Swarm save settled');
     await click('advanced-reset');
     assert.equal(await evaluate("return !$('reset-confirm').hidden && $('reset-keep-gateway').checked;"), true);
     await click('reset-cancel');
@@ -656,7 +692,7 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
     assert.ok(apiRequests.length > 0 && apiRequests.every(({ method, authenticated, status }) =>
       method === 'POST' && authenticated && status === 200), 'native reads and mutations use authenticated POSTs');
     await open(url + '/native-host?no-workspace&index', 460, 820, true);
-    await until(() => evaluate(`return $('list-loading').hidden && !$('routing-badge').disabled
+    await until(() => evaluate(`return $('list-loading').hidden && !$('language-toggle').disabled
       && !!document.querySelector('.session-card[data-run-id="${runId}"]');`), 'native startup without workspace metadata');
     assert.equal(await evaluate('return location.pathname;'), sidecarPrefix + '/index.html');
     const noWorkspaceFrame = (await cdp('Page.getFrameTree')).frameTree.frame;
@@ -666,14 +702,14 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
       && !document.querySelector('.session-card[data-run-id="${runId}"]');`), 'late first workspace narrows the run list');
 
     await open(url + '/native-host?opaque&no-workspace', 460, 820, true);
-    await until(() => evaluate(`return self.origin === 'null' && !!window.sidecar && !$('routing-badge').disabled
+    await until(() => evaluate(`return self.origin === 'null' && !!window.sidecar && !$('language-toggle').disabled
       && !!document.querySelector('.session-card[data-run-id="${runId}"]');`), 'opaque native iframe starts with authenticated data');
     assert.ok(sidecarRequests.some(({ path, method, authenticated, status }) =>
       path === '/api?token=' + sidecarToken && method === 'POST' && !authenticated && status === 200));
 
     authorizeSidecarAtGateway = true;
     await open(url + '/native-host?tokenless&no-workspace', 460, 820, true);
-    await until(() => evaluate(`return !$('routing-badge').disabled
+    await until(() => evaluate(`return !$('language-toggle').disabled
       && !!document.querySelector('.session-card[data-run-id="${runId}"]');`), 'gateway-authenticated native iframe without a query token');
     authorizeSidecarAtGateway = false;
     assert.ok(!sidecarRequests.some(({ path }) => path === '/_sidecar/get-conversation-metadata'),
@@ -682,14 +718,12 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
 
   await open(url + magpiePrefix + '/?theme=dark', 900, 820, false);
   await until(() => evaluate("return $('magpie-status')?.dataset.state === 'online' && !$('token-ratio-card')?.hidden;"), 'Magpie Console through a prefix');
-  await evaluate("document.querySelector('[data-timeout=\"3600\"]').click();");
-  await until(() => evaluate("return document.querySelector('[data-timeout=\"3600\"]').getAttribute('aria-pressed') === 'true';"), 'Magpie settings through a prefix');
-  assert.equal(JSON.parse(readFileSync(configPath)).codex.timeout_sec, 3600);
+  await saveTimeout(3600);
 
   assert.deepEqual(notFound, [], 'Chrome received no 404 responses');
   assert.deepEqual(errors, [], 'Chrome console and uncaught errors');
   assert.deepEqual(external, [], 'No external asset or network requests');
-  console.log('Chrome OK · Magpie HTTP and native Sidecar · prefixed, slashless, index, opaque, gateway-authenticated and late-workspace startup · four tabs, details, token ratio, settings and controls · 0 HTTP 404s, 0 console errors');
+  console.log('Chrome OK · Magpie HTTP and native Sidecar · prefixed, slashless, index, opaque, gateway-authenticated and late-workspace startup · five tabs, details, token ratio, settings and controls · 0 HTTP 404s, 0 console errors');
   for (const status of [401, 404, 500]) {
     sidecarFailure = status;
     await open(url + '/native-host?no-workspace', 460, 820, true);

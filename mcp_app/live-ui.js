@@ -5,9 +5,8 @@ import { renderMarkdown } from "./markdown.js";
 import { linkTarget, listArguments, streamRenderKey, timelineMessages } from "./live-state.js";
 import { mountSwarm } from "./swarm-ui.js";
 
-export function mountLive({ transport, host, sidecar }) {
+export function mountLive({ transport, sidecar }) {
   const applyLanguage = bindLanguage(document.body);
-  const embedded = Boolean(host);
   const params = new URLSearchParams(location.search);
   const tabs = ["live", "swarm", "overview", "requests", "sessions"];
   const active = new Set(["queued", "running", "waiting_gemini"]);
@@ -33,12 +32,10 @@ export function mountLive({ transport, host, sidecar }) {
   const basename = (p) => String(p || "").split(/[\\/]/).filter(Boolean).pop() || String(p || "");
 
   let ready = false;
-  let supportsTools = false;
   let appTab = "live";
   let sharedConsole;
   let swarmController;
   let latestMagpieStatus;
-  let routingSummary;
   let languagePreference = "auto";
   let savingLanguage = false;
   let languageRevision = 0;
@@ -53,18 +50,15 @@ export function mountLive({ transport, host, sidecar }) {
   let transcript = { text: "", complete: false };
   let fullGoal = null;
   let goalLoading = null;
-  let scope = embedded || sidecar ? "session" : "all";
+  let scope = sidecar ? "session" : "all";
   let linkedSession = null;
   let focusRun = null;
   let magpieCheck;
   let magpieTimer;
-  let scopeChosen = false;
   let lockedConversation = null;
   let nextOffset = null;
   let requestedCount = 0;
   let lastListConversation = null;
-  let activeConversation = null;
-  let connectFailed = false;
   let listLoaded = false;
   let listVersion = 0;
   let listTimer, streamTimer;
@@ -74,7 +68,6 @@ export function mountLive({ transport, host, sidecar }) {
   let streamWanted = false;
   let control = null;
   let confirming = false;
-  let bridgeBusy = false;
   let toastTimer;
   let toastPath = "";
   const hostStyleKeys = new Set();
@@ -111,13 +104,11 @@ export function mountLive({ transport, host, sidecar }) {
 
   const currentRun = () => snapshot?.run ?? runs.find((run) => run.run_id === selected);
   const isActive = () => active.has(currentRun()?.state);
-  const canFetch = () => appTab === "live" && ready && supportsTools && !document.hidden;
+  const canFetch = () => appTab === "live" && ready && !document.hidden;
 
   function updateHash(tab, id) {
-    if (!embedded) {
-      const hash = `#${tab}${id ? "/" + encodeURIComponent(id) : ""}`;
-      if (hash !== location.hash) history.pushState(null, "", hash);
-    }
+    const hash = `#${tab}${id ? "/" + encodeURIComponent(id) : ""}`;
+    if (hash !== location.hash) history.pushState(null, "", hash);
   }
 
   function hashLocation() {
@@ -127,8 +118,7 @@ export function mountLive({ transport, host, sidecar }) {
     return { tab: tabs.includes(tab) ? tab : sidecar ? "live" : "overview", id };
   }
 
-  function navigate(tab, { id, sessionId, focus = false, work = false, fromHash = false, preserveLive = false } = {}) {
-    const previous = appTab;
+  function navigate(tab, { id, sessionId, focus = false, fromHash = false } = {}) {
     appTab = tab;
     if (!fromHash) updateHash(tab, id);
     for (const name of tabs) {
@@ -144,24 +134,11 @@ export function mountLive({ transport, host, sidecar }) {
     $("live-panel").hidden = !live;
     $("swarm-panel").hidden = !swarm;
     $("view-console").hidden = !consoleTab;
-    if (swarm && supportsTools && !swarmController) {
-      swarmController = mountSwarm({
-        transport,
-        sidecar,
-        navigate,
-        openLink,
-        copy,
-        showToast: (message, kind) => toast(message, "", kind),
-      });
-    }
     swarmController?.setActive(swarm, { swarmId: swarm ? id : undefined });
-    if (consoleTab && supportsTools && !sharedConsole) {
-      const mode = params.get("mode")?.trim().toLowerCase();
+    if (consoleTab && !sharedConsole) {
       sharedConsole = mountConsole($("view-console"), transport, {
-        queryViewMode: ["mcp", "native"].includes(mode) ? mode : "",
         onState: (state) => {
           if (!savingLanguage && state.ui?.language) setLanguage(state.ui.language);
-          applyRoutingBadge({ gpt_share: state.work_profiles?.[state.work_split]?.gpt_share, native_swarm: state.native_swarm });
         },
         onLanguage: saveLanguage,
         refreshGateway: () => void Promise.resolve(magpieCheck).then(() => refreshMagpieStatus(true)),
@@ -171,13 +148,12 @@ export function mountLive({ transport, host, sidecar }) {
       });
       if (latestMagpieStatus) sharedConsole.patchGatewayStatus(latestMagpieStatus);
     }
-    if (consoleTab) sharedConsole?.setTab(tab, { id, work });
+    if (consoleTab) sharedConsole?.setTab(tab, { id });
     else sharedConsole?.setTab("live", {});
-    if (consoleTab && (connectFailed || (ready && !supportsTools))) showConsoleError(tr("当前宿主未开放控制台工具。"));
     clearTimeout(listTimer);
     clearTimeout(streamTimer);
     if (live) {
-      if (!preserveLive && (id || sessionId)) {
+      if (id || sessionId) {
         scope = "all";
         linkedSession = sessionId || null;
         lockedConversation = null;
@@ -186,7 +162,7 @@ export function mountLive({ transport, host, sidecar }) {
         if (id !== selected || fromHash) resetSelection(id || null);
         focusRun = focus ? id || true : null;
         render();
-      } else if (!preserveLive && (fromHash || !embedded || (previous === "live" && selected))) {
+      } else {
         resetSelection();
         linkedSession = null;
         lockedConversation = null;
@@ -195,7 +171,7 @@ export function mountLive({ transport, host, sidecar }) {
       }
       void refreshRuns();
       if (selected) void refreshStream();
-    } else if (tab === "overview" && ready && supportsTools) {
+    } else if (tab === "overview" && ready) {
       void refreshMagpieStatus();
     }
   }
@@ -230,21 +206,6 @@ export function mountLive({ transport, host, sidecar }) {
     }, delay);
   }
 
-  function showConsoleError(message) {
-    put("sync-message", message);
-    put("sync-announcement", message);
-    $("sync-retry").hidden = true;
-    $("sync-banner").hidden = false;
-  }
-
-  function applyRoutingBadge(routing) {
-    if (!routing || !Number.isFinite(routing.gpt_share)) return;
-    routingSummary = routing;
-    const mode = routing.gpt_share === 0 ? tr("关闭") : routing.native_swarm ? tr("原生") : "Swarm";
-    put("routing-badge", `${routing.gpt_share}% · ${mode}`);
-    $("routing-badge").disabled = false;
-  }
-
   function setLanguage(preference) {
     if (languagePreference === preference) return;
     languagePreference = preference;
@@ -252,7 +213,6 @@ export function mountLive({ transport, host, sidecar }) {
     applyLanguage(preference);
     if (locale() === previous) return;
     if (latestMagpieStatus) renderMagpieStatus(latestMagpieStatus);
-    applyRoutingBadge(routingSummary);
     delete $("stream").dataset.key;
     render();
     sharedConsole?.renderLanguage();
@@ -260,7 +220,7 @@ export function mountLive({ transport, host, sidecar }) {
   }
 
   async function saveLanguage(preference) {
-    if (!supportsTools || savingLanguage) return;
+    if (savingLanguage) return;
     const previous = languagePreference;
     savingLanguage = true;
     languageRevision++;
@@ -314,7 +274,7 @@ export function mountLive({ transport, host, sidecar }) {
 
   async function openLink(target, path = target.value) {
     try {
-      if (!embedded && target.kind === "web") {
+      if (target.kind === "web") {
         window.open(target.value, "_blank", "noopener,noreferrer");
         return;
       }
@@ -324,8 +284,7 @@ export function mountLive({ transport, host, sidecar }) {
         sidecar.ui.toggleAuxPane({ tabType: "fileView", uri: approved.value });
         return;
       }
-      if (!host) throw new Error("File previews require a host");
-      await host.openLink(target);
+      toast(tr("当前视图无法打开文件预览。"), path);
     } catch {
       if (target.kind === "file") toast(tr("当前视图无法打开文件预览。"), path);
       else toast(tr("当前视图无法打开链接。"));
@@ -424,7 +383,7 @@ export function mountLive({ transport, host, sidecar }) {
 
   function renderList() {
     const sessions = groupSessions(runs);
-    const loading = !listLoaded && !connectFailed && (!ready || supportsTools) && !sessions.length;
+    const loading = !listLoaded && !sessions.length;
     $("list-loading").hidden = !loading;
     $("list-wrap").setAttribute("aria-busy", String(loading));
     $("empty").hidden = loading || sessions.length > 0;
@@ -434,13 +393,8 @@ export function mountLive({ transport, host, sidecar }) {
     $("scope-all").setAttribute("aria-pressed", String(scope === "all" && !linkedSession));
     $("clear-live-session").hidden = !linkedSession;
     if (!sessions.length && !loading) {
-      if (connectFailed || !supportsTools) {
-        put("empty-title", tr("任务列表暂不可用"));
-        put("empty-message", connectFailed ? tr("请重新打开此页面。") : tr("当前宿主未开放实时工具调用。"));
-      } else {
-        put("empty-title", scope === "all" ? tr("暂无任务") : tr("当前会话暂无任务"));
-        put("empty-message", scope === "all" ? tr("发起任务后，执行进度会显示在这里。") : tr("可发起任务，或切换到「全部」查看记录。"));
-      }
+      put("empty-title", scope === "all" ? tr("暂无任务") : tr("当前会话暂无任务"));
+      put("empty-message", scope === "all" ? tr("发起任务后，执行进度会显示在这里。") : tr("可发起任务，或切换到「全部」查看记录。"));
     }
 
     const list = $("session-cards");
@@ -634,17 +588,17 @@ export function mountLive({ transport, host, sidecar }) {
 
 
   function renderControls(run = currentRun()) {
-    const usable = supportsTools && run?.can_control && !control;
+    const usable = run?.can_control && !control;
     $("controls").hidden = !active.has(run?.state);
     const instruction = tr("补充执行指令");
     $("steer").placeholder = instruction + "…";
     $("steer").setAttribute("aria-label", instruction);
     $("steer").disabled = !usable;
     $("send-steer").disabled = !usable || !$("steer").value.trim();
-    $("interrupt").disabled = !supportsTools || !run?.can_interrupt || Boolean(control);
+    $("interrupt").disabled = !run?.can_interrupt || Boolean(control);
     $("cancel-interrupt").hidden = !confirming;
     put("interrupt", confirming ? tr("确认中止") : tr("中止"));
-    const canConfirmInterrupt = Boolean(supportsTools && run?.remote_turn_unconfirmed && (run?.can_interrupt ?? run?.can_control));
+    const canConfirmInterrupt = Boolean(run?.remote_turn_unconfirmed && (run?.can_interrupt ?? run?.can_control));
     $("unconfirmed-interrupt").hidden = !canConfirmInterrupt;
     $("unconfirmed-interrupt").disabled = !canConfirmInterrupt || Boolean(control);
   }
@@ -659,7 +613,6 @@ export function mountLive({ transport, host, sidecar }) {
       $("reply-message").value = "";
       notice("reply-status");
     }
-    $("reply-form").hidden = !supportsTools;
     $("reply-message").disabled = replyBusy || submittedReply === replyKey;
     syncReplyButton();
     put("ask-question", ask.question || tr("正在等待回应"));
@@ -679,12 +632,6 @@ export function mountLive({ transport, host, sidecar }) {
         return li;
       }));
     }
-    const capabilities = host?.getCapabilities();
-    const matching = !run.host_conversation_id || !activeConversation || run.host_conversation_id === activeConversation;
-    $("attach-context").hidden = !(matching && capabilities?.updateModelContext?.text);
-    $("remind-host").hidden = !(matching && capabilities?.message?.text);
-    $("attach-context").disabled = $("remind-host").disabled = bridgeBusy;
-    $("ask-hint").hidden = supportsTools || !($("attach-context").hidden && $("remind-host").hidden);
   }
 
   function syncReplyButton() {
@@ -714,34 +661,6 @@ export function mountLive({ transport, host, sidecar }) {
     }
   }
 
-  async function bridgeAsk(action) {
-    const run = currentRun();
-    const pending = run?.pending_tool_call;
-    if (run?.state !== "waiting_gemini" || !pending?.call_id || bridgeBusy) return;
-    const { question, context, media_paths: media } = pending.arguments || {};
-    const attach = action === "attach";
-    const content = [{ type: "text", text: [
-      attach ? tr("GemPT 任务正在等待主对话回复。") : tr("请查看并处理这条 GemPT 任务的提问。"),
-      question, context, ...(media || []),
-      tr("任务 ID {0}", run.run_id),
-      tr("提问 ID {0}", pending.call_id),
-      tr("请在主对话回复后，通过 gpt_ctl 的 reply 操作将回答交回任务。"),
-    ].filter(Boolean).join("\n\n") }];
-    bridgeBusy = true;
-    renderAsk(run);
-    try {
-      const result = attach ? await host.updateModelContext({ content }, { timeout: 5000 })
-        : await host.sendMessage({ role: "user", content }, { timeout: 5000 });
-      if (result.isError) throw new Error("Host rejected the request");
-      toast(attach ? tr("已附带上下文，随下一条主对话消息发送。") : tr("已在主对话中发送提醒。"));
-    } catch {
-      toast(tr("当前视图无法发送，请回到任务所属的主对话处理。"));
-    } finally {
-      bridgeBusy = false;
-      if (currentRun()) renderAsk(currentRun());
-    }
-  }
-
   function renderDetail(run) {
     const title = runTitle(run);
     put("detail-title", title);
@@ -754,10 +673,9 @@ export function mountLive({ transport, host, sidecar }) {
     }
     put("detail-status", statusLabel(run));
     const unconfirmed = Boolean(run.remote_turn_unconfirmed);
-    $("unconfirmed-badge").hidden = !unconfirmed;
     $("unconfirmed-banner").hidden = !unconfirmed;
     if (unconfirmed) {
-      const canConfirmInterrupt = Boolean(supportsTools && (run.can_interrupt ?? run.can_control));
+      const canConfirmInterrupt = Boolean((run.can_interrupt ?? run.can_control));
       put("unconfirmed-text", canConfirmInterrupt
         ? tr("远端 Codex 回合可能仍在运行。请勿对同一会话盲目并发派发；可点击「尝试中断确认」向远端补发中断。")
         : tr("远端 Codex 回合可能仍在运行。请勿对同一会话盲目并发派发，待确认远端结束后再继续。"));
@@ -864,7 +782,6 @@ export function mountLive({ transport, host, sidecar }) {
   }
 
   function changeScope(next) {
-    scopeChosen = true;
     if (next === scope && !lockedConversation && !linkedSession) return;
     scope = next;
     linkedSession = null;
@@ -883,9 +800,6 @@ export function mountLive({ transport, host, sidecar }) {
   }
 
   function applyRunList(data) {
-    applyRoutingBadge(data.routing);
-    activeConversation = Object.hasOwn(data, "active_conversation_id")
-      ? data.active_conversation_id : data.bound_conversation_id ?? null;
     lastListConversation = data.bound_conversation_id ?? null;
     listLoaded = true;
     runs = data.runs;
@@ -1023,36 +937,6 @@ export function mountLive({ transport, host, sidecar }) {
     toast(message || tr("已复制。"));
   }
 
-  function onHostContext(context) {
-    applyHost(context);
-    if (ready && scope === "session" && !lockedConversation) void refreshRuns();
-  }
-
-  function onToolResult(result) {
-    const data = result?.structuredContent;
-    if (!Array.isArray(data?.runs)) return;
-    const explicit = data.requested_run && data.run_id && data.stream?.run?.run_id === data.run_id;
-    if (!explicit && (scopeChosen || selected)) return;
-    listVersion++;
-    linkedSession = null;
-    scope = data.scope === "all" ? "all" : "session";
-    lockedConversation = explicit && scope === "session" ? data.stream.run.host_conversation_id || null : null;
-    if (explicit && selected !== data.run_id) resetSelection(data.run_id);
-    if (explicit) {
-      acceptSnapshot(data.stream);
-      if (appTab !== "live") navigate("live", { preserveLive: true });
-    }
-    applyRunList(data);
-    requestedCount = runs.length;
-    if (explicit) {
-      void loadMoreTranscript(data.stream).catch((error) => {
-        if (snapshot === data.stream) notice("stream-error", errorText(error.message));
-      });
-      scheduleStream();
-    }
-    scheduleList();
-  }
-
   for (const element of document.querySelectorAll("[data-icon]")) element.append(icon(element.dataset.icon));
   for (const [index, tab] of tabs.entries()) {
     const button = $(`tab-${tab}`);
@@ -1069,7 +953,6 @@ export function mountLive({ transport, host, sidecar }) {
       }
     };
   }
-  $("routing-badge").onclick = () => navigate("overview", { work: true });
   $("refresh-btn").onclick = async () => {
     const button = $("refresh-btn");
     button.disabled = true;
@@ -1106,8 +989,6 @@ export function mountLive({ transport, host, sidecar }) {
     requestedCount = runs.length + 50;
     void refreshRuns();
   });
-  $("attach-context").addEventListener("click", () => void bridgeAsk("attach"));
-  $("remind-host").addEventListener("click", () => void bridgeAsk("remind"));
   $("toast-copy").addEventListener("click", () => void copy(toastPath, tr("已复制路径。")));
   $("toast-dismiss").addEventListener("click", () => toast(""));
   $("turn-strip").addEventListener("keydown", (event) => {
@@ -1158,115 +1039,89 @@ export function mountLive({ transport, host, sidecar }) {
   });
 
   function start() {
-    $("language-toggle").disabled = !supportsTools;
+    $("language-toggle").disabled = false;
     render();
-    if (supportsTools) {
-      const revision = languageRevision;
-      void transport.getSummary().then(({ routing, magpie, ui }) => {
-        if (ui?.language && revision === languageRevision) setLanguage(ui.language);
-        applyRoutingBadge(routing);
-        if (!magpieCheck && $("magpie-status").dataset.state === "checking") renderMagpieStatus(magpie);
-      }).catch(() => {});
-      void refreshMagpieStatus().finally(() => scheduleMagpieStatus(1500));
-      if (transport.swarm && !swarmController) {
-        swarmController = mountSwarm({
-          transport,
-          sidecar,
-          navigate,
-          openLink,
-          copy,
-          showToast: (message, kind) => toast(message, "", kind),
-        });
-      }
-      void swarmController?.pollBadge();
+    const revision = languageRevision;
+    void transport.getSummary().then(({ magpie, ui }) => {
+      if (ui?.language && revision === languageRevision) setLanguage(ui.language);
+      if (!magpieCheck && $("magpie-status").dataset.state === "checking") renderMagpieStatus(magpie);
+    }).catch(() => {});
+    void refreshMagpieStatus().finally(() => scheduleMagpieStatus(1500));
+    if (transport.swarm && !swarmController) {
+      swarmController = mountSwarm({
+        transport,
+        sidecar,
+        navigate,
+        openLink,
+        copy,
+        showToast: (message, kind) => toast(message, "", kind),
+      });
     }
-    if (embedded) navigate(appTab, { preserveLive: true });
-    else {
-      const location = hashLocation();
-      navigate(location.tab, { id: location.id, fromHash: true });
-    }
+    void swarmController?.pollBadge();
+    const location = hashLocation();
+    navigate(location.tab, { id: location.id, fromHash: true });
   }
 
-  if (embedded) {
-    host.onContext(onHostContext);
-    host.onToolResult(onToolResult);
-    systemTheme.addEventListener("change", () => applyHost(host.getContext()));
-    render();
-    applyHost(null);
-    host.connect().then(() => {
-      ready = true;
-      supportsTools = Boolean(host.getCapabilities()?.serverTools);
-      applyHost(host.getContext());
-      // Keep the MCP handshake as the only prerequisite for ready tools.
-      start();
-    }).catch((error) => {
-      connectFailed = true;
-      notice("list-error", errorText(error.message));
-      showConsoleError(errorText(error.message));
+  const context = () => {
+    const theme = params.get("theme");
+    const variables = {};
+    for (const [key, target] of Object.entries({
+      "--magpie-bg": "--color-background-primary", "--magpie-card": "--color-background-secondary",
+      "--magpie-surface": "--color-background-secondary", "--magpie-subtle": "--color-background-tertiary",
+      "--magpie-fg": "--color-text-primary", "--magpie-muted": "--color-text-secondary",
+      "--magpie-border": "--color-border-secondary", "--magpie-accent": "--color-ring-primary",
+      "--magpie-font": "--font-sans", "--magpie-mono": "--font-mono",
+    })) variables[key] = target;
+    let hostVariables = {};
+    if (params.has("tokens")) {
+      try {
+        const decoded = new TextDecoder().decode(Uint8Array.from(atob(params.get("tokens")), (c) => c.charCodeAt(0)));
+        for (const [key, value] of Object.entries(JSON.parse(decoded))) {
+          const val = String(value ?? "").trim();
+          if (!/^--[a-z0-9-]+$/i.test(key) || !val || val.length > 200 || /[;{}]|url\(/i.test(val)) continue;
+          hostVariables[key] = val;
+          if (Object.hasOwn(variables, key)) hostVariables[variables[key]] = val;
+        }
+      } catch { /* Fall back to the standalone theme. */ }
+    }
+    applyHost({ theme: ["light", "dark"].includes(theme) ? theme : undefined, styles: { variables: hostVariables } });
+  };
+  context();
+  systemTheme.addEventListener("change", context);
+  if (sidecar) {
+    document.documentElement.dataset.sidecar = "";
+    let hasWorkspace = false;
+    sidecar.onWorkspaceChange((uris) => {
+      const first = !hasWorkspace;
+      hasWorkspace = true;
+      // The initial request can already be in flight. Apply a late workspace
+      // scope while retaining the URL's original run or session selection.
+      if (first && !uris.length) return;
+      listVersion++;
+      if (!first) {
+        lockedConversation = null;
+        linkedSession = null;
+      }
+      requestedCount = 0;
+      nextOffset = null;
+      lastListConversation = null;
+      listLoaded = false;
+      runs = [];
+      resetSelection(first ? selected : null);
+      if (!first && appTab === "live") updateHash("live");
       render();
+      void refreshRuns();
+      if (first && selected) void refreshStream();
+      swarmController?.onWorkspaceChange();
     });
   } else {
-    const context = () => {
-      const theme = params.get("theme");
-      const variables = {};
-      for (const [key, target] of Object.entries({
-        "--magpie-bg": "--color-background-primary", "--magpie-card": "--color-background-secondary",
-        "--magpie-surface": "--color-background-secondary", "--magpie-subtle": "--color-background-tertiary",
-        "--magpie-fg": "--color-text-primary", "--magpie-muted": "--color-text-secondary",
-        "--magpie-border": "--color-border-secondary", "--magpie-accent": "--color-ring-primary",
-        "--magpie-font": "--font-sans", "--magpie-mono": "--font-mono",
-      })) variables[key] = target;
-      let hostVariables = {};
-      if (params.has("tokens")) {
-        try {
-          const decoded = new TextDecoder().decode(Uint8Array.from(atob(params.get("tokens")), (c) => c.charCodeAt(0)));
-          for (const [key, value] of Object.entries(JSON.parse(decoded))) {
-            const val = String(value ?? "").trim();
-            if (!/^--[a-z0-9-]+$/i.test(key) || !val || val.length > 200 || /[;{}]|url\(/i.test(val)) continue;
-            hostVariables[key] = val;
-            if (Object.hasOwn(variables, key)) hostVariables[variables[key]] = val;
-          }
-        } catch { /* Fall back to the standalone theme. */ }
-      }
-      applyHost({ theme: ["light", "dark"].includes(theme) ? theme : undefined, styles: { variables: hostVariables } });
-    };
-    context();
-    systemTheme.addEventListener("change", context);
-    if (sidecar) {
-      document.documentElement.dataset.sidecar = "";
-      let hasWorkspace = false;
-      sidecar.onWorkspaceChange((uris) => {
-        const first = !hasWorkspace;
-        hasWorkspace = true;
-        // The initial request can already be in flight. Apply a late workspace
-        // scope while retaining the URL's original run or session selection.
-        if (first && !uris.length) return;
-        listVersion++;
-        if (!first) {
-          lockedConversation = null;
-          linkedSession = null;
-        }
-        requestedCount = 0;
-        nextOffset = null;
-        lastListConversation = null;
-        listLoaded = false;
-        runs = [];
-        resetSelection(first ? selected : null);
-        if (!first && appTab === "live") updateHash("live");
-        render();
-        void refreshRuns();
-        if (first && selected) void refreshStream();
-        swarmController?.onWorkspaceChange();
-      });
-    } else {
-      $("scope-session").hidden = true;
-      $("scope-all").parentElement.hidden = true;
-    }
-    ready = supportsTools = true;
-    window.addEventListener("hashchange", () => {
-      const location = hashLocation();
-      navigate(location.tab, { id: location.id, fromHash: true });
-    });
-    start();
+    $("scope-session").hidden = true;
+    $("scope-all").parentElement.hidden = true;
   }
+  ready = true;
+  window.addEventListener("hashchange", () => {
+    const location = hashLocation();
+    navigate(location.tab, { id: location.id, fromHash: true });
+  });
+  start();
 }

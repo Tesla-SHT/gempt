@@ -728,7 +728,7 @@ console.log(JSON.stringify({
     magpie: { base_url: gatewayUrl, api_key: 'sk-swarm-test' },
     codex: { default_sandbox: 'workspace-write', timeout_sec: 300 },
     execution: { default_cli: 'claude', cli_paths: { claude: mockClaudeSwarm } },
-    routing_policy: { default_tier: 'sonnet', failover_mode: 'paired', native_swarm: false },
+    routing_policy: { default_tier: 'sonnet', failover_mode: 'paired' },
   }));
   const env = { ...process.env, GEMPT_CONFIG: configPath, GEMPT_SESSIONS_DIR: sessionsDir, GEMPT_DISABLE_IPC_DISPATCH: '1' };
 
@@ -770,7 +770,7 @@ console.log(JSON.stringify({
   assert.equal(msgs.filter((m) => m.from_agent === 'designer').length, 1);
 });
 
-test('backend exposes runners, execution config, zero-CLI readiness, and default native_swarm: false', async (t) => {
+test('backend exposes runners, execution config, zero-CLI readiness, without retired Swarm settings', async (t) => {
   const dir = makeTmp(t, 'gempt-backend-runners-');
   const configPath = join(dir, 'config.json');
   const sessionsDir = join(dir, 'sessions');
@@ -787,7 +787,7 @@ test('backend exposes runners, execution config, zero-CLI readiness, and default
 
   const env = { ...process.env, PATH: emptyBin };
   const st0 = await readState({ configPath, sessionsDir, magpieConfigDir, env });
-  assert.equal(st0.native_swarm, false, 'shell-free GemPT Swarm should be default (native_swarm: false)');
+  for (const key of ['native_swarm', 'swarm_shell_model', 'swarm_shell_models', 'swarm_split']) assert.ok(!Object.hasOwn(st0, key));
   assert.equal(st0.execution.default_cli, 'auto');
   assert.equal(st0.runners.length, 11);
 

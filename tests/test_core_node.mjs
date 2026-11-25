@@ -160,7 +160,7 @@ test('Node hook applies write and explore gates with exemptions, resets and fail
   mkdirSync(dirname(f.configPath));
   const health = join(f.root, 'app-server.json');
   const env = { ...f.env, GEMPT_APP_SERVER_STATE: health, GEMPT_CIRCUIT_WINDOW_SEC: '600' };
-  const set = (work_split) => writeFileSync(f.configPath, JSON.stringify({ routing_policy: { work_split, native_swarm: false } }));
+  const set = (work_split) => writeFileSync(f.configPath, JSON.stringify({ routing_policy: { work_split } }));
   const allow = (name, args, payload) => jsonProcess(process.execPath, [hookPath], { env,
     input: JSON.stringify({ hookEventName: 'PreToolUse', conversationId: 'turn', workspacePaths: [f.cwd],
       lastUserInput: 'Change this', toolCall: { name, args }, ...payload }) });
@@ -205,7 +205,7 @@ test('Node hook applies write and explore gates with exemptions, resets and fail
     assert.equal(allow('run_command', { CommandLine: 'gempt status --run-id 123 --wait' }).decision, 'allow');
     for (const delegation of [
       ['call_mcp_tool', { ServerName: 'gempt_gempt', ToolName: 'gpt_run' }],
-      ['invoke_subagent', { TypeName: 'gempt-worker', Prompt: 'Do it', Role: 'Example' }],
+      ['call_mcp_tool', { ServerName: 'gempt_gempt', ToolName: 'gpt_swarm' }],
     ]) {
       assert.equal(allow(...delegation, { lastUserInput: profile }).decision, 'allow');
       for (let count = 0; count < limit; count++) assert.equal(read().decision, 'allow');
@@ -224,6 +224,8 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const binDir = join(f.root, 'bin with spaces');
   const legacyLock = join(dirname(target), '.gempt-install.lock');
   const legacyWait = join(binDir, 'gempt-wait.py');
+  mkdirSync(join(target, 'agents'), { recursive: true });
+  writeFileSync(join(target, 'agents', 'gempt-worker.md'), 'legacy worker');
   mkdirSync(join(target, 'runtime', 'gempt'), { recursive: true });
   mkdirSync(binDir);
   writeFileSync(legacyLock, '');
@@ -260,6 +262,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   assert.equal(installed.installed, true);
   assert.ok(!existsSync(legacyLock));
   assert.ok(!existsSync(legacyWait));
+  assert.ok(!existsSync(join(target, 'agents', 'gempt-worker.md')));
   assert.ok(existsSync(join(binDir, 'gempt-wait.mjs')));
   const cliShim = join(binDir, process.platform === 'win32' ? 'gempt.cmd' : 'gempt');
   assert.ok(installed.cli_shims.includes(cliShim));
@@ -274,7 +277,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const bridge = join(target, 'work_split_hook.py');
   assert.equal(readFileSync(bridge, 'utf8').trimEnd().split('\n').length, 7);
   assert.ok(!existsSync(join(target, 'runtime', 'gempt')));
-  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.10.0' });
+  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.10.1' });
   const bundledSkills = new URL('../plugin/skills/', import.meta.url);
   assert.deepEqual(readdirSync(bundledSkills).sort(), ['gempt', 'gempt-chore']);
   assert.deepEqual(readdirSync(join(target, 'skills')).sort(), ['gempt', 'gempt-chore']);
@@ -294,7 +297,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const initialized = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' },
   }) });
-  assert.equal(initialized.result.serverInfo.version, '0.10.0');
+  assert.equal(initialized.result.serverInfo.version, '0.10.1');
   assert.equal(initialized.result.capabilities.resources, undefined);
   const listedResources = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'resources/list',
@@ -311,9 +314,9 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   assert.ok(rulesText.trim());
   const hooks = JSON.parse(readFileSync(join(target, 'hooks.json'), 'utf8'));
   const matcher = hooks['gempt-work-split'].PreToolUse[0].matcher.split('|');
-  for (const name of ['swarm', 'post_message', 'read_board', 'swarm_wait', 'define_subagent', 'send_message']) {
-    assert.ok(matcher.includes(name), name);
-  }
+  assert.ok(matcher.includes('call_mcp_tool'));
+  assert.ok(matcher.includes('run_command'));
+  assert.ok(!matcher.includes('invoke_subagent'));
   const hook = hooks['gempt-work-split'].SessionStart[0].command;
   assert.ok(hook.includes('work_split_hook.mjs'));
   assert.doesNotMatch(hook, /python/i);
@@ -1506,13 +1509,13 @@ test('Live run list defaults to an empty unbound session and can list all worksp
   assert.equal(scoped.scope, 'session');
   assert.equal(scoped.unbound_session, true);
   assert.deepEqual(scoped.runs, []);
-  assert.equal(scoped.app_server.version, '0.10.0');
+  assert.equal(scoped.app_server.version, '0.10.1');
 
   const all = await runLiveOperation('runs', { scope: 'all' }, opts);
   assert.equal(all.scope, 'all');
   assert.equal(all.unbound_session, false);
   assert.deepEqual(all.runs.map(({ run_id }) => run_id).sort(), [first, second]);
-  assert.equal(all.app_server.version, '0.10.0');
+  assert.equal(all.app_server.version, '0.10.1');
 });
 
 test('Live binds normalized workspaces and never selects another run for a filtered explicit ID', async (t) => {
@@ -1675,7 +1678,7 @@ test('standalone NDJSON MCP exposes only core tools without legacy MCP App resou
   const started = await request('initialize', { protocolVersion: '2026-test' });
   assert.equal(started.result.protocolVersion, '2026-test');
   assert.equal(started.result.serverInfo.name, 'gempt');
-  assert.equal(started.result.serverInfo.version, '0.10.0');
+  assert.equal(started.result.serverInfo.version, '0.10.1');
   assert.deepEqual(started.result.capabilities, { tools: { listChanged: false } });
   send({ method: 'notifications/initialized' });
   assert.deepEqual((await request('ping')).result, {});
@@ -1846,7 +1849,7 @@ test('Console migrates the legacy timeout and preserves a deliberately saved 600
   const run = await dispatchRun({ goal: 'Check migrated timeout', cwd: f.cwd, background: true }, f);
   assert.equal(run.execution_timeout_sec, 3600);
   assert.equal((await waitForRun(run.run_id, { ...f, timeoutSec: 5 })).execution_timeout_sec, 3600);
-  assert.equal((await updateSettings({ native_swarm: false }, f)).ok, true);
+  assert.equal((await updateSettings({ work_split: 'balanced' }, f)).ok, true);
   assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).codex.timeout_sec, 3600);
   const api = async (method, path, body) => dispatchPageApi({
     method, url: new URL(path, 'http://localhost'), rawPath: path.split('?', 1)[0], readBody: () => body,
@@ -1854,13 +1857,11 @@ test('Console migrates the legacy timeout and preserves a deliberately saved 600
   const appServer = createAppServerManager({ ...options, observeOnly: true });
   t.after(() => appServer.stop());
   const saved = await api('POST', '/api/settings', {
-    codex_timeout_sec: 600, native_swarm: true, swarm_shell_model: 'gemini-3.8-flash-low',
+    codex_timeout_sec: 600,
   });
   assert.equal(saved.status, 200);
   const overview = (await api('GET', '/api/overview')).body;
   assert.equal(overview.codex_timeout_sec, 600);
-  assert.equal(overview.native_swarm, true);
-  assert.equal(overview.swarm_shell_model, 'gemini-3.8-flash-low');
   assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).codex.timeout_sec_customized, true);
   const customized = await dispatchRun({ goal: 'Check saved timeout', cwd: f.cwd, background: true }, f);
   assert.equal(customized.execution_timeout_sec, 600);
@@ -2179,7 +2180,7 @@ test('runAppServer interrupt confirmation window distinguishes confirmed vs unco
   );
 });
 
-test('Live restricts out-of-workspace files, exposes remote_turn_unconfirmed, and hook applies swarm_split', async (t) => {
+test('Live restricts out-of-workspace files, exposes remote_turn_unconfirmed, and manual workers use the shared work split', async (t) => {
   const f = fixture(t);
   const inside = join(f.cwd, 'ok.txt');
   const outside = join(f.root, 'secret.txt');
@@ -2208,86 +2209,31 @@ test('Live restricts out-of-workspace files, exposes remote_turn_unconfirmed, an
     env: { ...env, GEMPT_SWARM_MODE: '1' },
     input: JSON.stringify({ hookEventName: 'SessionStart', conversationId: 'swarm-worker', workspacePaths: [f.cwd] }),
   });
-  assert.match(swarmStart.injectSteps[0].systemMessage.systemMessage, /80% GPT/);
-  writeFileSync(f.configPath, JSON.stringify({ routing_policy: { work_split: 'balanced', swarm_split: 'inherit' } }));
-  const inheritedStart = jsonProcess(process.execPath, [hookPath], {
-    env: { ...env, GEMPT_SWARM_MODE: '1' },
-    input: JSON.stringify({ hookEventName: 'SessionStart', conversationId: 'swarm-inherit', workspacePaths: [f.cwd] }),
-  });
-  assert.match(inheritedStart.injectSteps[0].systemMessage.systemMessage, /balanced \(35% GPT, swarm\)/);
+  assert.match(swarmStart.injectSteps[0].systemMessage.systemMessage, /35% GPT/);
 });
 
-test('Coordinator detects Swarm tools without a host flag and inherits the coordination policy', (t) => {
+test('hook uses the auto-selected runner and allows manual Swarm workers and user bypass', (t) => {
   const f = fixture(t);
-  mkdirSync(dirname(f.configPath), { recursive: true });
-  const appState = join(dirname(f.configPath), 'app-server.json');
-  writeFileSync(appState, JSON.stringify({ status: 'running', pid: process.pid, ws_url: 'ws://127.0.0.1:1' }));
-  const env = { ...f.env, GEMPT_APP_SERVER_STATE: appState, GEMPT_SWARM_MODE: '', GEMPT_IS_SWARM: '', GEMPT_SWARM_ROLE: '' };
-  const payload = { conversationId: 'coordinator', workspacePaths: [f.cwd], lastUserInput: 'Review the work.' };
-  const invoke = (event) => jsonProcess(process.execPath, [hookPath], { env, input: JSON.stringify({ ...payload, ...event }) });
-  const tool = (name, args, fields) => invoke({ hookEventName: 'PreToolUse', toolCall: { name, args }, ...fields });
-  const policy = (work_split, swarm_split = 'inherit', extra = {}) =>
-    writeFileSync(f.configPath, JSON.stringify({ routing_policy: { work_split, swarm_split, ...extra } }));
-  const path = join(f.cwd, 'index.mjs');
-  const statePath = join(dirname(f.configPath), 'hook-state', 'coordinator.json');
-  // Default mode (native_swarm: false): shell-free GemPT Swarm allows gpt_run and guides to gpt_swarm / gpt_board.
-  policy('gpt_first');
-  assert.equal(tool('swarm', { action: 'models' }).decision, 'allow');
-  assert.ok(!existsSync(statePath));
-  assert.match(tool('edit_file', { Path: path }).reason, /Write Gate.*gpt_swarm/);
-  const mcp = (ToolName, fields) => tool('call_mcp_tool', { ServerName: 'gempt_gempt', ToolName }, fields);
-  assert.equal(mcp('gpt_run').decision, 'allow');
-  assert.match(invoke({ hookEventName: 'SessionStart', conversationId: 'shell-free-default' }).injectSteps[0].systemMessage.systemMessage, /gpt_swarm.*gpt_board/);
-  // Opt-in AGY native Swarm mode (native_swarm: true).
-  policy('gpt_first', 'inherit', { native_swarm: true });
-  assert.equal(tool('swarm', { action: 'add' }).decision, 'allow');
-  assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).is_swarm, true);
-  assert.match(tool('edit_file', { Path: path }).reason, /80% Write Gate/);
-  const denied = mcp('gpt_run');
-  assert.equal(denied.decision, 'deny');
-  assert.match(denied.reason, /workspace="share".*"inherit".*plan.json.*--host coordinator --title <name> --goal -/);
-  const shellFreeSwarm = (args, fields) => tool('call_mcp_tool', {
-    ServerName: 'gempt_gempt', ToolName: 'gpt_swarm', Arguments: args,
-  }, fields);
-  for (const action of ['add', 'title', 'plan']) {
-    assert.deepEqual(shellFreeSwarm({ action }), denied, action);
+  mkdirSync(dirname(f.configPath));
+  writeFileSync(f.configPath, JSON.stringify({
+    execution: { default_cli: 'auto', cli_paths: { opencode: process.execPath } },
+    routing_policy: { work_split: 'gpt_first', default_tier: 'sonnet', native_swarm: true },
+    tiers: { sonnet: { exec_model: 'vendor/custom' } },
+  }));
+  const invoke = (toolCall, fields) => jsonProcess(process.execPath, [hookPath], { env: f.env,
+    input: JSON.stringify({ hookEventName: 'PreToolUse', conversationId: 'coordinator', toolCall, ...fields }) });
+  const edit = { name: 'edit_file', args: { Path: join(f.cwd, 'index.mjs') } };
+  assert.match(invoke(edit).reason, /80% Write Gate/);
+  assert.equal(invoke(edit, { lastUserInput: '自己改' }).decision, 'allow');
+  for (const ToolName of ['gpt_run', 'gpt_swarm', 'gpt_board']) {
+    assert.equal(invoke({ name: 'call_mcp_tool', args: { ServerName: 'gempt_gempt', ToolName, Arguments: { action: 'add' } } }).decision, 'allow');
   }
-  for (const args of [{}, ...['status', 'kill', 'model', 'channel'].map((action) => ({ action }))]) {
-    assert.equal(shellFreeSwarm(args).decision, 'allow', args.action ?? 'omitted action');
-  }
-  assert.equal(shellFreeSwarm({ action: 'add' }, { lastUserInput: '不用 swarm' }).decision, 'allow');
-  assert.equal(mcp('gpt_ask').decision, 'allow');
-  assert.equal(mcp('gpt_ctl').decision, 'allow');
-  assert.equal(mcp('gpt_run', { lastUserInput: '不用 swarm' }).decision, 'allow');
-  assert.equal(mcp('gpt_run', { lastUserInput: 'direct gpt_run' }).decision, 'allow');
+  const read = { name: 'read_file', args: { Path: join(f.cwd, 'index.mjs') } };
   const worker = { conversationId: 'worker', parentConversationId: 'coordinator' };
-  assert.equal(mcp('gpt_run', worker).decision, 'allow');
-  assert.equal(tool('run_command', { CommandLine: 'cat work.txt | gempt run --goal -' }, { conversationId: 'worker' }).decision, 'allow');
-  writeFileSync(appState, JSON.stringify({ status: 'running', healthy: false, pid: process.pid, ws_url: 'ws://127.0.0.1:1' }));
-  assert.equal(mcp('gpt_run').decision, 'allow');
-  writeFileSync(appState, JSON.stringify({ status: 'running', pid: process.pid, ws_url: 'ws://127.0.0.1:1' }));
-  writeFileSync(f.configPath, JSON.stringify({ routing_policy: { work_split: 'gpt_first', native_swarm: false } }));
-  assert.equal(mcp('gpt_run').decision, 'allow');
-  writeFileSync(f.configPath, JSON.stringify({ routing_policy: { work_split: 'gpt_first', native_swarm: true, swarm_shell_model: 'gemini-3.8-flash-low' } }));
-  const entry = (initialNumSteps) => invoke({ hookEventName: 'PreInvocation', invocationNum: 0, initialNumSteps });
-  const message = entry(1).injectSteps[0].systemMessage.systemMessage;
-  assert.match(message, /Swarm Coordinator.*gemini-3.8-flash-low/);
-  assert.match(message, /gempt run --cwd "\$PWD" --workspace inherit.*wait_command/);
-  assert.deepEqual(entry(1), {});
-  policy('gemini');
-  assert.match(entry(2).injectSteps[0].systemMessage.systemMessage, /0%/);
-  policy('gemini', 'gpt_first', { native_swarm: true });
-  assert.match(entry(3).injectSteps[0].systemMessage.systemMessage, /\[GemPT 80%\]/);
-  assert.match(tool('edit_file', { Path: path }).reason, /Write Gate/);
-  for (const [name, args] of [
-    ...['status', 'title', 'model', 'kill'].map((action) => ['swarm', { action }]),
-    ...['post_message', 'read_board', 'swarm_wait', 'define_subagent', 'send_message'].map((name) => [name, {}]),
-  ]) {
-    const conversationId = name === 'swarm' ? args.action : name;
-    tool(name, args, { conversationId });
-    const file = join(dirname(statePath), conversationId + '.json');
-    assert.equal(JSON.parse(readFileSync(file, 'utf8')).is_swarm, true);
-  }
+  for (let i = 0; i < 2; i++) assert.equal(invoke(read, worker).decision, 'allow');
+  assert.equal(invoke(read, worker).decision, 'deny');
+  assert.equal(invoke({ name: 'run_command', args: { CommandLine: 'cat work.txt | gempt run --goal -' } },
+    { conversationId: 'worker' }).decision, 'allow');
 });
 
 test('packaging guards unsafe output paths and rolls back in-place sync on verify failure', async (t) => {
@@ -2322,7 +2268,6 @@ test('Console API saves nested preferences and supports gateway actions', async 
   assert.equal(resetSettings({}, f).keep_gateway, true);
   const saved = await set({
     magpie: { base_url: url + '/', api_key: secret, api_key_env: '' },
-    swarm_shell_model: 'vendor/shell:stable@v2',
     routing_policy: { excluded_models: ['  model-to-skip  '] },
     utility: { model: 'vendor/model:small', reasoning_effort: 'high' },
     limits: { consult_timeout_sec: 1800 },
@@ -2331,7 +2276,6 @@ test('Console API saves nested preferences and supports gateway actions', async 
   });
   assert.equal(saved.ok, true);
   const state = await readOverview(f);
-  assert.equal(state.swarm_shell_model, 'vendor/shell:stable@v2');
   assert.equal(state.magpie_base_url, url);
   assert.equal(state.magpie_api_key_hint, '••••z123');
   assert.equal(state.magpie_api_key_env, '');
@@ -2358,10 +2302,14 @@ test('Console API saves nested preferences and supports gateway actions', async 
   assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).magpie.api_key, '');
 });
 
-test('solo gpt_run keeps its receipt and Codex tools, resumes one row and forks from the implicit board', async (t) => {
+test('legacy Swarm config routes ordinary gpt_run to the implicit board, preserves receipts, resumes and forks', async (t) => {
   const f = fixture(t);
   const controls = {};
   const packets = await appFixture(t, f, controls);
+  const cfg = JSON.parse(readFileSync(f.configPath));
+  const retired = { native_swarm: true, swarm_shell_model: 'old/shell', swarm_split: 'gemini' };
+  Object.assign(cfg.routing_policy, retired);
+  writeFileSync(f.configPath, JSON.stringify(cfg));
   const context = { cwd: f.cwd, host_conversation_id: 'conversation-A' };
   const run = async (goal, session_id) => {
     const res = await handleTool('gpt_run', { ...context, cli: 'codex', goal, session_id, background: true }, f.env, f);
@@ -2373,6 +2321,7 @@ test('solo gpt_run keeps its receipt and Codex tools, resumes one row and forks 
   const [a, b] = await Promise.all([run('Hold this turn'), run('Hold this turn too')]);
   const status = () => handleSwarmAction({ ...context, action: 'status' }, f);
   const { swarm_id, roster, head } = await status();
+  assert.equal(swarm_id, 'conversation-' + createHash('sha256').update(context.host_conversation_id).digest('hex'));
   assert.equal(head, 0);
   assert.deepEqual(new Set(roster.map((w) => w.session_id)), new Set([a.session_id, b.session_id]));
   assert.ok(roster.every((w) => w.state === 'working'));
@@ -2431,11 +2380,14 @@ test('solo gpt_run keeps its receipt and Codex tools, resumes one row and forks 
   assert.match(packets.filter((p) => p.method === 'turn/start').at(-1).params.input[0].text, /Prior finding: verify the result/);
   const unbound = await dispatchRun({ cwd: f.cwd, goal: 'No host' }, f);
   assert.equal(readRun(unbound.run_id, f.sessionsDir).swarm_id, undefined);
-  const cfg = JSON.parse(readFileSync(f.configPath));
-  cfg.routing_policy.native_swarm = true;
-  writeFileSync(f.configPath, JSON.stringify(cfg));
-  const native = await dispatchRun({ ...context, goal: 'Native mode' }, f);
-  assert.equal(readRun(native.run_id, f.sessionsDir).swarm_id, undefined);
+  const summary = await readOverview(f);
+  const saved = await updateSettings({ work_split: 'balanced' }, f);
+  assert.equal(saved.ok, true);
+  const policy = JSON.parse(readFileSync(f.configPath)).routing_policy;
+  for (const key of Object.keys(retired)) {
+    assert.equal(Object.hasOwn(summary, key), false);
+    assert.equal(Object.hasOwn(policy, key), false);
+  }
 });
 
 test('Codex swarm fork, fallback and warm wake use the right identities, prefixes and turn-local cache usage', async (t) => {

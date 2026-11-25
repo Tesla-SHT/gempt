@@ -11,8 +11,8 @@ import { resolveNodeExecutable } from '../../core/node-executable.mjs';
 import {
   CLI_CHOICES, DEFAULT_CONSULT_TIMEOUT_SEC, DEFAULT_TIERS, DEFAULT_UTILITY, FEATURES, TIER_ORDER, VALID_FAILOVER_MODES, VALID_SANDBOXES,
   buildTierView, editAdvancedSettings, editDefaultSandbox, editEffortSettings, editPairing, editWorkSplit, expandUser,
-  getExecutionConfig, getMcpEffort, getNativeSwarmPolicy, getPairing, getUiLanguage, hasApiSnapshot, hasRuntimeConfig,
-  isCodexModelId, isSafeModelId, normalizeDefaultTier, readJsonSafe, readPluginExecOption, readPluginMcpToolsOption,
+  getExecutionConfig, getMcpEffort, getPairing, getUiLanguage, hasApiSnapshot, hasRuntimeConfig,
+  isCodexModelId, normalizeDefaultTier, readJsonSafe, readPluginExecOption, readPluginMcpToolsOption,
   resolveConfigPath, resolveMagpieConfigDir, resolveSessionsDir, validateEffortSettings, withConfigTransaction,
 } from '../../core/config.mjs';
 import { detectAvailableRunners } from '../../core/runners/registry.mjs';
@@ -29,7 +29,7 @@ export {
   TIER_ORDER, VALID_EFFORTS, VALID_FAILOVER_MODES, VALID_SANDBOXES, expandUser, isCodexModelId,
   normalizeDefaultTier, readJsonSafe, resolveConfigPath, resolveMagpieConfigDir,
   resolveSessionsDir, setDefaultSandbox, setDefaultTier, setEffortSettings, setPairing,
-  setWorkSplit, writeConfigAtomic,
+  writeConfigAtomic,
 } from '../../core/config.mjs';
 export {
   defaultGatewayFromEnv, findMagpieCli, pickSubscriptionPlan, probeMagpie,
@@ -186,8 +186,7 @@ export function readRoutingSummary({ configPath } = {}) {
   const result = cachedProbe(path, url, config);
   return {
     ui: { language: getUiLanguage(config) },
-    routing: { profile, gpt_share: WORKLOAD.profiles[profile].gpt_share,
-      native_swarm: getNativeSwarmPolicy(policy).native_swarm },
+    routing: { profile, gpt_share: WORKLOAD.profiles[profile].gpt_share },
     magpie: { reachable: result?.reachable ?? null, url, error: result?.error || '' },
   };
 }
@@ -366,9 +365,6 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     has_any_runner: availableRunners.length > 0,
     consult_timeout_sec: rawCfg?.limits?.consult_timeout_sec ?? DEFAULT_CONSULT_TIMEOUT_SEC,
     work_split: workSplit,
-    swarm_split: policy.swarm_split ?? 'inherit',
-    ...getNativeSwarmPolicy(policy),
-    swarm_shell_models: WORKLOAD.swarm_shell_models,
     codex_timeout_sec: configuredExecTimeoutSec(rawCfg?.codex),
     work_profiles: WORKLOAD.profiles,
     ...(overview ? {} : { token_ratio: tokenRatio }),
@@ -466,11 +462,9 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
     execution: getExecutionConfig(existing),
     routing_policy: {
       work_split: existingPolicy.work_split ?? 'balanced',
-      swarm_split: existingPolicy.swarm_split ?? 'inherit',
-      ...getNativeSwarmPolicy(existingPolicy),
       pairings: existingPolicy.pairings ?? {},
       default_tier: defaultTier,
-        failover_mode: failover ?? 'paired',
+      failover_mode: failover ?? 'paired',
       auto_effort: Boolean(existingPolicy.auto_effort),
       mcp_effort: getMcpEffort(existingPolicy),
       excluded_models: excludedList,
@@ -540,8 +534,6 @@ export async function updateSettings(settings, { configPath, probeTimeoutMs = 20
       }
       return { next: { ...loaded.data, codex: { ...loaded.data.codex, timeout_sec: value, timeout_sec_customized: true } } };
     },
-    native_swarm: (loaded, value) => editSwarmSetting(loaded, 'native_swarm', value, typeof value === 'boolean'),
-    swarm_shell_model: (loaded, value) => editSwarmSetting(loaded, 'swarm_shell_model', value, isSafeModelId(value)),
     default_sandbox: editDefaultSandbox,
     pairing: (loaded, value) => {
       if (!value || typeof value !== 'object' || Array.isArray(value) ||
@@ -550,8 +542,7 @@ export async function updateSettings(settings, { configPath, probeTimeoutMs = 20
       }
       return editPairing(loaded, value.family, value.model);
     },
-    work_split: (loaded, value) => editWorkSplit(loaded, 'work_split', value),
-    swarm_split: (loaded, value) => editWorkSplit(loaded, 'swarm_split', value),
+    work_split: editWorkSplit,
   };
   const effortKeys = ['auto_effort', 'mcp_effort', 'tier_effort', 'tier'];
   const keys = settings && Object.keys(settings);
@@ -618,11 +609,6 @@ export async function updateSettings(settings, { configPath, probeTimeoutMs = 20
     probe = await probeMagpie(url, key, probeTimeoutMs, excluded);
     probeKey = result.probeKey;
   }
-}
-
-function editSwarmSetting({ data }, key, value, valid) {
-  if (!valid) return { ok: false, status: 400, error: `Invalid ${key}.` };
-  return { next: { ...data, routing_policy: { ...data.routing_policy, [key]: value } } };
 }
 
 function planFailover(current, normalized, probe) {

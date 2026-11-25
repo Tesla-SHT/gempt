@@ -36,7 +36,7 @@ export function stagePluginBundle(staged, { target, source, nodeBin, portable = 
   for (const name of ['plugin.json', 'mcp_config.json', 'hooks.json', 'work_split_hook.mjs']) {
     copyFileSync(join(plugin, name), join(staged, name));
   }
-  for (const name of ['rules', 'agents', 'skills', 'assets', 'sidecars']) {
+  for (const name of ['rules', 'skills', 'assets', 'sidecars']) {
     if (existsSync(join(plugin, name))) copyTree(join(plugin, name), join(staged, name));
   }
   copyTree(existsSync(join(plugin, 'templates')) ? join(plugin, 'templates') : join(projectSource, 'templates'),
@@ -114,7 +114,7 @@ export async function validatePluginBundle(staged, nodeBin, env = process.env, {
     JSON.parse(readFileSync(join(staged, 'templates', file), 'utf8'));
   }
   for (const file of ['README.md', 'LICENSE', 'THIRD_PARTY_LICENSES.txt', 'assets/logo.svg',
-    'hooks.json', 'mcp_config.json', 'rules/AGENTS.md', 'agents/gempt-worker.md',
+    'hooks.json', 'mcp_config.json', 'rules/AGENTS.md',
     'skills/gempt/SKILL.md', 'runtime/bin/gempt.mjs', 'runtime/core/assets/workload.json',
     'sidecars/gempt_live/sidecar.json', 'sidecars/gempt_live/main.mjs',
     ...['index.html', 'styles.css', 'app.js'].map((file) => `runtime/core/assets/http-ui/${file}`)]) {

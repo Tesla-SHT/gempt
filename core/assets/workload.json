@@ -3,60 +3,44 @@
     "gemini": {
       "label": "关闭 GemPT",
       "gpt_share": 0,
-      "kinds": [],
       "detail": "已关闭 GemPT 自动协作，全部任务直接由 Gemini 完成，不再派单给 GPT。"
     },
     "gemini_first": {
       "label": "Gemini 为主",
       "gpt_share": 15,
-      "kinds": ["specialist"],
       "detail": "Gemini 负责沟通、设计与常规实现，仅在疑难排错、复杂推理与专家复核时派给 GPT。"
     },
     "balanced": {
       "label": "按领域分工",
       "gpt_share": 35,
-      "kinds": [
-        "specialist",
-        "engineering"
-      ],
       "detail": "Gemini 负责沟通和设计，GPT 负责工程实施、排错和专家复核。"
     },
     "gpt": {
       "label": "GPT 为主",
       "gpt_share": 60,
-      "kinds": [
-        "specialist",
-        "engineering",
-        "design"
-      ],
       "detail": "GPT 接手设计、调查和实现，Gemini 处理日常问答与视觉判断。"
     },
     "gpt_first": {
       "label": "基本全由 GPT 做",
       "gpt_share": 80,
-      "kinds": [
-        "specialist",
-        "engineering",
-        "design",
-        "routine"
-      ],
       "detail": "实质任务直接派给 GPT。Gemini 澄清需求、补充视觉观察，并用用户听得懂的话解释结果。"
     }
   },
-  "native_swarm": false,
-  "swarm_shell_model": "gemini-4-hydrogen-low",
-  "swarm_shell_models": ["gemini-4-hydrogen-low", "gemini-3.8-flash-low", "gpt-oss-120b-medium"],
   "pairings": {
     "hydrogen": "default",
     "neon": "default",
     "carbon": "default"
   },
   "schema": {
-    "type": "object",
     "properties": {
-      "goal": {
+      "gemini_family": {
         "type": "string",
-        "description": "User's objective with known constraints and acceptance criteria. Dispatch immediately before reading workspace files in Gemini."
+        "enum": [
+          "hydrogen",
+          "neon",
+          "carbon"
+        ],
+        "description": "Current native Gemini family, or the coordinator family from the Swarm brief. Omit when unknown. An explicit tier overrides pairing."
       },
       "title": {
         "type": "string",
@@ -65,97 +49,7 @@
       "host_conversation_id": {
         "type": "string",
         "description": "Optional ID of the parent Antigravity conversation."
-      },
-      "kind": {
-        "type": "string",
-        "enum": [
-          "routine",
-          "design",
-          "engineering",
-          "specialist",
-          "visual"
-        ],
-        "description": "routine: everyday content or simple questions; design: planning or UX design; engineering: implementation, debugging, testing; specialist: difficult reasoning or independent expert review; visual: only the observation that requires native perception."
-      },
-      "access": {
-        "type": "string",
-        "enum": [
-          "provided",
-          "inspect",
-          "change"
-        ],
-        "description": "provided: solve from the supplied text; inspect: worker must inspect workspace or run read-only checks; change: implement and test in cwd."
-      },
-      "cwd": {
-        "type": "string",
-        "description": "Exact workspace for inspect or change."
-      },
-      "workspace": {
-        "type": "string",
-        "enum": [
-          "inherit",
-          "share"
-        ],
-        "description": "inherit (default) runs in cwd directly; share creates/reuses an isolated detached Git worktree bound to session_id so parallel GPT tasks can edit safely without colliding."
-      },
-      "background": {
-        "type": "boolean",
-        "description": "Return a durable run receipt (run_id, session_id, wait_command) immediately for zero-poll async waiting or concurrent fan-out."
-      },
-      "session_id": {
-        "type": "string",
-        "description": "GemPT session to continue."
-      },
-      "context": {
-        "type": "string",
-        "description": "Short verified findings or user constraints only. Do not paste full source files; pass file_paths or let GPT read cwd directly."
-      },
-      "file_paths": {
-        "type": "array",
-        "items": {"type": "string"},
-        "description": "Optional workspace file paths for GPT to read directly (keeps Gemini context lean)."
-      },
-      "gemini_family": {
-        "type": "string",
-        "enum": ["hydrogen", "neon", "carbon"],
-        "description": "Current native Gemini family, or the coordinator family from the Swarm brief. Omit when unknown. An explicit tier overrides pairing."
-      },
-      "tier": {
-        "type": "string",
-        "enum": [
-          "sonnet",
-          "opus",
-          "fable"
-        ],
-        "description": "Optional GPT tier for this assignment."
-      },
-      "verification": {
-        "type": "string",
-        "description": "Known verification command if available."
-      },
-      "role": {
-        "type": "string",
-        "enum": [
-          "solo",
-          "coordinator",
-          "worker",
-          "verifier",
-          "narrator"
-        ],
-        "description": "Use actual Antigravity Swarm role, otherwise solo."
-      },
-      "assignment_id": {
-        "type": "string",
-        "pattern": "^[a-f0-9]{32}$",
-        "description": "For Swarm workers and verifiers, the unique 32-hex assignment ID from the coordinator's board brief. Reuse for duplicate deliveries."
       }
-    },
-    "required": [
-      "goal",
-      "kind",
-      "access"
-    ],
-    "additionalProperties": false
-  },
-  "report": "Answer concisely in the user's language, leading with what the result means for them. List changed files, key checks (pass/fail), and any unresolved decisions briefly — omit raw diffs, file dumps, and verbose command logs (the user already sees live output in GemPT). For workspace tasks discover and read all relevant files yourself in cwd and carry the assigned task through verification. Do not spawn a nested team or call GemPT again."
+    }
+  }
 }

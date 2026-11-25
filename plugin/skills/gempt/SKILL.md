@@ -9,7 +9,7 @@ description: >-
 
 # gempt — Gemini × GPT 协作编排手册
 
-GemPT v0.10.0 使用 Node.js（`>= 22.13.0`）。Antigravity 的 `gempt_gempt` MCP 提供 `gpt_swarm`、`gpt_board`、`gpt_run`、`gpt_ask`、`gpt_ctl`，支持 11 种可插拔执行 CLI（`codex` / `opencode` / `claude` / `gemini` / `pi` / `cursor` / `kimi` / `grok` / `kilo` / `copilot` / `qoder`）以及按 Hydrogen、Neon、Carbon 家族配对 Magpie 模型。
+GemPT v0.10.1 使用 Node.js（`>= 22.13.0`）。Antigravity 的 `gempt_gempt` MCP 提供 `gpt_swarm`、`gpt_board`、`gpt_run`、`gpt_ask`、`gpt_ctl`，支持 11 种可插拔执行 CLI（`codex` / `opencode` / `claude` / `gemini` / `pi` / `cursor` / `kimi` / `grok` / `kilo` / `copilot` / `qoder`）以及按 Hydrogen、Neon、Carbon 家族配对 Magpie 模型。
 
 > 启用本插件时，`rules/AGENTS.md` 会常驻生效；按 Magpie 面板的 5 档工作分工（0% / 15% / 35% / 60% / 80%）决定何时委派。
 
@@ -17,25 +17,9 @@ GemPT v0.10.0 使用 Node.js（`>= 22.13.0`）。Antigravity 的 `gempt_gempt` M
 
 ---
 
-## 1. Initial Setup Wizard（首次使用或用户要求调整配置时）
+## 1. 首次配置
 
-当 `~/.config/gempt/config.json` 尚未初始化，或用户说“初始化 gempt / 配一下 gempt / 换模型或容灾策略”时，优先推荐无门槛的 **Codex 订阅直连（`subscription_only`）**，并在当前版本支持按需开启个人 **API 兜底（`api_fallback`）**：
-
-1. **最简一键开启**：确认已安装 Magpie（`>= 0.1.1340`）和 Magpie 侧 GemPT 插件并登录 ChatGPT/Codex 订阅后，在 Magpie 左侧栏打开 **`Plugins → GemPT`**，点击 **“一键启用订阅配置”** 即可完成初始化；后续也可在页面里一键切换 `仅订阅 | API 兜底` 与 `Codex 执行权限`。
-2. **命令行探测**。运行 `gempt discover`，检查 `magpie.reachable`、`subscription`、`magpie.codex_models`、`magpie.openai_models`、`magpie.utility_candidates` 与 `codex` CLI。
-   - 如果 `magpie.reachable` 为 `false`，先启动本地 Magpie（默认 `127.0.0.1:3425`）。
-3. **在「MCP 编排」确认配对和容灾策略**。
-   - Hydrogen、Neon、Carbon 默认配对 Terra、Sol、Astra。下拉可选其他 Codex 订阅模型，选择「默认模型」则使用 Magpie 探测到的默认订阅模型。
-   - **免费打杂 / 压缩通道（`chore` / `utility`）**：从 `utility_candidates` 推荐免费高速模型（如 `auto/deepseek-v4.1-flash`），用于 `gpt_ask(tier="chore")` 与 Magpie `compact` 规则。
-   - **容灾策略（`failover_mode`）**：
-     1. `subscription_only`（推荐默认）：仅用 Codex 订阅号（不自动切按量 API，防意外扣费）；多订阅号由 Magpie 自动轮转。
-     2. `api_fallback` 启用后，咨询遇到限流或可重试的网关错误时可使用匹配的按量 `openai/*` 模型。
-   - **思考强度**可固定设置，也可在面板选 **智能** 启用 `auto_effort`。
-   - **默认 Codex 沙箱（`default_sandbox`）**：推荐 `workspace-write`（只在目标工作区可写），并可通过环境变量 `GEMPT_WORKSPACE_ROOT` 限定可访问根目录。
-4. **落盘并验收**：
-   - 运行 `gempt init` 保存配置，再用 `gempt status` 验证。必要时调用 `gpt_ask(goal="Reply with OK")` 与一次只读 `gpt_run(access="inspect")` 做连通性验收。
-
----
+运行 `gempt discover` 检查 Magpie 网关、可用模型和执行 CLI，再用 `gempt init` 保存配置、`gempt status` 验证。在 Magpie 的 **Plugins → GemPT → 概览** 中设置工作分工、模型配对、思考强度与执行权限；连接与高级设置可测试网关并设置超时。
 
 ## 2. 工具选择与思考强度
 
@@ -72,9 +56,10 @@ GemPT v0.10.0 使用 Node.js（`>= 22.13.0`）。Antigravity 的 `gempt_gempt` M
 
 ---
 
-### 无壳 GemPT Swarm（默认）与原生 Swarm 混编
+### 会话 Swarm
 
-默认单轨 Mode B（`routing_policy.native_swarm: false`）将单次 `gpt_run` 与 `gpt_swarm` 工位归入当前会话的同一个 Swarm 工作台。1 个工位紧凑显示，2 个起自动展开。
+普通对话中的 `gpt_run` 和 `gpt_swarm` 共用当前会话的工作台。单工位显示任务卡；增加工位、收到消息或需要回复时自动展开。
+
 - 用 `gpt_swarm(action="title"|"plan"|"add"|"status"|"model"|"kill", cli?, ...)` 规划与拉起多 CLI 工位（不消耗 AGY 原生外壳 token），并行写入用 `workspace="share"` 自动创建 worktree。
 - 用 `gpt_board(action="post"|"read"|"wait"|"roster")` 在共享 SQLite 消息板上协同与自动唤醒；通过 `run_command(WaitMsBeforeAsync=500)` 执行返回的 `gempt-wait --board <swarm_id>` 零轮询等待。
 - 可通过 `cli` 参数或控制台 `execution.default_cli` 选择 `auto`（按模型亲和匹配已安装 CLI）或任意 11 种受支持 CLI。
@@ -85,7 +70,7 @@ GemPT v0.10.0 使用 Node.js（`>= 22.13.0`）。Antigravity 的 `gempt_gempt` M
   - **克制唤醒与引用**：`@name` 是唤醒门铃而非 CC（点对点交接勿顺手 `@coordinator`），旧帖一律用 `#seq` 引用勿复制粘贴；多领域并行时用 `action="channel"` 分区保持 `main` 安静。
   - **`gpt_ask` 文件前缀复用**：同一批 `file_paths` 会前置到 `Goal` 之前（Responses 路径附带确定性 `prompt_cache_key`），多次审阅同一组文件时保持 `file_paths` 集合稳定可提高前缀命中率。
 
-当需要与 AGY 原生 Gemini / Claude Swarm 工位混编时，可在控制台显式开启 `routing_policy.native_swarm: true`：Coordinator 用 `swarm(action="title")` / `swarm(action="add", model=routing_policy.swarm_shell_model)` 创建工位，工位内通过 `gempt run --cwd "$PWD" --workspace inherit --host <coordinator_id> --title <name> --goal -` 执行任务并运行 `wait_command`。默认执行预算为 3600 秒，等待 `ask_gemini` 回复期间暂停计时。
+手动使用 AGY `/swarm` 时，工位沿用相同工作分工。在工位中执行 `gempt run --cwd "$PWD" --workspace inherit --host <coordinator_id> --title <name> --goal -`，随后运行返回的 `wait_command`。
 
 ## 4. AI-to-AI Steering & Review Loop（内部纠偏闭环）
 

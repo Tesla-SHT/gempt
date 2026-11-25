@@ -49,6 +49,7 @@ export function mountAdvancedSettings($, { transport, showToast, refresh, refres
       'utility-effort': state.utility?.reasoning_effort,
       'excluded-models': state.excluded_models?.join(', '),
       'codex-cli-path': state.codex_cli_path,
+      'codex-timeout': state.codex_timeout_sec,
       'consult-timeout': state.consult_timeout_sec,
       'codex-extra-args': state.codex_extra_args?.join('\n'),
       'advanced-config-path': state.config_path,
@@ -113,6 +114,7 @@ export function mountAdvancedSettings($, { transport, showToast, refresh, refres
     stage('utility-effort', 'utility', 'reasoning_effort', $('utility-effort').value);
     stage('excluded-models', 'routing_policy', 'excluded_models', $('excluded-models').value.split(/[,\n]/).map((s) => s.trim()).filter(Boolean));
     stage('codex-cli-path', 'codex', 'cli_path', $('codex-cli-path').value.trim());
+    if (dirty.has('codex-timeout')) settings.codex_timeout_sec = $('codex-timeout').valueAsNumber;
     stage('consult-timeout', 'limits', 'consult_timeout_sec', $('consult-timeout').valueAsNumber);
     stage('codex-extra-args', 'codex', 'extra_args', extraArgs($('codex-extra-args').value));
     return settings;

@@ -1,7 +1,7 @@
 {
   "name": "gempt",
   "displayName": "GemPT",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "Pair Antigravity Gemini with any delegate model available in Magpie. Route work, follow runs, and manage settings in the bilingual GemPT side panel.",
   "author": {
     "name": "yizhang-dream",

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { connectAppServer, readAppServerState, readServerTurn, terminalTurn, TERMINAL_INTERRUPT_ERR, textInput, UNAVAILABLE } from '../magpie_plugin/lib/app-server-client.mjs';
 import { normalizeTitle, readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
-import { getExecutionConfig, getMcpEffort, getNativeSwarmPolicy } from './config.mjs';
+import { getExecutionConfig, getMcpEffort } from './config.mjs';
 import { resolveExecTimeoutSec, validateExecTimeoutSec } from '../magpie_plugin/lib/routing.mjs';
 import { resolveNodeExecutable } from './node-executable.mjs';
 import { readHostContext } from './host-context.mjs';
@@ -641,8 +641,7 @@ export async function dispatchRun(args, {
         ...(args.cli ? { cli: String(args.cli) } : {}),
         ...(args.model ? { model: String(args.model) } : {}),
       };
-      if (!legacyNative && hostId && !args.swarm_id && !args.swarm_agent
-          && !getNativeSwarmPolicy(cfg?.routing_policy).native_swarm) {
+      if (!legacyNative && hostId && !args.swarm_id && !args.swarm_agent) {
         record.swarm_id = resolveImplicitSwarmId(hostId);
         record.swarm_agent = soloWorkerName(sessionId);
         record.implicit_swarm_worker = true;

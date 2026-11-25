@@ -579,7 +579,7 @@ export function graphSnapshot(overview, board) {
     }).map(w => w.name);
     messages.push({ ...post, agent: post.from_agent, mentions: direct.mentions, all: direct.all, channel_mentions: channels, viaChannel });
   });
-  return { members, messages, title: overview.swarm.title || overview.swarm.id };
+  return { members, messages, attention: overview.system_attention || [], title: overview.swarm.title || overview.swarm.id };
 }
 
 function isRoleWorker(member, roster) {
@@ -942,9 +942,9 @@ function hiveStates(sc, seq, P) {
       else if (x.status === 'waiting_on') { st = 'wait'; who = x.waiting_on; }
       else if (n !== 'coordinator' && owned(n).length && owned(n).every(w => w.state === 'done')) st = 'done';
       out[n] = {st, who}; });
-    if (!sc.finished && out.coordinator && out.coordinator.st !== 'retired' && sc.attention.some(a => a.wait === 'you')) out.coordinator = {st: 'needs', who: null};
+    if (!sc.finished && out.coordinator && out.coordinator.st !== 'retired' && (sc.attention.length || names.some(n => sc.members[n].status === 'waiting_on'))) out.coordinator = {st: 'needs', who: null};
     const lp = P[P.length - 1];
-    return {st: out, done: null, beam: lp && Date.now() - Date.parse(lp.t) < 90 * 1000 ? lp : null};
+    return {st: out, beam: lp && Date.now() - Date.parse(lp.t) < 90 * 1000 ? lp : null};
   }
   let i = -1; while (i + 1 < P.length && P[i + 1].s <= seq) i++;
   const fin = Object.create(null), lastPost = Object.create(null), lastIn = Object.create(null), born = Object.assign(Object.create(null), {coordinator: true}), tms = k => Date.parse(P[k].t);
@@ -957,10 +957,10 @@ function hiveStates(sc, seq, P) {
     else if (x.killed && (fin[n] != null ? (i >= fin[n] && (i > fin[n] + 8 || now - tms(fin[n]) > HV_BUSY_MS)) : i > li + 8)) st = 'retired';
     else if (li > lp && now - tms(li) < HV_BUSY_MS) { st = 'working'; who = P[li].a; }
     else if (lp >= 0 && HV_ASK.test(P[lp].x) && to(P[lp]).length && now - tms(lp) < HV_ASK_MS && (lastPost[to(P[lp])[0]] ?? -1) <= lp) { st = 'wait'; who = to(P[lp])[0]; }
-    else if (lp >= 0 && fin[n] <= i && n !== 'coordinator') st = 'done';
+    else if (!x.killed && lp >= 0 && fin[n] <= i && n !== 'coordinator') st = 'done';
     else if (lp >= 0 && i - lp < 3 && now - tms(lp) < 4 * 60 * 1000) st = 'working';
     out[n] = {st, who: who === n ? null : who}; });
-  return {st: out, done: n => out[n] && (out[n].st === 'retired' || (fin[n] != null && fin[n] <= i)), beam: i >= 0 ? P[i] : null};
+  return {st: out, beam: i >= 0 ? P[i] : null};
 }
 
 
@@ -972,12 +972,12 @@ function hiveModel(snapshot) {
   const lastPosts = new Map(posts.map(p => [p.a,p]));
   const members = Object.fromEntries(snapshot.members.map(w => [w.name, {
     ...w, killed:w.status==="killed", issue:Boolean(w.error || w.quota_paused_seq),
-    waiting_on:lastPosts.get(w.name)?.to[0], status:w.status==="waiting_reply" ? "waiting_on" : w.status,
+    waiting_on:lastPosts.get(w.name)?.to[0], status:w.status==="waiting_reply" || w.telemetry?.state==="waiting_gemini" ? "waiting_on" : w.status,
   }]));
   const workstreams = snapshot.members.filter(w => w.name!=="coordinator").map(w => ({
     owners:[w.name], state:/\[done\]/i.test(lastPosts.get(w.name)?.x || "") ? "done" : "open"
   }));
-  return { members, posts, workstreams, attention:[], finished:posts.at(-1)?.a==="coordinator" && /\[done\]/i.test(posts.at(-1).x) };
+  return { members, posts, workstreams, attention:snapshot.attention, finished:posts.at(-1)?.a==="coordinator" && /\[done\]/i.test(posts.at(-1).x) };
 }
 
 export function createHiveView(host) {
@@ -1002,14 +1002,15 @@ export function createHiveView(host) {
 
   function draw() {
     if (!snapshot || !view.clientWidth) return;
-    const { st, done, beam } = hiveStates(model, sequence, model.posts);
+    const { st, beam } = hiveStates(model, sequence, model.posts);
     const visible = n => st[n] && st[n].st !== "unborn";
-    const settled = n => done ? done(n) : ["retired","done"].includes(st[n]?.st);
+    const settled = n => st[n]?.st === "done";
     const byState = [
       ["working", tr("运行中"), ["working"]],
       ["waiting", tr("等待回复"), ["wait", "issue"]],
       ["resting", tr("待命"), ["idle"]],
-      ["done", tr("已完成"), ["done", "retired"]],
+      ["done", tr("已完成"), ["done"]],
+      ["retired", tr("已终止"), ["retired"]],
     ];
     const cellsAtStep = groups.length ? groups : byState.map(([id, title, states]) => ({
       id, title, names: Object.keys(st).filter(n => n !== "coordinator" && states.includes(st[n].st)),
@@ -1046,7 +1047,7 @@ export function createHiveView(host) {
         "stroke-dasharray":`${cell.done / cell.names.length} 1`}));
       const clip = (s,n)=>s.length>n ? s.slice(0,n-1)+"…" : s;
       group.append(svgNode("text",{x,y:i ? y-53 : y+41,class:"sw-hex-title"},clip(cell.title,18)),
-        svgNode("text",{x,y:i ? y-36 : y+60,class:"sw-hex-meta"},tr("完成 {0}/{1}",cell.done,cell.names.length)));
+        svgNode("text",{x,y:i ? y-36 : y+60,class:"sw-hex-meta"},!i && st.coordinator?.st === "needs" ? tr("需要你处理") : tr("完成 {0}/{1}",cell.done,cell.names.length)));
       tiles.append(group);
       const many=cell.bees.length>6, shown=cell.bees.slice(0,many ? 5 : 6);
       const total=shown.length+(many ? 1 : 0);

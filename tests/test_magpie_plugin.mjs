@@ -358,7 +358,7 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files, version }] = JSON.parse(stdout);
-  assert.equal(version, '0.10.0');
+  assert.equal(version, '0.10.1');
   const paths = files.map((file) => file.path);
   assert.deepEqual(paths.filter((path) => /^plugin\/skills\/[^/]+\/SKILL\.md$/.test(path)).sort(),
     ['plugin/skills/gempt-chore/SKILL.md', 'plugin/skills/gempt/SKILL.md']);
@@ -382,7 +382,7 @@ test('shared Console HTTP adapter preserves relative HTTP paths and authenticati
   assert.match(html, /<link rel="stylesheet" href="\.\/styles\.css">/);
   assert.doesNotMatch(html, /<script/);
   const query = { q: 'a/b', offset: 0, limit: 25 };
-  const settings = { native_swarm: false, swarm_shell_model: 'gemini-3.8-flash-low', codex_timeout_sec: 1800 };
+  const settings = { work_split: 'balanced', codex_timeout_sec: 1800 };
   for (const base of ['http://127.0.0.1:3498/', 'https://magpie.invalid/service/gempt/']) {
     let request;
     const transport = createHttpTransport('test-key', async (path, options) => {
@@ -729,8 +729,8 @@ test('package.json Magpie manifest fields and single plugin factory export exist
     assert.ok(pkg.files.includes(item), `files missing ${item}`);
   }
   assert.ok(existsSync(join(REPO_ROOT, pkg.main)));
-  assert.ok(pkg.files.includes('plugin/agents/*.md'));
-  assert.ok(existsSync(join(REPO_ROOT, 'plugin/agents/gempt-worker.md')));
+  assert.ok(!pkg.files.includes('plugin/agents/*.md'));
+  assert.ok(!existsSync(join(REPO_ROOT, 'plugin/agents/gempt-worker.md')));
   assert.equal(pkg.magpie.name, 'GemPT');
   assert.equal(pkg.magpie.page.service.port, 3498);
   assert.equal(pkg.magpie.options.port, 3498);
@@ -1265,8 +1265,7 @@ test('page server preserves custom tier model IDs through failover and forwards 
         headers: { 'Content-Type': 'application/json', Origin: 'null', 'x-gempt-key': key },
         body: JSON.stringify({ [field]: 'gemini_first' }),
       });
-      assert.equal(response.status, 200);
-      assert.equal(JSON.parse(readFileSync(cfgPath, 'utf8')).routing_policy[field], 'gemini_first');
+      assert.equal(response.status, field === 'work_split' ? 200 : 400);
     }
     const stateRes = await fetch(`${origin}/api/state`, {
       headers: { 'x-gempt-key': key },
@@ -1274,7 +1273,7 @@ test('page server preserves custom tier model IDs through failover and forwards 
     assert.equal(stateRes.status, 200);
     const stateJson = await stateRes.json();
     assert.equal(stateJson.work_split, 'gemini_first');
-    assert.equal(stateJson.swarm_split, 'gemini_first');
+    assert.equal(stateJson.swarm_split, undefined);
     assert.deepEqual(Object.values(stateJson.work_profiles).map(({ gpt_share }) => gpt_share), [0, 15, 35, 60, 80]);
     assert.equal(stateJson.auto_effort, false);
     assert.equal(stateJson.mcp_effort, 'high');
@@ -2792,7 +2791,7 @@ test('mcpTools false disables duplicate Magpie GemPT tool registration', async (
 
 test('Magpie marketplace check shape and inspect+share guard hold', async () => {
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '0.10.0');
+  assert.equal(pkg.version, '0.10.1');
   assert.ok(pkg.keywords.includes('magpie-plugin'));
   assert.ok(pkg.files.includes('THIRD_PARTY_LICENSES.txt'));
   assert.ok(pkg.magpie?.summary?.en && pkg.magpie?.summary?.zh);
@@ -3361,7 +3360,7 @@ test('advanced HTTP settings validate, protect credentials, probe drafts and res
   };
   const saved = {
     magpie: { base_url: ' ' + gatewayUrl + '/// ', api_key: secret, api_key_env: envName },
-    routing_policy: { swarm_shell_model: 'vendor/custom:model@1', excluded_models: [' unused-provider  '] },
+    routing_policy: { excluded_models: [' unused-provider  '] },
     utility: { model: 'external/custom-v1', reasoning_effort: '' },
     codex: { cli_path: process.execPath, extra_args: ['--strict-config'] },
     limits: { consult_timeout_sec: 15 },
@@ -3378,7 +3377,7 @@ test('advanced HTTP settings validate, protect credentials, probe drafts and res
     assert.equal(data.magpie_api_key_hint, '••••1234');
     assert.equal(data.magpie_api_key_env, envName);
     assert.equal(data.magpie_base_url, gatewayUrl);
-    assert.equal(data.swarm_shell_model, saved.routing_policy.swarm_shell_model);
+    assert.equal(Object.hasOwn(data, 'swarm_shell_model'), false);
     assert.deepEqual(data.excluded_models, ['unused-provider']);
     assert.equal(data.utility.model, saved.utility.model);
     assert.equal(data.utility.reasoning_effort, '');

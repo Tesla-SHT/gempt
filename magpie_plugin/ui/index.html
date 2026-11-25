@@ -76,7 +76,7 @@
 
           <section id="work-controls" class="work-controls" tabindex="-1" aria-labelledby="work-label">
             <fieldset class="control-fieldset">
-              <legend id="work-label" class="control-legend">普通对话 · 工作分工</legend>
+              <legend id="work-label" class="control-legend">工作分工</legend>
               <div id="work-options" class="work-options"></div>
               <span id="work-detail" class="control-hint" aria-live="polite"></span>
               <div id="token-ratio-card" class="token-ratio-card" hidden>
@@ -110,36 +110,10 @@
               </div>
               <div class="control-hint" id="weekly-activity" hidden></div>
             </fieldset>
-            <fieldset class="control-fieldset">
-              <legend class="control-legend">Swarm 协作模式</legend>
-              <div class="seg-control swarm-dispatch">
-                <span class="seg-option">
-                  <input id="dispatch-direct" class="seg-radio sr-only" type="radio" name="native_swarm" value="false" disabled>
-                  <label class="seg-label" for="dispatch-direct">无壳 GemPT Swarm（默认）</label>
-                </span>
-                <span class="seg-option">
-                  <input id="dispatch-swarm" class="seg-radio sr-only" type="radio" name="native_swarm" value="true" disabled>
-                  <label class="seg-label" for="dispatch-swarm">AGY 原生 Swarm（混编）</label>
-                </span>
-              </div>
-              <span class="control-hint">默认使用无壳 GemPT Swarm（gpt_swarm / gpt_board）；需与 AGY 原生 Gemini/Claude 工位混编时可切到原生 Swarm。</span>
-            </fieldset>
-            <div class="swarm-settings">
-              <div class="swarm-choice">
-                <label for="execution-cli" class="control-legend">执行 CLI</label>
-                <select id="execution-cli" name="default_cli" aria-describedby="execution-cli-hint"></select>
-                <span id="execution-cli-hint" class="control-hint"></span>
-              </div>
-              <div class="swarm-choice">
-                <label for="swarm-split" class="control-legend">Swarm 工作分工</label>
-                <select id="swarm-split" name="swarm_split" aria-describedby="swarm-detail"></select>
-                <span id="swarm-detail" class="control-hint"></span>
-              </div>
-              <div class="swarm-choice">
-                <label for="swarm-shell-model" class="control-legend">原生 Swarm 工位模型</label>
-                <input id="swarm-shell-model" name="swarm_shell_model" list="swarm-shell-presets" maxlength="128" disabled>
-                <datalist id="swarm-shell-presets"></datalist>
-              </div>
+            <div class="execution-choice">
+              <label for="execution-cli" class="control-legend">执行 CLI</label>
+              <select id="execution-cli" name="default_cli" aria-describedby="execution-cli-hint"></select>
+              <span id="execution-cli-hint" class="control-hint"></span>
             </div>
             <fieldset id="pairing-controls" class="control-fieldset">
               <legend class="control-legend">Gemini 下属模型</legend>
@@ -224,19 +198,7 @@
                   <ul id="runner-cli-list" class="runner-cli-list"></ul>
                 </div>
                 <label class="advanced-field">咨询超时（秒）<input id="consult-timeout" type="number" min="15" max="1800" step="1" required></label>
-            <div class="control-fieldset timeout-form">
-              <label for="codex-timeout" class="control-legend">执行超时（秒）</label>
-              <div class="timeout-row">
-                <input id="codex-timeout" type="number" name="codex_timeout_sec" min="30" max="7200" step="any" value="3600" required disabled>
-                <button type="button" class="pill-copy-btn" data-timeout-save disabled>保存</button>
-                <div class="timeout-presets" role="group" aria-label="超时预算预设">
-                  <button type="button" class="pill-copy-btn" data-timeout="600" disabled>600s</button>
-                  <button type="button" class="pill-copy-btn" data-timeout="1800" disabled>1800s</button>
-                  <button type="button" class="pill-copy-btn" data-timeout="3600" disabled>3600s</button>
-                  <button type="button" class="pill-copy-btn" data-timeout="7200" disabled>7200s</button>
-                </div>
-              </div>
-            </div>
+                <label class="advanced-field">执行超时（秒）<input id="codex-timeout" type="number" min="30" max="7200" step="any" required></label>
                 <label class="advanced-field">附加 CLI 参数<textarea id="codex-extra-args" rows="2" placeholder="用空格或换行分隔标志"></textarea><span class="control-hint">附加参数需兼容 GemPT 的网关与沙箱设置。支持 --strict-config 和 --analytics-default-enabled。</span></label>
               </fieldset>
               <div class="advanced-actions">
@@ -245,6 +207,7 @@
               </div>
               <fieldset>
                 <legend>诊断与重置</legend>
+                <p id="exec-diagnostic" class="control-hint" hidden>Magpie 的 gempt_run 仅限只读。要允许写入，请在 GemPT 插件选项开启 exec。</p>
                 <label class="advanced-field">配置文件<input id="advanced-config-path" readonly></label>
                 <p id="codex-cli-status" class="control-hint"></p>
                 <div class="advanced-actions">

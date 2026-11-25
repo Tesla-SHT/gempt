@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { isValidSessionId } from './state.mjs';
 import { readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
-import { CLI_CHOICES, getExecutionConfig, getNativeSwarmPolicy } from './config.mjs';
+import { CLI_CHOICES, getExecutionConfig } from './config.mjs';
 import { readHostContext } from './host-context.mjs';
 import {
   ACTIVE_STATES, buildBoardWaitCommand, dispatchRun, interruptRun, readRun, replyToolCall, steerRun, validateExecTimeoutSec,
@@ -31,9 +31,8 @@ function resolveEngineContext(args = {}, options = {}) {
   const hostConversationId = (typeof args.host_conversation_id === 'string' && args.host_conversation_id.trim())
     || hostCtx.conversation_id || null;
   const geminiFamily = args.gemini_family || hostCtx.gemini_family || undefined;
-  const nativeSwarm = !args.swarm_id && getNativeSwarmPolicy(readJsonSafe(configPath)?.routing_policy).native_swarm;
   return {
-    nativeSwarm, env,
+    env,
     configPath,
     sessionsDir,
     cwd,
@@ -416,7 +415,6 @@ export async function handleSwarmAction(args = {}, options = {}) {
   const ctx = resolveEngineContext(args, options);
   const swarmId = await resolveSwarmId({
     swarmId: args.swarm_id,
-    nativeSwarm: ctx.nativeSwarm,
     hostConversationId: ctx.hostConversationId,
     cwd: ctx.cwd,
     sessionsDir: ctx.sessionsDir,
@@ -741,7 +739,6 @@ export async function handleBoardAction(args = {}, options = {}) {
   const ctx = resolveEngineContext(args, options);
   const swarmId = await resolveSwarmId({
     swarmId: args.swarm_id,
-    nativeSwarm: ctx.nativeSwarm,
     hostConversationId: ctx.hostConversationId,
     cwd: ctx.cwd,
     sessionsDir: ctx.sessionsDir,

@@ -35,13 +35,14 @@ import { runAppServer } from '../magpie_plugin/lib/app-server-run.mjs';
 import { compactSwarmView, groupWorkersByThreads, tokenizeBoardText } from '../mcp_app/swarm-ui.js';
 import { serveAppServerSocket } from './app-server-fixture.mjs';
 
-test('compact Swarm follows visible workers, board participants and the manual override', () => {
+test('compact Swarm follows visible workers, board activity and pending questions', () => {
   const overview = { swarm: { id: 'board' }, roster: [{ state: 'waiting' }, { state: 'killed' }] };
   assert.equal(compactSwarmView(overview), true);
-  assert.equal(compactSwarmView({ ...overview, counts: { visible: 0 } }), true);
-  assert.equal(compactSwarmView({ ...overview, counts: { active: 0, visible: 2 } }), false);
-  assert.equal(compactSwarmView(overview, [], true), false);
-  assert.equal(compactSwarmView(overview, [{ from_agent: 'alice' }]), true);
+  assert.equal(compactSwarmView({ ...overview, roster: [] }), false);
+  assert.equal(compactSwarmView({ ...overview, roster: [{ state: 'waiting_reply' }] }), false);
+  assert.equal(compactSwarmView({ ...overview, roster: [{ state: 'working' }, { state: 'waiting' }] }), false);
+  assert.equal(compactSwarmView(overview, [{ kind: 'system' }]), true);
+  assert.equal(compactSwarmView(overview, [{ from_agent: 'alice' }]), false);
   assert.equal(compactSwarmView(overview, [{ from_agent: 'alice' }, { from_agent: 'bob' }]), false);
   assert.equal(compactSwarmView(overview, [{ from_agent: 'alice', mentions: ['bob'] }]), false);
 });
@@ -1046,9 +1047,10 @@ test('Swarm UI helpers group threads, tokenize mentions safely, and built bundle
   ]);
 
   const builtHtml = readFileSync(join(REPO_ROOT, 'core', 'assets', 'http-ui', 'index.html'), 'utf8');
-  for (const id of ['tab-swarm', 'swarm-tab-badge', 'swarm-panel', 'swarm-subtab-overview', 'swarm-subtab-board', 'swarm-composer-input', 'swarm-sub-raw', 'swarm-hive-view', 'swarm-mentions-svg']) {
+  for (const id of ['tab-swarm', 'swarm-tab-badge', 'swarm-panel', 'swarm-subtab-overview', 'swarm-subtab-board', 'swarm-composer-input', 'swarm-subtab-graph', 'swarm-hive-view', 'swarm-mentions-svg']) {
     assert.ok(builtHtml.includes(`id="${id}"`), `built HTTP UI should contain #${id}`);
   }
+  assert.doesNotMatch(builtHtml, /swarm-sub-raw|swarm-toggle-full|routing-badge/);
   assert.doesNotMatch(builtHtml, /<meta\s+http-equiv=["']Content-Security-Policy["']/i);
 });
 

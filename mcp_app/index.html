@@ -29,7 +29,6 @@
     </nav>
     <div class="app-tools">
       <span id="magpie-status" class="connection-dot" role="status" data-state="checking" title="正在检查 Magpie 连接" aria-label="正在检查 Magpie 连接"></span>
-      <button id="routing-badge" class="routing-badge" type="button" title="查看工作分工" aria-label="查看工作分工" disabled>分工</button>
       <button id="language-toggle" class="language-toggle" type="button" disabled title="切换界面语言" aria-label="切换界面语言"><span lang="zh">中</span><span aria-hidden="true"> / </span><span lang="en">EN</span></button>
       <button id="refresh-btn" class="icon-btn" type="button" title="刷新当前页" aria-label="刷新当前页" data-icon="refresh"></button>
     </div>
@@ -74,7 +73,6 @@
           <h2 id="detail-title" class="detail-title" tabindex="-1">任务详情</h2>
           <span id="detail-status" class="detail-status"></span>
           <span id="detail-worktree" class="run-kind" hidden>独立 worktree</span>
-          <span id="unconfirmed-badge" class="unconfirmed-badge" hidden>远端终态未确认</span>
           <div class="top-actions">
             <button id="open-run-swarm" class="btn-ghost" type="button" hidden>查看协作</button>
             <button id="info-toggle" class="icon-btn" type="button" aria-expanded="false" aria-controls="meta-drawer" title="任务信息" aria-label="任务信息" data-icon="info"></button>
@@ -132,16 +130,11 @@
               <p id="ask-question" class="ask-q"></p>
               <p id="ask-context" class="ask-ctx" hidden></p>
               <ul id="ask-media" class="file-chips" hidden></ul>
-              <div id="reply-form" class="ask-reply" hidden>
+              <div class="ask-reply">
                 <input id="reply-message" class="steer-input" type="text" aria-label="回复提问" placeholder="回复提问…" required>
                 <button id="send-reply" class="btn-primary" type="button">发送回复</button>
               </div>
               <p id="reply-status" class="ask-hint" role="status" hidden></p>
-              <div class="ask-actions">
-                <button id="attach-context" class="btn-ghost" type="button" hidden>附带上下文到主对话</button>
-                <button id="remind-host" class="btn-ghost" type="button" hidden>在主对话中提醒处理</button>
-              </div>
-              <p id="ask-hint" class="ask-hint" hidden>请回到任务所属的主对话回复。</p>
             </section>
           </div>
         </section>
@@ -164,15 +157,13 @@
         <div class="swarm-identity">
           <select id="swarm-picker" class="swarm-picker" aria-label="切换 Swarm" hidden></select>
           <h1 id="swarm-title" class="swarm-title">Swarm 协作</h1>
-          <button id="swarm-edit-title" class="btn-ghost swarm-edit-btn" type="button" title="重命名 Swarm" aria-label="重命名 Swarm" hidden>改名</button>
+          <button id="swarm-edit-title" class="btn-ghost swarm-edit-btn" type="button" title="重命名 Swarm" aria-label="重命名 Swarm" hidden>✎</button>
         </div>
         <div class="top-actions swarm-header-actions">
           <div id="swarm-scope-switch" class="scope-switch" role="group" aria-label="Swarm 范围" hidden>
             <button id="swarm-scope-session" type="button" aria-pressed="true">当前会话</button>
             <button id="swarm-scope-all" type="button" aria-pressed="false">全部</button>
           </div>
-          <button id="swarm-toggle-full" class="btn-ghost" type="button" aria-controls="swarm-subtabs" aria-expanded="false" hidden>完整工作台</button>
-          <button id="swarm-refresh" class="icon-btn" type="button" title="刷新 Swarm" aria-label="刷新 Swarm" data-icon="refresh"></button>
         </div>
       </div>
       <form id="swarm-title-form" class="swarm-title-form" hidden>
@@ -183,10 +174,9 @@
       <p id="swarm-goal" class="swarm-goal" hidden></p>
       <div id="swarm-pills" class="swarm-pills" hidden></div>
       <div id="swarm-subtabs" class="swarm-subtabs" role="tablist" aria-label="Swarm 视图" hidden>
-        <button id="swarm-subtab-overview" type="button" role="tab" aria-selected="true" aria-controls="swarm-sub-overview">总览</button>
+        <button id="swarm-subtab-overview" type="button" role="tab" aria-selected="true" aria-controls="swarm-sub-overview">概览</button>
         <button id="swarm-subtab-board" type="button" role="tab" aria-selected="false" aria-controls="swarm-sub-board" tabindex="-1">消息板</button>
-        <button id="swarm-subtab-graph" type="button" role="tab" aria-selected="false" aria-controls="swarm-sub-graph" tabindex="-1">关系图</button>
-        <button id="swarm-subtab-raw" type="button" role="tab" aria-selected="false" aria-controls="swarm-sub-raw" tabindex="-1">原始数据</button>
+        <button id="swarm-subtab-graph" type="button" role="tab" aria-selected="false" aria-controls="swarm-sub-graph" tabindex="-1">图谱</button>
       </div>
     </header>
     <p id="swarm-error" class="notice" role="status" hidden></p>
@@ -226,7 +216,6 @@
     <section id="swarm-sub-overview" class="swarm-body" role="tabpanel" aria-labelledby="swarm-subtab-overview" hidden>
       <div id="swarm-view-overview" class="reading-column swarm-overview-col" hidden>
         <section id="swarm-attention" aria-label="需要关注" hidden></section>
-        <div id="swarm-team" aria-label="协作成员"></div>
         <div id="swarm-threads" class="swarm-threads"></div>
         <section id="swarm-screenshots-card" class="swarm-card swarm-screenshots-card" hidden>
           <header class="swarm-card-head">
@@ -248,17 +237,19 @@
             <div id="swarm-filters" class="sw-tool-row" hidden>
               <label>发送者 <select id="swarm-from"></select></label>
               <label>提及 <select id="swarm-mentioned"></select></label>
+            </div>
+            <div class="sw-tool-row">
               <label>频道 <select id="swarm-channel-filter"></select></label>
+              <details id="swarm-channel-actions">
+                <summary>管理频道</summary>
+                <form id="swarm-channel-form" class="sw-tool-row">
+                  <input id="swarm-channel-name" placeholder="频道名称" aria-label="频道名称" required maxlength="24" pattern="[a-z][a-z0-9\-]{0,23}">
+                  <input id="swarm-channel-topic" placeholder="主题（可选）" aria-label="主题（可选）">
+                  <button class="btn-primary" type="submit">创建</button>
+                </form>
+                <button id="swarm-archive" type="button" class="btn-ghost" hidden>归档频道</button>
+              </details>
             </div>
-            <div class="sw-tool-row"><div id="swarm-channel-tabs" class="sw-channels" role="group" aria-label="频道"></div>
-              <button id="swarm-new-channel" type="button" class="btn-ghost" aria-expanded="false" aria-controls="swarm-channel-form" hidden>新建频道</button>
-              <button id="swarm-archive" type="button" class="btn-ghost" hidden>归档频道</button>
-            </div>
-            <form id="swarm-channel-form" class="sw-tool-row" hidden>
-              <input id="swarm-channel-name" placeholder="频道名称" aria-label="频道名称" required maxlength="24" pattern="[a-z][a-z0-9\-]{0,23}">
-              <input id="swarm-channel-topic" placeholder="主题（可选）" aria-label="主题（可选）">
-              <button class="btn-primary" type="submit">创建</button>
-            </form>
           </section>
       </div></div>
       <div id="swarm-board-wrap" class="swarm-board-wrap">
@@ -294,7 +285,7 @@
           <div class="scope-switch" role="group" aria-label="图表视图">
             <button type="button" data-graph-mode="hive" aria-pressed="true">蜂巢</button><button type="button" data-graph-mode="mentions" aria-pressed="false">提及关系</button>
           </div>
-          <button type="button" id="swarm-export" class="btn-ghost">导出 GIF</button>
+          <button type="button" id="swarm-export" class="btn-ghost" hidden>导出提及 GIF</button>
         </div>
         <div class="sw-tool-row sw-playback" aria-label="回放控制">
           <button id="swarm-start" aria-label="回到起点" title="回到起点">⏮</button><button id="swarm-prev" aria-label="上一步" title="上一步">‹</button>
@@ -313,14 +304,6 @@
         <div id="swarm-legend"></div><p id="swarm-replay-caption"></p>
       </div>
     </section>
-    <section id="swarm-sub-raw" class="swarm-body" role="tabpanel" aria-labelledby="swarm-subtab-raw" hidden>
-      <div class="reading-column"><div class="sw-tool-row sw-raw-tools">
-        <div class="scope-switch" role="group" aria-label="数据文件">
-          <button data-raw="members" aria-pressed="true">members.json</button><button data-raw="board" aria-pressed="false">board.jsonl</button><button data-raw="plan" aria-pressed="false">plan.json</button>
-        </div><span id="swarm-raw-meta" role="status"></span><button id="swarm-raw-copy" class="btn-ghost">复制</button>
-      </div><pre id="swarm-raw-content" tabindex="0"></pre></div>
-    </section>
-
   </main>
   <!-- CONSOLE MARKUP -->
   <dialog id="console-copy-dialog" aria-labelledby="console-copy-label">

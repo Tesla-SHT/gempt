@@ -1,4 +1,4 @@
-# GemPT v0.10.0
+# GemPT v0.10.1
 
 [中文文档](./README.md) · [Antigravity Plugin README](./plugin/README.md) · [Third-Party Licenses](./THIRD_PARTY_LICENSES.txt)
 
@@ -10,7 +10,7 @@ Runtime code uses only Node.js built-in modules (`>= 22.13.0`). The GemPT panel 
 
 - **Node.js `>= 22.13.0`**
 - **Magpie `>= 0.1.1340`** ([yetone/magpie](https://github.com/yetone/magpie) / [usemagpie.ai](https://usemagpie.ai)), connected to at least one chat model. GPT is recommended. Set the gateway address in GemPT if using a custom endpoint.
-- **Magpie-side GemPT plugin `0.10.0`**: hosts the `Plugins → GemPT` control page and manages the shared Codex `app-server` (installing Codex CLI alone cannot replace it).
+- **Magpie-side GemPT plugin `0.10.1`**: hosts the `Plugins → GemPT` control page and manages the shared Codex `app-server` (installing Codex CLI alone cannot replace it).
 - **Codex CLI** (`npm install -g @openai/codex`, tested with `0.164.0`): required for `gpt_run` repository execution (optional if you only use `gpt_ask`).
 - **Git**: required when using `workspace="share"` for isolated worktrees.
 
@@ -22,7 +22,7 @@ Search for **GemPT** directly in the Magpie Plugin Marketplace, or install from 
 
 ```bash
 # Recommended: install from the GitHub release tag
-magpie plugin add github:yizhang-dream/gempt#v0.10.0
+magpie plugin add github:yizhang-dream/gempt#v0.10.1
 ```
 
 > **Note:** `gempt` is not yet published on the npm registry; do not run bare `magpie plugin add gempt` yet (it returns 404).
@@ -37,10 +37,10 @@ Installation targets the account running Magpie. For a custom layout, set `GEMPT
 
 ```bash
 # Recommended: one-command install from the GitHub release tag
-npx --yes github:yizhang-dream/gempt#v0.10.0 install-agy
+npx --yes github:yizhang-dream/gempt#v0.10.1 install-agy
 ```
 
-> **Note:** Since `gempt` is not yet published on the npm registry, use the GitHub tag above or install from a local checkout (bare `npx --yes gempt@0.10.0 install-agy` is not yet active).
+> **Note:** Since `gempt` is not yet published on the npm registry, use the GitHub tag above or install from a local checkout (bare `npx --yes gempt@0.10.1 install-agy` is not yet active).
 
 From a local checkout:
 - **Linux / macOS**: `bash install.sh`
@@ -76,7 +76,7 @@ The **中 / EN** control switches the interface immediately. Use **Overview → 
 
 ## Control Panel
 
-- **Native Swarm kernel and Workbench.** Assign workers with `gpt_swarm` and exchange messages by channel with `gpt_board`. In the Swarm Workbench, use Hive to inspect members and Mentions to trace who mentioned whom, export a replay as a GIF, manage channels, or inspect the underlying data in Raw.
+- **Native Swarm kernel and Workbench.** Assign workers with `gpt_swarm` and exchange messages by channel with `gpt_board`. Single tasks automatically appear in the conversation’s workbench. Manage channels on the Board, inspect the Hive in Graph, or export the Mentions replay as a GIF. Manual AGY `/swarm` workers use the same work split.
 - **MCP orchestration for Antigravity.** In **Plugins → GemPT**, pair Hydrogen, Neon, and Carbon with any model listed by the Magpie gateway (including custom Magpie group IDs you manage yourself; repository runs require Responses and tool support) or select the default Codex subscription model. The panel also controls reasoning effort, execution permissions, and Swarm, and shows actual token share. Work-split profiles are `0%` off, `15%` heavy-task hints, `35%` source-write gate, `60%` source-write plus a five-step read limit, and `80%` direct delegation plus a two-step read limit. Use `/gempt` for orchestration and `/gempt-chore` for utility consultations.
 
 ## Security & Permissions

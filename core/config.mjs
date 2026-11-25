@@ -8,7 +8,7 @@ import { RUNTIME_ROOT, resolvePluginRoot } from './bundle-paths.mjs';
 import { withLockSync } from './state.mjs';
 
 export const GEMPT_VERSION = readJsonSafe(join(RUNTIME_ROOT, 'package.json'))?.version
-  || readJsonSafe(join(resolvePluginRoot(), 'plugin.json'))?.version || '0.10.0';
+  || readJsonSafe(join(resolvePluginRoot(), 'plugin.json'))?.version || '0.10.1';
 export const TIER_ORDER = ['sonnet', 'opus', 'fable'];
 export const TIER_ALIASES = { lite: 'sonnet', mid: 'opus', max: 'fable' };
 export const VALID_SANDBOXES = ['read-only', 'workspace-write', 'danger-full-access'];
@@ -18,7 +18,6 @@ export const VALID_FAILOVER_MODES = ['subscription_only', 'api_fallback'];
 export const FEATURES = Object.freeze({ api_fallback: true });
 export const DEFAULT_MAGPIE_URL = 'http://127.0.0.1:3425';
 export const DEFAULT_MCP_EFFORT = 'medium';
-export const SAFE_MODEL_ID = /^[A-Za-z0-9._:/@-]{1,128}$/;
 export const UI_LANGUAGES = ['auto', 'zh', 'en'];
 export const UTILITY_EFFORTS = ['', 'low', 'medium', 'high'];
 export const DEFAULT_CONSULT_TIMEOUT_SEC = 180;
@@ -109,14 +108,6 @@ export function isCodexModelId(modelId) {
 export function getMcpEffort(policy) {
   const effort = String(policy?.mcp_effort || '').trim().toLowerCase();
   return VALID_EFFORTS.includes(effort) && effort !== 'ultra' ? effort : DEFAULT_MCP_EFFORT;
-}
-
-export function getNativeSwarmPolicy(policy) {
-  return {
-    native_swarm: typeof policy?.native_swarm === 'boolean' ? policy.native_swarm : WORKLOAD.native_swarm,
-    swarm_shell_model: isSafeModelId(policy?.swarm_shell_model)
-      ? policy.swarm_shell_model : WORKLOAD.swarm_shell_model,
-  };
 }
 
 export function getPairing(policy, family) {
@@ -211,7 +202,7 @@ export function readExistingConfigObject(configPath) {
     return {
       ok: false,
       status: 404,
-      error: '尚未启用 GemPT 配置，请先在页面上方点“一键启用订阅配置”，或在 Antigravity 中运行 /gempt。',
+      error: '尚未启用 GemPT 配置，请在 Antigravity 中运行 /gempt。',
     };
   }
   let current;
@@ -239,6 +230,12 @@ export function writeConfigAtomic(resolvedConfigPath, nextObj) {
   mkdirSync(parentDir, { recursive: true });
   const tmpFile = join(parentDir, `.config.json.tmp.${process.pid}.${randomUUID()}`);
   try {
+    // Old config files stay usable until any writer next persists them.
+    if (nextObj.routing_policy && typeof nextObj.routing_policy === 'object') {
+      const policy = { ...nextObj.routing_policy };
+      for (const key of ['native_swarm', 'swarm_shell_model', 'swarm_shell_models', 'swarm_split']) delete policy[key];
+      nextObj = { ...nextObj, routing_policy: policy };
+    }
     writeFileSync(tmpFile, JSON.stringify(nextObj, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600, flag: 'wx' });
     renameSync(tmpFile, resolvedConfigPath);
     return { ok: true, status: 200, path: resolvedConfigPath };
@@ -315,16 +312,11 @@ export function editPairing(loaded, family, model) {
   return { next: { ...loaded.data, routing_policy: { ...policy, pairings: { ...policy?.pairings, [family]: model } } } };
 }
 
-export function setWorkSplit(key, profile, { configPath } = {}) {
-  return withConfigTransaction(configPath, (loaded) => editWorkSplit(loaded, key, profile));
-}
-
-export function editWorkSplit(loaded, key, profile) {
-  if (!['work_split', 'swarm_split'].includes(key) ||
-      typeof profile !== 'string' || !(Object.hasOwn(WORKLOAD.profiles, profile) || (key === 'swarm_split' && profile === 'inherit'))) {
+export function editWorkSplit(loaded, profile) {
+  if (typeof profile !== 'string' || !Object.hasOwn(WORKLOAD.profiles, profile)) {
     return { ok: false, status: 400, error: '请选择有效的工作分工档位。' };
   }
-  return { next: { ...loaded.data, routing_policy: { ...loaded.data.routing_policy, [key]: profile } } };
+  return { next: { ...loaded.data, routing_policy: { ...loaded.data.routing_policy, work_split: profile } } };
 }
 
 export function setDefaultSandbox(sandbox, { configPath } = {}) {
@@ -462,7 +454,6 @@ export function validateEffortSettings({ mcpEffort, tierEffort, tier, autoEffort
 
 const cleanText = (value) => typeof value === 'string' && !/[\p{Cc}\p{Zl}\p{Zp}]/u.test(value);
 const cleanArray = (value) => Array.isArray(value) && value.every((item) => cleanText(item) && item.trim());
-export const isSafeModelId = (value) => cleanText(value) && SAFE_MODEL_ID.test(value);
 export const isPairingModelId = (value) => cleanText(value) && value.length > 0 && value.trim() === value;
 
 export function normalizeGatewayUrl(value) {
@@ -487,7 +478,7 @@ const settingRules = {
     api_key_env: (value) => cleanText(value) && /^(?:[A-Za-z_][A-Za-z0-9_]*)?$/.test(value),
     clear_api_key: (value) => typeof value === 'boolean',
   },
-  routing_policy: { swarm_shell_model: isSafeModelId, excluded_models: cleanArray },
+  routing_policy: { excluded_models: cleanArray },
   utility: { model: (value) => cleanText(value) && /^\S{1,256}$/u.test(value.trim()), reasoning_effort: (value) => UTILITY_EFFORTS.includes(value) },
   codex: { cli_path: cleanText, extra_args: cleanArray },
   execution: {
