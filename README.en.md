@@ -1,4 +1,4 @@
-# GemPT v0.9.0
+# GemPT v0.9.1
 
 [中文文档](./README.md) · [Antigravity Plugin README](./plugin/README.md) · [Third-Party Licenses](./THIRD_PARTY_LICENSES.txt)
 
@@ -10,7 +10,7 @@ Runtime code uses only Node.js built-in modules (`>= 22.13.0`). The GemPT panel 
 
 - **Node.js `>= 22.13.0`**
 - **Magpie `>= 0.1.1340`** ([yetone/magpie](https://github.com/yetone/magpie) / [usemagpie.ai](https://usemagpie.ai)), connected to at least one chat model. GPT is recommended. Set the gateway address in GemPT if using a custom endpoint.
-- **Magpie-side GemPT plugin `0.9.0`**: hosts the `Plugins → GemPT` control page and manages the shared Codex `app-server` (installing Codex CLI alone cannot replace it).
+- **Magpie-side GemPT plugin `0.9.1`**: hosts the `Plugins → GemPT` control page and manages the shared Codex `app-server` (installing Codex CLI alone cannot replace it).
 - **Codex CLI** (`npm install -g @openai/codex`, tested with `0.164.0`): required for `gpt_run` repository execution (optional if you only use `gpt_ask`).
 - **Git**: required when using `workspace="share"` for isolated worktrees.
 
@@ -22,7 +22,7 @@ Search for **GemPT** directly in the Magpie Plugin Marketplace, or install from 
 
 ```bash
 # Recommended: install from the GitHub release tag
-magpie plugin add github:yizhang-dream/gempt#v0.9.0
+magpie plugin add github:yizhang-dream/gempt#v0.9.1
 ```
 
 > **Note:** `gempt` is not yet published on the npm registry; do not run bare `magpie plugin add gempt` yet (it returns 404).
@@ -37,10 +37,10 @@ Installation targets the account running Magpie. For a custom layout, set `GEMPT
 
 ```bash
 # Recommended: one-command install from the GitHub release tag
-npx --yes github:yizhang-dream/gempt#v0.9.0 install-agy
+npx --yes github:yizhang-dream/gempt#v0.9.1 install-agy
 ```
 
-> **Note:** Since `gempt` is not yet published on the npm registry, use the GitHub tag above or install from a local checkout (bare `npx --yes gempt@0.9.0 install-agy` is not yet active).
+> **Note:** Since `gempt` is not yet published on the npm registry, use the GitHub tag above or install from a local checkout (bare `npx --yes gempt@0.9.1 install-agy` is not yet active).
 
 From a local checkout:
 - **Linux / macOS**: `bash install.sh`

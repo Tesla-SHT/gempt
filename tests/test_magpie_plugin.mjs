@@ -25,6 +25,20 @@ import { waitForRun } from '../core/runs.mjs';
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
+test('remote turn lookup requires matching thread history or confirmed inactivity', async () => {
+  const { readServerTurn } = await import('../magpie_plugin/lib/app-server-client.mjs');
+  const lookup = (thread) => readServerTurn({ async request(method, params) {
+    assert.equal(method, 'thread/read');
+    assert.deepEqual(params, { threadId: 'th', includeTurns: true });
+    return { thread };
+  } }, 'th', 'tu');
+  const terminal = { id: 'tu', status: 'interrupted' };
+  assert.deepEqual(await lookup({ id: 'th', turns: [terminal] }), terminal);
+  assert.equal(await lookup({ id: 'another', turns: [terminal] }), null);
+  assert.equal(await lookup({ id: 'th', turns: [], status: { type: 'active' } }), null);
+  assert.equal((await lookup({ id: 'th', turns: [], status: { type: 'idle' } })).status, 'failed');
+});
+
 test('thread cache keys expire after inactivity and evict least recently used mappings', () => {
   let time = 0;
   const keys = createThreadCacheKeys({ limit: 2, ttl: 10, now: () => time });
@@ -286,7 +300,7 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files, version }] = JSON.parse(stdout);
-  assert.equal(version, '0.9.0');
+  assert.equal(version, '0.9.1');
   const paths = files.map((file) => file.path);
   assert.deepEqual(paths.filter((path) => /^plugin\/skills\/[^/]+\/SKILL\.md$/.test(path)).sort(),
     ['plugin/skills/gempt-chore/SKILL.md', 'plugin/skills/gempt/SKILL.md']);
@@ -2678,7 +2692,7 @@ test('mcpTools false disables duplicate Magpie GemPT tool registration', async (
 
 test('Magpie marketplace check shape and inspect+share guard hold', async () => {
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '0.9.0');
+  assert.equal(pkg.version, '0.9.1');
   assert.ok(pkg.keywords.includes('magpie-plugin'));
   assert.ok(pkg.files.includes('THIRD_PARTY_LICENSES.txt'));
   assert.ok(pkg.magpie?.summary?.en && pkg.magpie?.summary?.zh);

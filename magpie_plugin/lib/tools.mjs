@@ -867,7 +867,7 @@ export function createExecutionTools({
         if (args.run_id !== undefined) {
           const record = readNativeRun(resolvedSessionsDir, args.run_id);
           normalizeWorkspaceCwd(record.cwd, { configPath, magpieConfigDir: resolvedMagpieDir, env });
-          return args.wait_sec ? waitForNativeRun(resolvedSessionsDir, args.run_id, args.wait_sec) : record;
+          return waitForNativeRun(resolvedSessionsDir, args.run_id, args.wait_sec || 0, { configPath, env });
         }
         const execEnabled = isExecEnabled(options, env);
         const state = await readState({

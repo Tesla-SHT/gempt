@@ -1,17 +1,24 @@
-import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { launchDetached, pidAlive } from '../magpie_plugin/lib/app-server-process.mjs';
 import { randomUUID } from 'node:crypto';
-import { accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmdirSync, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, readdirSync, rmdirSync, rmSync, statSync } from 'node:fs';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { connectAppServer, readAppServerState, TERMINAL_INTERRUPT_ERR, textInput, UNAVAILABLE } from '../magpie_plugin/lib/app-server-client.mjs';
+import { connectAppServer, readAppServerState, readServerTurn, terminalTurn, TERMINAL_INTERRUPT_ERR, textInput, UNAVAILABLE } from '../magpie_plugin/lib/app-server-client.mjs';
 import { normalizeTitle, readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
 import { getMcpEffort } from './config.mjs';
 import { resolveExecTimeoutSec, validateExecTimeoutSec } from '../magpie_plugin/lib/routing.mjs';
 import { resolveNodeExecutable } from './node-executable.mjs';
 import { readHostContext } from './host-context.mjs';
-import { atomicJson, resolvePath, validateSessionId, withLock, withinPath } from './state.mjs';
+import { atomicJson, resolvePath, validateSessionId, withLock, withLockSync, withinPath } from './state.mjs';
 import { ensureShareWorktree, recordInWorkspace, recordSourceCwd, resolveExternalWorktreeSourceCwd, samePath } from './worktrees.mjs';
+
+import { turnEvidence } from './run-journal.mjs';
+
+const threadOf = (r) => r.codex_thread_id || r.thread_id || r.progress?.thread_id;
+const turnOf = (r) => r.turn_id || r.progress?.turn_id;
+const codexRun = (r) => (r.cli || 'codex') === 'codex';
 
 export const ACTIVE_STATES = new Set(['queued', 'running', 'waiting_gemini']);
 export { EXEC_TIMEOUT_MIN_SEC, EXEC_TIMEOUT_MAX_SEC, validateExecTimeoutSec } from '../magpie_plugin/lib/routing.mjs';
@@ -65,14 +72,9 @@ function fileVersion(stat) {
   return stat && `${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
 }
 
-export function readRun(runId, sessionsDir, { stat, readonly = false, allowLegacyId = false } = {}) {
-  const path = join(runDirectory(runId, sessionsDir), 'state.json');
-  stat ??= statSync(path, { throwIfNoEntry: false });
-  const version = fileVersion(stat);
-  const cached = stateCache.get(path);
-  let data = version && cached?.version === version ? cached.data : undefined;
+function loadState(path, runId, allowLegacyId) {
+  let data;
   for (let attempt = 0; ; attempt++) {
-    if (data) break;
     try {
       data = JSON.parse(readFileSync(path, 'utf8'));
       break;
@@ -84,45 +86,111 @@ export function readRun(runId, sessionsDir, { stat, readonly = false, allowLegac
   }
   const storedId = data?.run_id || (allowLegacyId ? runId : undefined);
   if (storedId !== runId || typeof data?.state !== 'string') throw new Error('Run state does not match the requested ID.');
+  if (allowLegacyId && !data.run_id) data.run_id = runId;
+  return data;
+}
+
+function applyTerminal(record, turn, evidence = {}) {
+  record.state = turn.status === 'completed' ? 'finished' : turn.status;
+  record.finished_at = Number.isFinite(turn.completedAt) ? new Date(turn.completedAt * 1000).toISOString()
+    : record.finished_at || new Date().toISOString();
+  record.waiting_since = record.pending_tool_call = null;
+  record.progress = { ...record.progress, phase: record.state, updated_at: record.finished_at };
+  if (record.state === 'finished') {
+    const text = turn.items?.filter((item) => item.type === 'agentMessage').map((item) => item.text).filter(Boolean).join('\n\n')
+      || evidence.text || record.result?.text || record.progress.last_message || '';
+    record.result = { cli: record.cli || 'codex', model: record.model, ...record.result, session_id: record.session_id, codex_thread_id: threadOf(record), turn_id: turn.id,
+      text, usage: evidence.usage ?? turn.usage ?? record.result?.usage ?? record.progress.token_usage ?? {} };
+    delete record.error;
+  } else {
+    record.error = turn.error?.message || (record.cli || 'Codex') + ' turn ' + turn.status + '.';
+  }
+  delete record.remote_turn_unconfirmed;
+  delete record.unconfirmed_at;
+  return record;
+}
+
+export function readRun(runId, sessionsDir, { stat, readonly = false, allowLegacyId = false } = {}) {
+  const path = join(runDirectory(runId, sessionsDir), 'state.json');
+  stat ??= statSync(path, { throwIfNoEntry: false });
+  const version = fileVersion(stat);
+  const cached = stateCache.get(path);
+  let data = version && cached?.version === version ? cached.data : undefined;
+  data ??= loadState(path, runId, allowLegacyId);
   if (version && cached?.version !== version) {
     stateCache.delete(path);
     if (stateCache.size >= 1024) stateCache.delete(stateCache.keys().next().value);
     stateCache.set(path, { version, data });
   }
   // Reconcile time and worker liveness even when the file has not changed.
-  const record = readonly ? { ...data } : structuredClone(data);
-  reconcileRunState(record, () => stat?.mtimeMs);
+  let record = readonly ? { ...data } : structuredClone(data);
+  reconcileRunState(record, () => stat?.mtimeMs, true);
+  const changed = record.state !== data.state || record.remote_turn_unconfirmed !== data.remote_turn_unconfirmed;
+  if (changed && !(ACTIVE_STATES.has(data.state) && pidAlive(data.pid))) {
+    // Once the process is dead its final atomic rename is visible, even if the
+    // caller supplied an earlier stat. Serialize competing recovery readers.
+    record = withLockSync(join(dirname(path), 'reconcile.lock'), () => {
+      const fresh = loadState(path, runId, allowLegacyId);
+      const before = fresh.state;
+      const staleCli = !codexRun(fresh) && fresh.remote_turn_unconfirmed;
+      reconcileRunState(fresh, () => statSync(path).mtimeMs, true);
+      if (fresh.state !== before || staleCli) {
+        if (turnOf(fresh)) {
+          const evidence = turnEvidence(join(dirname(path), 'events.jsonl'), threadOf(fresh), turnOf(fresh));
+          if (terminalTurn(evidence.terminal)) applyTerminal(fresh, evidence.terminal, evidence);
+        }
+        if (fresh.state !== 'outcome_unknown') fresh.finished_at ||= new Date().toISOString();
+        fresh.waiting_since = null;
+        saveRun(path, fresh);
+      }
+      return fresh;
+    });
+  }
   const source = recordSourceCwd(record);
   if (source) record.source_cwd = source;
   record.title = normalizeTitle(record.title, record.goal, source || record.cwd);
   return record;
 }
 
-export function reconcileRunState(record, modifiedAt) {
+export function reconcileRunState(record, modifiedAt, deferToWorker = false) {
+  if (!codexRun(record) && record.remote_turn_unconfirmed) {
+    record.state = 'failed';
+    record.error = record.cli + ' worker exited without saving its result.';
+    record.pending_tool_call = null;
+    delete record.remote_turn_unconfirmed;
+    delete record.unconfirmed_at;
+  }
   if (!ACTIVE_STATES.has(record.state)) return record;
   const hasPid = Number.isInteger(record.pid) && record.pid > 0;
-  const created = record.state === 'queued' && !hasPid ? Date.parse(record.created_at) : null;
+  const created = record.state === 'queued' && (!hasPid || record.source === 'magpie_exec') ? Date.parse(record.created_at) : null;
   if (created !== null && Date.now() - (Number.isFinite(created) ? created : modifiedAt?.() ?? Infinity) >= STARTUP_GRACE_MS) {
-    return Object.assign(record, { state: 'failed', error: 'Codex worker startup timed out after 60s.',
+    return Object.assign(record, { state: 'failed', error: 'Execution worker startup timed out after 60s.',
       pending_tool_call: null });
   }
   const expired = record.state !== 'waiting_gemini' && now() > (record.deadline ?? Infinity);
-  let deadPid = false;
-  if (record.source === 'magpie_exec' && hasPid) {
-    try { process.kill(record.pid, 0); } catch (error) { deadPid = error.code === 'ESRCH'; }
-  }
+  const managed = record.source === 'magpie_exec' && hasPid;
+  const deadPid = managed && !pidAlive(record.pid);
+  // Give a live worker time to interrupt and save at its deadline. A hung
+  // process can still time out to readers, but retains ownership of its file.
+  if (managed && !deadPid && deferToWorker && now() <= record.deadline + 10) return record;
   if (!expired && !deadPid) return record;
   const phase = record.progress?.phase;
-  const threadId = record.codex_thread_id || record.thread_id || record.progress?.thread_id;
-  const turnId = record.turn_id || record.progress?.turn_id;
+  const threadId = threadOf(record);
+  const turnId = turnOf(record);
   record.pending_tool_call = null;
-  if (phase === 'connecting' && !threadId && !turnId) {
+  if (['completed', 'interrupted', 'failed'].includes(phase)) {
+    return applyTerminal(record, { id: turnId, status: phase, error: { message: record.error } });
+  }
+  if (!codexRun(record)) {
+    record.state = 'failed';
+    record.error = record.cli + (deadPid ? ' worker exited without saving its result.' : ' worker timed out.');
+  } else if (deadPid && !threadId && !turnId && !phase) {
+    record.state = 'failed';
+    record.error = 'Worker process exited before starting a turn.';
+  } else if (phase === 'connecting' && !threadId && !turnId) {
     record.state = 'failed';
     record.error = deadPid ? 'Worker process exited before connecting to Codex app-server (phase: connecting).'
       : 'Worker timed out connecting to Codex app-server.';
-  } else if (['interrupted', 'failed', 'completed'].includes(phase)) {
-    record.state = phase === 'completed' ? (record.result ? 'finished' : 'failed') : phase;
-    if (phase === 'completed' && !record.result) record.error = 'Codex turn completed before the worker saved its result.';
   } else {
     record.state = 'outcome_unknown';
     if (turnId) {
@@ -139,6 +207,62 @@ export function reconcileRunState(record, modifiedAt) {
   delete record.remote_turn_unconfirmed;
   delete record.unconfirmed_at;
   return record;
+}
+
+async function notifyRecovered(record, options) {
+  if (!record.swarm_id || !record.swarm_agent) return;
+  const { onWorkerTurnFinished } = await import('./swarm-engine.mjs');
+  await onWorkerTurnFinished({ ...options, swarmId: record.swarm_id, swarmAgent: record.swarm_agent,
+    runId: record.run_id, sessionId: record.session_id, startedAt: record.started_at,
+    outcome: record, result: record.result, error: record.error, recovered: true });
+}
+
+async function settleTurn(record, turn, options, evidence) {
+  const directory = runDirectory(record.run_id, options.sessionsDir);
+  const path = join(directory, 'state.json');
+  const updated = withLockSync(join(directory, 'reconcile.lock'), () => {
+    const fresh = loadState(path, record.run_id, true);
+    if ((!fresh.remote_turn_unconfirmed && !ACTIVE_STATES.has(fresh.state)) ||
+        turnOf(fresh) !== turn.id || threadOf(fresh) !== threadOf(record)) return null;
+    evidence ??= turn.id ? turnEvidence(join(directory, 'events.jsonl'), threadOf(record), turn.id) : {};
+    applyTerminal(fresh, terminalTurn(evidence.terminal) ? { ...turn, ...evidence.terminal } : turn, evidence);
+    if (options.interruptConfirmed) fresh.interrupt_confirmed_at = new Date().toISOString();
+    saveRun(path, fresh);
+    return fresh;
+  });
+  if (updated) await notifyRecovered(updated, options);
+  return readRun(record.run_id, options.sessionsDir, { allowLegacyId: true });
+}
+
+const pendingProbes = new Map();
+const retryAfter = new Map();
+
+export async function refreshRun(record, options = {}) {
+  const threadId = threadOf(record), turnId = turnOf(record);
+  if (!record.remote_turn_unconfirmed || !codexRun(record) || !threadId || !turnId) return record;
+  const directory = runDirectory(record.run_id, options.sessionsDir);
+  if (pendingProbes.has(directory)) return pendingProbes.get(directory);
+  if (Date.now() < (retryAfter.get(directory) || 0)) return record;
+  const probe = async () => {
+    const evidence = turnEvidence(join(directory, 'events.jsonl'), threadId, turnId);
+    let turn = evidence.terminal;
+    if (!terminalTurn(turn)) {
+      let client;
+      try {
+        const state = readAppServerState(record.config_path || options.configPath, options.env);
+        client = await connectAppServer(state);
+        turn = await readServerTurn(client, threadId, turnId);
+      } catch { /* Older or unavailable servers cannot confirm this turn. */ }
+      finally { client?.close(); }
+    }
+    if (terminalTurn(turn)) return settleTurn(record, turn, options, evidence);
+    if (retryAfter.size >= 512) retryAfter.delete(retryAfter.keys().next().value);
+    retryAfter.set(directory, Date.now() + 2000);
+    return readRun(record.run_id, options.sessionsDir, { allowLegacyId: true });
+  };
+  pendingProbes.set(directory, probe());
+  try { return await pendingProbes.get(directory); }
+  finally { pendingProbes.delete(directory); }
 }
 
 function normalizeRunIds(runIds) {
@@ -195,12 +319,13 @@ export function buildBoardWaitCommand(swarmId, { since = 0, mentionsOnly = true,
   return formatWaitInvocation(parts.join(' '), env);
 }
 
-export async function waitForRuns(runIds, { waitAll = false, timeoutSec, sessionsDir, pollInterval = 0.25 } = {}) {
+export async function waitForRuns(runIds, { waitAll = false, timeoutSec, sessionsDir, env, configPath, pollInterval = 0.25 } = {}) {
   const ids = normalizeRunIds(runIds);
   if (timeoutSec != null && !Number.isFinite(timeoutSec) && timeoutSec !== Infinity) throw new Error('Invalid wait timeout.');
   const deadline = timeoutSec == null ? Infinity : performance.now() + timeoutSec * 1000;
   while (true) {
-    const runs = Object.fromEntries(ids.map((id) => [id, readRun(id, sessionsDir)]));
+    const runs = Object.fromEntries(await Promise.all(ids.map(async (id) =>
+      [id, await refreshRun(readRun(id, sessionsDir), { sessionsDir, env, configPath })])));
     const active = ids.filter((id) => pending(runs[id].state));
     const ready = ids.filter((id) => !pending(runs[id].state));
     const remaining = deadline - performance.now();
@@ -225,8 +350,8 @@ async function controlRun(runId, method, message, {
   configPath, sessionsDir, env = process.env, getState, connect = connectAppServer, confirmMs = 500,
 } = {}) {
   const record = readRun(runId, sessionsDir);
-  const threadId = record.codex_thread_id || record.thread_id || record.progress?.thread_id;
-  const turnId = record.turn_id || record.progress?.turn_id;
+  const threadId = threadOf(record);
+  const turnId = turnOf(record);
   const isInterrupt = method === 'turn/interrupt';
   const isActive = ['running', 'waiting_gemini'].includes(record.state);
   const isUnconfirmed = Boolean(record.remote_turn_unconfirmed);
@@ -248,26 +373,13 @@ async function controlRun(runId, method, message, {
     }
     throw runError(`CLI '${cli}' does not support mid-turn steer; message will be delivered on the next turn.`, 409);
   }
-  function confirmInterrupt(status, error, note) {
-    const file = join(runDirectory(runId, sessionsDir), 'state.json');
-    const updated = readRun(runId, sessionsDir);
-    updated.interrupt_confirmed_at = new Date().toISOString();
-    delete updated.remote_turn_unconfirmed;
-    delete updated.unconfirmed_at;
-    if (updated.state === 'outcome_unknown' || (ACTIVE_STATES.has(updated.state) && !pidAlive(updated.pid))) {
-      updated.state = status;
-      updated.error = error;
-      updated.finished_at ||= updated.interrupt_confirmed_at;
-      updated.pending_tool_call = null;
-      updated.waiting_since = null;
-      updated.progress = { ...updated.progress, phase: status, updated_at: updated.interrupt_confirmed_at };
-    }
-    saveRun(file, updated);
+  async function confirmInterrupt(turn, note) {
+    await settleTurn(record, turn, { sessionsDir, configPath, env, interruptConfirmed: true });
     return { ok: true, run_id: runId, session_id: record.session_id, thread_id: threadId ?? null,
       turn_id: turnId ?? null, cleared_unconfirmed: true, ...(note ? { note } : {}) };
   }
   if (isInterrupt && isUnconfirmed && (!threadId || !turnId)) {
-    return confirmInterrupt('failed', 'Worker stopped without a remote turn identity.');
+    return confirmInterrupt({ id: turnId, status: 'failed', error: { message: 'Worker stopped without a remote turn identity.' } });
   }
   if ((!isActive && !(isInterrupt && isUnconfirmed)) || !threadId || !turnId) {
     throw runError(`Run ${runId} has no active Codex turn.`, 409);
@@ -275,7 +387,7 @@ async function controlRun(runId, method, message, {
   let client;
   let observedTerminal;
   let resolveTerminal;
-  const onEvent = isInterrupt && isUnconfirmed ? ({ method: evMethod, params: event }) => {
+  const onEvent = isInterrupt ? ({ method: evMethod, params: event }) => {
     if (evMethod === 'turn/completed' && event?.threadId === threadId && event.turn?.id === turnId) {
       observedTerminal = event.turn;
       resolveTerminal?.(observedTerminal);
@@ -295,7 +407,7 @@ async function controlRun(runId, method, message, {
     try {
       await client.request(method, params);
     } catch (error) {
-      if (isInterrupt && isUnconfirmed && !client.disconnected && TERMINAL_INTERRUPT_ERR.test(String(error?.message || ''))) {
+      if (isInterrupt && !client.disconnected && TERMINAL_INTERRUPT_ERR.test(String(error?.message || ''))) {
         note = String(error.message);
       } else if (!observedTerminal) {
         throw error;
@@ -308,14 +420,20 @@ async function controlRun(runId, method, message, {
         client.onFailure?.(() => { clearTimeout(timer); resolveTerminal = undefined; resolve(); });
       });
     }
+    if (isInterrupt && (note || isUnconfirmed) && !terminalTurn(observedTerminal)) {
+      try {
+        const snapshot = await readServerTurn(client, threadId, turnId);
+        observedTerminal ??= snapshot;
+      } catch { /* Use explicit interrupt evidence. */ }
+    }
   } finally {
     client.close();
   }
-  if (isInterrupt && isUnconfirmed) {
-    if (observedTerminal?.status === 'interrupted' || (!observedTerminal && !note)) {
-      return confirmInterrupt('interrupted', 'Codex turn interrupted.');
-    }
-    return confirmInterrupt('failed', observedTerminal?.error?.message || note || 'Codex turn ended without a saved result.', note);
+  if (isInterrupt && terminalTurn(observedTerminal) && (isUnconfirmed || note || !pidAlive(record.pid))) {
+    return confirmInterrupt(observedTerminal, note);
+  }
+  if (isInterrupt && note && !observedTerminal) {
+    return confirmInterrupt({ id: turnId, status: 'failed', error: { message: note } }, note);
   }
   return { ok: true, run_id: runId, session_id: record.session_id, thread_id: threadId, turn_id: turnId };
 }
@@ -466,6 +584,10 @@ export async function dispatchRun(args, {
   let worktreePath = null;
   let record;
   try {
+    if (args.session_id) {
+      const [prior] = listActiveRoster({ limit: 1, sessionId, sessionsDir: sessions });
+      if (prior?.remote_turn_unconfirmed) await refreshRun(readRun(prior.run_id, sessions), { sessionsDir: sessions, configPath: config, env });
+    }
     await withLock(join(sessions, `${sessionId}.dispatch.lock`), async () => {
       if (args.session_id) {
         const [busy] = listActiveRoster({ limit: 1, sessionId, sessionsDir: sessions, includeUnconfirmed: true });
@@ -524,24 +646,24 @@ export async function dispatchRun(args, {
     ...(args.swarm_agent ? { GEMPT_AGENT_NAME: String(args.swarm_agent) } : {}),
     GEMPT_SESSIONS_DIR: sessions,
   } : env;
+  const packetPath = join(directory, 'dispatch.json');
   try {
-    const stderr = openSync(join(directory, 'worker.stderr.log'), 'a', 0o600);
-    let child;
-    try {
-      child = spawn(resolveNodeExecutable({ env }), [workerPath], {
-        env: childEnv, windowsHide: true, detached: true, stdio: ['pipe', 'ignore', stderr],
-      });
-    } finally {
-      closeSync(stderr);
-    }
-    const packet = JSON.stringify({ file, record, args: request, host, agent });
-    await new Promise((resolve, reject) => {
-      child.once('error', reject);
-      child.stdin.once('error', reject);
-      child.once('spawn', () => child.stdin.end(packet, resolve));
+    atomicJson(packetPath, { file, record, args: request, host, agent });
+    const child = await launchDetached(resolveNodeExecutable({ env }), [workerPath, '--packet', packetPath], {
+      cwd: process.cwd(), env: childEnv, windowsHide: true, detached: true, stdio: 'ignore',
     });
-    child.unref();
+    if (!child.pid) await once(child, 'spawn');
+    child.unref?.();
+    record.pid = child.pid;
+    // The worker may already have published a newer state while CIM returned its PID.
+    await withLock(join(sessions, sessionId + '.dispatch.lock'), () => {
+      const latest = readJsonSafe(file);
+      if (latest?.state === 'queued') saveRun(file, { ...latest, pid: child.pid });
+      else if (latest) record = latest;
+    }, { attempts: 80, delayMs: 25 });
   } catch (error) {
+    if (record.pid) throw error;
+    rmSync(packetPath, { force: true });
     saveRun(file, { ...record, state: 'failed', error: error.message, finished_at: new Date().toISOString() });
     throw error;
   }
@@ -550,11 +672,6 @@ export async function dispatchRun(args, {
   if (legacyNative || ACTIVE_STATES.has(result.state) || result.state === 'interrupted') return result;
   if (!result.result) throw new Error(`${id}: ${result.error || result.state}`);
   return { ...result.result, run_id: id, state: 'finished', execution_timeout_sec: result.execution_timeout_sec };
-}
-
-function pidAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid < 1) return false;
-  try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }
 }
 
 export async function tryDelegateDispatch(args, {

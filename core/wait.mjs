@@ -3,7 +3,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
-import { ACTIVE_STATES, compactReceiptText, readRun, waitForRuns } from './runs.mjs';
+import { ACTIVE_STATES, compactReceiptText, waitForRuns } from './runs.mjs';
 import { boardPostPreview, detectSystemAttention, getBoardHead, listChannels, listRoster, mentionMatchesAgent, openSwarmDb, readBoardMessages } from './swarm-bus.mjs';
 
 import { ALL, activeAt, countsUnread, mentionsIn } from './swarm-channels.mjs';
@@ -142,11 +142,7 @@ export async function runWait(args, { sessionsDir, readOnly = false } = {}) {
     }
     const waitAll = Boolean(values.all || values['wait-all']);
     const wait = !readOnly || values.wait || waitAll;
-    const result = wait ? await waitForRuns(ids, { waitAll, sessionsDir }) : (() => {
-      const runs = Object.fromEntries(ids.split(',').map((id) => id.trim()).filter(Boolean).map((id) => [id, readRun(id, sessionsDir)]));
-      const active = Object.keys(runs).filter((id) => ['queued', 'running'].includes(runs[id].state));
-      return { active, ready: Object.keys(runs).filter((id) => !active.includes(id)), runs };
-    })();
+    const result = await waitForRuns(ids, { waitAll, sessionsDir, timeoutSec: wait ? undefined : 0 });
     const runs = wait ? Object.fromEntries(Object.entries(result.runs).map(([id, record]) => [id, compactRecord(record)])) : result.runs;
     const records = Object.values(runs);
     const single = !values['run-ids'] && records.length === 1;

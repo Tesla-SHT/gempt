@@ -267,9 +267,7 @@ async function getOverview(args, options) {
   const roots = workspaceScope(options);
   const db = await openSwarmDb(sessionsDir);
   try {
-    const overview = await getSwarmOverview(swarmId, { messageLimit: 0, db, analytics: true });
-    if (!overview) throw notFound();
-    if (!swarmInScope(overview.swarm, roots)) throw forbidden();
+    const overview = await assertExistingScopedSwarm(swarmId, sessionsDir, roots, { db, analytics: true });
     const counts = countRosterStates(overview.roster);
     const screenshots = collectScreenshots(db, overview.swarm, overview.roster, roots);
     return {
@@ -292,9 +290,7 @@ async function getBoard(args, options) {
   const roots = workspaceScope(options);
   const db = await openSwarmDb(sessionsDir);
   try {
-    const overview = await getSwarmOverview(swarmId, { messageLimit: 0, db });
-    if (!overview) throw notFound();
-    if (!swarmInScope(overview.swarm, roots)) throw forbidden();
+    const overview = await assertExistingScopedSwarm(swarmId, sessionsDir, roots, { db });
     const messages = await readBoardMessages(swarmId, {
       since: args.since, channel: args.channel,
       limit: args.limit ?? 100,
@@ -326,11 +322,12 @@ function buildEngineOptions(options = {}, sessionsDir) {
   };
 }
 
-async function assertExistingScopedSwarm(swarmId, sessionsDir, roots) {
+async function assertExistingScopedSwarm(swarmId, sessionsDir, roots, options = {}) {
   if (!swarmDbExists(sessionsDir)) throw notFound();
-  const overview = await getSwarmOverview(swarmId, { messageLimit: 0, sessionsDir });
+  const overview = await getSwarmOverview(swarmId, { ...options, messageLimit: 0, sessionsDir,
+    checkScope(swarm) { if (!swarmInScope(swarm, roots)) throw forbidden(); },
+  });
   if (!overview) throw notFound();
-  if (!swarmInScope(overview.swarm, roots)) throw forbidden();
   return overview;
 }
 

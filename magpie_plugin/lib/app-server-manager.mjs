@@ -8,7 +8,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { readActiveRuns } from './activity.mjs';
 import { defaultGatewayFromEnv, resolveMagpieApiKey } from '../../core/magpie.mjs';
 import { appServerStatePath, connectAppServer } from './app-server-client.mjs';
-import { launchAppServer, matchesAppServerProcess, pidAlive, terminateAppServer, waitForProcessExit } from './app-server-process.mjs';
+import { launchDetached, matchesAppServerProcess, pidAlive, terminateAppServer, waitForProcessExit } from './app-server-process.mjs';
 import { codexAppServerExtraArgs, readJsonSafe, resolveConfigPath } from '../../core/config.mjs';
 import { findExecutable, resolveExecutableInvocation } from '../../core/runners/detect.mjs';
 import { interruptRun as interruptCoreRun } from '../../core/runs.mjs';
@@ -336,7 +336,7 @@ export function createAppServerManager({
       }
       const spawnOpts = { cwd: homedir(), env: childEnv, windowsHide: true, detached: true, stdio: ['ignore', 'ignore', 'pipe'] };
       const spawned = child = spawnProcess === spawn
-        ? await launchAppServer(bin, args, spawnOpts)
+        ? await launchDetached(bin, args, spawnOpts)
         : spawnProcess(bin, args, spawnOpts);
       spawned.unref?.();
       startedAt = Date.now();

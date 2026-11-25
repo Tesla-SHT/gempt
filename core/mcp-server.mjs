@@ -5,7 +5,7 @@ import { readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_p
 import { GEMPT_VERSION } from './config.mjs';
 import { readHostContext } from './host-context.mjs';
 import { runLiveOperation } from './live-service.mjs';
-import { ACTIVE_STATES, buildWaitCommand, compactReceiptText, dispatchRun, interruptRun, readRun, replyToolCall, runWithinRoot, steerRun, validateExecTimeoutSec } from './runs.mjs';
+import { ACTIVE_STATES, buildWaitCommand, compactReceiptText, dispatchRun, interruptRun, readRun, refreshRun, replyToolCall, runWithinRoot, steerRun, validateExecTimeoutSec } from './runs.mjs';
 import { lockStaleMsForBudget, resolvePath, validateSessionId, withLock } from './state.mjs';
 import { handleBoardAction, handleSwarmAction } from './swarm-engine.mjs';
 import { boardPostPreview } from './swarm-bus.mjs';
@@ -70,6 +70,7 @@ async function control(args, options) {
     ...(args.host_conversation_id ? { host_conversation_id: args.host_conversation_id } : {}),
     ...(['session', 'all'].includes(args.scope) ? { scope: args.scope } : {}),
   };
+  if (record) return textResult(compactStatus(null, await refreshRun(record, options), options));
   const live = await runLiveOperation('open', liveArgs, options);
   return textResult(compactStatus(live, record, options));
 }

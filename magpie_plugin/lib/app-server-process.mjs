@@ -13,8 +13,8 @@ function quoteWindowsArg(value) {
   return `"${value.replace(/(\\*)"/g, '$1$1\\"').replace(/\\+$/, '$&$&')}"`;
 }
 
-export async function launchAppServer(bin, args, options) {
-  if (process.platform !== 'win32') return spawn(bin, args, options);
+export async function launchDetached(bin, args, options) {
+  if (process.platform !== 'win32' || options.env?.GEMPT_DISABLE_CIM === '1') return spawn(bin, args, options);
   try {
     const launch = execFileAsync(powershell, psArgs(`
       $ErrorActionPreference = 'Stop'
@@ -40,7 +40,7 @@ export async function launchAppServer(bin, args, options) {
       environment: Object.entries(options.env).filter(([, value]) => value != null).map(([key, value]) => `${key}=${value}`),
     }));
     const pid = Number((await launch).stdout.trim());
-    if (!Number.isSafeInteger(pid) || pid < 1) throw new Error('Windows did not return a Codex app-server PID.');
+    if (!Number.isSafeInteger(pid) || pid < 1) throw new Error('Windows did not return a process ID.');
     return { pid, detachedOutOfJob: true };
   } catch {
     // Fallback if WMI/CIM is disabled in a locked-down Windows environment.

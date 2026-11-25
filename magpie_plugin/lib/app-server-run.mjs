@@ -1,9 +1,10 @@
 import { cacheHitRatio, normalizeUsage } from '../../core/token-usage.mjs';
 import { appendFileSync, readFileSync } from 'node:fs';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { dirname, join, resolve } from 'node:path';
 import {
   approvalReply, ASK_GEMINI, connectAppServer, DEVELOPER_INSTRUCTIONS, PROVIDER,
-  readAppServerState, SANDBOX_TYPES, SWARM_DEVELOPER_INSTRUCTIONS, TERMINAL_INTERRUPT_ERR, textInput,
+  readAppServerState, readServerTurn, terminalTurn, SANDBOX_TYPES, SWARM_DEVELOPER_INSTRUCTIONS, TERMINAL_INTERRUPT_ERR, textInput,
 } from './app-server-client.mjs';
 import { saveRun, toolReplyPath } from '../../core/runs.mjs';
 import { readJsonSafe, resolveConfigPath } from '../../core/config.mjs';
@@ -35,6 +36,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
   const remaining = () => Math.max(1, deadline - (pausedAt ?? Date.now()));
   const directory = dirname(runFile);
   const record = JSON.parse(readFileSync(runFile, 'utf8'));
+  record.cli = 'codex';
   record.execution_timeout_sec = timeoutSec;
   record.deadline = deadline / 1000;
   const state = readAppServerState(configPath, env);
@@ -55,7 +57,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
   let confirmResolve;
   let complete;
   let fail;
-  const completion = new Promise((resolve, reject) => { complete = resolve; fail = reject; });
+  let completion = new Promise((resolve, reject) => { complete = resolve; fail = reject; });
   // The socket can close while a thread/turn RPC is still awaiting its response.
   completion.catch(() => {});
   const progress = { phase: 'connecting', thread_id: threadId || null, turn_id: null, last_message: '',
@@ -283,6 +285,16 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     }
   };
 
+  function finishTurn(turn) {
+    for (const entry of turn.items || []) item(entry);
+    if (turn.status === 'interrupted') throw new TurnInterrupted('Codex turn interrupted.');
+    if (turn.status !== 'completed') throw new Error(turn.error?.message || `Codex turn ${turn.status}.`);
+    const text = [...messages.values()].map((value) => value.trim()).filter(Boolean).join('\n\n');
+    if (!text) throw new Error('Codex finished without an assistant message.');
+    return { forkMode: record.fork_mode, threadId: progress.thread_id, turnId: progress.turn_id, sandbox: record.sandbox,
+      text, elapsedSec: (Date.now() - start) / 1000, commands: [...commands.values()], usage };
+  }
+
   save(true);
   try {
     client = await connectAppServer(state, onEvent);
@@ -349,7 +361,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     poll = setInterval(() => {
       try {
         const [id, pending] = tools.entries().next().value || [];
-        if (!pending) return;
+        if (!pending || client.disconnected) return;
         const reply = JSON.parse(readFileSync(toolReplyPath(directory, pending.call_id), 'utf8'));
         if (typeof reply.answer !== 'string' || typeof reply.success !== 'boolean') throw new Error('Invalid ask_gemini reply.');
         client.reply(id, { success: reply.success, contentItems: [{ type: 'inputText', text: reply.answer }] });
@@ -370,15 +382,46 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     // The short RPC timer can only fail startup before that proof arrives.
     const acknowledgement = client.request('turn/start', { threadId: progress.thread_id, input: textInput(prompt), model, effort,
       cwd, approvalPolicy, sandboxPolicy: { type: SANDBOX_TYPES[sandbox] } }, 15_000).then(({ turn }) => turn.id);
-    const startedTurnId = await Promise.race([observedTurn, acknowledgement, completion.then((turn) => turn.id)]);
-    identity(progress.thread_id, startedTurnId);
-    const turn = await completion;
-    if (turn.status === 'interrupted') throw new TurnInterrupted('Codex turn interrupted.');
-    if (turn.status !== 'completed') throw new Error(turn.error?.message || `Codex turn ${turn.status}.`);
-    const text = [...messages.values()].map((value) => value.trim()).filter(Boolean).join('\n\n');
-    if (!text) throw new Error('Codex finished without an assistant message.');
-    return { forkMode: record.fork_mode, threadId: progress.thread_id, turnId: progress.turn_id, sandbox: Object.keys(SANDBOX_TYPES)[actual],
-      text, elapsedSec: (Date.now() - start) / 1000, commands: [...commands.values()], usage };
+    try {
+      const startedTurnId = await Promise.race([observedTurn, acknowledgement, completion.then((turn) => turn.id)]);
+      identity(progress.thread_id, startedTurnId);
+      return finishTurn(await completion);
+    } catch (err) {
+      if (terminal || !client.disconnected || !progress.turn_id) throw err;
+    }
+
+    // A plugin reload may briefly unpublish the endpoint. Rejoin the original
+    // thread, including notifications that arrived between read and resume.
+    let recoveryError;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt) await sleep(Math.min(remaining(), 250 * attempt));
+      try {
+        const latest = readAppServerState(configPath, env);
+        if (latest.gateway_url?.replace(/\/+$/, '') !== gatewayUrl) throw new Error('Codex gateway changed.');
+        completion = new Promise((resolve, reject) => { complete = resolve; fail = reject; });
+        completion.catch(() => {});
+        client = await connectAppServer(latest, onEvent);
+        client.onFailure(fail);
+        let turn = await readServerTurn(client, progress.thread_id, progress.turn_id);
+        if (!turn) throw new Error('Codex could not identify the disconnected turn.');
+        if (!terminalTurn(turn)) {
+          tools.clear();
+          pendingChanged();
+          const resumed = await client.request('thread/resume', { ...common, threadId: progress.thread_id });
+          if (resumed.thread?.id !== progress.thread_id) throw new Error('Codex returned a different thread on rejoin.');
+          confirmedSandbox(resumed);
+          turn = resumed.thread.turns?.find((entry) => entry.id === progress.turn_id);
+          if (!terminalTurn(turn)) turn = await completion;
+        }
+        notifyTerminal(turn);
+        return finishTurn(turn);
+      } catch (err) {
+        if (terminal || (client && !client.disconnected && Date.now() >= deadline && pausedAt === null)) throw err;
+        recoveryError = err;
+        client?.close();
+      }
+    }
+    throw Object.assign(recoveryError, { transportLost: true });
   } catch (err) {
     clearInterval(poll);
     clearTimeout(timeout);
@@ -387,7 +430,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     // After acceptTurn, turn/start is the only outstanding RPC that can reject this try block.
     if (acceptTurn && err.rpcError && !turnId) throw err;
     let noActiveTurn = false;
-    if (!terminal && turnId) {
+    if (!terminal && turnId && !err.transportLost) {
       const params = { threadId: progress.thread_id, turnId };
       const interrupt = async (connection) => {
         try {
@@ -395,23 +438,17 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
           if (!terminal) await waitForTerminal(interruptConfirmMs, connection);
         } catch (error) {
           noActiveTurn = !connection.disconnected && error.rpcError && TERMINAL_INTERRUPT_ERR.test(error.message);
+          if (noActiveTurn) {
+            try {
+              const ended = await readServerTurn(connection, params.threadId, params.turnId);
+              if (terminalTurn(ended)) notifyTerminal(ended);
+            } catch { /* The interrupt error still confirms inactivity. */ }
+          }
         }
       };
       if (client && !client.disconnected) await interrupt(client);
-      if (!terminal && !noActiveTurn && (!client || client.disconnected)) {
-        let recovery;
-        try {
-          const latest = readAppServerState(configPath, env);
-          recovery = await connectAppServer(latest, ({ method, params: event }) => {
-            if (method === 'turn/completed' && event?.threadId === params.threadId && event.turn?.id === params.turnId) {
-              notifyTerminal(event.turn);
-            }
-          });
-          await interrupt(recovery);
-        } catch { /* The original turn state is still unknown. */ }
-        finally { recovery?.close(); }
-      }
     }
+    if (terminal?.status === 'completed') return finishTurn(terminal);
     if (acceptTurn && !terminal && !noActiveTurn) {
       throw Object.assign(new Error(`Remote Codex turn may still be running (no terminal status confirmed). ${err.message}`,
         { cause: err }), { remoteTurnUnconfirmed: true });

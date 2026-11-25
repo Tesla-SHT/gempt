@@ -9,10 +9,10 @@ export function readNativeRun(sessionsDir, id) {
   return requireNativeRun(readRun(id, sessionsDir));
 }
 
-export async function waitForNativeRun(sessionsDir, id, seconds) {
+export async function waitForNativeRun(sessionsDir, id, seconds, options = {}) {
   readNativeRun(sessionsDir, id);
   return requireNativeRun(await waitForRun(id, {
-    sessionsDir, timeoutSec: Math.min(20, Math.max(0, Number(seconds) || 0)),
+    ...options, sessionsDir, timeoutSec: Math.min(20, Math.max(0, Number(seconds) || 0)),
   }));
 }
 

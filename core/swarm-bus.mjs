@@ -1,5 +1,7 @@
+import { ACTIVE_STATES, readRun, refreshRun } from './runs.mjs';
+import { pidAlive } from '../magpie_plugin/lib/app-server-process.mjs';
 import { createHash, randomBytes } from 'node:crypto';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
 import { openDatabase } from './sqlite.mjs';
 import { resolvePath } from './state.mjs';
@@ -16,6 +18,7 @@ const RESERVED_WORKER_NAMES = new Set(['all', 'coordinator', 'human']);
 const MENTION_RE = /(?<![\p{L}\p{Nd}_-])@([a-z0-9][a-z0-9_-]{0,23})(?![\p{L}\p{Nd}_-])/giu;
 const SCREENSHOT_RE = /^Screenshot:\s*(.+?)\s*\|\s*(.+)$/gmi;
 
+const SCHEMA_VERSION = 2;
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS swarms (
   id TEXT PRIMARY KEY,
@@ -110,7 +113,8 @@ export function resolveSwarmDbPath(sessionsDir) {
 export async function openSwarmDb(sessionsDir) {
   const db = await openDatabase(resolveSwarmDbPath(sessionsDir));
   try {
-    if (!db.get("SELECT 1 FROM sqlite_master WHERE name='idx_swarm_request_id'")) {
+    const { user_version } = db.get('PRAGMA user_version');
+    if (user_version < SCHEMA_VERSION || !db.get("SELECT 1 FROM sqlite_master WHERE name='idx_swarm_request_id'")) {
       db.transaction(() => {
         db.exec(SCHEMA_SQL);
         for (const [table, columns] of Object.entries(migrations)) {
@@ -122,6 +126,7 @@ export async function openSwarmDb(sessionsDir) {
         db.exec(`CREATE TABLE IF NOT EXISTS post_window (swarm_id TEXT, agent TEXT, posted_ms INTEGER);
           CREATE INDEX IF NOT EXISTS idx_post_window ON post_window(swarm_id, agent, posted_ms);
           CREATE UNIQUE INDEX IF NOT EXISTS idx_swarm_request_id ON messages(swarm_id, request_id) WHERE request_id IS NOT NULL`);
+        db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
       });
     }
     return db;
@@ -434,7 +439,7 @@ export async function addWorkerBriefs(swarmId, specs, options = {}) {
       }
       const message = appendMessage(conn, id, { from: worker.added_by, kind: 'brief', channel,
         text: `@${name} ${worker.brief}`, meta: { worker: name } }, { skipRateLimit: true });
-      saveWorker(conn, id, name, { ...worker, run_id: null, session_id: null, worktree_path: null,
+      saveWorker(conn, id, name, { ...worker, run_id: worker.run_id ?? null, session_id: null, worktree_path: null,
         last_seq: message.seq, last_read_seq: message.seq, wait_since: 0, last_nudged_seq: 0,
         last_park_blocked_seq: 0, quota_paused_seq: 0, wake_mode: 'mentions' }, options);
       conn.run('INSERT INTO deliveries VALUES (?, ?, ?, ?)', message.seq, id, name, nowIso());
@@ -495,11 +500,34 @@ export async function getWorker(swarmId, name, { sessionsDir, db } = {}) {
 
 export async function listRoster(swarmId, { includeKilled = true, sessionsDir, db } = {}) {
   const id = validateSwarmId(swarmId);
-  return withDb(sessionsDir, (conn) => {
+  return withDb(sessionsDir, async (conn) => {
     const sql = includeKilled
       ? 'SELECT * FROM roster WHERE swarm_id = ? ORDER BY created_at ASC, name ASC'
       : "SELECT * FROM roster WHERE swarm_id = ? AND state != 'killed' ORDER BY created_at ASC, name ASC";
-    return conn.all(sql, id).map(formatWorker);
+    const roster = conn.all(sql, id).map(formatWorker);
+    let changed = false;
+    const options = { sessionsDir: sessionsDir || dirname(conn.filePath) };
+    for (const worker of roster) {
+      if (!worker.run_id || !['working', 'waiting_reply', 'stopped'].includes(worker.state)) continue;
+      let record;
+      try { record = readRun(worker.run_id, options.sessionsDir, { readonly: true }); }
+      catch (error) {
+        if (error.status === 400 || error.status === 404) continue;
+        throw error;
+      }
+      if (record.swarm_id && record.swarm_id !== id || record.swarm_agent && record.swarm_agent !== worker.name) continue;
+      if (record.remote_turn_unconfirmed) {
+        record = await refreshRun(record, options);
+        changed ||= !record.remote_turn_unconfirmed;
+      }
+      if (ACTIVE_STATES.has(record.state) || pidAlive(record.pid)) continue;
+      const next = record.state === 'finished' ? 'waiting' : 'stopped';
+      if (worker.state === 'stopped') continue;
+      changed = true;
+      await updateWorker(id, worker.name, { state: next, parked_on: null, error: record.error || null },
+        { db: conn, expectedState: worker.state, expectedRun: worker.run_id });
+    }
+    return changed ? conn.all(sql, id).map(formatWorker) : roster;
   }, db);
 }
 
@@ -880,11 +908,12 @@ export async function markDelivered(swarmId, seqs, targetAgent, { sessionsDir, d
   }), db);
 }
 
-export async function getSwarmOverview(swarmId, { messageLimit = 20, analytics = false, sessionsDir, db } = {}) {
+export async function getSwarmOverview(swarmId, { messageLimit = 20, analytics = false, sessionsDir, db, checkScope } = {}) {
   const id = validateSwarmId(swarmId);
   return withDb(sessionsDir, async (conn) => {
     const swarm = formatSwarm(conn.get('SELECT * FROM swarms WHERE id = ?', id));
     if (!swarm) return null;
+    checkScope?.(swarm);
     const roster = await listRoster(id, { includeKilled: true, db: conn });
     const head = await getBoardHead(id, { db: conn });
     const recent_messages = messageLimit > 0 ? await readBoardMessages(id, { limit: messageLimit, db: conn }) : [];

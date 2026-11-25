@@ -1,12 +1,13 @@
 import { normalizeUsage, cacheHitRatio } from './token-usage.mjs';
-import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
+import { visitJournal } from './run-journal.mjs';
+import { closeSync, fstatSync, openSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { listConsultSessions, workspaceName } from '../magpie_plugin/lib/activity.mjs';
 import { readRoutingSummary } from '../magpie_plugin/lib/backend.mjs';
 import { GEMPT_VERSION } from './config.mjs';
 import { readHostContext } from './host-context.mjs';
-import { ACTIVE_STATES, interruptRun, readRun, replyToolCall, runDirectory, stateEntries, steerRun } from './runs.mjs';
+import { ACTIVE_STATES, interruptRun, readRun, refreshRun, replyToolCall, runDirectory, stateEntries, steerRun } from './runs.mjs';
 import { resolvePath, withinPath } from './state.mjs';
 import { recordInWorkspace, workspaceFileRoots } from './worktrees.mjs';
 
@@ -117,7 +118,8 @@ function workspaceRun(id, options) {
   return record;
 }
 
-function listRuns(args, { root, workspaceRoots, conversationId, configPath, sessionsDir }) {
+async function listRuns(args, options) {
+  const { root, workspaceRoots, conversationId, configPath, sessionsDir } = options;
   const roots = workspaceScope({ root, workspaceRoots });
   const { routing } = readRoutingSummary({ configPath });
   const context = readHostContext(configPath, root);
@@ -144,7 +146,7 @@ function listRuns(args, { root, workspaceRoots, conversationId, configPath, sess
   let budget = TEXT_BYTES;
   const runs = [];
   for (const record of items.slice(offset, offset + limit)) {
-    const item = runSummary(record, true);
+    const item = runSummary(await refreshRun(record, options), true);
     budget -= jsonSize(item) + 2;
     if (budget < 0) break;
     runs.push(item);
@@ -267,37 +269,7 @@ class Journal {
   }
 
   read(fd, size, record) {
-    let position = this.offset;
-    const chunk = Buffer.alloc(64 * 1024);
-    let parts = [];
-    let skipping = false;
-    // GemPT writes method first. Check the short JSON prefix before allocating
-    // or decoding a full diff from older, potentially large journals.
-    const isDiff = (value) => /^\s*\{\s*"method"\s*:\s*"turn\/diff\/updated"/.test(value.toString('utf8', 0, 128));
-    while (position < size) {
-      const count = readSync(fd, chunk, 0, Math.min(chunk.length, size - position), position);
-      if (!count) break;
-      let start = 0;
-      for (let end = chunk.indexOf(10, start); end >= 0 && end < count; end = chunk.indexOf(10, start)) {
-        const last = chunk.subarray(start, end);
-        if (!skipping && (parts.length || !isDiff(last))) {
-          try {
-            const raw = JSON.parse((parts.length ? Buffer.concat([...parts, last]) : last).toString('utf8'));
-            if (raw && raw.method !== 'turn/diff/updated') this.event(raw, record);
-          } catch { /* Incomplete or invalid JSON. */ }
-        }
-        this.offset = position + end + 1;
-        start = end + 1;
-        parts = [];
-        skipping = false;
-      }
-      if (start < count && !skipping) {
-        const tail = chunk.subarray(start, count);
-        skipping = !parts.length && isDiff(tail);
-        if (!skipping) parts.push(Buffer.from(tail));
-      }
-      position += count;
-    }
+    this.offset = visitJournal(fd, size, this.offset, (raw) => this.event(raw, record));
   }
 
   textPage(value) {
@@ -446,7 +418,7 @@ export async function runLiveOperation(operation, args, options) {
   checkArgs(operation, args, schema);
   if (operation === 'runs') return listRuns(args, options);
   if (operation === 'open') {
-    const data = listRuns(args, options);
+    const data = await listRuns(args, options);
     let record;
     if (args.run_id) {
       try { record = readRun(args.run_id, options.sessionsDir); } catch (error) {
@@ -455,17 +427,19 @@ export async function runLiveOperation(operation, args, options) {
       if (record && (!recordInWorkspace(record, workspaceScope(options)) ||
           (data.scope === 'session' && (!data.bound_conversation_id ||
            record.host_conversation_id !== data.bound_conversation_id)))) record = null;
+      if (record) record = await refreshRun(record, options);
     }
     return { ...data, run_id: record?.run_id ?? null, requested_run: Boolean(record),
       stream: record ? stream(record, {}, options) : null };
   }
   const record = workspaceRun(args.run_id, options);
   if (operation === 'stream') {
+    const refreshed = await refreshRun(record, options);
     if (args.goal_offset !== undefined) {
       const page = pageText(record.goal, args.goal_offset, GOAL_BYTES);
       return { goal: page.full_text, next_goal_offset: page.next_text_offset };
     }
-    return stream(record, args, options);
+    return stream(refreshed, args, options);
   }
   if (operation === 'reply') {
     if (!args.message.trim()) throw Object.assign(new Error('A reply message is required.'), { status: 400 });

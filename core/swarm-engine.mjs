@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { isValidSessionId } from './state.mjs';
 import { readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
@@ -228,13 +229,14 @@ export async function routeBoardDeliveries(swarmId, options = {}) {
         'Respond on the board via `board_post` (tag the relevant peer or `@coordinator [done] ...` when finished).',
       ].join('\n');
       const prevState = currentState;
+      const runId = randomUUID().replaceAll('-', '');
       const claimed = await updateWorker(swarmId, worker.name, {
-        state: 'working', parked_on: null, error: null, run_id: null,
+        state: 'working', parked_on: null, error: null, run_id: runId,
       }, { sessionsDir: ctx.sessionsDir, expectedState: worker.state, expectedRun: worker.run_id });
       if (!claimed) continue;
       try {
         const run = await ctx.dispatchRunImpl({
-          goal: wakeGoal,
+          run_id: runId, goal: wakeGoal,
           cwd: wakeCwd,
           access: worker.access || 'change',
           workspace: worker.worktree_path ? 'inherit' : (worker.workspace || 'inherit'),
@@ -268,7 +270,7 @@ export async function routeBoardDeliveries(swarmId, options = {}) {
           run_id: run.run_id,
           session_id: run.session_id || worker.session_id,
           worktree_path: run.worktree_path || worker.worktree_path,
-        }, { sessionsDir: ctx.sessionsDir });
+        }, { sessionsDir: ctx.sessionsDir, expectedRun: runId });
         deliveries.push({
           worker: worker.name,
           mode: 'wake',
@@ -280,7 +282,7 @@ export async function routeBoardDeliveries(swarmId, options = {}) {
         await updateWorker(swarmId, worker.name, {
           state: prevState, run_id: worker.run_id, parked_on: worker.parked_on,
           error: String(err?.message || err),
-        }, { sessionsDir: ctx.sessionsDir });
+        }, { sessionsDir: ctx.sessionsDir, expectedRun: runId, expectedState: 'working' });
         deliveries.push({ worker: worker.name, mode: 'wake_failed', seqs, error: String(err?.message || err) });
       }
     }
@@ -290,7 +292,7 @@ export async function routeBoardDeliveries(swarmId, options = {}) {
 }
 
 export async function onWorkerTurnFinished({
-  swarmId, swarmAgent, runId, sessionId, startedAt, outcome, result, error,
+  swarmId, swarmAgent, runId, sessionId, startedAt, outcome, result, error, recovered = false,
   sessionsDir, configPath, env = process.env, dispatchRunImpl, steerRunImpl, replyToolCallImpl, readRunImpl,
 }) {
   if (!swarmId || !swarmAgent) return null;
@@ -298,7 +300,7 @@ export async function onWorkerTurnFinished({
   const worker = await getWorker(swarmId, swarmAgent, { sessionsDir: resolvedSessions });
   if (!worker) return null;
   if (worker.state === 'killed') return { skipped: true, reason: 'killed' };
-  if (runId && worker.run_id && runId !== worker.run_id) return { skipped: true, reason: 'superseded' };
+  if (runId && (recovered || worker.run_id) && runId !== worker.run_id) return { skipped: true, reason: 'superseded' };
 
   const finishedOk = outcome?.state === 'finished';
   const nextState = finishedOk ? 'waiting' : 'stopped';
@@ -308,7 +310,7 @@ export async function onWorkerTurnFinished({
   const recent = await readBoardMessages(swarmId, { limit: 100, sessionsDir: resolvedSessions });
   const startMs = startedAt ? Date.parse(startedAt) : NaN;
   const postedDuringTurn = recent.some((msg) => {
-    if (msg.from_agent !== swarmAgent) return false;
+    if (msg.from_agent !== swarmAgent || (recovered && finishedOk && msg.meta?.auto_summary && msg.kind === 'error')) return false;
     if (msg.meta?.run_id && runId && msg.meta.run_id === runId) return true;
     if (Number.isFinite(startMs)) {
       const msgMs = Date.parse(msg.created_at);
@@ -326,6 +328,7 @@ export async function onWorkerTurnFinished({
       from: swarmAgent,
       kind: finishedOk ? 'summary' : 'error',
       text: summaryText,
+      requestId: runId ? 'turn-finished/' + runId + '/' + nextState : null,
       meta: { run_id: runId || worker.run_id, auto_summary: true },
     }, { sessionsDir: resolvedSessions, skipRateLimit: true });
   }
@@ -335,7 +338,7 @@ export async function onWorkerTurnFinished({
     ...(result?.fork_mode ? { fork_mode: result.fork_mode } : {}),
     ...(result?.cli ? { cli: result.cli } : {}),
     session_id: result?.session_id || sessionId || worker.session_id,
-    parked_on: worker.parked_on?.startsWith('board_wait') ? worker.parked_on : null,
+    parked_on: !recovered && finishedOk && worker.parked_on?.startsWith('board_wait') ? worker.parked_on : null,
     quota_paused_seq: QUOTA_ERROR.test(errText || '') ? await getBoardHead(swarmId, { sessionsDir: resolvedSessions }) : 0,
     error: errText,
   }, { sessionsDir: resolvedSessions, expectedState: worker.state, expectedRun: worker.run_id });
@@ -538,9 +541,10 @@ export async function handleSwarmAction(args = {}, options = {}) {
       forkContext = [source?.task_summary || source?.brief, ...memory.map((m) => `#${m.seq} ${truncateText(m.text)}`),
         `Everything before this turn is @${args.fork}'s memory. Do not redo its work or answer its old requests. Follow your own assignment.`].filter(Boolean).join('\n');
     }
-    const briefs = await addWorkerBriefs(swarmId, specs.map((spec) => ({
+    const runIds = specs.map(() => randomUUID().replaceAll('-', ''));
+    const briefs = await addWorkerBriefs(swarmId, specs.map((spec, index) => ({
       channel: homeChannelOf(roleOf(spec.name), channels, registry),
-      worker: { name: spec.name, cli, model, tier, access, workspace, source_cwd: ctx.cwd || null, state: 'working',
+      worker: { name: spec.name, run_id: runIds[index], cli, model, tier, access, workspace, source_cwd: ctx.cwd || null, state: 'working',
         fork_mode: args.fork ? 'summary_fallback' : null,
         role: roleOf(spec.name), channels, added_by: owner, brief: spec.fullBrief, task_summary: spec.taskSummary, parked_on: null, error: null },
     })), storage);
@@ -553,7 +557,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
         role: roleOf(spec.name), registry, channels, shardInstruction: spec.shardInstruction };
       try {
         const run = await ctx.dispatchRunImpl({
-          goal: buildWorkerInstructions({ ...instructions, forkContext }),
+          run_id: runIds[index], goal: buildWorkerInstructions({ ...instructions, forkContext }),
           cwd: ctx.cwd,
           access,
           workspace,
@@ -592,8 +596,8 @@ export async function handleSwarmAction(args = {}, options = {}) {
           worktree_path: run.worktree_path || null,
           source_cwd: run.source_cwd || ctx.cwd || null,
           model: run.model || model,
-        }, { sessionsDir: ctx.sessionsDir });
-        spawned.push({ ...compactRosterItem(saved), brief_seq: msg.seq });
+        }, { sessionsDir: ctx.sessionsDir, expectedRun: runIds[index] });
+        spawned.push({ ...compactRosterItem(saved || await getWorker(swarmId, spec.name, storage)), brief_seq: msg.seq });
       } catch (err) {
         for (const remaining of specs.slice(index)) {
           await updateWorker(swarmId, remaining.name, { state: 'stopped', error: String(err?.message || err) }, storage);

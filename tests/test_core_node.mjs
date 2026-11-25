@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { serveAppServerSocket, threadFixture } from './app-server-fixture.mjs';
 import { once } from 'node:events';
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync,
-  realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+  realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { syncBuiltinESMExports } from 'node:module';
 import { homedir, tmpdir } from 'node:os';
@@ -20,7 +20,7 @@ import { buildTierView, GEMPT_VERSION, setEffortSettings } from '../core/config.
 import { assertSafeOutDir } from '../scripts/build-agy-plugin.mjs';
 import { contextPath, readHostContext, updateHostContext } from '../core/host-context.mjs';
 import { handleSwarmAction, handleBoardAction } from '../core/swarm-engine.mjs';
-import { getWorker } from '../core/swarm-bus.mjs';
+import { ensureSwarm, getWorker, readBoardMessages, upsertWorker } from '../core/swarm-bus.mjs';
 import { runLiveOperation, workspaceRun } from '../core/live-service.mjs';
 import { handleTool, TOOLS } from '../core/mcp-server.mjs';
 import { buildWaitCommand, dispatchRun, interruptRun, isRecentUnconfirmedRun, listActiveRoster, readRun,
@@ -90,7 +90,7 @@ function fixture(t) {
   const cwd = join(root, 'repo');
   mkdirSync(cwd);
   return { root, cwd, configPath, sessionsDir, env: { ...process.env, GEMPT_CONFIG: configPath,
-    GEMPT_SESSIONS_DIR: sessionsDir, GEMPT_WORKTREES_DIR: join(root, 'worktrees'), GEMPT_WORKSPACE_ROOT: cwd } };
+    GEMPT_DISABLE_CIM: '1', GEMPT_SESSIONS_DIR: sessionsDir, GEMPT_WORKTREES_DIR: join(root, 'worktrees'), GEMPT_WORKSPACE_ROOT: cwd } };
 }
 
 function jsonProcess(command, args, options = {}) {
@@ -239,7 +239,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const bridge = join(target, 'work_split_hook.py');
   assert.equal(readFileSync(bridge, 'utf8').trimEnd().split('\n').length, 7);
   assert.ok(!existsSync(join(target, 'runtime', 'gempt')));
-  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.9.0' });
+  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.9.1' });
   const bundledSkills = new URL('../plugin/skills/', import.meta.url);
   assert.deepEqual(readdirSync(bundledSkills).sort(), ['gempt', 'gempt-chore']);
   assert.deepEqual(readdirSync(join(target, 'skills')).sort(), ['gempt', 'gempt-chore']);
@@ -259,7 +259,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const initialized = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' },
   }) });
-  assert.equal(initialized.result.serverInfo.version, '0.9.0');
+  assert.equal(initialized.result.serverInfo.version, '0.9.1');
   assert.equal(initialized.result.capabilities.resources, undefined);
   const listedResources = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'resources/list',
@@ -615,6 +615,13 @@ async function appFixture(t, f, controls = {}) {
           return send({ id, error: { code: -32601, message: 'Unknown method thread/fork' } });
         }
         result = openThread(method, params);
+        if (method === 'thread/resume' && controls.completeOnRejoin) {
+          setImmediate(() => send({ method: 'turn/completed', params: { threadId: params.threadId,
+            turn: { id: 'turn-1', status: 'completed', items: [{ type: 'agentMessage', id: 'final', text: 'after reconnect' }] } } }));
+        }
+      } else if (method === 'thread/read' && controls.readThread) {
+        assert.equal(params.includeTurns, true);
+        result = { thread: controls.readThread(params.threadId) };
       } else if (method === 'turn/start') {
         if (controls.rejectStart) {
           controls.beforeReject?.();
@@ -653,7 +660,8 @@ async function appFixture(t, f, controls = {}) {
         return;
       } else if (method === 'turn/interrupt') {
         if (controls.interruptError) return send({ id, error: { code: -32000, message: controls.interruptError } });
-        turns.get(params.turnId)?.('interrupted');
+        if (turns.has(params.turnId)) turns.get(params.turnId)('interrupted');
+        else send({ method: 'turn/completed', params: { threadId: params.threadId, turn: { id: params.turnId, status: 'interrupted' } } });
       } else if (id === 'ask-rpc') {
         turns.get(activeTurn)?.('completed');
         return;
@@ -1091,7 +1099,7 @@ test('steer and interrupt send turn identity over WebSocket and ask_gemini relay
     { success: true, contentItems: [{ type: 'inputText', text: 'Confirmed.' }] });
 });
 
-test('exceptional turns attempt interruption on an open socket and after reconnecting', async (t) => {
+test('local turn errors interrupt, while transport loss probes without cancelling the turn', async (t) => {
   const f = fixture(t);
   const packets = await appFixture(t, f);
   const asking = await dispatchRun({ goal: 'Request a cross-check', cwd: f.cwd, background: true }, f);
@@ -1113,7 +1121,8 @@ test('exceptional turns attempt interruption on an open socket and after reconne
   assert.equal(outcome.state, 'failed', outcome.error);
   assert.equal(outcome.remote_turn_unconfirmed, true);
   assert.match(outcome.error, /Remote Codex turn may still be running/);
-  assert.ok(packets.some(({ method, params }) => method === 'turn/interrupt' && params.turnId === outcome.turn_id));
+  assert.ok(packets.some(({ method }) => method === 'thread/read'));
+  assert.ok(!packets.some(({ method, params }) => method === 'turn/interrupt' && params.turnId === outcome.turn_id));
 });
 
 test('expired connecting runs and persisted terminal events reconcile without a remote hold', () => {
@@ -1127,9 +1136,9 @@ test('expired connecting runs and persisted terminal events reconcile without a 
   assert.equal(reconcileRunState({ ...expired, thread_id: 'bound', progress: { phase: 'connecting' } }).state, 'outcome_unknown');
   for (const phase of ['interrupted', 'failed', 'completed']) {
     const run = reconcileRunState({ ...expired, turn_id: 'turn', progress: { phase }, remote_turn_unconfirmed: true });
-    assert.equal(run.state, phase === 'interrupted' ? 'interrupted' : 'failed');
+    assert.equal(run.state, phase === 'completed' ? 'finished' : phase);
     assert.equal(run.remote_turn_unconfirmed, undefined);
-    if (phase === 'completed') assert.match(run.error, /completed.*result/);
+    if (phase === 'completed') assert.equal(run.result.turn_id, 'turn');
   }
 });
 
@@ -1148,7 +1157,108 @@ test('repeated reads of a dead worker release the session after the unconfirmed 
     assert.deepEqual(listActiveRoster(f), []);
     await sleep(5);
   }
-  assert.equal(JSON.parse(readFileSync(join(runDirectory(id, f.sessionsDir), 'state.json'))).state, 'running');
+  assert.equal(JSON.parse(readFileSync(join(runDirectory(id, f.sessionsDir), 'state.json'))).state, 'outcome_unknown');
+});
+
+test('dispatch starts the packet worker, records its PID and removes transient files', async (t) => {
+  const f = fixture(t);
+  await appFixture(t, f);
+  const preload = join(f.root, 'capture-packet.mjs');
+  const capture = join(f.root, 'capture.json');
+  writeFileSync(preload, [
+    "import { readFileSync, writeFileSync, statSync } from 'node:fs';",
+    "const [flag, path] = process.argv.slice(2);",
+    "const { record } = JSON.parse(readFileSync(path));",
+    "writeFileSync(process.env.CAPTURE, JSON.stringify({ flag, path, run: record.run_id, pid: process.pid, mode: statSync(path).mode }));",
+  ].join('\n'));
+  const env = { ...f.env, GEMPT_DISABLE_CIM: '', CAPTURE: capture, NODE_OPTIONS: '--import=' + pathToFileURL(preload).href };
+  const run = await dispatchRun({ cwd: f.cwd, goal: 'Finish', background: true }, { ...f, env });
+  const file = join(runDirectory(run.run_id, f.sessionsDir), 'dispatch.json');
+  const done = await waitForRun(run.run_id, { ...f, timeoutSec: 8 });
+  assert.equal(done.state, 'finished', done.error);
+  const actual = JSON.parse(readFileSync(capture));
+  assert.deepEqual([actual.flag, actual.path, actual.run, actual.pid], ['--packet', file, run.run_id, run.pid]);
+  assert.equal(readRun(run.run_id, f.sessionsDir).pid, actual.pid);
+  if (process.platform !== 'win32') assert.equal(actual.mode & 0o777, 0o600);
+  assert.ok(!existsSync(file));
+  await until(() => !existsSync(join(dirname(file), 'worker.stderr.log')));
+});
+
+test('worker exit rereads state past a cached stat before reconciling', async (t) => {
+  const f = fixture(t), id = '1'.repeat(32);
+  const child = spawn(process.execPath, ['-e', "process.stdin.resume()"], { windowsHide: true });
+  const exit = once(child, 'exit');
+  state(f, id, { source: 'magpie_exec', pid: child.pid });
+  const path = join(runDirectory(id, f.sessionsDir), 'state.json');
+  const stat = statSync(path);
+  assert.equal(readRun(id, f.sessionsDir, { stat }).state, 'running');
+  state(f, id, { state: 'finished', result: { text: 'atomic rename' } });
+  child.stdin.end();
+  await exit;
+  assert.equal(readRun(id, f.sessionsDir, { stat }).result.text, 'atomic rename');
+  assert.equal(JSON.parse(readFileSync(path)).state, 'finished');
+});
+
+test('dead Codex run recovers only its terminal journal event, text and usage', (t) => {
+  const f = fixture(t), id = '3'.repeat(32);
+  state(f, id, { source: 'magpie_exec', pid: 2147483000, turn_id: 'tu', codex_thread_id: 'th' });
+  const directory = runDirectory(id, f.sessionsDir);
+  const events = [
+    { method: 'item/completed', params: { item: { id: 'answer', type: 'agentMessage', text: 'final answer' } } },
+    { method: 'thread/tokenUsage/updated', runUsage: { input_tokens: 17 }, params: {} },
+    { method: 'turn/completed', params: { turn: { id: 'tu', status: 'completed' } } },
+    { method: 'turn/completed', params: { turnId: 'other', turn: { id: 'other', status: 'interrupted' } } },
+  ];
+  writeFileSync(join(directory, 'events.jsonl'), events.map((e) => JSON.stringify({
+    ...e, params: { threadId: 'th', turnId: 'tu', ...e.params },
+  })).join('\n') + '\n{"partial"');
+  const done = readRun(id, f.sessionsDir);
+  assert.equal(done.state, 'finished');
+  assert.equal(done.result.text, 'final answer');
+  assert.deepEqual(done.result.usage, { input_tokens: 17 });
+  assert.equal(JSON.parse(readFileSync(join(directory, 'state.json'))).remote_turn_unconfirmed, undefined);
+});
+
+test('worker rejoins an in-progress turn after disconnect, receives completion and never starts it twice', async (t) => {
+  const f = fixture(t);
+  const packets = await appFixture(t, f, { completeOnRejoin: true,
+    readThread: (id) => ({ id, turns: [{ id: 'turn-1', status: 'inProgress' }] }) });
+  const run = await dispatchRun({ goal: 'Disconnect the turn socket', cwd: f.cwd, background: true }, f);
+  const done = await waitForRun(run.run_id, { ...f, timeoutSec: 5 });
+  assert.equal(done.state, 'finished', done.error);
+  assert.match(done.result.text, /after reconnect/);
+  assert.equal(packets.filter((p) => p.method === 'turn/start').length, 1);
+  assert.ok(packets.some((p) => p.method === 'thread/resume'));
+  assert.ok(!packets.some((p) => p.method === 'turn/interrupt'));
+});
+
+test('thread/read heals an orphan and interrupt recovers a completed turn on no-active RPC', async (t) => {
+  const f = fixture(t), id = '4'.repeat(32);
+  const controls = { interruptError: 'no active turn to interrupt', readThread: (id) => ({
+    id, turns: [{ id: 'tu', status: 'completed', items: [{ type: 'agentMessage', text: 'remote result' }] }],
+  }) };
+  const packets = await appFixture(t, f, controls);
+  const seed = () => state(f, id, { state: 'outcome_unknown', remote_turn_unconfirmed: true,
+    codex_thread_id: 'th', turn_id: 'tu', progress: { token_usage: { input_tokens: 11 } } });
+  seed();
+  await ensureSwarm({ swarmId: 'orphan', cwd: f.cwd, sessionsDir: f.sessionsDir });
+  await upsertWorker('orphan', { name: 'builder', state: 'working', parked_on: 'ask', run_id: id }, f);
+  const orphan = readRun(id, f.sessionsDir);
+  state(f, id, { ...orphan, swarm_id: 'orphan', swarm_agent: 'builder' });
+  const run = await waitForRun(id, { ...f, timeoutSec: 0 });
+  assert.equal(run.state, 'finished');
+  assert.equal(run.result.text, 'remote result');
+  assert.deepEqual(run.result.usage, { input_tokens: 11 });
+  assert.equal(run.remote_turn_unconfirmed, undefined);
+  const worker = await getWorker('orphan', 'builder', f);
+  assert.equal(worker.state, 'waiting');
+  assert.equal(worker.parked_on, null);
+  const posts = await readBoardMessages('orphan', f);
+  assert.ok(posts.some((msg) => msg.meta?.run_id === id && msg.text.includes('remote result')));
+  seed();
+  await interruptRun(id, f);
+  assert.equal(readRun(id, f.sessionsDir).result.text, 'remote result');
+  assert.equal(packets.filter((p) => p.method === 'thread/read').length, 2);
 });
 
 test('worker logs RPC start rejection without marking the turn unconfirmed and removes empty stderr on success', async (t) => {
@@ -1246,7 +1356,7 @@ test('worker records uncaught exceptions and unhandled rejections during a live 
   }
 });
 
-test('automatic interrupt accepts terminal RPC errors on the original and rotated endpoints', async (t) => {
+test('automatic interrupt accepts terminal RPC errors and reconnect reads a rotated endpoint', async (t) => {
   const f = fixture(t);
   const controls = { interruptError: 'Turn already completed' };
   const packets = await appFixture(t, f, controls);
@@ -1265,14 +1375,15 @@ test('automatic interrupt accepts terminal RPC errors on the original and rotate
   assert.ok(packets.some((p) => p.method === 'turn/interrupt' && p.params.turnId === waiting.turn_id));
 
   const replacement = fixture(t);
-  const recovered = await appFixture(t, replacement, { token: 'rotated-token', interruptError: 'No active turn' });
+  const recovered = await appFixture(t, replacement, { token: 'rotated-token',
+    readThread: (id) => ({ id, status: { type: 'idle' }, turns: [] }) });
   const published = f.env.GEMPT_APP_SERVER_STATE;
   controls.beforeDisconnect = () => copyFileSync(replacement.env.GEMPT_APP_SERVER_STATE, published);
   const dead = await dispatchRun({ goal: 'Disconnect the turn socket', cwd: f.cwd, background: true }, f);
   const outcome = await waitForRun(dead.run_id, { ...f, timeoutSec: 5 });
   assert.equal(outcome.state, 'failed', outcome.error);
   assert.equal(outcome.remote_turn_unconfirmed, undefined);
-  assert.ok(recovered.some((p) => p.method === 'turn/interrupt' && p.params.turnId === outcome.turn_id));
+  assert.ok(recovered.some((p) => p.method === 'thread/read' && p.params.threadId === outcome.codex_thread_id));
 });
 
 test('expired queued claims release occupancy, but old active sessions still protect their worktree', async (t) => {
@@ -1360,13 +1471,13 @@ test('Live run list defaults to an empty unbound session and can list all worksp
   assert.equal(scoped.scope, 'session');
   assert.equal(scoped.unbound_session, true);
   assert.deepEqual(scoped.runs, []);
-  assert.equal(scoped.app_server.version, '0.9.0');
+  assert.equal(scoped.app_server.version, '0.9.1');
 
   const all = await runLiveOperation('runs', { scope: 'all' }, opts);
   assert.equal(all.scope, 'all');
   assert.equal(all.unbound_session, false);
   assert.deepEqual(all.runs.map(({ run_id }) => run_id).sort(), [first, second]);
-  assert.equal(all.app_server.version, '0.9.0');
+  assert.equal(all.app_server.version, '0.9.1');
 });
 
 test('Live binds normalized workspaces and never selects another run for a filtered explicit ID', async (t) => {
@@ -1529,7 +1640,7 @@ test('standalone NDJSON MCP exposes only core tools without legacy MCP App resou
   const started = await request('initialize', { protocolVersion: '2026-test' });
   assert.equal(started.result.protocolVersion, '2026-test');
   assert.equal(started.result.serverInfo.name, 'gempt');
-  assert.equal(started.result.serverInfo.version, '0.9.0');
+  assert.equal(started.result.serverInfo.version, '0.9.1');
   assert.deepEqual(started.result.capabilities, { tools: { listChanged: false } });
   send({ method: 'notifications/initialized' });
   assert.deepEqual((await request('ping')).result, {});
@@ -1811,8 +1922,8 @@ test('remote_turn_unconfirmed blocks concurrent dispatch and worktree prune unti
 test('manual interrupt settles missing identity, ACK and observed terminal outcomes for an unknown run', async (t) => {
   const f = fixture(t);
   const id = 'd'.repeat(32);
-  for (const [confirmation, expected] of [['missing', 'failed'], ['ack', 'interrupted'],
-    ['interrupted', 'interrupted'], ['failed', 'failed'], ['completed', 'failed']]) {
+  for (const [confirmation, expected] of [['missing', 'failed'], ['ack', 'outcome_unknown'],
+    ['interrupted', 'interrupted'], ['failed', 'failed'], ['completed', 'finished']]) {
     state(f, id, { state: 'outcome_unknown', remote_turn_unconfirmed: true, unconfirmed_at: 'old',
       progress: { thread_id: 'th', turn_id: confirmation === 'missing' ? null : 'tu' }, pending_tool_call: {} });
     const cleared = await interruptRun(id, { ...f, confirmMs: 0, getState: () => ({ status: 'running' }),
@@ -1826,6 +1937,10 @@ test('manual interrupt settles missing identity, ACK and observed terminal outco
         close() {},
       }),
     });
+    if (confirmation === 'ack') {
+      assert.equal(readRun(id, f.sessionsDir).remote_turn_unconfirmed, true);
+      continue;
+    }
     assert.equal(cleared.cleared_unconfirmed, true);
     const settled = readRun(id, f.sessionsDir);
     assert.equal(settled.state, expected, confirmation);

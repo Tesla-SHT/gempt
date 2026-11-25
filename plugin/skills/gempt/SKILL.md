@@ -9,7 +9,7 @@ description: >-
 
 # gempt — Gemini × GPT 协作编排手册
 
-GemPT v0.9.0 使用 Node.js（`>= 22.13.0`）。Antigravity 的 `gempt_gempt` MCP 提供 `gpt_swarm`、`gpt_board`、`gpt_run`、`gpt_ask`、`gpt_ctl`，支持 11 种可插拔执行 CLI（`codex` / `opencode` / `claude` / `gemini` / `pi` / `cursor` / `kimi` / `grok` / `kilo` / `copilot` / `qoder`）以及按 Hydrogen、Neon、Carbon 家族配对 Magpie 模型。
+GemPT v0.9.1 使用 Node.js（`>= 22.13.0`）。Antigravity 的 `gempt_gempt` MCP 提供 `gpt_swarm`、`gpt_board`、`gpt_run`、`gpt_ask`、`gpt_ctl`，支持 11 种可插拔执行 CLI（`codex` / `opencode` / `claude` / `gemini` / `pi` / `cursor` / `kimi` / `grok` / `kilo` / `copilot` / `qoder`）以及按 Hydrogen、Neon、Carbon 家族配对 Magpie 模型。
 
 > 启用本插件时，`rules/AGENTS.md` 会常驻生效；按 Magpie 面板的 5 档工作分工（0% / 15% / 35% / 60% / 80%）决定何时委派。
 

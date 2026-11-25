@@ -6,6 +6,7 @@ import { resolveBudgetAsync } from './token-ratio.mjs';
 import { WORKLOAD } from '../../core/assets.mjs';
 import { agyInstallPaths, RUNTIME_ROOT, resolvePluginRoot } from '../../core/bundle-paths.mjs';
 import { GEMPT_VERSION } from '../../core/config.mjs';
+import { readRun, refreshRun } from '../../core/runs.mjs';
 import { resolveNodeExecutable } from '../../core/node-executable.mjs';
 import {
   CLI_CHOICES, DEFAULT_CONSULT_TIMEOUT_SEC, DEFAULT_TIERS, DEFAULT_UTILITY, FEATURES, TIER_ORDER, VALID_FAILOVER_MODES, VALID_SANDBOXES,
@@ -254,6 +255,18 @@ export function readRunState({ appServer, sessionsDir, activeRuns } = {}) {
   };
 }
 
+async function healedActiveRun(activeRuns, options) {
+  const pending = activeRuns.filter((run) => run.remote_turn_unconfirmed && run.codex_thread_id && run.turn_id);
+  const results = await Promise.all(pending.map((run) =>
+    refreshRun(readRun(run.run_id, options.sessionsDir, { allowLegacyId: true }), options)));
+  return results.some((run) => !run.remote_turn_unconfirmed);
+}
+
+export async function currentRunState(options) {
+  const state = readRunState(options);
+  return await healedActiveRun(state.active_runs, options) ? readRunState(options) : state;
+}
+
 export function warmPageTelemetry(options = {}) {
   setImmediate(() => {
     void Promise.allSettled([
@@ -314,10 +327,14 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     fallback_models: Array.isArray(utilRaw.fallback_models) ? utilRaw.fallback_models.filter(Boolean).map(String) : [],
   };
 
-  const { recentSessions, recentRuns, activityTotals, activeRuns } = overview
-    ? await readOverviewActivity(resolvedSessionsDir)
+  const activity = () => overview ? readOverviewActivity(resolvedSessionsDir)
     : { ...readRecentActivity(resolvedSessionsDir, 6),
         activityTotals: readDispatchActivity(resolvedSessionsDir).totals, activeRuns: readActiveRuns(resolvedSessionsDir) };
+  let snapshot = await activity();
+  if (await healedActiveRun(snapshot.activeRuns, { sessionsDir: resolvedSessionsDir, configPath: resolvedConfigPath, env })) {
+    snapshot = await activity();
+  }
+  const { recentSessions, recentRuns, activityTotals, activeRuns } = snapshot;
   const workSplit = policy.work_split ?? 'balanced';
   const tokenRatio = overview ? null : await readRatio({
     range: ratioRange,

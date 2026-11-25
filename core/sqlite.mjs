@@ -51,6 +51,7 @@ export async function openDatabase(filePath) {
   }
 
   return {
+    filePath,
     runtime,
     exec(sql) {
       raw.exec(sql);

@@ -531,6 +531,26 @@ test('swarm-engine orchestrates add/sharding/steer/warm-wake/reply/model/kill an
   assert.match(waitInfo.wait_command, /--board sw-demo --since 2 --all-messages/);
 });
 
+test('board wait repairs a dead CLI worker and clears its parked call in SQLite', async (t) => {
+  const sessionsDir = makeTmp(t), opts = { sessionsDir }, swarmId = 'dead-cli';
+  await ensureSwarm({ swarmId, cwd: sessionsDir, sessionsDir });
+  for (const [index, cli] of ['claude', 'gemini', 'opencode', 'custom-cli'].entries()) {
+    const run_id = String(index).repeat(32);
+    const file = join(sessionsDir, 'runs', run_id, 'state.json');
+    saveRun(file, { run_id, state: 'running', cli, source: 'magpie_exec', pid: 2147483000, turn_id: 'synthetic' });
+    await upsertWorker(swarmId, { name: cli, run_id, state: 'working', parked_on: 'call' }, opts);
+    const { roster } = await waitForBoard(swarmId, { ...opts, timeoutMs: 0 });
+    const worker = roster.find((worker) => worker.name === cli);
+    assert.equal(worker.state, 'stopped');
+    assert.equal((await getWorker(swarmId, cli, opts)).parked_on, null);
+    const run = JSON.parse(readFileSync(file));
+    assert.equal(run.state, 'failed');
+    assert.match(run.error, new RegExp(cli));
+    assert.doesNotMatch(run.error, /remote codex/i);
+    assert.equal(run.remote_turn_unconfirmed, undefined);
+  }
+});
+
 test('waitForBoard and gempt-wait --board wake on coordinator mentions and worker questions', async (t) => {
   const dir = makeTmp(t);
   const sessionsDir = join(dir, 'sessions');
@@ -1075,6 +1095,26 @@ test('migration preserves legacy messages, deliveries and roster across concurre
     ['preserved', 'worker', null, 'coordinator', 'mentions', 0]);
   assert.equal((await readBoardMessages('legacy', opts))[0].channel, 'main');
   assert.deepEqual(await listUndeliveredForWorker('legacy', 'w', opts), []);
+});
+
+test('migration adds fork_mode to a v0.8.0 database with the request index', async (t) => {
+  const sessionsDir = makeTmp(t);
+  const legacy = await openSwarmDb(sessionsDir);
+  try {
+    legacy.exec('ALTER TABLE roster DROP COLUMN fork_mode; PRAGMA user_version = 0');
+    assert.ok(legacy.get("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_swarm_request_id'"));
+  } finally {
+    legacy.close();
+  }
+
+  const db = await openSwarmDb(sessionsDir);
+  try {
+    await upsertWorker('legacy', { name: 'child', fork_mode: 'summary_fallback' }, { db });
+    assert.equal(db.get('PRAGMA user_version').user_version, 2);
+  } finally {
+    db.close();
+  }
+  assert.equal((await getWorker('legacy', 'child', { sessionsDir })).fork_mode, 'summary_fallback');
 });
 
 test('posts enforce byte and channel limits, idempotency and shared sliding rate windows', async (t) => {

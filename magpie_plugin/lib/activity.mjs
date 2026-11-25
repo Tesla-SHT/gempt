@@ -4,7 +4,7 @@ import { isValidSessionId } from '../../core/state.mjs';
 import {
   existsSync, lstatSync, readdirSync, statSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { isMainThread, workerData } from 'node:worker_threads';
 import { createBackgroundWorker, serveBackgroundWorker } from './background-worker.mjs';
 import { correlateGatewayUsage } from './activity-gateway.mjs';
@@ -157,7 +157,7 @@ const ACTIVE_RUN_STATES = new Set(['queued', 'running', 'waiting_gemini']);
 
 function reconcileActivityRun(data, modifiedMs) {
   const record = { ...data };
-  return reconcileRunState(record, () => modifiedMs);
+  return reconcileRunState(record, () => modifiedMs, true);
 }
 
 export function listConsultSessions(sessionsDir, { limit, matches }) {
@@ -205,12 +205,9 @@ export function readRecentActivity(sessionsDir, limit = 6) {
   if (existsSync(runsDir)) {
     const runDirs = sortedMtimeEntries(runsDir, (name) => ACTIVITY_RUN_ID.test(name));
     for (const dirEntry of runDirs) {
-      const stateFile = join(dirEntry.full, 'state.json');
-      const file = readActivityFile(stateFile);
-      if (!file) continue;
-      const { data, modifiedMs } = file;
-      if (data.run_id && data.run_id !== dirEntry.name) continue;
-      const reconciled = reconcileActivityRun(data, modifiedMs);
+      let reconciled;
+      try { reconciled = readRun(dirEntry.name, sessionsDir, { readonly: true, allowLegacyId: true }); }
+      catch { continue; }
       recentRuns.push({
         run_id: String(reconciled.run_id || dirEntry.name),
         session_id: reconciled.session_id ?? null,
@@ -255,8 +252,8 @@ export function readActiveRuns(sessionsDir) {
       created_at: reconciled.created_at ?? null,
       started_at: reconciled.started_at ?? null,
       title: normalizeTitle(reconciled.title, reconciled.goal, reconciled.cwd),
-      codex_thread_id: reconciled.codex_thread_id ?? null,
-      turn_id: reconciled.turn_id ?? null,
+      codex_thread_id: reconciled.codex_thread_id || reconciled.thread_id || reconciled.progress?.thread_id || null,
+      turn_id: reconciled.turn_id || reconciled.progress?.turn_id || null,
       progress: reconciled.progress ?? null,
       pending_tool_call: reconciled.pending_tool_call ?? null,
       ...(reconciled.remote_turn_unconfirmed ? { remote_turn_unconfirmed: true } : {}),
@@ -462,7 +459,8 @@ function readActivityRun(dir, id, liveRunChecks) {
   if (!file) return null;
   const { data, modified, modifiedMs } = file;
   if ((data.run_id && data.run_id !== id) || !data.state) return null;
-  const reconciled = reconcileActivityRun(data, modifiedMs);
+  let reconciled;
+  try { reconciled = readRun(id, dirname(dir), { readonly: true, allowLegacyId: true }); } catch { return null; }
   const nowMs = Date.now();
   const occupying = isRunOccupying(reconciled, nowMs, modifiedMs);
   if (ACTIVE_RUN_STATES.has(data.state) || occupying || reconciled.remote_turn_unconfirmed) {
@@ -491,6 +489,7 @@ function readActivityRun(dir, id, liveRunChecks) {
   const reply = result?.reply ?? String(result?.text || '').replace(/^\[mode=exec \| [^\r\n]+\]\r?\n\r?\n/, '');
   const request = activityRequest({
     ...reconciled,
+    title: data.title,
     ...result,
     status,
     state: status === 'succeeded' ? 'finished' : status,

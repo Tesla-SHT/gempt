@@ -157,6 +157,25 @@ export async function connectAppServer(state, onEvent = () => {}, { timeoutMs = 
   };
 }
 
+export const terminalTurn = (turn) => ['completed', 'failed', 'interrupted'].includes(turn?.status);
+
+export async function readServerTurn(client, threadId, turnId) {
+  let thread;
+  try {
+    ({ thread } = await client.request('thread/read', { threadId, includeTurns: true }));
+  } catch (err) {
+    if (!err.rpcError || !/^thread not found(?:\s*[:.]|$)/i.test(err.message)) throw err;
+    return { id: turnId, status: 'failed', error: { message: err.message } };
+  }
+  if (thread?.id !== threadId || !Array.isArray(thread.turns)) return null;
+  const turn = thread.turns.find((entry) => entry.id === turnId);
+  if (turn) return turn;
+  if (['idle', 'notLoaded'].includes(thread.status?.type)) {
+    return { id: turnId, status: 'failed', error: { message: 'Codex thread has no active turn or recorded outcome for this turn.' } };
+  }
+  return null;
+}
+
 export function approvalReply(method, params, sandbox) {
   const full = sandbox === 'danger-full-access';
   switch (method) {

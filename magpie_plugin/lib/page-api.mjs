@@ -10,7 +10,7 @@ import {
   readOverview,
   readRoutingSummary,
   readPageMagpieStatus,
-  readRunState,
+  currentRunState,
   readRatio,
   setDefaultTier,
   updateSettings,
@@ -77,7 +77,7 @@ export async function dispatchPageApi({ method, url, rawPath = url.pathname, rea
     if (pathname === '/api/magpie-status') {
       return reply(200, await readPageMagpieStatus({ ...options, force: url.searchParams.get('force') === '1' }));
     }
-    if (pathname === '/api/active-runs') return reply(200, readRunState(options));
+    if (pathname === '/api/active-runs') return reply(200, await currentRunState(options));
     if (pathname === '/api/overview') return reply(200, await readOverview(options));
     if (pathname === '/api/token-ratio') {
       const range = url.searchParams.get('range') ?? '24h';

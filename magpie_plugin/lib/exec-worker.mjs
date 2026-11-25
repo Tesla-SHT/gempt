@@ -1,10 +1,11 @@
 import { createExecutionTools } from './tools.mjs';
 import { readRun, saveRun } from '../../core/runs.mjs';
 import { TurnInterrupted } from './app-server-run.mjs';
-import { statSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { lockStaleMsForBudget, withLock } from '../../core/state.mjs';
 
+let diagnosticFd;
 let packet;
 let outcome;
 let saved = false;
@@ -21,7 +22,7 @@ function terminalRecord(latest, outcome) {
 }
 
 function diagnose(message) {
-  try { writeSync(2, message + '\n'); } catch { /* Still attempt to persist the state if stderr fails. */ }
+  try { writeSync(diagnosticFd ?? 2, message + '\n'); } catch { /* Still attempt to persist the state if stderr fails. */ }
 }
 
 function fatal(error, origin) {
@@ -34,7 +35,7 @@ function fatal(error, origin) {
       const failed = { state: 'failed', error: String(error?.message || error) };
       const unknown = outcome ? outcome.remote_turn_unconfirmed
         : (latest.turn_id || latest.progress?.turn_id) && !['interrupted', 'failed', 'completed'].includes(latest.progress?.phase);
-      if (unknown) {
+      if (unknown && (!latest.cli || latest.cli === 'codex')) {
         failed.remote_turn_unconfirmed = true;
         failed.unconfirmed_at = outcome?.unconfirmed_at || latest.unconfirmed_at || new Date().toISOString();
       }
@@ -48,10 +49,18 @@ function fatal(error, origin) {
 process.on('uncaughtException', fatal);
 process.on('unhandledRejection', (reason) => fatal(reason, 'unhandledRejection'));
 
-const chunks = [];
-for await (const chunk of process.stdin) chunks.push(chunk);
-packet = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+const packetPath = process.argv[2] === '--packet' && process.argv[3];
+if (packetPath) {
+  diagnosticFd = openSync(join(dirname(packetPath), 'worker.stderr.log'), 'a', 0o600);
+  packet = JSON.parse(readFileSync(packetPath, 'utf8'));
+  unlinkSync(packetPath);
+} else {
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  packet = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
 const { file, record, args, host, agent } = packet;
+diagnosticFd ??= openSync(join(dirname(file), 'worker.stderr.log'), 'a', 0o600);
 const running = { ...record, state: 'running', pid: process.pid, started_at: new Date().toISOString() };
 try {
   const started = await withLock(join(host.sessionsDir, `${record.session_id}.dispatch.lock`), () => {
@@ -100,6 +109,7 @@ if (outcome) {
 }
 
 process.once('exit', (code) => {
+  closeSync(diagnosticFd);
   if (code !== 0) return;
   const log = join(dirname(file), 'worker.stderr.log');
   try {
