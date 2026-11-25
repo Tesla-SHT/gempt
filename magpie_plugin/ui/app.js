@@ -22,7 +22,6 @@ export function mountConsole(root, transport, {
   let visible = false;
   const pendingSettings = new Set();
   let installingAgy = false;
-  let retryAgy = false;
   const advanced = mountAdvancedSettings($, { transport, showToast, onLanguage, refreshGateway,
     refresh: () => refreshState({ replace: true }), init: activateSubscriptionConfig });
 
@@ -444,25 +443,46 @@ export function mountConsole(root, transport, {
     }
 
     const chipAgy = $('chip-agy');
-    const chipAgyVal = $('chip-agy-val');
-    if (chipAgy && chipAgyVal) {
-      chipAgy.dataset.tone = clients.antigravity_installed ? 'ok' : 'neutral';
-      chipAgyVal.textContent = clients.antigravity_installed ? tr('插件已安装') : tr('未安装');
-    }
     const paths = clients.agy_install;
     const setup = $('agy-setup');
-    setup.hidden = !paths || !(transport.installAgy || transport.installPage)
-      || (!retryAgy && clients.antigravity_installed && paths.installed_version === paths.bundled_version);
-    if (!setup.hidden) {
-      $('agy-setup-title').textContent = clients.antigravity_installed
-        ? tr('安装随包版本 {0}（当前 {1}）', paths.bundled_version, paths.installed_version || '—')
-        : tr('启用 Antigravity 集成');
-      $('agy-target').textContent = paths.target;
-      $('agy-bin').textContent = paths.bin_dir;
-      $('agy-install').hidden = !transport.installAgy;
-      $('agy-install').disabled = installingAgy;
-      $('agy-install-link').hidden = $('agy-copy-link').hidden = !transport.installPage;
-      if (transport.installPage) $('agy-install-link').href = transport.installPage;
+    const install = $('agy-install');
+    const link = $('agy-install-link');
+    setup.hidden = !paths || !(transport.installAgy || transport.installPage);
+    chipAgy.disabled = setup.hidden;
+    if (!paths) {
+      chipAgy.dataset.tone = clients.antigravity_installed ? 'ok' : 'neutral';
+      $('chip-agy-val').textContent = clients.antigravity_installed ? tr('插件已安装') : tr('未安装');
+      return;
+    }
+    const current = paths.installed_version || '—';
+    const bundled = paths.bundled_version;
+    const ready = clients.antigravity_installed && current === bundled;
+    if (ready) {
+      chipAgy.dataset.tone = 'ok';
+      $('chip-agy-val').textContent = tr('已安装 v{0}', current);
+      $('agy-setup-title').textContent = tr('Antigravity 插件已就绪（v{0}）', current);
+      install.textContent = tr('重新安装 / 修复');
+    } else if (clients.antigravity_installed) {
+      chipAgy.dataset.tone = 'warn';
+      $('chip-agy-val').textContent = tr('可更新 v{0}', bundled);
+      $('agy-setup-title').textContent = tr('更新 Antigravity 插件到 v{0}（当前 {1}）', bundled, current);
+      install.textContent = tr('一键更新到 v{0}', bundled);
+    } else {
+      chipAgy.dataset.tone = 'neutral';
+      $('chip-agy-val').textContent = setup.hidden ? tr('未安装') : tr('未安装 · 去安装');
+      $('agy-setup-title').textContent = tr('启用 Antigravity 集成');
+      install.textContent = tr('一键安装 Antigravity 插件');
+    }
+    $('agy-target').textContent = paths.target;
+    $('agy-bin').textContent = paths.bin_dir;
+    install.hidden = !transport.installAgy;
+    install.disabled = installingAgy;
+    install.classList.toggle('is-ready', ready);
+    link.classList.toggle('is-ready', ready);
+    link.hidden = $('agy-copy-link').hidden = !transport.installPage;
+    if (transport.installPage) {
+      link.href = transport.installPage;
+      link.textContent = tr('{0}（独立控制台）', install.textContent);
     }
   }
 
@@ -475,12 +495,10 @@ export function mountConsole(root, transport, {
     result.textContent = tr('正在安装…');
     try {
       const installed = await transport.installAgy();
-      retryAgy = !installed.installed;
-      const message = retryAgy ? tr('安装未全部完成，可重试。') : tr('已安装。请在 Antigravity 中打开新会话；若未出现，请重启客户端。');
+      const message = installed.installed ? tr('已安装。请在 Antigravity 中打开新会话；若未出现，请重启客户端。') : tr('安装未全部完成，可重试。');
       result.textContent = [message, ...(installed.warnings || [])].join(' ');
       await refreshState({ replace: true });
     } catch (error) {
-      retryAgy = true;
       result.textContent = errorText(error.message);
     } finally {
       installingAgy = false;
@@ -2556,6 +2574,11 @@ export function mountConsole(root, transport, {
     }
     if (btn.id === 'init-sub-btn') {
       activateSubscriptionConfig();
+      return;
+    }
+    if (btn.id === 'chip-agy') {
+      $('agy-setup').scrollIntoView({ block: 'center' });
+      (transport.installAgy ? $('agy-install') : $('agy-install-link')).focus({ preventScroll: true });
       return;
     }
     if (btn.id === 'agy-install') {

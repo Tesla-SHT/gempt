@@ -278,6 +278,8 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
     // Launch the source sidecar without --import to exercise its installed SDK lookup.
     const entry = fileURLToPath(new URL('../plugin/sidecars/gempt_live/main.mjs', import.meta.url));
     sidecarChild = spawn(process.execPath, [entry], { cwd: dirname(entry), env: { ...env,
+      GEMPT_MAGPIE_PLUGIN_PORT: String(consoleServer.port),
+      GEMPT_AGY_PLUGIN_DIR: join(root, 'client plugins', 'gempt'), GEMPT_BIN_DIR: join(root, 'commands with spaces'),
       ANTIGRAVITY_LS_ADDRESS: '127.0.0.1:0', ANTIGRAVITY_CSRF_TOKEN: 'fixture', ANTIGRAVITY_CONVERSATION_ID: host,
       ANTIGRAVITY_AGENTAPI_EXE: agentApi,
       ANTIGRAVITY_SIDECAR_WEB_PORT: '0', ANTIGRAVITY_SIDECAR_UI_TOKEN: sidecarToken }, stdio: ['ignore', 'pipe', 'inherit'] });
@@ -373,21 +375,43 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
   const click = (id) => evaluate(`$(${JSON.stringify(id)}).click();`);
 
   gatewayDelay = 400;
-  await open(standaloneUrl, 1280, 900, false);
+  await open(standaloneUrl, 1440, 900, false);
   await until(() => evaluate("return $('magpie-status')?.dataset.state === 'online' && !$('token-ratio-card')?.hidden;"), 'authenticated Magpie Overview')
     .catch((error) => { throw new Error(`${error.message} · ${JSON.stringify({ requests, errors })}`); });
   gatewayDelay = 0;
   assert.equal(requests.filter(path => path === '/api/overview').length, 1, 'gateway status patches the existing overview');
   assert.equal(requests.filter(path => path === '/api/magpie-status').length, 1, 'the status poll waits for the first probe');
   await shot('magpie-standalone-dark');
-  await evaluate("$('agy-setup').open = true;");
+  const installText = () => evaluate("return $('agy-install')?.textContent;");
+  assert.equal(await installText(), '一键安装 Antigravity 插件');
+  assert.equal(await evaluate("return $('agy-install').checkVisibility() && $('agy-install').getBoundingClientRect().bottom <= innerHeight;"), true);
+  await click('chip-agy');
+  assert.equal(await evaluate('return document.activeElement.id;'), 'agy-install');
   assert.equal(await evaluate("return $('agy-target').textContent;"), resolvePath(join(root, 'client plugins', 'gempt')));
   assert.equal(await evaluate("return $('agy-bin').textContent;"), resolvePath(join(root, 'commands with spaces')));
-  await evaluate("$('agy-install').scrollIntoView({block:'center'});");
   await shot('magpie-enable-antigravity');
   await click('agy-install');
-  await until(() => evaluate("return $('agy-setup').hidden && !!$('agy-install-result').textContent;"), 'bundled integration installed');
-  assert.equal(JSON.parse(readFileSync(join(root, 'client plugins', 'gempt', 'plugin.json'))).name, 'gempt');
+  const repairReady = () => evaluate("return $('agy-install')?.checkVisibility() && !$('agy-install').disabled && $('agy-install').textContent === '重新安装 / 修复';");
+  await until(repairReady, 'bundled integration ready for repair');
+  const pluginDir = join(root, 'client plugins', 'gempt');
+  const manifestPath = join(pluginDir, 'plugin.json');
+  const manifest = JSON.parse(readFileSync(manifestPath));
+  assert.equal(manifest.name, 'gempt');
+  const pluginRules = join(pluginDir, 'rules', 'AGENTS.md');
+  rmSync(pluginRules);
+  await click('agy-install');
+  await until(async () => existsSync(pluginRules) && await repairReady(), 'same-version repair restores missing rules');
+  writeFileSync(manifestPath, JSON.stringify({ ...manifest, version: '0.0.1' }));
+  await open(standaloneUrl.replace('dark', 'light'), 390, 844, false);
+  await until(async () => await installText() === '一键更新到 v' + manifest.version, 'older installation offers update');
+  await assertGeometry('390px update card');
+  await shot('magpie-update-light-390');
+  await click('agy-install');
+  await until(repairReady, 'update returns to repair action');
+  assert.equal(JSON.parse(readFileSync(manifestPath)).version, manifest.version);
+  await open(standaloneUrl, 1440, 900, false);
+  await until(repairReady, 'ready card on fresh Overview');
+  await shot('gempt-agy-btn-qa');
   assert.equal(requests.some(path => /^\/api\/(sessions|requests)/.test(path)), false);
   await evaluate("document.querySelector('[data-timeout=\"7200\"]').click();");
   await until(() => evaluate("return document.querySelector('[data-timeout=\"7200\"]').getAttribute('aria-pressed') === 'true';"), 'Magpie timeout update over HTTP');
@@ -482,6 +506,9 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
     await click('tab-overview');
     await until(() => evaluate(`return $('view-console').classList.contains('gp-ready') && !$('token-ratio-card').hidden
       && $('magpie-status').dataset.state === 'online' && Number.parseFloat($('token-ratio-gpt-bar').style.width) > 0;`), 'native Console and token data');
+    await click('chip-agy');
+    assert.equal(await evaluate("return document.activeElement.id;"), 'agy-install-link');
+    assert.equal(await evaluate("return $('agy-install-link').href;"), new URL(standaloneUrl).origin + '/');
     await evaluate("document.querySelector('[data-ratio-range=\"7d\"]').click();");
     await until(() => evaluate("return $('token-ratio-title').textContent.includes('7 天') && !$('token-ratio-card').hidden;"), 'native token range change');
     await evaluate("$('advanced-settings').open = true; document.querySelector('[data-timeout=\"1800\"]').click();");
@@ -560,7 +587,9 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
         assert.equal(await evaluate("return document.querySelector('#advanced-settings summary').textContent;"), 'Connection & Advanced Settings');
         assert.match(await evaluate("return $('work-detail').textContent;"), /GPT handles substantive tasks/);
       }
-      for (const width of [420, 460]) {
+      assert.equal(await evaluate("return $('agy-install-link').textContent;"),
+        language === 'zh' ? '重新安装 / 修复（独立控制台）' : 'Reinstall / repair (standalone console)');
+      for (const width of [390, 420, 460]) {
         await resize(width, 1170);
         await assertGeometry(language + ' ' + width);
         await assertTopbar(language + ' ' + width);

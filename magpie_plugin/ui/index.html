@@ -26,6 +26,23 @@
         </div>
       </section>
 
+      <section id="agy-setup" class="agy-setup-card" aria-labelledby="agy-setup-title" hidden>
+        <header class="agy-setup-header">
+          <h2 id="agy-setup-title">启用 Antigravity 集成</h2>
+          <div class="agy-setup-actions">
+            <button type="button" class="primary-btn" id="agy-install">一键安装 Antigravity 插件</button>
+            <a id="agy-install-link" class="primary-btn" target="_blank" rel="noopener noreferrer" hidden>在独立控制台确认安装</a>
+            <button type="button" id="agy-copy-link" class="pill-copy-btn" hidden>复制控制台地址</button>
+          </div>
+        </header>
+        <p class="control-hint">安装在运行 Magpie 的机器上。如果 Antigravity 在另一台机器，请在那台机器运行安装器。</p>
+        <dl class="agy-setup-paths">
+          <dt>插件目录</dt><dd><code id="agy-target"></code></dd>
+          <dt>命令目录</dt><dd><code id="agy-bin"></code></dd>
+        </dl>
+        <p id="agy-install-result" class="control-hint" role="status" hidden></p>
+      </section>
+
       <section id="active-runs" class="section" aria-labelledby="active-runs-label" hidden>
         <div class="section-head">
           <h2 id="active-runs-label" class="section-eyebrow">运行中任务</h2>
@@ -262,11 +279,11 @@
               <span class="chip-name">内置 MCP 工具</span>
               <span id="chip-mcp-val" class="chip-val">复制独立配置</span>
             </button>
-            <span id="chip-agy" class="status-chip is-static">
+            <button id="chip-agy" type="button" class="status-chip" aria-controls="agy-setup" disabled>
               <span class="chip-dot" aria-hidden="true"></span>
               <span class="chip-name">Antigravity</span>
               <span id="chip-agy-val" class="chip-val">未安装</span>
-            </span>
+            </button>
             <button id="chip-app-server" type="button" class="status-chip" title="点击重启共享 Codex app-server（无需重启 Magpie）">
               <span class="chip-dot" aria-hidden="true"></span>
               <span class="chip-name">Codex app-server</span>
@@ -275,15 +292,6 @@
           </div>
           <p id="app-server-error" class="app-server-error" hidden></p>
           <p id="zero-cli-guide" class="zero-cli-guide control-hint" hidden></p>
-          <details id="agy-setup" class="advanced-settings" hidden>
-            <summary id="agy-setup-title">启用 Antigravity 集成</summary>
-            <p class="control-hint">安装在运行 Magpie 的机器上。如果 Antigravity 在另一台机器，请在那台机器运行安装器。</p>
-            <p class="control-hint"><span>插件目录</span> <code id="agy-target"></code><br><span>命令目录</span> <code id="agy-bin"></code></p>
-            <button type="button" class="pill-copy-btn" id="agy-install">确认安装</button>
-            <a id="agy-install-link" target="_blank" rel="noopener noreferrer" hidden>在独立控制台确认安装</a>
-            <button type="button" id="agy-copy-link" class="pill-copy-btn" hidden>复制控制台地址</button>
-          </details>
-          <p id="agy-install-result" class="control-hint" role="status" hidden></p>
 
           <div class="utility-row">
             <div class="utility-left">

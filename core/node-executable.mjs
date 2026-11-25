@@ -1,6 +1,6 @@
 import { accessSync, constants, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, delimiter, join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 
 function nvmNodeBinDirs(home) {
   const root = join(home, '.nvm', 'versions', 'node');
@@ -15,14 +15,19 @@ function nvmNodeBinDirs(home) {
   }
 }
 
-export function resolveNodeExecutable({ execPath = process.execPath, env = process.env, platform = process.platform, home = homedir() } = {}) {
+export function resolveNodeExecutable({
+  execPath = process.execPath,
+  env = process.env,
+  platform = process.platform,
+  home = homedir(),
+  systemDirs = ['/opt/homebrew/bin', '/usr/local/bin'],
+} = {}) {
   if (/^node(?:\.exe)?$/i.test(basename(execPath))) return execPath;
   const name = platform === 'win32' ? 'node.exe' : 'node';
-  const dirs = (env.PATH || env.Path || '').split(delimiter).filter(Boolean);
+  const dirs = (env.PATH || env.Path || '').split(platform === 'win32' ? ';' : ':').filter(Boolean);
   if (platform !== 'win32') {
     dirs.push(
-      '/opt/homebrew/bin',
-      '/usr/local/bin',
+      ...systemDirs,
       join(home, '.local', 'bin'),
       join(home, '.volta', 'bin'),
       join(home, '.fnm', 'current', 'bin'),

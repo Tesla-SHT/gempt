@@ -63,6 +63,7 @@ function mountSidecar() {
       cleanup();
     }
   });
+  transport.installPage = document.documentElement.dataset.installPage;
   mountLive({ transport, sidecar });
 }
 

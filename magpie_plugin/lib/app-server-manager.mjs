@@ -16,7 +16,7 @@ import { interruptRun as interruptCoreRun } from '../../core/runs.mjs';
 const STRIPPED_ENV = ['CODEX_WINDOWS_REGISTERED_CORE', 'CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY', 'CODEX_APP_TOOLS_PIPE_PATH',
   'CODEX_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_TOOL_CALL_ID', 'GEMPT_APP_SERVER_GATEWAY_TOKEN'];
 
-export function findCodexCli(configuredPath = '', env = process.env, { platform = process.platform, home = homedir() } = {}) {
+export function findCodexCli(configuredPath = '', env = process.env, { platform = process.platform, home = homedir(), systemDirs } = {}) {
   return findExecutable({
     configuredPath,
     envVars: ['CODEX_CLI_PATH', 'CODEX_BIN'],
@@ -24,6 +24,7 @@ export function findCodexCli(configuredPath = '', env = process.env, { platform 
     env,
     platform,
     home,
+    systemDirs,
   });
 }
 

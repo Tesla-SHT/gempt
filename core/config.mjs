@@ -184,7 +184,7 @@ export function buildTierView(tierId, tierCfg, defaultTier, fallbackPreset) {
   };
 }
 
-function readPluginOptions(magpieConfigDir) {
+export function readPluginOptions(magpieConfigDir) {
   const plugins = readJsonSafe(join(magpieConfigDir, 'plugins.json'));
   const list = Array.isArray(plugins?.plugins) ? plugins.plugins : [];
   const entry = list.find((item) => String(item?.spec || '').toLowerCase().includes('gempt'));

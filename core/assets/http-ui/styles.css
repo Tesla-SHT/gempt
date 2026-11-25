@@ -1717,8 +1717,43 @@ button.status-chip:focus-visible {
   outline-offset: 1px;
 }
 
-.status-chip.is-static {
-  cursor: default;
+.agy-setup-card {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--gp-border);
+  border-radius: var(--gp-control-radius);
+  background: var(--gp-card);
+  overflow-wrap: anywhere;
+}
+
+.agy-setup-card :is(h2, p, dl, dd) { margin: 0; }
+.agy-setup-header, .agy-setup-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.agy-setup-header { justify-content: space-between; }
+.agy-setup-header h2 { font-size: 15px; }
+.agy-setup-actions { max-width: 100%; }
+.agy-setup-actions > * {
+  max-width: 100%;
+  white-space: normal;
+  text-decoration: none;
+}
+.agy-setup-actions .is-ready {
+  background: var(--gp-subtle);
+  color: var(--gp-fg);
+  border-color: var(--gp-active-border);
+}
+.agy-setup-paths {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 2px 10px;
+  font-size: 11px;
+  color: var(--gp-muted);
 }
 
 .chip-dot {

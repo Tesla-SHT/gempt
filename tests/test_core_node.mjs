@@ -208,10 +208,11 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   mkdirSync(nvmNew, { recursive: true });
   writeFileSync(join(nvmOld, 'node'), '#!/bin/sh\n', { mode: 0o755 });
   writeFileSync(join(nvmNew, 'node'), '#!/bin/sh\n', { mode: 0o755 });
-  assert.equal(resolveNodeExecutable({ execPath: join(f.root, 'magpie-bun'), env: { PATH: '' }, platform: 'darwin', home: macHome }), join(nvmNew, 'node'));
+  const macOptions = { platform: 'darwin', home: macHome, systemDirs: [] };
+  assert.equal(resolveNodeExecutable({ execPath: join(f.root, 'magpie-bun'), env: { PATH: '' }, ...macOptions }), join(nvmNew, 'node'));
   const { findCodexCli } = await import('../magpie_plugin/lib/app-server-manager.mjs');
   writeFileSync(join(nvmNew, 'codex'), '#!/bin/sh\n', { mode: 0o755 });
-  assert.equal(findCodexCli('', { PATH: '' }, { platform: 'darwin', home: macHome }), join(nvmNew, 'codex'));
+  assert.equal(findCodexCli('', { PATH: '' }, macOptions), join(nvmNew, 'codex'));
   const installed = await installAgy({ target, binDir, env });
   assert.equal(installed.installed, true);
   assert.ok(!existsSync(legacyLock));

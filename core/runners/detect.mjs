@@ -49,7 +49,11 @@ export function nvmNodeBinDirs(home = homedir()) {
   }
 }
 
-export function getExecutableSearchDirs(env = process.env, { platform = process.platform, home = homedir() } = {}) {
+export function getExecutableSearchDirs(env = process.env, {
+  platform = process.platform,
+  home = homedir(),
+  systemDirs = ['/opt/homebrew/bin', '/usr/local/bin'],
+} = {}) {
   const dirs = [];
   const seen = new Set();
   const add = (dir) => {
@@ -64,8 +68,7 @@ export function getExecutableSearchDirs(env = process.env, { platform = process.
   for (const dir of String(env.PATH || env.Path || '').split(delimiter)) add(dir);
 
   if (platform !== 'win32') {
-    add('/opt/homebrew/bin');
-    add('/usr/local/bin');
+    for (const dir of systemDirs) add(dir);
     add(join(home, '.local', 'bin'));
     add(join(home, '.volta', 'bin'));
     add(join(home, '.npm-global', 'bin'));
@@ -99,10 +102,11 @@ export function findExecutable({
   env = process.env,
   platform = process.platform,
   home = homedir(),
+  systemDirs,
   includeFallbackDirs = true,
 } = {}) {
   const dirs = includeFallbackDirs
-    ? getExecutableSearchDirs(env, { platform, home })
+    ? getExecutableSearchDirs(env, { platform, home, systemDirs })
     : String(env.PATH || env.Path || '').split(delimiter).filter(Boolean);
 
   const explicitEntries = [configuredPath, ...envVars.map((key) => env[key])].filter(Boolean);

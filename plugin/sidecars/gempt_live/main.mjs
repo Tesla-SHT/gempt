@@ -11,6 +11,7 @@ const { readPageAsset } = await import(new URL('magpie_plugin/lib/page-assets.mj
 const { warmPageTelemetry } = await import(new URL('magpie_plugin/lib/backend.mjs', runtime));
 const { createAppServerManager } = await import(new URL('magpie_plugin/lib/app-server-manager.mjs', runtime));
 const { resolvePath } = await import(new URL('core/state.mjs', runtime));
+const { readPluginOptions, resolveMagpieConfigDir } = await import(new URL('core/config.mjs', runtime));
 
 let sdkUrl;
 try {
@@ -81,10 +82,13 @@ const entryHash = createHash('sha256').update(bootstrap).digest('base64');
 
 async function entryPage() {
   const { data, type } = await readPageAsset('/');
+  // The installed sidecar runs inside the directory the Magpie installer replaces.
+  const port = Number(readPluginOptions(resolveMagpieConfigDir())?.port ?? process.env.GEMPT_MAGPIE_PLUGIN_PORT);
+  const consolePort = Number.isInteger(port) && port > 0 && port <= 65535 ? port : 3498;
   const html = data.toString('utf8')
     .replace("script-src 'self';", `script-src 'self' 'sha256-${entryHash}';`)
     .replace('<link rel="stylesheet" href="./styles.css">', `<meta name="referrer" content="no-referrer">\n  <script>${bootstrap}</script>`)
-    .replace('<html ', '<html data-sidecar ')
+    .replace('<html ', `<html data-sidecar data-install-page="http://127.0.0.1:${consolePort}/" `)
     .replace(/<script\s+(?:type="module"|defer)\s+src="\.\/app\.js"><\/script>/, '');
   return new Response(html, { contentType: type, headers: noStore });
 }
