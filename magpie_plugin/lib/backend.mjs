@@ -270,8 +270,8 @@ export async function currentRunState(options) {
 export function warmPageTelemetry(options = {}) {
   setImmediate(() => {
     void Promise.allSettled([
-      Promise.resolve().then(() => readRatio(options)),
-      Promise.resolve().then(() => readOverviewActivity(options.sessionsDir, options.magpieConfigDir)),
+      Promise.resolve().then(() => readRatio({ ...options, range: '7d' })),
+      Promise.resolve().then(() => readOverviewActivity(options.sessionsDir, options.magpieConfigDir, options.configPath)),
     ]);
   }).unref();
 }
@@ -327,7 +327,7 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     fallback_models: Array.isArray(utilRaw.fallback_models) ? utilRaw.fallback_models.filter(Boolean).map(String) : [],
   };
 
-  const activity = () => overview ? readOverviewActivity(resolvedSessionsDir)
+  const activity = () => overview ? readOverviewActivity(resolvedSessionsDir, resolvedMagpieDir, resolvedConfigPath)
     : { ...readRecentActivity(resolvedSessionsDir, 6),
         activityTotals: readDispatchActivity(resolvedSessionsDir).totals, activeRuns: readActiveRuns(resolvedSessionsDir) };
   let snapshot = await activity();
@@ -392,6 +392,7 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     tiers,
     utility,
     activity_totals: activityTotals,
+    ...(overview ? { activity_7d: snapshot.weekly } : {}),
     recent_sessions: recentSessions,
     recent_runs: recentRuns,
     checked_at: new Date().toISOString(),

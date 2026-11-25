@@ -137,6 +137,24 @@ test('Node hook emits entry banners and one user-only alert per context mileston
   }
 });
 
+test('hook counts each explicit bypass turn once across invocations and tool calls', async (t) => {
+  const f = fixture(t);
+  mkdirSync(dirname(f.configPath));
+  writeFileSync(f.configPath, JSON.stringify({ routing_policy: { work_split: 'gpt_first' } }));
+  const invoke = fields => jsonProcess(process.execPath, [hookPath], { env: f.env,
+    input: JSON.stringify({ conversationId: 'counted', lastUserInput: '自己查', ...fields }) });
+  const tool = { hookEventName: 'PreToolUse', toolCall: { name: 'read_file', args: { Path: 'app.mjs' } } };
+  for (const initialNumSteps of [3, 7]) {
+    for (const invocationNum of [0, 1]) invoke({ hookEventName: 'PreInvocation', initialNumSteps, invocationNum });
+    invoke(tool);
+    invoke(tool);
+  }
+  invoke({ ...tool, lastUserInput: 'review' });
+  const saved = JSON.parse(readFileSync(join(dirname(f.configPath), 'hook-state', 'counted.json')));
+  assert.equal(saved.bypass_count, 2);
+  assert.equal((await readOverview(f)).activity_7d.bypass_count, 2);
+});
+
 test('Node hook applies write and explore gates with exemptions, resets and fail-open', (t) => {
   const f = fixture(t);
   mkdirSync(dirname(f.configPath));
@@ -162,12 +180,28 @@ test('Node hook applies write and explore gates with exemptions, resets and fail
   }
   for (const [profile, share, limit] of [['gpt', 60, 5], ['gpt_first', 80, 2]]) {
     set(profile);
+    const turn = { lastUserInput: profile };
+    const probes = [
+      ['list_dir', {}], ['find_by_name', {}], ['run_command', { CommandLine: 'git status' }],
+      ['run_command', { CommandLine: 'rg --files' }],
+      ['run_command', { CommandLine: 'git branch && git log --oneline || git rev-parse HEAD; git tag\nls | dir; Get-ChildItem; gci; tree' }],
+    ];
+    for (const probe of probes) assert.equal(allow(...probe, turn).decision, 'allow');
     const read = () => allow('read_file', { Path: join(f.cwd, 'app.mjs') }, { lastUserInput: profile });
     for (let count = 0; count < limit; count++) assert.equal(read().decision, 'allow');
+    for (const probe of probes) assert.equal(allow(...probe, turn).decision, 'allow');
+    for (const [index, probe] of [
+      ['grep_search', {}], ['run_command', { CommandLine: 'git diff' }],
+      ['run_command', { CommandLine: 'git status && cat foo.mjs' }],
+      ['run_command', { CommandLine: 'rg --files | Select-String app' }],
+      ['run_command', { CommandLine: 'git log -p' }],
+      ['run_command', { CommandLine: 'git status -v' }],
+      ['run_command', { CommandLine: 'git status || rg pattern; gempt status --wait' }],
+    ].entries()) assert.match(allow(...probe, turn).reason, new RegExp((limit + index + 1) + ' workspace content'));
     const reason = read().reason;
     assert.ok(reason.startsWith(`[GemPT ${share}% Explore Stop-Loss] `));
     assert.match(reason, new RegExp(`limit ${limit}`));
-    assert.equal(reason.includes('Codex CLI'), profile === 'gpt_first');
+    if (profile === 'gpt_first') assert.match(reason, /1–5 known files.*synchronous gpt_ask\(file_paths\).*single-track gpt_swarm or gpt_run/);
     assert.equal(allow('run_command', { CommandLine: 'gempt status --run-id 123 --wait' }).decision, 'allow');
     for (const delegation of [
       ['call_mcp_tool', { ServerName: 'gempt_gempt', ToolName: 'gpt_run' }],
@@ -240,7 +274,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const bridge = join(target, 'work_split_hook.py');
   assert.equal(readFileSync(bridge, 'utf8').trimEnd().split('\n').length, 7);
   assert.ok(!existsSync(join(target, 'runtime', 'gempt')));
-  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.9.1' });
+  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.10.0' });
   const bundledSkills = new URL('../plugin/skills/', import.meta.url);
   assert.deepEqual(readdirSync(bundledSkills).sort(), ['gempt', 'gempt-chore']);
   assert.deepEqual(readdirSync(join(target, 'skills')).sort(), ['gempt', 'gempt-chore']);
@@ -260,7 +294,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const initialized = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' },
   }) });
-  assert.equal(initialized.result.serverInfo.version, '0.9.1');
+  assert.equal(initialized.result.serverInfo.version, '0.10.0');
   assert.equal(initialized.result.capabilities.resources, undefined);
   const listedResources = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'resources/list',
@@ -1472,13 +1506,13 @@ test('Live run list defaults to an empty unbound session and can list all worksp
   assert.equal(scoped.scope, 'session');
   assert.equal(scoped.unbound_session, true);
   assert.deepEqual(scoped.runs, []);
-  assert.equal(scoped.app_server.version, '0.9.1');
+  assert.equal(scoped.app_server.version, '0.10.0');
 
   const all = await runLiveOperation('runs', { scope: 'all' }, opts);
   assert.equal(all.scope, 'all');
   assert.equal(all.unbound_session, false);
   assert.deepEqual(all.runs.map(({ run_id }) => run_id).sort(), [first, second]);
-  assert.equal(all.app_server.version, '0.9.1');
+  assert.equal(all.app_server.version, '0.10.0');
 });
 
 test('Live binds normalized workspaces and never selects another run for a filtered explicit ID', async (t) => {
@@ -1641,7 +1675,7 @@ test('standalone NDJSON MCP exposes only core tools without legacy MCP App resou
   const started = await request('initialize', { protocolVersion: '2026-test' });
   assert.equal(started.result.protocolVersion, '2026-test');
   assert.equal(started.result.serverInfo.name, 'gempt');
-  assert.equal(started.result.serverInfo.version, '0.9.1');
+  assert.equal(started.result.serverInfo.version, '0.10.0');
   assert.deepEqual(started.result.capabilities, { tools: { listChanged: false } });
   send({ method: 'notifications/initialized' });
   assert.deepEqual((await request('ping')).result, {});

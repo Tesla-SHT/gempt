@@ -9,11 +9,11 @@ export function mountConsole(root, transport, {
   const LIVE_POLL_MS = 2800;
   const RATIO_RANGE_STORAGE_KEY = 'gempt-ratio-range';
   const RATIO_RANGE_TITLES = {
-    '1h': '1 小时内实际 Token 占比',
-    '6h': '6 小时内实际 Token 占比',
-    today: '今天实际 Token 占比',
-    '24h': '近 24h 实际 Token 占比',
-    '7d': '近 7 天实际 Token 占比',
+    '1h': '1 小时内实际工作量占比',
+    '6h': '6 小时内实际工作量占比',
+    today: '今天实际工作量占比',
+    '24h': '近 24h 实际工作量占比',
+    '7d': '近 7 天实际工作量占比',
   };
   const SUPPORTS_HAS = typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('selector(:has(*))');
   const $ = (id) => root.querySelector(`#${id}`);
@@ -76,7 +76,7 @@ export function mountConsole(root, transport, {
 
   function readStoredRatioRange() {
     const saved = consolePreference(RATIO_RANGE_STORAGE_KEY);
-    return Object.hasOwn(RATIO_RANGE_TITLES, saved) ? saved : '24h';
+    return Object.hasOwn(RATIO_RANGE_TITLES, saved) ? saved : '7d';
   }
 
   function selectRatioRange(range) {
@@ -242,7 +242,7 @@ export function mountConsole(root, transport, {
     latestRatio = ratio;
     card.hidden = !ratio;
     if (!ratio) return;
-    const rangeTitle = tr(RATIO_RANGE_TITLES[ratio.range]) || tr(RATIO_RANGE_TITLES['24h']);
+    const rangeTitle = tr(RATIO_RANGE_TITLES[ratio.range]) || tr(RATIO_RANGE_TITLES['7d']);
     const title = $('token-ratio-title');
     if (title) title.textContent = rangeTitle;
     const badge = $('token-ratio-badge');
@@ -278,7 +278,7 @@ export function mountConsole(root, transport, {
 
     if (gptText) {
       gptText.textContent = hasData
-        ? `GPT ${gptPct.toFixed(1)}% · ${formatCompactTokens(ratio.gpt_tokens)}`
+        ? tr("GPT / 委派 {0}% · {1}", gptPct.toFixed(1), formatCompactTokens(ratio.gpt_tokens))
         : tr('GPT 暂无数据');
       gptText.title = hasData ? tr("GPT 总 Token {0}（含缓存）", formatCompactTokens(ratio.gpt_tokens)) : '';
     }
@@ -519,6 +519,15 @@ export function mountConsole(root, transport, {
   }
 
   function renderActivity(state) {
+    const weekly = $('weekly-activity');
+    if (weekly) {
+      weekly.hidden = !state.activity_7d;
+      if (state.activity_7d) {
+        const { cache_hit_rate, bypass_count } = state.activity_7d;
+        weekly.textContent = tr("近 7 天 · 委派提示缓存命中率 {0} · 旁路 {1} 轮",
+          cache_hit_rate == null ? tr('暂无数据') : cacheRateText(cache_hit_rate), bypass_count);
+      }
+    }
     const list = $('activity-list');
     const count = $('activity-count');
     if (!list || !count) return;

@@ -556,7 +556,7 @@ body:has(#swarm-view-board:not([hidden])):has(#swarm-panel:not([hidden])) #toast
 }
 :root[lang="zh"] .language-toggle [lang="zh"],
 :root[lang="en"] .language-toggle [lang="en"] { color: var(--fg); font-weight: 650; }
-@media (max-width: 520px) {
+@media (max-width: 600px) {
   .app-topbar { gap: 5px; padding-inline: 7px; font-size: 12px; }
   .app-brand { gap: 2px; }
   .app-brand svg { width: 16px; height: 16px; }

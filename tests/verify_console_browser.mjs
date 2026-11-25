@@ -17,6 +17,7 @@ import { ensureSwarm, postBoardMessage, setSwarmPlan, upsertWorker } from '../co
 import { updateSettings } from '../magpie_plugin/lib/backend.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
 
+const narrow = process.argv.includes('--narrow');
 const output = process.env.GEMPT_VERIFY_DIR || '/tmp/gempt-v060-verify';
 const root = mkdtempSync(join(tmpdir(), 'gempt-verify-'));
 const configPath = join(root, 'config.json');
@@ -216,6 +217,7 @@ async function seedSwarm() {
     run_id: swarmWorkerRunId, session_id: 'exec-swarm-designer', parked_on: 'ask_swarm_1',
     task_summary: '实现总览线程卡片、截图时间线与消息板发送器',
   }, { sessionsDir });
+  if (narrow) return;
   await upsertWorker(swarmId, {
     name: 'reviewer', cli: 'codex', model, workspace: 'inherit',
     source_cwd: cwd, state: 'waiting', run_id: priorRunId, session_id: sessionId,
@@ -247,7 +249,7 @@ async function until(predicate, description) {
   throw new Error('Browser condition timed out: ' + description);
 }
 
-try {
+async function verify() {
   const serverEntry = fileURLToPath(new URL('../core/mcp-server.mjs', import.meta.url));
   const { result: { tools } } = JSON.parse(execFileSync(process.execPath, [serverEntry], {
     input: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) + '\n', encoding: 'utf8', env,
@@ -374,6 +376,27 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
   }
   const click = (id) => evaluate(`$(${JSON.stringify(id)}).click();`);
 
+  if (narrow) {
+    await open(url + '/native-host', 540, 920, true);
+    await until(() => evaluate("return !$('language-toggle')?.disabled;"), 'Sidecar header');
+    await click('tab-overview');
+    await until(() => evaluate("return !$('weekly-activity').hidden && parseFloat($('token-ratio-gpt-bar').style.width) > 0;"), 'weekly telemetry');
+    for (const language of ['zh', 'en']) {
+      if (language === 'en') {
+        await click('language-toggle');
+        await until(() => evaluate("return document.documentElement.lang === 'en';"), 'English header');
+      }
+      await assertTopbar(language + ' Overview');
+      await evaluate("$('token-ratio-card').scrollIntoView({block:'center'});");
+      await shot('overview-540-' + language);
+    }
+    await click('tab-swarm');
+    await until(() => evaluate("return !$('swarm-single').hidden && $('swarm-single-worker').children.length === 1;"), 'compact Swarm');
+    await assertTopbar('compact Swarm');
+    await shot('swarm-540-en');
+    console.log('Chrome OK · 540px native Sidecar, bilingual Overview and single-worker Swarm');
+    return;
+  }
   gatewayDelay = 400;
   await open(standaloneUrl, 1440, 900, false);
   await until(() => evaluate("return $('magpie-status')?.dataset.state === 'online' && !$('token-ratio-card')?.hidden;"), 'authenticated Magpie Overview')
@@ -681,6 +704,10 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
   console.log('Chrome OK · native HTTP 401, 404, 500 and a missing script replace skeletons with an error');
   chrome.kill();
   await exited;
+}
+
+try {
+  await verify();
 } finally {
   ws?.close();
   if (chrome && chrome.exitCode === null && chrome.signalCode === null) {

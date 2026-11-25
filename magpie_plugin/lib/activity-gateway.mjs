@@ -33,7 +33,7 @@ function gatewayRow(row) {
     status_code: count(row.status ?? row.status_code),
     input_tokens: count(row.in ?? row.input_tokens),
     output_tokens: count(row.out ?? row.output_tokens),
-    cache_read_tokens: count(row.cache_read ?? row.cache_read_tokens),
+    cache_read_tokens: count(row.cache_read ?? row.cached_input_tokens ?? row.cache_read_tokens),
     cache_write_tokens: count(row.cache_write ?? row.cache_write_tokens),
     reasoning_tokens: count(row.reasoning ?? row.reasoning_tokens),
     // Magpie's short 'in' field counts uncached input.

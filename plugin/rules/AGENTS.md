@@ -1,4 +1,4 @@
-# GemPT v0.9.1
+# GemPT v0.10.0
 - 使用 `gempt_gempt` MCP 的 `gpt_swarm`、`gpt_board`、`gpt_run`、`gpt_ask`、`gpt_ctl`（沿用当前 Gemini 家族配对，杂活传 `tier="chore"`）。用 `gpt_swarm(action="channel")` 管理频道与订阅。
 - **默认单轨 Mode B（`native_swarm: false`）** 下，单任务 `gpt_run` 和多工位 `gpt_swarm` 共用当前会话的 Swarm 工作台。1 个工位紧凑显示，2 个起自动展开。多工位用 `gpt_board` 交接。
 - 支持 11 种可插拔执行 CLI（`auto` 按模型亲和自动选，或显式传 `cli`：`codex` / `opencode` / `claude` / `gemini` / `pi` / `cursor` / `kimi` / `grok` / `kilo` / `copilot` / `qoder`）；零 CLI 环境仍可用 `gpt_ask`。

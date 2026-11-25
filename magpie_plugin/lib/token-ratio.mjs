@@ -23,7 +23,7 @@ const MAX_MEM_CACHE_ENTRIES = 32;
 const SWARM_COORD_TOOLS = new Set(['read_board', 'swarm_wait', 'post_message', 'swarm', 'schedule', 'manage_task']);
 const VISION_TOOLS = new Set(['generate_image', 'browser_subagent']);
 const GEMPT_TOOLS = new Set([
-  'gempt_gempt', 'gpt_run', 'gpt_ask', 'gpt_ctl', 'gempt_run', 'gempt_ask', 'gempt_ctl', 'gempt-worker',
+  'gempt_gempt', 'gpt_swarm', 'gpt_board', 'gpt_run', 'gpt_ask', 'gpt_ctl', 'gempt_run', 'gempt_ask', 'gempt_ctl', 'gempt-worker',
 ]);
 const GEMPT_COMMAND = /(?:^|[;&|]\s*)(?:&\s+)?(?:"[^"\r\n]*[/\\]|'[^'\r\n]*[/\\]|[^\s"';&|]*[/\\]|["'])?(?:gempt-wait(?:\.cmd)?["']?|gempt(?:\.cmd)?["']?\s+(?:run|ask|steer|reply-tool))(?=\s|[;&|]|$)/i;
 const MEDIA_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.ico', '.svg', '.mp4', '.mov', '.webm', '.wav', '.mp3', '.pdf']);
@@ -298,9 +298,10 @@ function readUsageRows(usageFile, size, start) {
     const ts = parseTimestampMs(obj.t ?? obj.created_at ?? obj.timestamp);
     if (ts === null) return;
     const cls = classifyModel(obj.served || obj.model || obj.req, obj.provider);
-    rows.push([ts, cls, obj.in !== undefined ? obj.in : obj.input_tokens,
-      obj.out !== undefined ? obj.out : obj.output_tokens,
-      obj.cache_read !== undefined ? obj.cache_read : obj.cache_read_tokens]);
+    const cached = obj.cache_read ?? obj.cached_input_tokens ?? obj.cache_read_tokens ?? 0;
+    // Short Magpie input is uncached. Canonical input already includes hits.
+    const fresh = obj.in ?? Math.max(0, (obj.input_tokens ?? 0) - cached);
+    rows.push([ts, cls, fresh, obj.out ?? obj.output_tokens, cached]);
   };
 
   let fd;

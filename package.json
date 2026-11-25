@@ -1,6 +1,6 @@
 {
   "name": "gempt",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "description": "Antigravity MCP orchestration that pairs Gemini with models from your Magpie gateway.",
   "author": {
     "name": "yizhang-dream",

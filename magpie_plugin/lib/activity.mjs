@@ -270,10 +270,10 @@ function activityEntries(directory) {
   }
 }
 
-function readActivityFile(file) {
+function readActivityFile(file, since = -Infinity) {
   try {
     const stat = lstatSync(file);
-    if (stat.isFile()) {
+    if (stat.isFile() && stat.mtimeMs >= since) {
       const data = readJsonSafe(file);
       if (data) return { data, modified: stat.mtime.toISOString(), modifiedMs: stat.mtimeMs };
     }
@@ -398,7 +398,7 @@ function activityRequest(source, context) {
     ttft_ms: activityNumber(source.ttft_ms),
     output_tokens_per_sec: activityNumber(source.tokens_per_sec ?? source.output_tokens_per_sec),
     cost: activityNumber(source.cost_usd ?? source.cost),
-    usage: activityUsage(source.usage),
+    usage: activityUsage(source.usage ?? source.progress?.token_usage),
     verification: {
       status: String(verification?.status || (requested ? 'unverified' : '')),
       requested: String(requested || ''),
@@ -580,6 +580,16 @@ function activityCost(rows) {
   return sumKnown(rows, (row) => row.cost_usd);
 }
 
+function gatewayCandidates(requests) {
+  return requests.map(row => ({ ...row, dispatchSessionId: row.session_id || row.dispatchSessionId,
+    active: ACTIVE_RUN_STATES.has(row.status) }));
+}
+
+function gatewayPromptTokens(row) {
+  if (row.input_tokens == null) return null;
+  return row.input_tokens + (row.input_includes_cache ? 0 : (row.cache_read_tokens ?? 0) + (row.cache_write_tokens ?? 0));
+}
+
 function mergeGatewayUsage(request, rows) {
   request.gateway_requests = rows;
   request.gateway_request_count = rows.length;
@@ -602,8 +612,7 @@ function mergeGatewayUsage(request, rows) {
 
   const usage = request.usage;
   const cached = sumKnown(rows, (row) => row.cache_read_tokens);
-  const input = sumKnown(rows.filter((row) => row.cache_read_tokens != null), (row) => row.input_tokens == null ? null
-    : row.input_tokens + (row.input_includes_cache ? 0 : row.cache_read_tokens + (row.cache_write_tokens ?? 0)));
+  const input = sumKnown(rows.filter((row) => row.cache_read_tokens != null), gatewayPromptTokens);
   if (cached != null) {
     usage.cache_read_tokens = cached;
     usage.cache_hit_rate = input > 0 ? Math.min(1, cached / input) : null;
@@ -722,7 +731,55 @@ const overviewWorker = createBackgroundWorker(new URL(import.meta.url), 'gempt-o
 const overviewReads = new Map();
 const overviewSnapshots = new WeakMap();
 
-function snapshotOverviewActivity(dir) {
+function recentBypasses(configPath, since, now) {
+  let count = 0;
+  const dir = join(dirname(configPath), 'hook-state');
+  for (const entry of activityEntries(dir)) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    const state = readActivityFile(join(dir, entry.name), since)?.data;
+    for (const at of Object.values(state?.bypass_turns || {})) {
+      if (at * 1000 >= since && at * 1000 <= now) count++;
+    }
+  }
+  return count;
+}
+
+async function weeklyActivity(ledger, magpieDir, configPath) {
+  const now = Date.now();
+  const since = now - 7 * 86400000;
+  const recent = ledger.filter(row => {
+    const at = Date.parse(row.timestamp);
+    return at >= since && at <= now;
+  });
+  let input = 0;
+  let cached = 0;
+  // Prefer normalized receipts. Fill missing observations with correlated
+  // gateway calls only, so a request seen by both sources counts once.
+  if (recent.some(row => row.usage.cache_hit_rate == null)) {
+    const candidates = gatewayCandidates(recent);
+    const linked = await correlateGatewayUsage(join(magpieDir, 'usage.jsonl'), candidates);
+    for (const request of candidates) {
+      if (request.usage.cache_hit_rate != null) continue;
+      for (const row of linked.get(request) || []) {
+        const at = Date.parse(row.timestamp);
+        const prompt = gatewayPromptTokens(row);
+        if (at >= since && at <= now && prompt > 0 && row.cache_read_tokens != null) {
+          input += prompt;
+          cached += Math.min(prompt, row.cache_read_tokens);
+        }
+      }
+    }
+  }
+  for (const { usage } of recent) {
+    if (usage.cache_hit_rate == null) continue;
+    input += usage.input_tokens;
+    cached += Math.min(usage.input_tokens, usage.cache_read_tokens);
+  }
+  return { cache_hit_rate: cacheHitRatio({ input_tokens: input, cached_input_tokens: cached }),
+    bypass_count: recentBypasses(configPath, since, now) };
+}
+
+async function snapshotOverviewActivity(dir, magpieDir, configPath) {
   const ledger = readDispatchActivity(dir);
   if (!overviewSnapshots.has(ledger)) {
     const { recentSessions, recentRuns } = readRecentActivity(dir, 6);
@@ -730,15 +787,16 @@ function snapshotOverviewActivity(dir) {
       activityTotals: ledger.totals, recentSessions, recentRuns, activeRuns: readActiveRuns(dir),
     });
   }
-  return overviewSnapshots.get(ledger);
+  return { ...overviewSnapshots.get(ledger), weekly: await weeklyActivity(ledger.ledger, magpieDir, configPath) };
 }
 
-export function readOverviewActivity(sessionsDir) {
-  const dir = resolveSessionsDir(sessionsDir);
-  if (!overviewReads.has(dir)) {
-    overviewReads.set(dir, overviewWorker(dir).finally(() => overviewReads.delete(dir)));
+export function readOverviewActivity(sessionsDir, magpieConfigDir, configPath) {
+  const args = [resolveSessionsDir(sessionsDir), resolveMagpieConfigDir(magpieConfigDir), resolveConfigPath(configPath)];
+  const key = JSON.stringify(args);
+  if (!overviewReads.has(key)) {
+    overviewReads.set(key, overviewWorker(...args).finally(() => overviewReads.delete(key)));
   }
-  return overviewReads.get(dir);
+  return overviewReads.get(key);
 }
 
 if (!isMainThread && workerData === 'gempt-overview') serveBackgroundWorker(snapshotOverviewActivity);
@@ -761,8 +819,7 @@ async function enrichDispatchActivity(sessionsDir, magpieConfigDir, configPath) 
   const { data, liveRunChecks } = built;
   const cfg = readJsonSafe(resolvedCfgPath);
   const baseUrl = cfg?.magpie?.base_url || defaultGatewayFromEnv();
-  const candidates = data.ledger.map((row) => ({ ...row, dispatchSessionId: row.session_id || row.dispatchSessionId,
-    active: ACTIVE_RUN_STATES.has(row.status) }));
+  const candidates = gatewayCandidates(data.ledger);
   const linked = await correlateGatewayUsage(usageFile, candidates,
     { baseUrl, apiKey: cfg ? resolveMagpieApiKey(cfg, baseUrl) : '' });
   data.ledger.forEach((row, index) => mergeGatewayUsage(row, linked.get(candidates[index]) || []));

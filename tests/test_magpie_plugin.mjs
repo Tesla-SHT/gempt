@@ -358,7 +358,7 @@ test('npm pack dry run includes the MIT license and Live bundle and excludes loc
     ...(npmCli ? [npmCli] : []), 'pack', '--dry-run', '--json', '--ignore-scripts',
   ], { cwd: REPO_ROOT, timeout: 30_000, windowsHide: true });
   const [{ files, version }] = JSON.parse(stdout);
-  assert.equal(version, '0.9.1');
+  assert.equal(version, '0.10.0');
   const paths = files.map((file) => file.path);
   assert.deepEqual(paths.filter((path) => /^plugin\/skills\/[^/]+\/SKILL\.md$/.test(path)).sort(),
     ['plugin/skills/gempt-chore/SKILL.md', 'plugin/skills/gempt/SKILL.md']);
@@ -437,7 +437,7 @@ test('UI token-ratio card offers all ranges, shows observation states and has no
   const script = readFileSync(join(REPO_ROOT, 'magpie_plugin', 'ui', 'app.js'), 'utf-8');
   assert.deepEqual([...html.matchAll(/data-ratio-range="([^"]+)" aria-pressed="([^"]+)">([^<]+)/g)].map((match) => match.slice(1)), [
     ['1h', 'false', '1小时内'], ['6h', 'false', '6小时内'], ['today', 'false', '今天'],
-    ['24h', 'true', '24小时'], ['7d', 'false', '7天'],
+    ['24h', 'false', '24小时'], ['7d', 'true', '7天'],
   ]);
   assert.doesNotMatch(html + script, /放宽派单|强力放宽|低于目标|已回落 Gemini|仅派专研|当前接单|自动放宽|RATIO_ADJ_META|effective_kinds/);
   const renderSource = script.match(/  function renderTokenRatio\([\s\S]+?\r?\n  }/)?.[0];
@@ -459,11 +459,11 @@ test('UI token-ratio card offers all ranges, shows observation states and has no
     tr: (str, ...args) => args.length ? str.replace(/\{(\d+)\}/g, (_, i) => args[i]) : str,
   });
   for (const [range, titleText, target, status, badgeText] of [
-    ['1h', '1 小时内实际 Token 占比', 0, 'off', '已关闭'],
-    ['6h', '6 小时内实际 Token 占比', 15, 'no_data', '暂无数据'],
-    ['today', '今天实际 Token 占比', 35, 'warming_up', '样本积累中'],
-    ['24h', '近 24h 实际 Token 占比', 60, 'observing', '实时观测'],
-    ['7d', '近 7 天实际 Token 占比', 80, 'observing', '实时观测'],
+    ['1h', '1 小时内实际工作量占比', 0, 'off', '已关闭'],
+    ['6h', '6 小时内实际工作量占比', 15, 'no_data', '暂无数据'],
+    ['today', '今天实际工作量占比', 35, 'warming_up', '样本积累中'],
+    ['24h', '近 24h 实际工作量占比', 60, 'observing', '实时观测'],
+    ['7d', '近 7 天实际工作量占比', 80, 'observing', '实时观测'],
   ]) {
     const total = status === 'observing' ? 66.7 : null;
     renderTokenRatio({ range, target_gpt_share: target, status, actual_gpt_total_share: total });
@@ -2600,7 +2600,7 @@ test('boot prewarms token ratio and overview, coalesces refreshes and reflects l
   const { port, close } = await startServer({ port: 0, configPath: join(dir, 'config.json'), sessionsDir, magpieConfigDir: dir });
   t.after(close);
   await eventually(() => posted.some(([scope]) => scope === sessionsDir)
-    && posted.some(([, options]) => options?.range === '24h'));
+    && posted.some(([, options]) => options?.range === '7d'));
 
   const { readOverviewActivity } = await import('../magpie_plugin/lib/activity.mjs');
   const first = readOverviewActivity(sessionsDir, dir);
@@ -2615,6 +2615,48 @@ test('boot prewarms token ratio and overview, coalesces refreshes and reflects l
     rawHttpGet({ port, path: '/api/summary', headers })]);
   assert.equal(JSON.parse(overview.text).activity_totals.requests, 1);
   assert.equal(JSON.parse(summary.text).magpie.reachable, null);
+});
+
+test('Overview reports weighted weekly prompt cache hits and bypassed turns', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'gempt-weekly-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const sessionsDir = join(dir, 'sessions');
+  mkdirSync(sessionsDir);
+  const { port, close } = await startServer({ port: 0, configPath: join(dir, 'config.json'), sessionsDir, magpieConfigDir: dir });
+  t.after(close);
+  const page = await rawHttpGet({ port, path: '/' });
+  const headers = { 'x-gempt-key': page.text.match(/name="gempt-key" content="([^"]+)"/)[1] };
+  const weekly = async () => JSON.parse((await rawHttpGet({ port, path: '/api/overview', headers })).text).activity_7d;
+  assert.deepEqual(await weekly(), { cache_hit_rate: null, bypass_count: 0 });
+
+  const now = Date.now() - 1000;
+  const old = now - 8 * 86400000;
+  const receipt = (name, at, usage) => writeFileSync(join(sessionsDir, 'consult-' + name + '.json'), JSON.stringify({
+    mode: 'consult', turns: [{ timestamp: new Date(at).toISOString(), response_id: name, goal: name, usage }],
+  }));
+  receipt('old', old, { input_tokens: 999, cached_input_tokens: 999 });
+  receipt('unknown', now, { input_tokens: 1000 });
+  receipt('cold', now, { input_tokens: 100, cached_input_tokens: 0 });
+  assert.deepEqual(await weekly(), { cache_hit_rate: 0, bypass_count: 0 });
+  receipt('warm', now, { input_tokens: 300, cached_input_tokens: 200 });
+  receipt('gateway', now, {});
+  writeFileSync(join(dir, 'usage.jsonl'), [
+    { t: now, response_id: 'warm', in: 100, cache_read: 200 },
+    { t: now, response_id: 'gateway', in: 50, cache_read: 50 },
+  ].map(row => JSON.stringify(row)).join('\n'));
+  mkdirSync(join(dir, 'hook-state'));
+  writeFileSync(join(dir, 'hook-state', 'active.json'), JSON.stringify({
+    bypass_count: 3, bypass_turns: { expired: old / 1000, recent: now / 1000, again: now / 1000 },
+  }));
+  writeFileSync(join(dir, 'hook-state', 'legacy.json'), '{}');
+  assert.deepEqual(await weekly(), { cache_hit_rate: 0.5, bypass_count: 2 });
+  writeFileSync(join(dir, 'usage.jsonl'), JSON.stringify({
+    t: now, model: 'gpt', input_tokens: 100, cached_input_tokens: 80, output_tokens: 10,
+  }));
+  const { readTokenRatio } = await import('../magpie_plugin/lib/token-ratio.mjs');
+  const ratio = readTokenRatio({ magpieConfigDir: dir, brainDir: '', sessionsDir, range: '7d', nowMs: now });
+  assert.equal(ratio.gpt.work, 70);
+  assert.equal(ratio.gpt.total, 110);
 });
 
 test('summary and overview avoid a stalled gateway, and the separate probe coalesces and caches failures', async (t) => {
@@ -2750,7 +2792,7 @@ test('mcpTools false disables duplicate Magpie GemPT tool registration', async (
 
 test('Magpie marketplace check shape and inspect+share guard hold', async () => {
   const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '0.9.1');
+  assert.equal(pkg.version, '0.10.0');
   assert.ok(pkg.keywords.includes('magpie-plugin'));
   assert.ok(pkg.files.includes('THIRD_PARTY_LICENSES.txt'));
   assert.ok(pkg.magpie?.summary?.en && pkg.magpie?.summary?.zh);
