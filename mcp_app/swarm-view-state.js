@@ -34,12 +34,12 @@ export function normalizeMessage(message) {
 export function snapshotQuery({ swarmId, scope, cursor }) {
   return { ...(swarmId && { swarm_id: swarmId }), scope, omitRaw: 1, tail: 1,
     ...(cursor && { etag: cursor.etag, since: cursor.head, known: cursor.known,
-      rosterKey: cursor.rosterKey, viewKey: cursor.viewKey ?? "" }) };
+      rosterKey: cursor.rosterKey, viewKey: cursor.viewKey ?? "", ...(cursor.timelineKey && { timelineKey: cursor.timelineKey }) }) };
 }
 
 export function historyQuery(swarmId, cursor, first, fromSeq) {
   return { swarm_id: swarmId, rosterKey: cursor.rosterKey, before: cursor.offset,
-    beforeSeq: first, limit: BOARD_WINDOW, ...(fromSeq != null && { fromSeq }) };
+    beforeSeq: first, limit: BOARD_WINDOW, ...(cursor.timelineKey && { timelineKey: cursor.timelineKey }), ...(fromSeq != null && { fromSeq }) };
 }
 
 export function selectBoardRows(messages, limit, focusSeq) {

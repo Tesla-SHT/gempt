@@ -18,6 +18,8 @@ const english = {
   "已完成 {0}/{1}": "{0}/{1} complete", "反馈": "Send feedback", "反馈内容": "Feedback", "已提交反馈": "Feedback sent",
   "按频道与成员查看消息": "Filter by channel and member", "尚无已读取的原始数据": "Raw data is unavailable",
   "实时": "Live", "最新消息 {0}": "Last post {0}", "查看完整回放": "Load full replay",
+  "融合消息板为只读。": "The combined board is read-only.",
+  "原生消息板为只读。": "The native board is read-only.",
   "在新窗口打开": "Open in new window", "显示了部分消息，加载更早消息以继续筛选。": "Search covers loaded posts. Load earlier posts to search more.",
 };
 const tr = (value, ...args) => locale() === "en" && Object.hasOwn(english, value)
@@ -108,7 +110,8 @@ export function groupWorkersByThreads(threads, roster = []) {
       }
       return false;
     };
-    for (const candidate of [...(thread?.workers || []), ...(thread?.members || [])]) {
+    for (const candidate of [...(Array.isArray(thread?.workers) ? thread.workers : []),
+      ...(Array.isArray(thread?.members) ? thread.members : [])]) {
       claim(candidate);
     }
     for (const task of Array.isArray(thread?.tasks) ? thread.tasks : []) {
@@ -224,6 +227,34 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
   let fetchWanted = false;
   let pollTimer = null;
   let opaqueWriteBlocked = Boolean(transport.opaqueOrigin);
+  const fused = () => ["native", "hybrid"].includes(overview?.source);
+  const boardReadOnly = () => opaqueWriteBlocked || fused();
+
+  function memberJump(worker) {
+    if (!worker) return null;
+    if (worker.run_id) return () => navigate("live", { id: worker.run_id, focus: true });
+    const conv = worker.origin === "native" ? worker.conversationId :
+      worker.host_conversation_id || (worker.conversation_id !== worker.session_id ? worker.conversation_id : null);
+    if (!conv || !sidecar?.ui) return null;
+    if (typeof sidecar.ui.openConversation === "function") return () => sidecar.ui.openConversation(conv);
+    if (typeof sidecar.ui.toggleConversation === "function") return () => sidecar.ui.toggleConversation(conv);
+    return null;
+  }
+
+  function sourceBadge(item) {
+    if (!item?.origin) return null;
+    const label = item.origin === "native" ? "Gemini / Native" : item.cli || "GemPT";
+    const badge = node("span", label, "sw-source-badge");
+    badge.dataset.origin = item.origin;
+    return badge;
+  }
+
+  function actionTarget(worker) {
+    if (!worker || worker.origin === "native") return null;
+    if (!fused()) return { swarm_id: selectedSwarmId, name: worker.name };
+    return worker.origin === "gempt" && worker.control_swarm_id ?
+      { swarm_id: worker.control_swarm_id, name: worker.control_name } : null;
+  }
   let posting = false;
   let replyTo = null; // { seq, from }
   let pendingConfirm = null; // { action: "interrupt" | "kill", name }
@@ -409,8 +440,8 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     const displayTitle = swarm ? (swarm.title || swarm.goal_title || (swarm.id.startsWith("conversation-") ? tr("会话协作") : swarm.id)) : tr("Swarm 协作");
     put("swarm-title", displayTitle);
     $("swarm-title").title = swarm ? `${displayTitle} (${swarm.id})` : displayTitle;
-    $("swarm-edit-title").hidden = !hasSwarm || opaqueWriteBlocked || editingTitle;
-    $("swarm-title-form").hidden = !hasSwarm || !editingTitle;
+    $("swarm-edit-title").hidden = !hasSwarm || boardReadOnly() || editingTitle;
+    $("swarm-title-form").hidden = !hasSwarm || boardReadOnly() || !editingTitle;
 
     const goalEl = $("swarm-goal");
     const goalParts = [swarm?.goal_title, swarm?.goal_line].filter(Boolean);
@@ -436,10 +467,14 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       if (c.killed > 0) items.push({ state: "killed", label: tr("已终止 {0}", c.killed) });
       if (!items.length) items.push({ state: "idle", label: tr("共 {0} 个工位", c.total) });
 
-      const key = JSON.stringify(items);
+      const key = JSON.stringify([overview.source, items]);
       if (pills.dataset.key !== key) {
         pills.dataset.key = key;
-        pills.replaceChildren(...items.map((item) => {
+        const origin = overview.source === "hybrid" ? "Hybrid · Native Gemini + External CLI" :
+          overview.source === "native" ? "Native · Gemini" : null;
+        const originPill = origin ? node("span", origin, "sw-source-badge sw-source-summary") : null;
+        if (originPill) originPill.dataset.origin = overview.source;
+        pills.replaceChildren(...(originPill ? [originPill] : []), ...items.map((item) => {
           const pill = node("span", "", "swarm-pill");
           pill.dataset.state = item.state;
           pill.append(node("span", "", "swarm-dot"));
@@ -493,7 +528,9 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     if (worker.steps != null) top.append(node("span", tr("{0} 步", worker.steps), "sw-meta-pill"));
 
     const details = node("div", "", "sw-worker-details");
-    if (worker.cli) {
+    const origin = sourceBadge(worker);
+    if (origin) top.append(origin);
+    else if (worker.cli) {
       const cliPill = node("span", worker.cli, "swarm-cli-pill mono");
       cliPill.dataset.cli = worker.cli;
       cliPill.title = tr("执行 CLI：{0}", worker.cli);
@@ -506,7 +543,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       top.append(rt);
     }
 
-    const ratio = worker.telemetry?.cache_hit_ratio;
+    const ratio = worker.cache_hit_ratio ?? worker.telemetry?.cache_hit_ratio;
     if (Number.isFinite(ratio)) details.append(node("span", tr("缓存命中率") + " " + pctFmt.format(ratio), "sw-meta-pill"));
     if (worker.workspace === "share" || worker.worktree_path) {
       const wt = node("span", "Worktree", "run-kind");
@@ -553,10 +590,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       main.append(current);
     }
     const actions = node("div", "", "swarm-worker-actions");
-    const hostConversation = worker.host_conversation_id
-      || (worker.conversation_id !== worker.session_id ? worker.conversation_id : null);
-    const jump = worker.run_id ? () => navigate("live", { id: worker.run_id, focus: true })
-      : hostConversation && sidecar?.ui?.toggleConversation ? () => sidecar.ui.toggleConversation(hostConversation) : null;
+    const jump = memberJump(worker);
     if (jump) {
       const open = node("button", worker.name, "sw-member-link");
       open.type = "button"; open.title = tr("打开成员会话");
@@ -565,9 +599,10 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       li.onclick = event => { if (!event.target.closest("button,summary,a,input")) jump(); };
     }
 
-    const canInterrupt = !opaqueWriteBlocked && Boolean(worker.run_id)
+    const canControl = !opaqueWriteBlocked && Boolean(actionTarget(worker));
+    const canInterrupt = canControl && Boolean(worker.run_id)
       && (worker.telemetry?.can_interrupt ?? (worker.state === "working" || worker.state === "waiting_reply"));
-    const canKill = !opaqueWriteBlocked && worker.state !== "killed" && worker.role !== "coordinator";
+    const canKill = canControl && worker.state !== "killed" && worker.role !== "coordinator";
 
     if (canInterrupt) {
       const isConfirm = pendingConfirm?.action === "interrupt" && pendingConfirm?.name === worker.name;
@@ -607,7 +642,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       actions.append(btn);
     }
 
-    if (!opaqueWriteBlocked && worker.role !== "coordinator" && ["waiting", "stopped"].includes(worker.state)) {
+    if (canControl && worker.role !== "coordinator" && ["waiting", "stopped"].includes(worker.state)) {
       const form = node("form", "", "sw-tool-row sw-model-form");
       const input = node("input");
       input.placeholder = tr("模型名称"); input.setAttribute("aria-label", input.placeholder);
@@ -658,7 +693,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     else if (!view?.jsonError) narratorLastGood = null;
     const model = narratorLastGood;
     const narrator = overview?.narrator;
-    root.hidden = !model && !narrator;
+    root.hidden = !model && !narrator && !view?.html;
     if (root.hidden) { removeNarratorFrame(); return; }
     const date = formatStamp(model?.updated_at || view?.jsonMtime);
     const stale = narrator?.stale ?? Boolean(narrator && overview.head - Math.max(model?.as_of_seq || 0, narrator.last_read_seq || 0) >= 10
@@ -668,14 +703,15 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     const template = typeof view?.html === "string" && new TextEncoder().encode(view.html).length <= 65536 ? view.html : "";
     const key = template && (view.htmlKey || template);
     if (narratorFailure && body.dataset.failedKey !== key) narratorFailure = false;
-    mode.hidden = !model || !template;
+    mode.hidden = !template;
     mode.textContent = tr(narratorRequested && !narratorFailure ? "纯文本视图" : "自定义视图");
-    if (model && template && narratorRequested && !narratorFailure && active) {
+    if (template && narratorRequested && !narratorFailure && active) {
+      const dataModel = model || {};
       const meta = { head: overview.head, narrator, members: overview.roster.map(({ name, role, state }) => ({ name, role, status: state })) };
-      const data = JSON.stringify([model, meta]);
+      const data = JSON.stringify([dataModel, meta]);
       if (narratorFrame && narratorFrameKey === key) {
         if (narratorData !== data) {
-          narratorFrame.contentWindow?.postMessage({ type: "DATA_UPDATE", view: model, meta }, "*");
+          narratorFrame.contentWindow?.postMessage({ type: "DATA_UPDATE", view: dataModel, meta }, "*");
           narratorData = data;
           clearTimeout(narratorWatchdog);
           narratorWatchdog = setTimeout(narratorFallback, 3000);
@@ -689,7 +725,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       frame.setAttribute("sandbox", "allow-scripts");
       frame.referrerPolicy = "no-referrer";
       const nonce = document.querySelector('script[src="./app.js"]')?.nonce;
-      frame.srcdoc = buildNarratorSrcdoc(template, model, meta, narratorTheme(), nonce);
+      frame.srcdoc = buildNarratorSrcdoc(template, dataModel, meta, narratorTheme(), nonce);
       narratorFrame = frame;
       narratorFrameKey = key;
       narratorData = data;
@@ -701,7 +737,8 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       return;
     }
     removeNarratorFrame();
-    const plainKey = JSON.stringify([locale(), model, opaqueWriteBlocked]);
+    const canFeedback = !opaqueWriteBlocked && narrator?.origin !== "native" && view?.origin !== "native";
+    const plainKey = JSON.stringify([locale(), model, canFeedback]);
     if (body.dataset.key === plainKey && body.childElementCount) return;
     body.dataset.key = plainKey;
     body.replaceChildren();
@@ -719,7 +756,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
         for (const ref of Array.isArray(item.refs) ? item.refs.slice(0, 12) : []) {
           if (Number.isSafeInteger(ref?.seq) && ref.seq > 0 && ref.seq <= overview.head) row.append(citation(ref.seq));
         }
-        if (!opaqueWriteBlocked && typeof item.id === "string") {
+        if (canFeedback && typeof item.id === "string") {
           const feedback = node("button", tr("反馈"), "btn-ghost");
           feedback.type = "button";
           feedback.onclick = () => requestFeedback(item.id);
@@ -738,11 +775,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       void jumpTo(Number(target));
     } else if (action?.type === "open_conv" && typeof target === "string") {
       const member = overview.roster.find(({ name }) => name === target);
-      if (member?.run_id) navigate("live", { id: member.run_id, focus: true });
-      else {
-        const conv = member?.host_conversation_id ?? member?.conversation_id;
-        if (conv && conv !== member?.session_id) sidecar?.ui?.toggleConversation?.(conv);
-      }
+      memberJump(member)?.();
     } else if (action?.type === "url" && typeof target === "string") {
       try {
         const url = new URL(target);
@@ -763,6 +796,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       && ["attention", "workstreams", "milestones", "risks"].some(key =>
         Array.isArray(narratorLastGood?.[key]) && narratorLastGood[key].some(item => item?.id === id));
     if (!valid) return;
+    if (overview?.narrator?.origin === "native" || overview?.view?.origin === "native") return;
     if (opaqueWriteBlocked) { showToast?.(tr("嵌入式只读视图")); return; }
     const swarmId = selectedSwarmId, feedbackScope = scope;
     const dialog = node("dialog", "", "sw-feedback-dialog");
@@ -842,7 +876,19 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
         for (const worker of group.workers) {
           const row = node("li", "", "sw-thread-member");
           const status = node("span", "", "swarm-dot"); status.dataset.state = worker.state;
-          row.append(status, node("strong", worker.name), node("span", worker.task_summary || ""));
+          row.append(status);
+          const jump = memberJump(worker);
+          if (worker.origin && jump) {
+            const open = node("button", worker.name, "sw-member-link");
+            open.type = "button";
+            open.onclick = jump;
+            row.append(open);
+          } else row.append(node("strong", worker.name));
+          const origin = sourceBadge(worker);
+          if (origin) row.append(origin);
+          const ratio = worker.cache_hit_ratio ?? worker.telemetry?.cache_hit_ratio;
+          if (Number.isFinite(ratio)) row.append(node("span", tr("缓存命中率") + " " + pctFmt.format(ratio), "sw-meta-pill"));
+          if (worker.task_summary) row.append(node("span", worker.task_summary, "sw-thread-task"));
           if (worker.last_post_seq) row.append(citation(worker.last_post_seq));
           ul.append(row);
         }
@@ -904,11 +950,17 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
 
   async function renderRaw() {
     const version = selectionVersion;
-    const key = JSON.stringify([selectedSwarmId, boardHead, cursor?.rosterKey, overview.view?.jsonMtime, overview.plan, overview.swarm.title]);
+    const key = JSON.stringify([selectedSwarmId, boardHead, cursor?.rosterKey, cursor?.timelineKey, overview.rawKey, overview.view?.jsonMtime, overview.plan, overview.swarm.title]);
     const output = $("swarm-raw");
-    const kind = $("swarm-raw-kind").value;
     if (raw?.key === key) {
-      const value = raw.data[kind];
+      const files = [["members", "members.json"], ["board", "board.jsonl"], ["view", "view.json"], ["plan", "plan.json"]];
+      const origins = ["native", "gempt"].filter((origin) => raw.data[origin]);
+      const entries = origins.length ? origins.flatMap((origin) => [
+        ...files, ...(origin === "native" && raw.data.native.html ? [["html", "view.html"]] : []),
+      ].map(([kind, filename]) => [origin + "/" + kind, (origin === "native" ? "Native" : "GemPT") + " · " + filename])) : files;
+      selectOptions("swarm-raw-kind", entries);
+      const [origin, kind] = $("swarm-raw-kind").value.split("/");
+      const value = kind ? raw.data[origin]?.[kind] : raw.data[origin];
       output.textContent = typeof value === "string" ? value : JSON.stringify(value ?? null, null, 2);
       $("swarm-raw-copy").disabled = false;
       return;
@@ -934,13 +986,13 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     if (!wrap) return;
     const roster = (overview?.roster || []).filter((w) => w.state !== "killed");
     const names = [...new Set(["all", "coordinator", ...roster.map((w) => w.name), ...registry().filter(c => !c.archived && c.name !== "main").map(c => "#" + c.name)])];
-    const key = JSON.stringify([opaqueWriteBlocked, names]);
+    const key = JSON.stringify([boardReadOnly(), names]);
     if (wrap.dataset.key === key) return;
     wrap.dataset.key = key;
     wrap.replaceChildren(...names.map((name) => {
       const chip = node("button", `@${name}`, "swarm-mention-chip mono");
       chip.type = "button";
-      chip.disabled = opaqueWriteBlocked;
+      chip.disabled = boardReadOnly();
       chip.dataset.mention = name;
       chip.addEventListener("click", () => insertMention(name));
       return chip;
@@ -992,7 +1044,19 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     const input = $("swarm-composer-input");
     const send = $("swarm-composer-send");
     if (!input || !send) return;
-    input.disabled = opaqueWriteBlocked || !selectedSwarmId || registry().some(c => c.name === channel && c.archived);
+    const composer = $("swarm-composer");
+    const readOnly = fused();
+    composer.querySelector(".swarm-composer-col").hidden = readOnly;
+    let notice = composer.querySelector(".sw-board-readonly");
+    if (readOnly && !notice) {
+      notice = node("p", "", "reading-column sw-board-readonly");
+      composer.append(notice);
+    }
+    if (notice) {
+      notice.hidden = !readOnly;
+      notice.textContent = tr(overview?.source === "native" ? "原生消息板为只读。" : "融合消息板为只读。");
+    }
+    input.disabled = boardReadOnly() || !selectedSwarmId || registry().some(c => c.name === channel && c.archived);
     const disabled = input.disabled || posting;
     send.disabled = disabled || !input.value.trim();
   }
@@ -1029,7 +1093,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     renderReplyBanner();
     syncComposerControls();
 
-    const key = JSON.stringify([locale(), opaqueWriteBlocked, selectedSwarmId, boardRevision, mounted.map(m => m.seq), divider]);
+    const key = JSON.stringify([locale(), boardReadOnly(), selectedSwarmId, boardRevision, mounted.map(m => m.seq), divider]);
     if (feed.dataset.key === key) return;
     feed.dataset.key = key;
     const old = new Map([...feed.children].map(el => [el.dataset.seq ?? "divider", el]));
@@ -1039,7 +1103,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       const previous = mounted[index - 1];
       const grouped = msg.seq !== divider && predecessor.get(msg)?.seq === previous?.seq && boardGroup(previous, msg);
       if (msg.seq === divider) desired.push(node("li", tr("未读消息"), "sw-unread-divider"));
-      const itemKey = JSON.stringify([locale(), opaqueWriteBlocked, grouped, msg, self?.name]);
+      const itemKey = JSON.stringify([locale(), boardReadOnly(), grouped, msg, self?.name]);
       const existing = old.get(String(msg.seq));
       if (existing?.dataset.key === itemKey) { desired.push(existing); return; }
       const li = node("li", "", "swarm-msg");
@@ -1053,10 +1117,15 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
 
       const head = node("div", "", "swarm-msg-head");
       const seqEl = node("span", `#${msg.seq}`, "swarm-seq mono");
-      const sender = node("span", senderDisplayName(msg.from_agent), "swarm-sender-pill");
+      const worker = msg.origin && overview.roster.find(({ name }) => name === msg.from_agent);
+      const jump = msg.run_id ? () => navigate("live", { id: msg.run_id, focus: true }) : memberJump(worker);
+      const sender = node(jump ? "button" : "span", senderDisplayName(msg.from_agent), "swarm-sender-pill");
+      if (jump) { sender.type = "button"; sender.onclick = jump; }
       sender.dataset.palette = agentPaletteIndex(msg.from_agent);
       sender.title = `@${msg.from_agent}`;
       head.append(seqEl, sender);
+      const origin = sourceBadge(msg);
+      if (origin) head.append(origin);
       head.append(node("span", "#" + (msg.channel || "main"), "sw-meta-pill mono"));
       const to = recipients(msg);
       if (to.length) head.append(node("span", "→ " + to.join(" "), "sw-recipients"));
@@ -1082,7 +1151,8 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       const body = node("div", "", "swarm-msg-body");
       for (const token of tokenizeBoardText(msg.text)) {
         if (token.type === "seq_ref") {
-          body.append(citation(token.seq));
+          const seq = msg.source_key ? msg.references?.[token.seq] : token.seq;
+          body.append(seq ? citation(seq) : document.createTextNode(token.value));
         } else if (token.type === "mention" || token.type === "channel_mention") {
           body.append(node("span", token.value, "swarm-mention mono"));
         } else if (token.type === "done") {
@@ -1105,7 +1175,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
 
       if (Array.isArray(msg.screenshots) && msg.screenshots.length) {
         const chips = node("div", "", "swarm-msg-shots");
-        const shotLookup = new Map((overview?.screenshots || [])
+        const shotLookup = new Map((overview?.postedFrames || overview?.screenshots || [])
           .filter((s) => s.seq === msg.seq)
           .map((s) => [s.path, s]));
         for (const shot of msg.screenshots) {
@@ -1115,7 +1185,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
         li.append(chips);
       }
 
-      if (!msg.control && !opaqueWriteBlocked && msg.from_agent && msg.from_agent !== "human") {
+      if (!msg.control && !boardReadOnly() && msg.from_agent && msg.from_agent !== "human") {
         const actions = node("div", "", "swarm-msg-actions");
         const replyBtn = node("button", tr("回复 @{0}", msg.from_agent), "btn-ghost swarm-reply-btn");
         replyBtn.type = "button";
@@ -1213,7 +1283,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
         for (const message of rows) boardBySeq.set(message.seq, message);
       }
       cursor = { etag: result.etag, head: result.head, rosterKey: result.rosterKey, viewKey: result.viewKey,
-        known: result.totalMessages };
+        known: result.totalMessages, timelineKey: result.timelineKey };
       if (historyCursor) historyCursor.rosterKey = result.rosterKey;
       boardHead = result.head;
       boardRevision++;
@@ -1306,12 +1376,13 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
   }
 
   async function runWorkerAction(action, name, extras = {}) {
-    if (!selectedSwarmId || busyWorkerAction || opaqueWriteBlocked) return;
+    const target = actionTarget(overview?.roster.find((worker) => worker.name === name));
+    if (!target || busyWorkerAction || opaqueWriteBlocked) return;
     busyWorkerAction = `${action}:${name}`;
     pendingConfirm = null;
     render();
     try {
-      await transport.swarm("action", { swarm_id: selectedSwarmId, action, name, ...extras });
+      await transport.swarm("action", { ...target, action, ...extras });
       showToast?.(tr({ kill: "已终止工位 {0}", interrupt: "已中断 {0}", model: "已切换 {0} 的模型" }[action], name));
       await refresh({ silent: true });
     } catch (error) {
@@ -1325,7 +1396,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
   async function submitTitle(event) {
     event.preventDefault();
     const nextTitle = $("swarm-title-input").value.trim();
-    if (!selectedSwarmId || !nextTitle || savingTitle || opaqueWriteBlocked) return;
+    if (!selectedSwarmId || !nextTitle || savingTitle || boardReadOnly()) return;
     savingTitle = true;
     $("swarm-title-save").disabled = true;
     try {
@@ -1369,7 +1440,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
 
 
   function recipients(msg) {
-    const tokens = tokenizeBoardText(msg.text).filter(t => t.type === "mention" || t.type === "channel_mention");
+    const tokens = tokenizeBoardText(msg.text).filter(t => (t.type === "mention" && !msg.source_key) || t.type === "channel_mention");
     return [...new Set([...tokens.map(t => t.value.toLowerCase()), ...(msg.mentions || []).map(name =>
       "@" + name.replace(/^@/, "")), ...(msg.all ? ["@all"] : [])])];
   }
@@ -1391,9 +1462,9 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     $("swarm-earlier").disabled = true;
     try {
       const response = await read("messages", historyQuery(selectedSwarmId, {
-        rosterKey: cursor.rosterKey, offset: target?.offset ?? 0,
+        rosterKey: cursor.rosterKey, timelineKey: cursor.timelineKey, offset: target?.offset ?? 0,
       }, historyLowerBound, fromSeq));
-      if (selectionVersion !== version) return null;
+      if (selectionVersion !== version || target !== historyCursor) return null;
       if (response.stale || (response.rosterKey && response.rosterKey !== cursor?.rosterKey)) {
         await refresh({ silent: true, forceBoard: true });
         return null;
@@ -1482,7 +1553,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     const roster = overview.roster || [];
     const attention = $("swarm-attention");
     const alerts = overview.system_attention || [];
-    const labels = { error:"错误", quota:"配额暂停", stuck:"工位无更新", stall:"协作停滞" };
+    const labels = { error:"错误", quota:"配额暂停", stuck:"工位无更新", stall:"协作停滞", waiting_gemini:"等待回复" };
     attention.hidden = !alerts.length;
     attention.replaceChildren(...alerts.map(a => {
       const actor = a.agent ?? a.member;
@@ -1491,7 +1562,8 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       row.type = "button"; row.dataset.severity = a.kind;
       row.append(node("strong",tr(labels[a.kind] || "需要关注")),node("span",[actor && ("@"+actor),errorText(a.text ?? a.title)].filter(Boolean).join(" · ")));
       const seq = a.seq || Number(a.text?.match(/#(\d+)/)?.[1]) || worker?.last_post_seq || boardHead;
-      row.onclick = () => worker?.run_id && a.kind!=="stall" ? navigate("live",{id:worker.run_id,focus:true}) : seq ? jumpTo(seq) : setSubtab("board");
+      const jump = a.kind !== "stall" ? memberJump(worker) : null;
+      row.onclick = jump || (() => seq ? jumpTo(seq) : setSubtab("board"));
       return row;
     }));
   }
@@ -1515,14 +1587,14 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     selectOptions("swarm-channel-filter",choices);
     $("swarm-channel-filter").value=channel;
     selectOptions("swarm-target",[["main","#main"],...channels.filter(c=>!c.archived).map(c=>[c.name,"#"+c.name])]);
-    $("swarm-target-label").hidden = channel !== "*" || !channels.some(c => !c.archived) || opaqueWriteBlocked;
-    $("swarm-channel-actions").hidden = opaqueWriteBlocked;
-    $("swarm-archive").hidden=opaqueWriteBlocked || !channels.some(c=>c.name===channel && !c.archived);
+    $("swarm-target-label").hidden = channel !== "*" || !channels.some(c => !c.archived) || boardReadOnly();
+    $("swarm-channel-actions").hidden = boardReadOnly();
+    $("swarm-archive").hidden=boardReadOnly() || !channels.some(c=>c.name===channel && !c.archived);
     $("swarm-archive").disabled=channelBusy;
   }
 
   async function writeChannel(op) {
-    if (opaqueWriteBlocked || channelBusy || !selectedSwarmId) return;
+    if (boardReadOnly() || channelBusy || !selectedSwarmId) return;
     const name = op==="create" ? $("swarm-channel-name").value.trim() : channel;
     const version=selectionVersion;
     channelBusy=true;
@@ -1539,7 +1611,15 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
 
   function graphData() {
     const key=JSON.stringify([selectedSwarmId,boardRevision,overview.roster,overview.channels,overview.system_attention,overview.swarm]);
-    if(key!==graphKey) {snapshot=graphSnapshot(overview,messages());graphKey=key;graphDrawKey="";}
+    if (key !== graphKey) {
+      const rows = messages();
+      // Recipient resolution took place on each source board before the merge.
+      snapshot = graphSnapshot(overview, fused() ? [] : rows);
+      if (fused()) snapshot.messages = rows.filter((message) => !message.control).map((message) =>
+        ({ ...message, viaChannel: message.via_channel || [] }));
+      graphKey = key;
+      graphDrawKey = "";
+    }
     return snapshot;
   }
 
