@@ -385,7 +385,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     const picker = $("swarm-picker");
     const hasSwarm = Boolean(selectedSwarmId && overview?.swarm);
     if (picker) {
-      picker.hidden = false;
+      picker.hidden = swarms.length <= 1;
       picker.disabled = !swarms.length;
       if (swarms.length) {
         const key = JSON.stringify([selectedSwarmId, swarms.map((s) => [s.id, s.title, s.counts?.active, s.head])]);
@@ -688,7 +688,8 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       frame.title = tr("自定义视图");
       frame.setAttribute("sandbox", "allow-scripts");
       frame.referrerPolicy = "no-referrer";
-      frame.srcdoc = buildNarratorSrcdoc(template, model, meta, narratorTheme());
+      const nonce = document.querySelector('script[src="./app.js"]')?.nonce;
+      frame.srcdoc = buildNarratorSrcdoc(template, model, meta, narratorTheme(), nonce);
       narratorFrame = frame;
       narratorFrameKey = key;
       narratorData = data;

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { buildNarratorSrcdoc, frameDataUrl } from "../mcp_app/narrator-bootstrap.js";
 import {
   BOARD_WINDOW, boardGroup, historyQuery, memberGroups, normalizeMessage, selectBoardRows,
@@ -103,13 +105,14 @@ test("bundle inputs include scoped styles and the inline narrator bootstrap", ()
   assert.match(readSource("swarm.css"), /#swarm-panel\s*\{/);
   assert.match(readSource("hive.css"), /^#swarm-panel\s*\{/);
   assert.match(readSource("swarm-ui.js"), /from "\.\/narrator-bootstrap\.js"/);
-  const bundleDir = process.env.GEMPT_TEST_BUILT_UI;
-  if (bundleDir) {
-    const html = readFileSync(`${bundleDir}/index.html`, "utf8");
-    const css = readFileSync(`${bundleDir}/styles.css`, "utf8");
-    const js = readFileSync(`${bundleDir}/app.js`, "utf8");
-    for (const [, name] of template.matchAll(/id="swarm-subtab-([^"]+)"/g)) assert.ok(html.includes(`id="swarm-subtab-${name}"`));
-    assert.match(css, /#swarm-panel\s*\{\s*#swarm-hive-view/);
-    assert.match(js, /FEEDBACK_INTENT/);
-  }
+  const bundleDir = process.env.GEMPT_TEST_BUILT_UI
+    ? pathToFileURL(resolve(process.env.GEMPT_TEST_BUILT_UI) + "/")
+    : new URL("../core/assets/http-ui/", import.meta.url);
+  const html = readFileSync(new URL("index.html", bundleDir), "utf8");
+  const css = readFileSync(new URL("styles.css", bundleDir), "utf8");
+  const js = readFileSync(new URL("app.js", bundleDir), "utf8");
+  for (const [, name] of template.matchAll(/id="swarm-subtab-([^"]+)"/g)) assert.ok(html.includes(`id="swarm-subtab-${name}"`));
+  assert.doesNotMatch(html, /<meta\b[^>]*http-equiv\s*=\s*["']?Content-Security-Policy/i);
+  assert.match(css, /#swarm-panel\s*\{\s*#swarm-hive-view/);
+  assert.match(js, /FEEDBACK_INTENT/);
 });

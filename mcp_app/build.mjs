@@ -92,7 +92,7 @@ try {
   }
   const pkgs = await writeThirdPartyLicenses(nodeModules, http.metafile);
   const splitHtml = renderTemplate(template)
-    .replace(/\r?\n[ \t]*<meta http-equiv="Content-Security-Policy"[^>]*>/, "")
+    .replace(/[ \t]*<meta\b(?=[^>]*\bhttp-equiv\s*=\s*(?:"content-security-policy"|'content-security-policy'|content-security-policy(?=[\s/>])))[^>]*>\r?\n?/gi, "")
     .replace(/<style>[\s\S]*?<\/style>/, '<link rel="stylesheet" href="./styles.css">')
     .replace('<script>/* SCRIPT */</script>', '<script defer src="./app.js"></script>');
   const splitCss = [styles, swarmCss, hiveCss, consoleCss].join("\n");

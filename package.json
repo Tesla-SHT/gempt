@@ -23,7 +23,7 @@
     "build:mcp-app": "node mcp_app/build.mjs",
     "build:agy-plugin": "node scripts/build-agy-plugin.mjs",
     "sync:local": "node scripts/sync-local.mjs",
-    "test": "node --test tests/test_core_node.mjs tests/test_magpie_plugin.mjs tests/test_swarm_bus.mjs tests/test_runners.mjs"
+    "test": "node --test tests/test_core_node.mjs tests/test_magpie_plugin.mjs tests/test_swarm_bus.mjs tests/test_runners.mjs tests/test_swarm_ui.mjs"
   },
   "files": [
     "bin/gempt.mjs",

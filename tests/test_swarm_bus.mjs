@@ -1067,10 +1067,10 @@ test('Swarm UI helpers group threads, tokenize mentions safely, and built bundle
   ]);
 
   const builtHtml = readFileSync(join(REPO_ROOT, 'core', 'assets', 'http-ui', 'index.html'), 'utf8');
-  for (const id of ['tab-swarm', 'swarm-tab-badge', 'swarm-panel', 'swarm-subtab-overview', 'swarm-subtab-board', 'swarm-composer-input', 'swarm-subtab-graph', 'swarm-hive-view', 'swarm-mentions-svg']) {
+  for (const id of ['tab-swarm', 'swarm-tab-badge', 'swarm-panel', 'swarm-subtab-overview', 'swarm-subtab-board', 'swarm-composer-input', 'swarm-subtab-members', 'swarm-sub-members', 'swarm-subtab-graph', 'swarm-subtab-raw', 'swarm-sub-raw', 'swarm-hive-view', 'swarm-mentions-svg']) {
     assert.ok(builtHtml.includes(`id="${id}"`), `built HTTP UI should contain #${id}`);
   }
-  assert.doesNotMatch(builtHtml, /swarm-sub-raw|swarm-toggle-full|routing-badge/);
+  assert.doesNotMatch(builtHtml, /swarm-single|swarm-toggle-full|routing-badge/);
   assert.doesNotMatch(builtHtml, /<meta\s+http-equiv=["']Content-Security-Policy["']/i);
 });
 

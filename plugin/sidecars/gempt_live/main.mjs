@@ -93,7 +93,7 @@ async function entryPage() {
     .replace('<link rel="stylesheet" href="./styles.css">', `<meta name="referrer" content="no-referrer">\n  <script>${bootstrap}</script>`)
     .replace('<html ', `<html data-sidecar data-install-page="http://127.0.0.1:${consolePort}/" `)
     .replace(/<script\s+(?:type="module"|defer)\s+src="\.\/app\.js"><\/script>/, '');
-  return new Response(html, { contentType: type, headers: noStore });
+  return new Response(html, { contentType: type, headers: { ...noStore, 'Content-Security-Policy': 'frame-src about:' } });
 }
 app.page('/', entryPage);
 app.page('/index.html', entryPage);

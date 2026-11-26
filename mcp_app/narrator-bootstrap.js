@@ -36,9 +36,21 @@ function narratorBootstrap() {
 
 const FRAME_CSP = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'";
 
-export function buildNarratorSrcdoc(template, view, meta, theme) {
+const FRAME_STYLE = 'body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--fg, var(--foreground, CanvasText)); background: var(--bg, var(--background, Canvas)); }';
+
+export function buildNarratorSrcdoc(template, view, meta, theme, nonce) {
+  let scriptNonce = "";
+  if (nonce && /^[A-Za-z0-9+/_=-]+$/.test(nonce)) {
+    // srcdoc inherits the standalone page's script policy. Grant its nonce
+    // only to inline scripts in this opaque frame, never to external scripts.
+    const fragment = document.createElement("template");
+    fragment.innerHTML = template;
+    for (const script of fragment.content.querySelectorAll("script:not([src])")) script.setAttribute("nonce", nonce);
+    template = fragment.innerHTML;
+    scriptNonce = ` nonce="${nonce}"`;
+  }
   const payload = JSON.stringify({ view, meta, theme }).replace(/</g, "\\u003c");
-  return `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${FRAME_CSP}"><script type="application/json" id="narrator-data">${payload}</script><script>(${narratorBootstrap.toString()})();</script>${template}`;
+  return `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${FRAME_CSP}"><style>${FRAME_STYLE}</style><script type="application/json" id="narrator-data">${payload}</script><script${scriptNonce}>(${narratorBootstrap.toString()})();</script>${template}`;
 }
 
 export function frameDataUrl(response) {

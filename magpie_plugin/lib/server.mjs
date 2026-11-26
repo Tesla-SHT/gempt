@@ -388,11 +388,13 @@ export async function startServer({
           return send(req, res, 403, { error: 'cross-origin page read not allowed' }, undefined, false);
         }
         const asset = await readPageAsset('/index.html');
+        const nonce = randomBytes(24).toString('base64url');
         const html = asset.data.toString('utf8')
-          .replace('<head>', `<head>\n  <meta name="gempt-key" content="${KEY}">`);
+          .replace('<head>', `<head>\n  <meta name="gempt-key" content="${KEY}">`)
+          .replace('<script defer src="./app.js">', `<script nonce="${nonce}" defer src="./app.js">`);
         const ownOrigins = [...OWN].filter((o) => !o.includes('[::1]')).join(' ');
         return await send(req, res, 200, html, asset.type, false, undefined, {
-          'content-security-policy': `default-src 'none'; script-src 'self' ${ownOrigins}; connect-src 'self' ${ownOrigins}; style-src 'self' ${ownOrigins} 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'`,
+          'content-security-policy': `default-src 'none'; script-src 'self' ${ownOrigins} 'nonce-${nonce}'; frame-src about:; connect-src 'self' ${ownOrigins}; style-src 'self' ${ownOrigins} 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'`,
         });
       }
       const asset = await readPageAsset(pathname);

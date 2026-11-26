@@ -418,7 +418,8 @@ test('built HTTP UI uses the full shared Console markup and scoped styles', () =
   assert.deepEqual([...resource.matchAll(/id="tab-(live|overview|requests|sessions)"/g)].map((match) => match[1]),
     ['live', 'overview', 'requests', 'sessions']);
   assert.equal((resource.match(/id="refresh-btn"/g) || []).length, 1);
-  assert.equal((resource.match(/<dialog\b/g) || []).length, 1);
+  assert.deepEqual([...resource.matchAll(/<dialog id="([^"]+)"/g)].map((match) => match[1]),
+    ['swarm-frame-dialog', 'console-copy-dialog']);
   assert.equal((resource.match(/id="toast"/g) || []).length, 1);
 });
 
@@ -2566,9 +2567,13 @@ test('Magpie serves split gzip assets with conditional caching and a private HTM
   assert.equal(html.headers['cache-control'], 'no-store');
   assert.equal(html.headers.etag, undefined);
   assert.equal(html.headers['content-encoding'], 'gzip');
-  const { text: markup } = await rawHttpGet({ port, path: '/' });
+  const { text: markup, headers } = await rawHttpGet({ port, path: '/' });
   assert.match(markup, /name="gempt-key"/);
-  assert.match(markup, /<script defer src="\.\/app.js"><\/script>/);
+  const nonce = markup.match(/<script nonce="([A-Za-z0-9_-]+)" defer src="\.\/app\.js"><\/script>/)?.[1];
+  assert.ok(nonce);
+  assert.ok(headers['content-security-policy'].includes(`'nonce-${nonce}'`));
+  assert.match(headers['content-security-policy'], /frame-src about:/);
+  assert.doesNotMatch(markup, /<meta\s+http-equiv=["']Content-Security-Policy["']/i);
   assert.match(markup, /<link rel="stylesheet" href="\.\/styles.css">/);
   for (const path of ['/app.js', '/styles.css']) {
     const zipped = await get(path, { 'accept-encoding': 'br, gzip;q=0.8', origin: 'null' });
