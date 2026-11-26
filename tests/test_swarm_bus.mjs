@@ -1907,7 +1907,14 @@ test('branch workspace clones isolate Git storage and kill cleans only clean sha
 test('models tools expose installed-runner metadata and desired model switches at the next safe turn', async (t) => {
   const sessionsDir = makeTmp(t);
   const configPath = join(sessionsDir, 'config.json');
-  writeFileSync(configPath, JSON.stringify({ tiers: { sonnet: { exec_model: 'claude/custom-sonnet', fallback_models: ['codex/example'] } } }));
+  const gateway = createServer((_, response) => {
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({ data: [{ id: 'openai/catalog-example' }] }));
+  });
+  await new Promise((listen) => gateway.listen(0, '127.0.0.1', listen));
+  t.after(() => gateway.close());
+  writeFileSync(configPath, JSON.stringify({ magpie: { base_url: 'http://127.0.0.1:' + gateway.address().port },
+    tiers: { sonnet: { exec_model: 'claude/custom-sonnet', fallback_models: ['codex/example'] } } }));
   const launches = [];
   const opts = { sessionsDir, configPath, dispatchRunImpl: async (args) => {
     launches.push(args);
@@ -1918,6 +1925,8 @@ test('models tools expose installed-runner metadata and desired model switches a
   const catalog = JSON.parse((await handleTool('gpt_swarm', { action: 'models', all: true }, {}, opts)).content[0].text);
   assert.ok(catalog.models.some(({ id, cli, tiers }) => id === 'claude/custom-sonnet' && cli === 'claude' && tiers.includes('sonnet')));
   assert.ok(catalog.models.some(({ id }) => id === 'codex/example'));
+  assert.ok(catalog.models.some(({ id }) => id === 'openai/catalog-example'));
+  assert.equal(catalog.gateway_reachable, true);
   const asAlice = { ...opts, swarmId: 'models', agentName: 'alice' };
   const workerCatalog = JSON.parse((await handleBoardMcpTool('board_swarm', { action: 'models', all: true }, {}, asAlice)).content[0].text);
   assert.deepEqual(workerCatalog.tiers, catalog.tiers);

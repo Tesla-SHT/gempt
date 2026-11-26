@@ -5,7 +5,7 @@ import { removeBranchWorkspace, removeShareWorktree } from './worktrees.mjs';
 import { detectAvailableRunners, preferredRunnerForModel } from './runners/registry.mjs';
 import { sweepSwarmMonitors } from './swarm-monitor.mjs';
 import { SIDECAR_URI } from './mcp-app.mjs';
-import { readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
+import { readJsonSafe, readMagpieStatus, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
 import { CLI_CHOICES, DEFAULT_UTILITY, TIER_ORDER, buildTierView, getExecutionConfig } from './config.mjs';
 import { readHostContext } from './host-context.mjs';
 import {
@@ -521,10 +521,16 @@ export async function handleSwarmAction(args = {}, options = {}) {
       add(tier.exec_model || tier.consult_model, tier.id);
       if (args.all) for (const id of [tier.consult_model, tier.escalate_model, ...tier.fallback_models]) add(id, tier.id);
     }
-    if (args.all) add(cfg.utility?.model || DEFAULT_UTILITY.model, 'chore');
+    let gatewayReachable;
+    if (args.all) {
+      add(cfg.utility?.model || DEFAULT_UTILITY.model, 'chore');
+      const catalog = await readMagpieStatus({ configPath: ctx.configPath, probeTimeoutMs: ctx.probeTimeoutMs });
+      gatewayReachable = catalog.reachable;
+      for (const id of catalog.models || []) add(id);
+    }
     const runners = args.all ? detected : detected.filter((runner) => runner.available);
     return { ok: true, swarm_id: swarmId, models: [...models.values()], runners, tiers: tiers.map(({ id }) => id),
-      default_cli: getExecutionConfig(cfg).default_cli };
+      default_cli: getExecutionConfig(cfg).default_cli, ...(args.all ? { gateway_reachable: gatewayReachable } : {}) };
   }
   if (action === 'channel') {
     const { op, channel, topic } = args;
