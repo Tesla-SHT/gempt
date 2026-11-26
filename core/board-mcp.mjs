@@ -4,8 +4,9 @@ import { fileURLToPath } from 'node:url';
 import { resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
 import { GEMPT_VERSION } from './config.mjs';
 import { resolvePath } from './state.mjs';
-import { getBoardHead, getSwarmOverview, listRoster, postBoardMessage, updateWorker } from './swarm-bus.mjs';
+import { getWorker, getSwarmOverview, postBoardMessage, updateWorker } from './swarm-bus.mjs';
 import { TOOLS } from './tool-schemas.mjs';
+import { publishNarratorView } from './swarm-narrator.mjs';
 import { handleBoardAction, handleSwarmAction } from './swarm-engine.mjs';
 
 function tool(name, description, properties, required) {
@@ -53,11 +54,13 @@ export const BOARD_TOOLS = [
     {}),
   tool('board_wait', 'Park until a concerning post arrives. Pass the highest sequence actually read. End your turn if parked.',
     { since: { type: 'integer', minimum: 0 }, mentions_only: { type: 'boolean', default: true }, channel: { type: 'string' } }, ['since']),
+  tool('board_publish_view', 'Publish the narrator Overview. Available only to a live narrator.',
+    { view: { type: 'object' }, html: { type: ['string', 'null'] } }, ['view']),
   tool('board_swarm', 'Inspect this swarm, manage channels and add, kill or switch your own helpers.',
     Object.fromEntries(Object.entries(TOOLS.find((t) => t.name === 'gpt_swarm').inputSchema.properties)
       .filter(([key]) => ['action', 'op', 'channel', 'channels', 'topic', 'targets', 'name', 'brief', 'role', 'fork', 'tasks',
-        'n', 'model', 'tier', 'workspace', 'access', 'cli', 'reason', 'timeout_sec'].includes(key))
-      .map(([key, schema]) => [key, key === 'action' ? { type: 'string', enum: ['status', 'add', 'kill', 'model', 'channel'] } : schema])), ['action']),
+        'n', 'all', 'model', 'tier', 'workspace', 'access', 'cli', 'reason', 'timeout_sec'].includes(key))
+      .map(([key, schema]) => [key, key === 'action' ? { type: 'string', enum: ['status', 'add', 'kill', 'model', 'models', 'channel'] } : schema])), ['action']),
 ];
 
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -73,6 +76,16 @@ export async function handleBoardMcpTool(name, args = {}, env = process.env, ove
 
   const options = { ...overrides, sessionsDir, configPath, env, actor: agentName };
   const runId = overrides.runId || env.GEMPT_RUN_ID || null;
+  if (['board_publish_view', 'board_post', 'board_ask', 'board_swarm'].includes(name)) {
+    const member = await getWorker(swarmId, agentName, { sessionsDir }).catch(() => null);
+    if (name === 'board_publish_view') {
+      if (member?.role !== 'narrator' || member.state === 'killed') throw new Error('Only a live narrator can publish a view.');
+      return textResult({ ok: true, view: publishNarratorView(sessionsDir, swarmId, args) });
+    }
+    if (member?.role === 'narrator' && (name !== 'board_swarm' || !['status', 'models'].includes(args.action))) {
+      throw new Error('Narrator is read-only except for publishing the view.');
+    }
+  }
   if (['board_post', 'board_read', 'board_wait'].includes(name)) {
     const result = await handleBoardAction({
       text: args.text, kind: args.kind, reply_to_seq: args.reply_to_seq, request_id: args.request_id, channel: args.channel,
@@ -110,9 +123,7 @@ export async function handleBoardMcpTool(name, args = {}, env = process.env, ove
     return textResult({ ok: true, swarm_id: swarmId, message, head: message.seq });
   }
   if (name === 'board_roster') {
-    const roster = await listRoster(swarmId, { sessionsDir });
-    const head = await getBoardHead(swarmId, { sessionsDir });
-    return textResult({ ok: true, swarm_id: swarmId, head, roster });
+    return textResult(await handleBoardAction({ action: 'roster', swarm_id: swarmId }, options));
   }
   throw new Error(`Unknown board tool: ${name}`);
 }

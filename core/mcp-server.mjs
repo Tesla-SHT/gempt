@@ -9,8 +9,9 @@ import { LAUNCHER_META, LAUNCHER_PATH, LAUNCHER_TYPE, LAUNCHER_URI, SIDECAR_URI 
 import { runLiveOperation } from './live-service.mjs';
 import { ACTIVE_STATES, buildWaitCommand, compactReceiptText, dispatchRun, interruptRun, readRun, refreshRun, replyToolCall, runWithinRoot, steerRun, validateExecTimeoutSec } from './runs.mjs';
 import { lockStaleMsForBudget, resolvePath, validateSessionId, withLock } from './state.mjs';
-import { handleBoardAction, handleSwarmAction } from './swarm-engine.mjs';
+import { handleBoardAction, handleSwarmAction, routeBoardDeliveries } from './swarm-engine.mjs';
 import { boardPostPreview, getSwarmOverview } from './swarm-bus.mjs';
+import { startSwarmMonitor } from './swarm-monitor.mjs';
 import { TOOLS } from './tool-schemas.mjs';
 import { normalizeTitle } from '../magpie_plugin/lib/activity.mjs';
 export { TOOLS };
@@ -92,9 +93,10 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
       agent: typeof callCtx?.agent === 'string' ? callCtx.agent : undefined,
     });
     const action = String(args.action || 'status').trim();
+    if (action === 'models') return textResult(data);
     const overview = action === 'status' ? null
       : await getSwarmOverview(data.swarm_id, { sessionsDir: options.sessionsDir, messageLimit: 0 }).catch(() => null);
-    const roster = (data.roster ?? overview?.roster ?? data.workers ?? []).filter(({ state }) => state !== 'killed');
+    const roster = (data.roster ?? overview?.roster ?? data.workers ?? []).filter(({ state, role }) => state !== 'killed' && role !== 'coordinator');
     return textResult(data, { structuredContent: launcherSummary({
       kind: 'swarm', action, title: data.title ?? overview?.swarm.title ?? data.goal?.title ?? null,
       state: roster.some(({ state }) => state === 'working' || state === 'waiting_reply') ? 'working' : 'idle',
@@ -210,10 +212,15 @@ async function dispatch(request, env) {
 
 export async function serveStdio(input = process.stdin, output = process.stdout, env = process.env) {
   const pending = new Set();
+  const sessionsDir = resolveSessionsDir(env.GEMPT_SESSIONS_DIR);
+  const stopMonitor = startSwarmMonitor({ sessionsDir, env,
+    dispatchAlert: (swarmId) => routeBoardDeliveries(swarmId, { sessionsDir, env }) });
   const write = (message) => {
     if (message) output.write(`${JSON.stringify(message)}\n`);
   };
-  for await (const line of createInterface({ input, crlfDelay: Infinity })) {
+  const readline = createInterface({ input, crlfDelay: Infinity });
+  readline.once('close', stopMonitor);
+  for await (const line of readline) {
     if (!line.trim()) continue;
     let request;
     try { request = JSON.parse(line); } catch (error) {

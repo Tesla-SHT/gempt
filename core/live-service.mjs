@@ -1,7 +1,7 @@
 import { normalizeUsage, cacheHitRatio } from './token-usage.mjs';
 import { visitJournal } from './run-journal.mjs';
-import { closeSync, fstatSync, openSync } from 'node:fs';
-import { isAbsolute, join, resolve } from 'node:path';
+import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { listConsultSessions, workspaceName } from '../magpie_plugin/lib/activity.mjs';
 import { readRoutingSummary } from '../magpie_plugin/lib/backend.mjs';
@@ -315,6 +315,61 @@ function readJournal(path, record) {
       journal.size = size;
     }
     return journal;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+export function readMemberActivity(record, sessionsDir) {
+  const journal = readJournal(join(runDirectory(record.run_id, sessionsDir), 'events.jsonl'), record);
+  const last = [...journal.rows.values()].at(-1);
+  const progress = record.progress || {};
+  return {
+    steps: Math.max(journal.rows.size, Number(progress.steps) || Number(progress.event_count) || 0),
+    activity: text(progress.last_message || (last?.type === 'command' && journal.commands.get(last.id)?.command)
+      || last?.text || progress.phase || record.result?.text, 200),
+    activityKind: last?.type || '',
+  };
+}
+
+export function antigravityApplicationData(env = process.env) {
+  const directory = env.ANTIGRAVITY_EXECUTABLE_DATA_DIR;
+  if (typeof directory !== 'string' || !isAbsolute(directory)) return null;
+  for (let path = directory; dirname(path) !== path; path = dirname(path)) {
+    if (basename(path) === 'sidecar_data') return dirname(path);
+  }
+  return directory;
+}
+
+export function readCoordinatorActivity(conversationId, env = process.env) {
+  const appData = antigravityApplicationData(env);
+  if (!appData || !/^[A-Za-z0-9-]{1,128}$/.test(conversationId ?? '')) return null;
+  const path = join(appData, 'brain', conversationId, '.system_generated', 'logs', 'transcript.jsonl');
+  let fd;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || !stat.size) return null;
+    const start = Math.max(0, stat.size - 256 * 1024);
+    const tail = Buffer.alloc(stat.size - start);
+    const size = readSync(fd, tail, 0, tail.length, start);
+    const lines = tail.toString('utf8', 0, size).trimEnd().split('\n').slice(start ? 1 : 0);
+    const steps = lines.map((line) => { try { return JSON.parse(line); } catch { return null; } });
+    const last = steps.findLast(Boolean);
+    if (!last) return null;
+    const planner = steps.findLastIndex((step) => ['USER_INPUT', 'PLANNER_RESPONSE'].includes(step?.type));
+    const calls = array(steps[planner]?.tool_calls);
+    const results = steps.slice(planner + 1);
+    const wait = calls.findIndex(({ name }) => name === 'swarm_wait' || name === 'gpt_board_wait');
+    const idle = steps[planner]?.type === 'PLANNER_RESPONSE' && (
+      !calls.length ? results.length === 0 : wait >= 0 && results.length === calls.length && results[wait]?.status === 'DONE');
+    const state = last.type === 'ERROR_MESSAGE' ? 'stopped' : idle ? 'waiting' : 'working';
+    const tool = calls.at(-1);
+    return { state, steps: Number.isInteger(last.step_index) ? last.step_index + 1 : steps.length,
+      activity: state === 'working' ? text(tool?.toolSummary || tool?.name || '', 200) : '',
+      activityKind: tool ? 'tool' : '', transcriptMtime: stat.mtimeMs };
+  } catch {
+    return null;
   } finally {
     if (fd !== undefined) closeSync(fd);
   }

@@ -21,7 +21,7 @@ import { buildTierView, GEMPT_VERSION, setEffortSettings } from '../core/config.
 import { assertSafeOutDir } from '../scripts/build-agy-plugin.mjs';
 import { contextPath, readHostContext, updateHostContext } from '../core/host-context.mjs';
 import { handleSwarmAction, handleBoardAction } from '../core/swarm-engine.mjs';
-import { ensureSwarm, getRunLineage, getWorker, readBoardMessages, upsertWorker } from '../core/swarm-bus.mjs';
+import { ensureSwarm, getRunLineage, getWorker, postBoardMessage, readBoardMessages, upsertWorker } from '../core/swarm-bus.mjs';
 import { runLiveOperation, workspaceRun } from '../core/live-service.mjs';
 import { handleTool, TOOLS } from '../core/mcp-server.mjs';
 import { buildWaitCommand, dispatchRun, interruptRun, isRecentUnconfirmedRun, listActiveRoster, readRun,
@@ -604,6 +604,12 @@ test('packaged native sidecar serves shared assets and authenticates scoped APIs
   state(f, otherWorkspace, { state: 'finished', host_conversation_id: active, cwd: alternate });
   state(f, otherConversation, { state: 'finished', host_conversation_id: 'other-conversation' });
   await updateHostContext('other-conversation', [f.cwd], f);
+  await ensureSwarm({ swarmId: 'sidecar-board', hostConversationId: active, cwd: f.cwd, ...f });
+  await upsertWorker('sidecar-board', { name: 'worker', state: 'waiting', source_cwd: f.cwd }, f);
+  const shot = join(f.cwd, 'sidecar.png');
+  const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  writeFileSync(shot, png);
+  await postBoardMessage('sidecar-board', { from: 'worker', text: `Screenshot: ${shot} | Worker result` }, f);
   mkdirSync(dirname(f.configPath), { recursive: true });
   writeFileSync(f.configPath, '{}');
   const token = 'fixture-sidecar-token';
@@ -657,6 +663,14 @@ test('packaged native sidecar serves shared assets and authenticates scoped APIs
     assert.equal((await fetch(base + '/api?token=' + token + '&path=./api/summary', { method: 'POST' })).status, 200);
     assert.equal((await fetch(base + '/api')).status, 405);
     const workspaceUris = [pathToFileURL(f.cwd).href];
+    const swarm = await call('swarm/snapshot?tail=1&omitRaw=1', { workspaceUris }).then((response) => response.json());
+    assert.equal(swarm.swarm_id, 'sidecar-board');
+    assert.equal(swarm.self, 'coordinator');
+    assert.equal(swarm.frames.length, 1);
+    const frameRequest = swarm.frames[0].frameUrl.slice('./api/'.length);
+    assert.equal((await call(frameRequest, { workspaceUris }, 'bad-token')).status, 401);
+    assert.equal((await call(frameRequest, { workspaceUris }).then((response) => response.json())).data_url,
+      'data:image/png;base64,' + png.toString('base64'));
     const list = await call('live/runs', { workspaceUris }).then((response) => response.json());
     assert.equal(list.active_conversation_id, active);
     assert.deepEqual(list.runs.map((run) => run.run_id), [id]);
@@ -1889,7 +1903,9 @@ test('standalone NDJSON MCP serves the inline launcher and preserves cross-direc
   const statusResult = (await swarm('status')).result;
   const statusReceipt = JSON.parse(statusResult.content[0].text);
   assert.equal(statusReceipt.swarm_id, swarmId);
-  assert.equal(statusReceipt.roster.length, 2);
+  assert.equal(statusReceipt.roster.length, 3);
+  assert.ok(statusReceipt.roster.some((member) => member.name === 'coordinator' && member.conversation_id === 'host'));
+  assert.equal(statusReceipt.open_board, 'sidecar://gempt/gempt_live/');
   assert.equal(statusResult.structuredContent.auto_open_panel, false);
   assert.equal(statusResult.structuredContent.member_count, 2);
   assert.equal((await waitForRun(addReceipt.workers[0].run_id, { ...f, timeoutSec: 5 })).host_conversation_id, 'host');
@@ -2499,7 +2515,11 @@ test('legacy Swarm config routes ordinary gpt_run to the implicit board, preserv
     return receipt;
   };
   const [a, b] = await Promise.all([run('Hold this turn'), run('Hold this turn too')]);
-  const status = () => handleSwarmAction({ ...context, action: 'status' }, f);
+  const status = async () => {
+    const receipt = await handleSwarmAction({ ...context, action: 'status' }, f);
+    assert.equal(receipt.roster.find(({ role }) => role === 'coordinator').conversation_id, context.host_conversation_id);
+    return { ...receipt, roster: receipt.roster.filter(({ role }) => role !== 'coordinator') };
+  };
   const { swarm_id, roster, head } = await status();
   assert.equal(swarm_id, 'conversation-' + createHash('sha256').update(context.host_conversation_id).digest('hex'));
   assert.equal(head, 0);
@@ -2700,4 +2720,29 @@ test('legacy Codex resume and fork without explicit dynamic board marker attach 
   const childWorker = status2.roster.find((w) => w.name === 'child');
   assert.equal(childWorker.implicit, false);
   assert.equal(childWorker.board_capable, true);
+});
+
+test('a dispatched Swarm branch uses its isolated checkout across real worker turns', async (t) => {
+  const f = fixture(t);
+  const packets = await appFixture(t, f);
+  git(f.cwd, 'init', '-q');
+  writeFileSync(join(f.cwd, 'branch-fixture.txt'), 'source');
+  git(f.cwd, 'add', '.');
+  git(f.cwd, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'test branch workspace');
+  const opts = { ...f, env: { ...f.env, GEMPT_WORKTREES_DIR: join(f.root, 'branch-workspaces') } };
+  const args = { swarm_id: 'branch-dispatch', cwd: f.cwd };
+  const added = await handleSwarmAction({ ...args, action: 'add', name: 'reviewer', brief: 'Review the fixture', workspace: 'branch', cli: 'codex' }, opts);
+  const worker = added.workers[0];
+  const first = await waitForRun(worker.run_id, { ...opts, timeoutSec: 10 });
+  assert.equal(first.state, 'finished', first.error);
+  assert.equal(first.cwd, worker.worktree_path);
+  assert.equal(first.source_cwd, f.cwd);
+  assert.equal(packets.find((packet) => packet.method === 'thread/start')?.params.cwd, worker.worktree_path);
+  await until(async () => (await getWorker(args.swarm_id, worker.name, opts)).state === 'waiting');
+  const wake = await handleBoardAction({ ...args, action: 'post', text: '@reviewer Verify the branch' }, opts);
+  assert.equal(wake.deliveries[0].mode, 'wake', JSON.stringify(wake.deliveries));
+  const again = await waitForRun(wake.deliveries[0].run_id, { ...opts, timeoutSec: 10 });
+  assert.equal(again.state, 'finished', again.error);
+  assert.equal(again.cwd, first.cwd);
+  assert.equal(again.session_id, first.session_id);
 });

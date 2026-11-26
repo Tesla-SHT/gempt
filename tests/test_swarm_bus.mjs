@@ -1,7 +1,7 @@
 import { createGifEncoder } from '../mcp_app/swarm-gif.js';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer, get as httpGet } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -24,6 +24,9 @@ import {
 } from '../core/swarm-channels.mjs';
 import { handleBoardMcpTool } from '../core/board-mcp.mjs';
 import { buildWorkerInstructions, handleBoardAction, handleSwarmAction, onWorkerTurnFinished } from '../core/swarm-engine.mjs';
+import { ensureBranchWorkspace, ensureShareWorktree } from '../core/worktrees.mjs';
+import { narratorDirectory, publishNarratorView, readNarratorView } from '../core/swarm-narrator.mjs';
+import { detectMonitorStall, MONITOR_INTERVAL_MS, runMonitorTick, sweepSwarmMonitors } from '../core/swarm-monitor.mjs';
 import { runSwarmOperation } from '../core/swarm-service.mjs';
 import { reconcileRunState, saveRun, tryDelegateDispatch } from '../core/runs.mjs';
 import { handleTool, TOOLS } from '../core/mcp-server.mjs';
@@ -643,7 +646,7 @@ test('board-mcp stdio server exposes board_post, board_read, board_ask, and boar
   const init = await req('initialize', { protocolVersion: '2024-11-05' });
   assert.equal(init.result.serverInfo.name, 'gempt-board');
   const list = await req('tools/list');
-  assert.deepEqual(list.result.tools.map((x) => x.name), ['board_post', 'board_read', 'board_ask', 'board_roster', 'board_wait', 'board_swarm']);
+  assert.deepEqual(list.result.tools.map((x) => x.name), ['board_post', 'board_read', 'board_ask', 'board_roster', 'board_wait', 'board_publish_view', 'board_swarm']);
 
   const posted = await req('tools/call', { name: 'board_post', arguments: { text: '@coordinator hello from helper' } });
   const postData = JSON.parse(posted.result.content[0].text);
@@ -663,7 +666,7 @@ test('board-mcp stdio server exposes board_post, board_read, board_ask, and boar
   assert.equal(JSON.parse(read.result.content[0].text).messages.length, 2);
 
   const roster = await req('tools/call', { name: 'board_roster', arguments: {} });
-  assert.equal(JSON.parse(roster.result.content[0].text).roster.length, 1);
+  assert.deepEqual(JSON.parse(roster.result.content[0].text).roster.map(({ name }) => name), ['coordinator', 'helper']);
 
   child.stdin.end();
 });
@@ -724,7 +727,7 @@ test('runAppServer registers board_post/board_read/board_roster dynamic tools an
       const rosterReply = await ctx.callTool('board_roster', {});
       assert.equal(rosterReply.success, true);
       const statusReply = await ctx.callTool('board_swarm', { action: 'status' });
-      assert.equal(JSON.parse(statusReply.contentItems[0].text).roster[0].name, 'codex-a');
+      assert.deepEqual(JSON.parse(statusReply.contentItems[0].text).roster.map(({ name }) => name), ['coordinator', 'codex-a']);
       const waitReply = await ctx.callTool('board_wait', { since: JSON.parse(readReply.contentItems[0].text).head });
       assert.equal(JSON.parse(waitReply.contentItems[0].text).parked, true);
       // Also verify ask_gemini posts a question to the board and parks the worker.
@@ -782,7 +785,7 @@ test('runAppServer registers board_post/board_read/board_roster dynamic tools an
     swarmAgent: 'codex-a',
   });
 
-  assert.deepEqual(sawDynamicTools, ['ask_gemini', 'board_post', 'board_read', 'board_roster', 'board_wait', 'board_swarm']);
+  assert.deepEqual(sawDynamicTools, ['ask_gemini', 'board_post', 'board_read', 'board_roster', 'board_wait', 'board_publish_view', 'board_swarm']);
   assert.match(res.text, /All native board tools succeeded/);
   const msgs = await readBoardMessages('sw-native', { since: 0, sessionsDir });
   assert.equal(msgs.length, 3);
@@ -819,6 +822,7 @@ test('Swarm HTTP API serves list/overview/board/post/action and enforces key + o
 
   // Unauthenticated request rejected with 401.
   assert.equal((await fetch(`${base}/api/swarm/list`)).status, 401);
+  assert.equal((await fetch(`${base}/api/swarm`)).status, 401);
 
   // Empty list returns cleanly WITHOUT creating swarm.sqlite on disk.
   const emptyList = await (await fetch(`${base}/api/swarm/list`, { headers: auth })).json();
@@ -858,6 +862,22 @@ test('Swarm HTTP API serves list/overview/board/post/action and enforces key + o
     kind: 'question',
     text: '@coordinator Approve dark mode contrast?\nScreenshot: shot.png | Dark mode preview',
   }, { sessionsDir });
+
+  const registered = join(workDir, 'shot.png');
+  const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  writeFileSync(registered, png);
+  const frameDb = await openSwarmDb(sessionsDir);
+  try {
+    const framePost = await postBoardMessage('sw-http', { from: 'tester', text: `Screenshot: ${registered} | Binary frame` }, { sessionsDir });
+    const native = await fetch(`${base}/api/swarm?swarm_id=sw-http&tail=1&omitRaw=1`, { headers: auth }).then((response) => response.json());
+    assert.equal(native.swarm_id, 'sw-http');
+    assert.equal(native.frames[0].path, registered);
+    const frame = await fetch(`${base}/api/frame?` + new URLSearchParams({ swarm_id: 'sw-http', path: registered }), { headers: auth });
+    assert.equal(frame.headers.get('content-type'), 'image/png');
+    assert.equal(frame.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(Buffer.from(await frame.arrayBuffer()), png);
+    frameDb.run('DELETE FROM messages WHERE seq = ?', framePost.seq);
+  } finally { frameDb.close(); }
 
   // Opaque Magpie iframe (Origin: null) can read GET endpoints.
   const opaqueListRes = await fetch(`${base}/api/swarm/list`, { headers: { ...auth, Origin: 'null' } });
@@ -1129,14 +1149,14 @@ test('migration adds fork_mode to a v0.8.0 database with the request index', asy
   const db = await openSwarmDb(sessionsDir);
   try {
     await upsertWorker('legacy', { name: 'child', fork_mode: 'summary_fallback' }, { db });
-    assert.equal(db.get('PRAGMA user_version').user_version, 3);
+    assert.equal(db.get('PRAGMA user_version').user_version, 4);
   } finally {
     db.close();
   }
   assert.equal((await getWorker('legacy', 'child', { sessionsDir })).fork_mode, 'summary_fallback');
 });
 
-test('v2 to v3 preserves board data and creates the indexed lineage table once', async (t) => {
+test('v2 to v4 preserves board data and creates the indexed lineage table once', async (t) => {
   const sessionsDir = makeTmp(t);
   const old = await openSwarmDb(sessionsDir);
   await upsertWorker('migration', { name: 'scout', brief: 'read the code' }, { db: old });
@@ -1146,8 +1166,8 @@ test('v2 to v3 preserves board data and creates the indexed lineage table once',
   for (let i = 0; i < 2; i++) {
     const db = await openSwarmDb(sessionsDir);
     try {
-      assert.equal(db.get('PRAGMA user_version').user_version, 3);
-      assert.equal(db.get('SELECT brief FROM roster').brief, 'read the code');
+      assert.equal(db.get('PRAGMA user_version').user_version, 4);
+      assert.equal(db.get("SELECT brief FROM roster WHERE name = 'scout'").brief, 'read the code');
       assert.equal(db.get('SELECT text FROM messages').text, 'found the entry point');
       assert.deepEqual(db.all("PRAGMA index_list(run_lineage)").filter((idx) => !idx.unique)
         .map((idx) => db.all(`PRAGMA index_info(${idx.name})`).map((c) => c.name).join(',')).sort(),
@@ -1729,4 +1749,240 @@ test('auto_summary runs after interim [progress] posts, skips after [done] or [h
   assert.equal(fin3.auto_post, null);
   assert.equal(fin3.board_posts_worker, 1);
   assert.equal(fin3.board_posts_auto, 0);
+});
+
+test('native snapshot aliases resolve a conversation and preserve sparse cursor, tail, delta, reset and raw contracts', async (t) => {
+  const sessionsDir = makeTmp(t);
+  const opts = { sessionsDir, conversationId: 'owner-conv' };
+  const http = (route, query = {}) => dispatchPageApi({
+    method: 'GET', url: new URL(route + '?' + new URLSearchParams(query), 'http://local'),
+  }, opts).then((response) => response.body);
+  assert.equal((await http('/api/swarm')).empty, true);
+  await ensureSwarm({ swarmId: 'board', hostConversationId: 'owner-conv', cwd: sessionsDir, sessionsDir });
+  await upsertWorker('board', { name: 'alice', session_id: 'alice-conv', task_summary: 'Review parser' }, opts);
+  const first = await postBoardMessage('board', { from: 'alice', text: 'First result' }, opts);
+  await postBoardMessage('unrelated', { text: 'Creates a sparse seq' }, opts);
+  const last = await postBoardMessage('board', { text: '@alice Continue' }, opts);
+  const full = await http('/api/swarm/snapshot', { tail: 1, omitRaw: 1 });
+  assert.equal(full.self, 'coordinator');
+  assert.deepEqual(full.members.map(({ name, isSelf }) => [name, isSelf]), [['alice', false], ['coordinator', true]]);
+  assert.equal(full.members[0].last_post_seq, first.seq);
+  assert.equal(full.plan.tasks.alice, 'Review parser');
+  assert.equal(full.head, last.seq);
+  assert.deepEqual(full.messages.map(({ seq }) => seq), [last.seq]);
+  assert.equal(full.messagesOffset, 1);
+  assert.equal(full.totalMessages, 2);
+  assert.equal(full.hasMore, true);
+  assert.equal('raw' in full, false);
+  const cursor = { swarm_id: 'board', etag: full.etag, rosterKey: full.rosterKey, tail: 1, omitRaw: 1, known: 2, since: last.seq };
+  assert.equal((await http('/api/swarm', cursor)).mode, 'unchanged');
+  const old = { swarm_id: 'board', before: full.offset, beforeSeq: last.seq, rosterKey: full.rosterKey };
+  assert.deepEqual((await http('/api/swarm/messages', { ...old, fromSeq: first.seq })).messages.map(({ seq }) => seq), [first.seq]);
+  assert.equal((await http('/api/swarm/messages', { ...old, fromSeq: first.seq + 1 })).notFound, true);
+  assert.equal((await http('/api/swarm/messages', { ...old, beforeSeq: 900 })).stale, true);
+  const append = await postBoardMessage('board', { from: 'alice', text: '@coordinator [done] Done' }, opts);
+  const delta = await http('/api/swarm', cursor);
+  assert.equal(delta.mode, 'delta');
+  assert.deepEqual(delta.messages.map(({ seq }) => seq), [append.seq]);
+  await createChannel('board', { channel: 'parser' }, opts);
+  assert.equal((await http('/api/swarm', cursor)).reset, true);
+  assert.equal((await http('/api/swarm/messages', old)).stale, true);
+  const raw = await http('/api/swarm/raw', { swarm_id: 'board', kind: 'members' });
+  assert.equal(raw.content, raw.members);
+  assert.equal(JSON.parse(raw.members).members.coordinator.conversation_id, 'owner-conv');
+  assert.equal(raw.board.split('\n').filter(Boolean).length, 4);
+  assert.equal((await http('/api/swarm', { swarm_id: 'unrelated', conversationId: 'untrusted' })).empty, true);
+});
+
+test('board_read channel override and a blocked board_wait preserve the global read cursor', async (t) => {
+  const sessionsDir = makeTmp(t), opts = { sessionsDir };
+  await ensureSwarm({ swarmId: 'cursor', sessionsDir });
+  await upsertWorker('cursor', { name: 'alice', state: 'working' }, opts);
+  await createChannel('cursor', { channel: 'parser' }, opts);
+  const bell = await postBoardMessage('cursor', { channel: 'parser', text: '@alice read separately' }, opts);
+  await postBoardMessage('another', { text: 'seq gap' }, opts);
+  assert.deepEqual(await readBoardMessages('cursor', { viewer: 'alice', seqs: [] , ...opts }), []);
+  assert.equal((await readBoardMessages('cursor', { viewer: 'alice', channel: 'parser', ...opts })).at(-1).seq, bell.seq);
+  assert.equal((await readBoardMessages('cursor', { viewer: 'alice', channel: '*', ...opts })).at(-1).seq, bell.seq);
+  assert.equal((await getWorker('cursor', 'alice', opts)).last_read_seq, 0);
+  const blocked = await handleBoardAction({ action: 'wait', swarm_id: 'cursor', from: 'alice', since: 0 }, opts);
+  assert.equal(blocked.park_blocked, true);
+  assert.equal((await getWorker('cursor', 'alice', opts)).last_read_seq, 0);
+  assert.equal((await getWorker('cursor', 'alice', opts)).last_park_blocked_seq, bell.seq);
+  await readBoardMessages('cursor', { viewer: 'alice', seqs: [bell.seq], ...opts });
+  assert.equal((await getWorker('cursor', 'alice', opts)).last_read_seq, bell.seq);
+});
+
+test('frame and narrator APIs enforce registration, root, magic and byte limits and relay scoped feedback', async (t) => {
+  const sessionsDir = makeTmp(t);
+  const cwd = join(sessionsDir, 'workspace');
+  mkdirSync(cwd);
+  const opts = { sessionsDir, workspaceRoots: [cwd], conversationId: 'viewer' };
+  await ensureSwarm({ swarmId: 'visual', hostConversationId: 'viewer', cwd, sessionsDir });
+  await upsertWorker('visual', { name: 'alice', state: 'waiting', source_cwd: cwd }, opts);
+  await upsertWorker('visual', { name: 'narrator', role: 'narrator', state: 'waiting', source_cwd: cwd }, opts);
+  const good = join(cwd, 'good.png'), wrong = join(cwd, 'wrong.png'), large = join(cwd, 'large.png');
+  const external = join(sessionsDir, 'outside.png'), symlink = join(cwd, 'symlink.png');
+  const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  for (const path of [good, external]) writeFileSync(path, png);
+  writeFileSync(wrong, 'plaintext');
+  writeFileSync(large, Buffer.alloc(8 * 1024 * 1024 + 1));
+  symlinkSync(external, symlink);
+  const post = await postBoardMessage('visual', { from: 'alice', text: [good, wrong, large, external, symlink]
+    .map((path) => `Screenshot: ${path} | Frame`).join('\n') }, opts);
+  const request = (path, format, sidecarJson = false) => dispatchPageApi({ method: 'GET',
+    url: new URL('/api/frame?' + new URLSearchParams({ swarm_id: 'visual', path, ...(format && { format }) }), 'http://local'),
+  }, { ...opts, sidecarJson });
+  const binary = await request(good);
+  assert.equal(binary.type, 'image/png');
+  assert.deepEqual(binary.body, png);
+  assert.equal((await request(good, undefined, true)).body.data_url, 'data:image/png;base64,' + png.toString('base64'));
+  for (const invalid of [wrong, large, external, symlink, join(cwd, 'unregistered.jpg')]) await assert.rejects(request(invalid), /Frame not found/);
+  const publish = (agentName, args) => handleBoardMcpTool('board_publish_view', args, {}, { ...opts, swarmId: 'visual', agentName });
+  const view = { headline: 'Progress', as_of_seq: post.seq, attention: [{ id: 'card', title: 'Review' }],
+    reel: { frames: [{ path: good, seq: post.seq, caption: 'Narrator frame' }] } };
+  await assert.rejects(publish('alice', { view }), /Only a live narrator/);
+  await publish('narrator', { view, html: '<p>Review</p>' });
+  await assert.rejects(publish('narrator', { view, html: 'x'.repeat(65537) }), /64 KiB/);
+  await assert.rejects(handleBoardMcpTool('board_post', { text: 'No' }, {}, { ...opts, swarmId: 'visual', agentName: 'narrator' }), /read-only/);
+  const frameState = await runSwarmOperation('snapshot', { swarm_id: 'visual' }, opts);
+  assert.equal(frameState.frames[0].caption, 'Narrator frame');
+  assert.equal(frameState.postedFrames.length, 5);
+  assert.match(frameState.frames[0].frameUrl, /^\.\/api\/swarm\/frame\?/);
+  const dir = narratorDirectory(sessionsDir, 'visual');
+  for (const bad of ['{', ' '.repeat(65537)]) {
+    writeFileSync(join(dir, 'view.json'), bad);
+    assert.equal(readNarratorView(sessionsDir, 'visual').json.headline, 'Progress');
+    assert.ok(readNarratorView(sessionsDir, 'visual').jsonError);
+  }
+  const feedback = (target_id, route = 'feedback') => runSwarmOperation(route, { swarm_id: 'visual', target_id,
+    text: 'Looks good @all', ...(route === 'action' ? { action: 'feedback' } : {}) }, {
+    ...opts, dispatchRunImpl: async ({ run_id }) => ({ run_id, session_id: 'narrator-session' }),
+  });
+  await assert.rejects(feedback('unlisted'), /Unknown narrator feedback target/);
+  const relay = await feedback('card', 'action');
+  assert.deepEqual(relay.message.mentions, ['narrator']);
+  await publish('narrator', { view: { ...view, reel: { frames: [] }, feedback_ack: { through_seq: relay.message.seq, text: 'Read' } } });
+  const fallback = await runSwarmOperation('snapshot', { swarm_id: 'visual' }, opts);
+  assert.equal(fallback.frames[0].caption, 'Frame');
+  assert.equal(fallback.view.json.feedback_ack.through_seq, relay.message.seq);
+});
+
+test('branch workspace clones isolate Git storage and kill cleans only clean share and branch roots', async (t) => {
+  const sessionsDir = makeTmp(t);
+  const cwd = join(sessionsDir, 'repo');
+  const env = { ...process.env, GEMPT_WORKTREES_DIR: join(sessionsDir, 'worktrees') };
+  delete env.GEMPT_WORKSPACE_ROOT;
+  mkdirSync(cwd);
+  const git = (dir, ...args) => execFileSync('git', ['-C', dir, ...args], { stdio: 'pipe', encoding: 'utf8' }).trim();
+  git(cwd, 'init');
+  writeFileSync(join(cwd, 'task.txt'), 'source');
+  git(cwd, 'add', 'task.txt');
+  git(cwd, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'start');
+  const opts = { sessionsDir, env, dispatchRunImpl: async ({ run_id, workspace }, dispatch) => {
+    assert.equal(workspace, 'share');
+    const session_id = 'clean-branch';
+    const allocation = ensureShareWorktree(cwd, session_id, dispatch.env);
+    return { run_id, session_id, worktree_path: allocation.worktree_root, source_cwd: allocation.source_cwd };
+  } };
+  const add = await handleSwarmAction({ action: 'add', swarm_id: 'isolated', cwd, workspace: 'branch', name: 'clean', brief: 'Test' }, opts);
+  const cloned = add.workers[0].worktree_path;
+  assert.equal(git(cloned, 'remote', 'get-url', 'origin'), cwd);
+  assert.equal(git(cloned, 'rev-parse', 'HEAD'), git(cwd, 'rev-parse', 'HEAD'));
+  const dirty = ensureBranchWorkspace(cwd, 'dirty-branch', env).worktree_root;
+  writeFileSync(join(dirty, 'keep.txt'), 'in progress');
+  const share = ensureShareWorktree(cwd, 'clean-share', env).worktree_root;
+  for (const [name, workspace, path] of [['dirty', 'branch', dirty], ['share', 'share', share]]) {
+    await upsertWorker('isolated', { name, state: 'waiting', workspace, worktree_path: path, source_cwd: cwd }, opts);
+  }
+  await updateWorker('isolated', 'clean', { state: 'waiting' }, opts);
+  await upsertWorker('isolated', { name: 'helper', added_by: 'clean', state: 'waiting' }, opts);
+  for (const name of ['clean', 'dirty', 'share']) await handleSwarmAction({ action: 'kill', swarm_id: 'isolated', name }, opts);
+  assert.equal(existsSync(cloned), false);
+  assert.equal(existsSync(share), false);
+  assert.equal(existsSync(join(dirty, 'keep.txt')), true);
+  assert.equal((await getWorker('isolated', 'helper', opts)).state, 'waiting');
+});
+
+test('models tools expose installed-runner metadata and desired model switches at the next safe turn', async (t) => {
+  const sessionsDir = makeTmp(t);
+  const configPath = join(sessionsDir, 'config.json');
+  writeFileSync(configPath, JSON.stringify({ tiers: { sonnet: { exec_model: 'claude/custom-sonnet', fallback_models: ['codex/example'] } } }));
+  const launches = [];
+  const opts = { sessionsDir, configPath, dispatchRunImpl: async (args) => {
+    launches.push(args);
+    return { run_id: args.run_id, session_id: args.session_id ?? 'worker-sid', model: args.model };
+  } };
+  const add = await handleSwarmAction({ action: 'add', swarm_id: 'models', cwd: sessionsDir, name: 'alice', brief: 'Test', model: 'old' }, opts);
+  assert.ok(add.open_board);
+  const catalog = JSON.parse((await handleTool('gpt_swarm', { action: 'models', all: true }, {}, opts)).content[0].text);
+  assert.ok(catalog.models.some(({ id, cli, tiers }) => id === 'claude/custom-sonnet' && cli === 'claude' && tiers.includes('sonnet')));
+  assert.ok(catalog.models.some(({ id }) => id === 'codex/example'));
+  const asAlice = { ...opts, swarmId: 'models', agentName: 'alice' };
+  const workerCatalog = JSON.parse((await handleBoardMcpTool('board_swarm', { action: 'models', all: true }, {}, asAlice)).content[0].text);
+  assert.deepEqual(workerCatalog.tiers, catalog.tiers);
+  const run = add.workers[0].run_id;
+  await handleBoardMcpTool('board_swarm', { action: 'model', model: 'new' }, {}, asAlice);
+  assert.equal(launches.length, 1);
+  let worker = await getWorker('models', 'alice', opts);
+  assert.equal(worker.desired_model, 'new');
+  assert.equal(worker.applied_model, 'old');
+  await onWorkerTurnFinished({ swarmId: 'models', swarmAgent: 'alice', runId: run, result: { model: 'old' },
+    outcome: { state: 'finished' }, ...opts });
+  worker = await getWorker('models', 'alice', opts);
+  assert.equal(worker.applied_model, 'new');
+  assert.match(launches.at(-1).goal, /\[board\] The latest message is #/);
+  await updateWorker('models', 'alice', { state: 'stopped' }, opts);
+  const queued = await handleSwarmAction({ action: 'model', swarm_id: 'models', name: 'alice', model: 'third' }, opts);
+  assert.equal(queued.pending, true);
+  assert.equal(launches.length, 2);
+  await handleBoardAction({ action: 'post', swarm_id: 'models', text: '@alice resume' }, opts);
+  assert.equal((await getWorker('models', 'alice', opts)).applied_model, 'third');
+});
+
+test('monitor identifies all five native stalls, throttles retries, dormancy and resume', async (t) => {
+  const sessionsDir = makeTmp(t);
+  const opts = { sessionsDir };
+  const swarmId = 'monitored';
+  await ensureSwarm({ swarmId, sessionsDir });
+  for (const [name, role, channels] of [['alice', 'worker', ['ui']], ['bob', 'worker', ['ui']], ['monitor', 'monitor', ['*']]]) {
+    await upsertWorker(swarmId, { name, role, channels, state: 'waiting' }, opts);
+  }
+  await createChannel(swarmId, { channel: 'ui' }, opts);
+  const { readSwarmSnapshot } = await import('../core/swarm-bus.mjs');
+  const base = await readSwarmSnapshot({ swarmId, scope: 'all', sessionsDir });
+  const message = (seq, from_agent, text, channel = 'main') => ({
+    seq, from_agent, text, channel, mentions: parseMentions(text), channel_mentions: channelMentions(text), kind: 'message',
+  });
+  const snapshot = (...posts) => ({ ...base, messages: [...base.messages, ...posts] });
+  const classify = (...posts) => detectMonitorStall(snapshot(...posts)).kind;
+  assert.equal(classify(message(10, 'alice', '[done] Fixed UI')), 'unaddressed');
+  assert.equal(classify(message(10, 'alice', '@coordinator Read this')), 'coordinator_unread');
+  assert.equal(classify(message(10, 'alice', '@bob Please verify')), 'unanswered_mention');
+  assert.equal(classify(message(10, 'alice', '@bob Please verify'), message(11, 'bob', '@alice Need your diff')), 'waiting_chain');
+  assert.equal(classify(message(10, 'alice', '@bob Please verify', 'ui'), message(11, 'bob', '@alice Need your diff', 'ui')), 'channel_deadlock');
+  const idle = snapshot(message(10, 'alice', '@bob Please verify'));
+  const first = runMonitorTick(idle, {}, 100);
+  assert.equal(first.alert.target, 'bob');
+  let state = first.state;
+  let alerts = 1;
+  for (let i = 1; i <= 9; i++) {
+    const tick = runMonitorTick(idle, state, 100 + i * MONITOR_INTERVAL_MS);
+    state = tick.state;
+    if (tick.alert) {
+      assert.ok(i === 3 || i === 6);
+      assert.equal(tick.alert.target, 'coordinator');
+      alerts++;
+    }
+  }
+  assert.equal(alerts, 3);
+  assert.equal(state.dormant, true);
+  const resume = runMonitorTick(snapshot(message(11, 'coordinator', '@monitor resume')), state, 100 + 10 * MONITOR_INTERVAL_MS);
+  assert.equal(resume.state.dormant, false);
+  const done = runMonitorTick(snapshot(message(12, 'coordinator', '[done] Complete')), resume.state, 100 + 11 * MONITOR_INTERVAL_MS);
+  assert.equal(done.state.dormant, true);
+  assert.equal(done.alert, null);
+  const [published] = await sweepSwarmMonitors(opts, 5000);
+  assert.equal(published.from_agent, 'monitor');
+  assert.deepEqual(await sweepSwarmMonitors(opts, 5000), []);
 });

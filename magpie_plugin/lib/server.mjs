@@ -1,3 +1,5 @@
+import { startSwarmMonitor } from '../../core/swarm-monitor.mjs';
+import { routeBoardDeliveries } from '../../core/swarm-engine.mjs';
 /**
  * Local HTTP page service for the GemPT Magpie Page Plugin.
  *
@@ -362,7 +364,7 @@ export async function startServer({
       }
 
       const rawPath = (req.url || '/').split('?', 1)[0];
-      if (pathname.startsWith('/api/') || /^\/api\/(requests|sessions)(?:\/|$)/.test(rawPath)) {
+      if (pathname === '/api/swarm' || pathname.startsWith('/api/') || /^\/api\/(requests|sessions)(?:\/|$)/.test(rawPath)) {
         if (!keyOK(req)) return send(req, res, 401, { error: 'unauthorized: send the x-gempt-key header' });
         const result = await dispatchPageApi({
           method: req.method, url, rawPath, readBody: () => readJsonBody(req),
@@ -475,7 +477,10 @@ export async function startServer({
     takeoverTimer.unref?.();
   });
 
+  let stopMonitor;
   const startManager = () => {
+    stopMonitor ??= startSwarmMonitor({ sessionsDir: resolveSessionsDir(sessionsDir),
+      dispatchAlert: (id) => routeBoardDeliveries(id, pageOptions()) });
     if (manageAppServer ?? target !== 0) {
       appServer = createAppServerManager({ configPath, sessionsDir, ...appServerOptions,
         proxyBaseUrl: `http://127.0.0.1:${actualPort}${PROXY_PATH}`, proxyToken,
@@ -494,6 +499,7 @@ export async function startServer({
       get appServer() { return appServer; },
       async close() {
         closed = true;
+        stopMonitor?.();
         if (takeoverTimer) {
           clearTimeout(takeoverTimer);
           takeoverTimer = null;

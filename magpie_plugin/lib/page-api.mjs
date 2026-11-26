@@ -57,21 +57,22 @@ export async function dispatchPageApi({ method, url, rawPath = url.pathname, rea
     const data = await runLiveOperation(live, args, options);
     return reply(200, data);
   }
-  const swarmOp = /^\/api\/swarm\/(list|overview|board|post|action|raw)$/.exec(pathname)?.[1];
+  const swarmOp = pathname === '/api/swarm' ? 'snapshot' : pathname === '/api/frame' ? 'frame'
+    : /^\/api\/swarm\/(list|overview|board|post|action|raw|snapshot|messages|frame|feedback)$/.exec(pathname)?.[1];
   if (swarmOp) {
-    const read = swarmOp === 'list' || swarmOp === 'overview' || swarmOp === 'board' || swarmOp === 'raw';
+    const read = !['post', 'action', 'feedback'].includes(swarmOp);
     if (method !== (read ? 'GET' : 'POST')) return reply(405, { error: 'method not allowed' });
     if (!read && opaqueOrigin) return reply(403, { error: 'invalid origin' });
     const args = read ? Object.fromEntries([...url.searchParams].map(([key, value]) => {
       const field = Object.hasOwn(SWARM_OPERATIONS[swarmOp].properties, key) && SWARM_OPERATIONS[swarmOp].properties[key];
       return [key, field?.type === 'integer' && /^\d+$/.test(value) ? Number(value)
-        : field?.type === 'boolean' && ['true', 'false'].includes(value) ? value === 'true' : value];
+        : field?.type === 'boolean' && ['true', 'false', '1', '0'].includes(value) ? ['true', '1'].includes(value) : value];
     })) : await readBody();
     if (swarmOp === 'list') {
       args.scope ??= options.conversationId === undefined ? 'all' : 'session';
     }
     const data = await runSwarmOperation(swarmOp, args, options);
-    return reply(200, data);
+    return swarmOp === 'frame' && data.bytes ? reply(200, data.bytes, data.mime) : reply(200, data);
   }
   if (method === 'GET') {
     if (pathname === '/api/summary') return reply(200, readRoutingSummary(options));

@@ -6,6 +6,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const bundledRuntime = new URL('../../runtime/', import.meta.url);
 const runtime = existsSync(bundledRuntime) ? bundledRuntime : new URL('../../../', import.meta.url);
+const { startSwarmMonitor } = await import(new URL('core/swarm-monitor.mjs', runtime));
+const { routeBoardDeliveries } = await import(new URL('core/swarm-engine.mjs', runtime));
+const { resolveSessionsDir } = await import(new URL('core/config.mjs', runtime));
 const { dispatchPageApi } = await import(new URL('magpie_plugin/lib/page-api.mjs', runtime));
 const { readPageAsset } = await import(new URL('magpie_plugin/lib/page-assets.mjs', runtime));
 const { warmPageTelemetry } = await import(new URL('magpie_plugin/lib/backend.mjs', runtime));
@@ -114,7 +117,7 @@ function workspacePath(uri) {
 const apiHeaders = { ...noStore, 'Access-Control-Allow-Origin': 'null' };
 app.api('/api', async ({ path, body, conversationId, workspaceUris }) => {
   try {
-    if (typeof path !== 'string' || !path.startsWith('./api/')) {
+    if (typeof path !== 'string' || path !== './api/swarm' && !path.startsWith('./api/swarm?') && !path.startsWith('./api/')) {
       return new Response(JSON.stringify({ error: 'invalid API path' }), {
         status: 400, contentType: 'application/json', headers: apiHeaders,
       });
@@ -127,6 +130,7 @@ app.api('/api', async ({ path, body, conversationId, workspaceUris }) => {
       method: body === undefined ? 'GET' : 'POST', url, rawPath, readBody: () => body,
     }, {
       ...options,
+      sidecarJson: true,
       conversationId: activeConversation,
       ...(Array.isArray(workspaceUris) && workspaceUris.length
         ? { workspaceRoots: workspaceUris.map(workspacePath).filter(Boolean) } : {}),
@@ -142,6 +146,8 @@ app.api('/api', async ({ path, body, conversationId, workspaceUris }) => {
   }
 });
 const server = await app.run();
+const sessionsDir = resolveSessionsDir(process.env.GEMPT_SESSIONS_DIR);
+const stopMonitor = startSwarmMonitor({ sessionsDir, dispatchAlert: (id) => routeBoardDeliveries(id, { sessionsDir }) });
 const watchedFiles = [
   fileURLToPath(import.meta.url),
   fileURLToPath(new URL('sidecar.json', import.meta.url)),
@@ -167,6 +173,7 @@ const watchTimer = setInterval(() => {
 }, 2000);
 watchTimer.unref();
 server.once('close', () => {
+  stopMonitor();
   clearInterval(watchTimer);
   void appServer.stop();
 });

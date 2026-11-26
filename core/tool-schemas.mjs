@@ -54,8 +54,9 @@ export const TOOLS = [
   tool('gpt_swarm',
     "Manage a shell-free GemPT Swarm: set title/plan, spawn single/homogeneous/sharded Codex workers (`add`), check compact roster (`status`), switch a waiting worker's model (`model`), or stop a worker (`kill`).",
     {
-      action: { type: 'string', enum: ['title', 'plan', 'add', 'status', 'model', 'kill', 'channel'], default: 'status',
+      action: { type: 'string', enum: ['title', 'plan', 'add', 'status', 'model', 'models', 'kill', 'channel'], default: 'status',
         description: 'Swarm action (default: status).' },
+      all: { type: 'boolean', description: 'Include every configured tier and runner in the model catalog.' },
       swarm_id: { type: 'string', description: 'Optional explicit swarm ID; defaults to the host conversation or workspace swarm.' },
       host_conversation_id: { type: 'string', description: 'Optional Antigravity conversation ID.' },
       cwd: { type: 'string', description: 'Target workspace directory.' },
@@ -75,8 +76,8 @@ export const TOOLS = [
       tier: { type: 'string', description: 'Optional Codex tier.' },
       access: { type: 'string', enum: ['change', 'inspect'], default: 'change',
         description: "'change' edits/tests workspace; 'inspect' runs read-only investigation." },
-      workspace: { type: 'string', enum: ['inherit', 'share'], default: 'inherit',
-        description: "'share' creates an isolated git worktree per worker." },
+      workspace: { type: 'string', enum: ['inherit', 'share', 'branch'], default: 'inherit',
+        description: "'share' creates a Git worktree; 'branch' creates an independent clone." },
       n: { type: 'integer', minimum: 1, maximum: 32, description: 'Number of homogeneous worker copies (<name>-1..n) for add.' },
       tasks: { description: 'For add: array of per-worker task slice strings (<name>-1..k). For plan: object mapping worker name to task summary.' },
       goal: {

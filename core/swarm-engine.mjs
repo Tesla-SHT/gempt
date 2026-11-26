@@ -1,14 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { isValidSessionId } from './state.mjs';
+import { removeBranchWorkspace, removeShareWorktree } from './worktrees.mjs';
+import { detectAvailableRunners, preferredRunnerForModel } from './runners/registry.mjs';
+import { sweepSwarmMonitors } from './swarm-monitor.mjs';
+import { SIDECAR_URI } from './mcp-app.mjs';
 import { readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
-import { CLI_CHOICES, getExecutionConfig } from './config.mjs';
+import { CLI_CHOICES, DEFAULT_UTILITY, TIER_ORDER, buildTierView, getExecutionConfig } from './config.mjs';
 import { readHostContext } from './host-context.mjs';
 import {
   ACTIVE_STATES, buildBoardWaitCommand, dispatchRun, interruptRun, readRun, replyToolCall, steerRun, validateExecTimeoutSec,
 } from './runs.mjs';
 import {
-  addWorkerBriefs, archiveChannel, createChannel, listChannels, subscribeChannels, markRead, parkWorker, QUOTA_ERROR,
+  addWorkerBriefs, archiveChannel, createChannel, listChannels, subscribeChannels, parkWorker, QUOTA_ERROR,
   ensureSwarm, getBoardHead, getSwarmOverview, getWorker, killWorkerRecord, listRoster,
   listUndeliveredForWorker, markDelivered, postBoardMessage, readBoardMessages, readWorkerTurnPosts, resolveSwarmId,
   setSwarmPlan, setSwarmTitle, updateWorker, validateWorkerName,
@@ -16,7 +20,7 @@ import {
 
 import { ALL, MAIN, ROLE_WORKER_RE, effectiveChannels, homeChannelOf, validateChannelName } from './swarm-channels.mjs';
 
-const VALID_SWARM_ACTIONS = ['title', 'plan', 'add', 'status', 'model', 'kill', 'channel'];
+const VALID_SWARM_ACTIONS = ['title', 'plan', 'add', 'status', 'model', 'models', 'kill', 'channel'];
 const VALID_BOARD_ACTIONS = ['post', 'read', 'wait', 'roster'];
 
 function resolveEngineContext(args = {}, options = {}) {
@@ -66,9 +70,18 @@ export function buildWorkerInstructions({ swarmId, workerName, brief, seq, regis
     '- When idle call board_wait with the highest seq you actually read. End the turn when parked. mentions_only defaults to true. Set it to false to wake on visible work.',
     '- Use board_swarm to add and manage your own helpers. Ownership is recorded in added_by. Kill your helpers when finished. Killing a parent leaves its helpers running.',
     '- Never poll the board.',
+    '- Start your assigned slice immediately. Claim only unassigned work, and read the board before claiming it.',
+    '- Without since, board_read gives recent posts oldest first. Use the highest seq you actually read for incremental reads and waits. Passing the head when you have not read the posts can suppress a doorbell.',
+    '- A normal turn ending already parks you. board_wait is for idle time and ends your turn; do any board_post in the same turn first.',
+    '- A new helper sees its public brief. Use fork only for needed context, and give each helper its own scope and workspace.',
+    '- Leave model unspecified to inherit where possible. Model changes retain the logical session; use them for quota or user-directed changes.',
+    '- Use @all for decisions or interface changes the whole team needs. Unaddressed posts are visible next time a peer wakes.',
+
   ];
   return [
-    ...(nativeParent ? [`Everything before this turn is @${nativeParent}'s context. Do not redo its work or answer its old requests.`] : protocol),
+    ...(role === 'narrator' ? [
+      'Narrator role: observe only. Use board_read and board_wait. Publish Overview data through board_publish_view (view object and optional html). Never post on the board or take on worker work. Use feedback_ack.through_seq and feedback_ack.text to acknowledge feedback in the view.',
+    ] : nativeParent ? [`Everything before this turn is @${nativeParent}'s context. Do not redo its work or answer its old requests.`] : protocol),
     '',
     '## Assignment',
     brief,
@@ -82,8 +95,14 @@ export function buildWorkerInstructions({ swarmId, workerName, brief, seq, regis
     `Swarm: ${swarmId}`,
     `Opening brief: #${seq}`,
     ...(shardInstruction ? [shardInstruction] : []),
-    ...(nativeParent ? ['', 'Shared message board protocol:', ...reporting] : []),
+    ...(nativeParent && role !== 'narrator' ? ['', 'Shared message board protocol:', ...reporting] : []),
   ].join('\n');
+}
+
+async function withHeadNudge(goal, swarmId, worker, sessionsDir) {
+  const head = await getBoardHead(swarmId, { sessionsDir });
+  if (head <= worker.last_read_seq) return goal;
+  return goal + `\n\n[board] The latest message is #${head} (read through #${worker.last_read_seq}). Read any missed posts with board_read before parking.`;
 }
 
 function formatBoardMessagesForWorker(messages) {
@@ -107,6 +126,10 @@ function compactRosterItem(worker) {
     state: worker.state,
     cli: worker.cli,
     model: worker.model,
+    desired_model: worker.desired_model,
+    applied_model: worker.applied_model,
+    tail_from_seq: worker.tail_from_seq,
+    conversation_id: worker.role === 'coordinator' ? worker.session_id : null,
     tier: worker.tier,
     implicit: worker.implicit,
     board_capable: worker.board_capable ?? false,
@@ -157,7 +180,7 @@ export async function routeBoardDeliveries(swarmId, options = {}) {
   const deliveries = [];
 
   for (let worker of roster) {
-    if (worker.implicit || worker.state === 'killed' || (worker.state === 'working' && worker.parked_on?.startsWith('board_wait'))) continue;
+    if (worker.implicit || worker.role === 'monitor' || worker.state === 'killed' || (worker.state === 'working' && worker.parked_on?.startsWith('board_wait'))) continue;
     const unread = await listUndeliveredForWorker(swarmId, worker.name, { since: 0, sessionsDir: ctx.sessionsDir });
     if (!unread.length) continue;
 
@@ -252,11 +275,14 @@ export async function routeBoardDeliveries(swarmId, options = {}) {
     // 3. If worker is waiting or stopped, warm-wake reusing its session_id & worktree.
     if (currentState === 'waiting' || currentState === 'stopped') {
       const seqs = remainingUnread.map((m) => m.seq);
-      const wakeCwd = worker.worktree_path || worker.source_cwd || swarm.cwd;
+      const wakeCwd = (worker.workspace === 'branch' ? worker.source_cwd : worker.worktree_path)
+        || worker.source_cwd || swarm.cwd;
       if (!wakeCwd) {
         deliveries.push({ worker: worker.name, mode: 'wake_skipped', seqs, reason: 'Worker has no recorded cwd.' });
         continue;
       }
+      const desired = worker.desired_runtime;
+      const runtime = desired ?? worker;
       const wakeGoal = [
         formatBoardMessagesForWorker(remainingUnread),
         '',
@@ -270,13 +296,13 @@ export async function routeBoardDeliveries(swarmId, options = {}) {
       if (!claimed) continue;
       try {
         const run = await ctx.dispatchRunImpl({
-          run_id: runId, goal: wakeGoal,
+          run_id: runId, goal: await withHeadNudge(wakeGoal, swarmId, worker, ctx.sessionsDir),
           cwd: wakeCwd,
           access: worker.access || 'change',
           workspace: worker.worktree_path ? 'inherit' : (worker.workspace || 'inherit'),
-          cli: worker.cli || 'auto',
-          ...(worker.model ? { model: worker.model } : {}),
-          ...(worker.tier ? { tier: worker.tier } : {}),
+          cli: runtime.cli || 'auto',
+          ...(runtime.model ? { model: runtime.model } : {}),
+          ...(runtime.tier ? { tier: runtime.tier } : {}),
           ...(worker.session_id ? { session_id: worker.session_id } : {}),
           title: `${worker.name}: board #${seqs[seqs.length - 1]}`,
           host_conversation_id: swarm.host_conversation_id || undefined,
@@ -304,6 +330,8 @@ export async function routeBoardDeliveries(swarmId, options = {}) {
           run_id: run.run_id,
           session_id: run.session_id || worker.session_id,
           worktree_path: run.worktree_path || worker.worktree_path,
+          ...(desired ? { model: run.model || desired.model, cli: run.cli || desired.cli, tier: run.tier || desired.tier,
+            desired_model: run.model || desired.model, applied_model: run.model || desired.model, desired_runtime: null } : {}),
         }, { sessionsDir: ctx.sessionsDir, expectedRun: runId });
         deliveries.push({
           worker: worker.name,
@@ -351,7 +379,7 @@ export async function onWorkerTurnFinished({
     || (lastReport.mentions.length > 0 && (lastReport.kind === 'handoff' || /\[handoff\]/i.test(lastReport.text))));
 
   let autoPost = null;
-  if (!implicit && !reported && !(finishedOk && worker.parked_on?.startsWith('board_wait'))
+  if (!implicit && !['monitor', 'narrator'].includes(worker.role) && !reported && !(finishedOk && worker.parked_on?.startsWith('board_wait'))
       && !posts.some((msg) => msg.meta?.auto_summary && msg.kind === (finishedOk ? 'summary' : 'error'))) {
     const summaryText = finishedOk
       ? `@${worker.added_by} [done] ${truncateText(stripSummaryHeader(result?.text) || 'Turn finished.', 600)}`
@@ -374,6 +402,7 @@ export async function onWorkerTurnFinished({
     state: nextState,
     ...(result?.fork_mode ? { fork_mode: result.fork_mode } : {}),
     cli: result?.cli || outcome?.cli, model: result?.model || outcome?.model, tier: result?.tier || outcome?.tier,
+    applied_model: result?.model || outcome?.model || worker.applied_model,
     session_id: result?.session_id || sessionId || worker.session_id,
     parked_on: !recovered && finishedOk && worker.parked_on?.startsWith('board_wait') ? worker.parked_on : null,
     quota_paused_seq: QUOTA_ERROR.test(errText || '') ? await getBoardHead(swarmId, { sessionsDir: resolvedSessions }) : 0,
@@ -381,6 +410,17 @@ export async function onWorkerTurnFinished({
   }, { sessionsDir: resolvedSessions, expectedState: worker.state, expectedRun: worker.run_id });
   if (!finished) return { skipped: true, reason: 'state changed' };
 
+  if (finished.desired_runtime && nextState === 'waiting') {
+    const runtime = finished.desired_runtime;
+    try {
+      await handleSwarmAction({ action: 'model', swarm_id: swarmId, name: swarmAgent, ...runtime }, {
+        sessionsDir: resolvedSessions, configPath, env, dispatchRunImpl, steerRunImpl, replyToolCallImpl, readRunImpl,
+      });
+      return { state: nextState, auto_post: autoPost, deliveries: [], ...boardStats };
+    } catch {
+      // The queued selection survives a failed dispatch and can apply on a later wake.
+    }
+  }
   let deliveries = [];
   if (!implicit && nextState === 'waiting') {
     const pending = await listUndeliveredForWorker(swarmId, swarmAgent, { since: 0, sessionsDir: resolvedSessions });
@@ -464,6 +504,27 @@ export async function handleSwarmAction(args = {}, options = {}) {
     parent = await getWorker(swarmId, actor, storage);
     if (!parent || parent.state === 'killed') throw new Error('Actor must be a live swarm member.');
     if (['title', 'plan'].includes(action)) throw new Error('Only coordinator may edit the title or plan.');
+    if (parent.role === 'narrator' && !['status', 'models'].includes(action)) throw new Error('Narrator is read-only.');
+  }
+  if (action === 'models') {
+    const cfg = readJsonSafe(ctx.configPath) || {};
+    const detected = detectAvailableRunners(cfg, ctx.env);
+    const tiers = TIER_ORDER.map((id) => buildTierView(id, cfg.tiers?.[id], cfg.routing_policy?.default_tier || 'sonnet'));
+    const models = new Map();
+    const add = (id, tier) => {
+      if (!id || typeof id !== 'string') return;
+      const item = models.get(id) || { id, model: id, cli: preferredRunnerForModel(id), tiers: [] };
+      if (tier && !item.tiers.includes(tier)) item.tiers.push(tier);
+      models.set(id, item);
+    };
+    for (const tier of tiers) {
+      add(tier.exec_model || tier.consult_model, tier.id);
+      if (args.all) for (const id of [tier.consult_model, tier.escalate_model, ...tier.fallback_models]) add(id, tier.id);
+    }
+    if (args.all) add(cfg.utility?.model || DEFAULT_UTILITY.model, 'chore');
+    const runners = args.all ? detected : detected.filter((runner) => runner.available);
+    return { ok: true, swarm_id: swarmId, models: [...models.values()], runners, tiers: tiers.map(({ id }) => id),
+      default_cli: getExecutionConfig(cfg).default_cli };
   }
   if (action === 'channel') {
     const { op, channel, topic } = args;
@@ -501,12 +562,12 @@ export async function handleSwarmAction(args = {}, options = {}) {
   }
 
   if (action === 'status') {
-    const overview = await getSwarmOverview(swarmId, { sessionsDir: ctx.sessionsDir, messageLimit: 0, analytics: true });
+    const overview = await getSwarmOverview(swarmId, { sessionsDir: ctx.sessionsDir, messageLimit: 0, analytics: true, includeCoordinator: true });
     if (!overview) {
       return {
         ok: true,
         swarm_id: swarmId,
-        title: null,
+        title: null, open_board: '',
         goal: { title: null, line: null },
         threads: [],
         head: 0,
@@ -516,7 +577,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
     return {
       ok: true,
       swarm_id: overview.swarm.id,
-      title: overview.swarm.title,
+      title: overview.swarm.title, open_board: SIDECAR_URI,
       goal: { title: overview.swarm.goal_title, line: overview.swarm.goal_line },
       threads: overview.swarm.threads,
       head: overview.head,
@@ -531,12 +592,13 @@ export async function handleSwarmAction(args = {}, options = {}) {
     if (parent?.access === 'inspect' && args.access === 'change') throw new Error('An inspect-only worker can add only inspect helpers.');
     const forkWorker = args.fork && args.fork !== 'coordinator' ? await getWorker(swarmId, args.fork, storage) : null;
     if (args.fork && args.fork !== 'coordinator' && !forkWorker) throw new Error(`Cannot fork unknown member '${args.fork}'.`);
-    const access = String(args.access || parent?.access || forkWorker?.access || 'change').trim();
+    const isNarrator = args.role === 'narrator' || (!args.role && /^narrator(?:-\d+)?$/.test(args.name || ''));
+    const access = isNarrator ? 'inspect' : String(args.access || parent?.access || forkWorker?.access || 'change').trim();
     if (!['change', 'inspect'].includes(access)) throw new Error(`Invalid access '${access}'.`);
     const workspace = String(args.workspace || 'inherit').trim();
-    if (!['inherit', 'share'].includes(workspace)) throw new Error(`Invalid workspace '${workspace}'.`);
-    if (access === 'inspect' && workspace === 'share') {
-      throw new Error("workspace='share' is not allowed with read-only access ('inspect'); use workspace='inherit'.");
+    if (!['inherit', 'share', 'branch'].includes(workspace)) throw new Error(`Invalid workspace '${workspace}'.`);
+    if (access === 'inspect' && workspace !== 'inherit') {
+      throw new Error(`workspace='${workspace}' is not allowed with read-only access ('inspect'); use workspace='inherit'.`);
     }
     const timeoutSec = validateExecTimeoutSec(args.timeout_sec);
     const cfg = readJsonSafe(ctx.configPath) || {};
@@ -599,11 +661,19 @@ export async function handleSwarmAction(args = {}, options = {}) {
       const instructions = { swarmId, workerName: spec.name, brief: String(args.brief).trim(), seq: msg.seq, owner,
         role: roleOf(spec.name), registry, channels, shardInstruction: spec.shardInstruction };
       try {
+        if (instructions.role === 'monitor') {
+          const saved = await updateWorker(swarmId, spec.name, { state: 'waiting', run_id: null, parked_on: 'board_wait' },
+            { ...storage, expectedRun: runIds[index] });
+          spawned.push({ ...compactRosterItem(saved), brief_seq: msg.seq });
+          continue;
+        }
+        const sourceCwd = ctx.cwd || forkWorker?.worktree_path || forkWorker?.source_cwd;
+        const openingWorker = await getWorker(swarmId, spec.name, storage);
         const run = await ctx.dispatchRunImpl({
-          run_id: runIds[index], goal: buildWorkerInstructions({ ...instructions, forkContext }),
-          cwd: ctx.cwd || forkWorker?.worktree_path || forkWorker?.source_cwd,
+          run_id: runIds[index], goal: await withHeadNudge(buildWorkerInstructions({ ...instructions, forkContext }), swarmId, openingWorker, ctx.sessionsDir),
+          cwd: sourceCwd,
           access,
-          workspace,
+          workspace: workspace === 'branch' ? 'share' : workspace,
           cli,
           ...(model ? { model } : {}),
           ...(tier ? { tier } : {}),
@@ -627,6 +697,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
           agent: ctx.agent,
           env: {
             ...ctx.env,
+            GEMPT_SWARM_WORKSPACE_MODE: workspace === 'branch' ? 'branch' : '',
             GEMPT_SWARM_ID: swarmId,
             GEMPT_AGENT_NAME: spec.name,
             GEMPT_SESSIONS_DIR: ctx.sessionsDir,
@@ -638,7 +709,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
           cli: run.cli || cli,
           worktree_path: run.worktree_path || null,
           source_cwd: run.source_cwd || run.cwd || ctx.cwd || forkWorker?.source_cwd || null,
-          model: run.model || model,
+          model: run.model || model, desired_model: run.model || model, applied_model: run.model || model,
         }, { sessionsDir: ctx.sessionsDir, expectedRun: runIds[index] });
         spawned.push({ ...compactRosterItem(saved || await getWorker(swarmId, spec.name, storage)), brief_seq: msg.seq });
       } catch (err) {
@@ -654,7 +725,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
       ok: true,
       swarm_id: swarmId,
       workers: spawned,
-      head,
+      head, open_board: SIDECAR_URI,
       wait_command: buildBoardWaitCommand(swarmId, { since: lastBriefSeq, env: ctx.env }),
     };
   }
@@ -666,7 +737,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
     if (!worker) throw new Error(`Worker '${workerName}' not found in swarm '${swarmId}'.`);
     if (parent && worker.name !== actor && worker.added_by !== actor) throw new Error('Cannot switch the model of another worker’s helper.');
     if (worker.state === 'killed') throw new Error(`Worker '${workerName}' has been killed and cannot switch models.`);
-    if (worker.state !== 'waiting' && worker.state !== 'stopped') {
+    if (worker.state !== 'waiting' && worker.state !== 'stopped' && worker.name !== actor) {
       throw new Error(`Worker '${workerName}' must be in 'waiting' or 'stopped' state to switch model (current: ${worker.state}).`);
     }
     const nextModel = args.model !== undefined ? (String(args.model || '').trim() || null) : worker.model;
@@ -675,9 +746,17 @@ export async function handleSwarmAction(args = {}, options = {}) {
     if (nextCli && !CLI_CHOICES.includes(nextCli)) {
       throw new Error(`Invalid cli '${args.cli}'. Expected one of: ${CLI_CHOICES.join(', ')}.`);
     }
+    if (worker.state === 'stopped' || (worker.name === actor && worker.state !== 'waiting')) {
+      const queued = await updateWorker(swarmId, workerName, { desired_model: nextModel,
+        desired_runtime: { model: nextModel, tier: nextTier, cli: nextCli } },
+      { ...storage, expectedState: worker.state, expectedRun: worker.run_id });
+      if (!queued) throw new Error('Worker state changed concurrently; retry model switch.');
+      return { ok: true, swarm_id: swarmId, worker: compactRosterItem(queued), pending: true };
+    }
     const runId = randomUUID().replaceAll('-', '');
     const claimed = await updateWorker(swarmId, workerName, {
       model: nextModel,
+      desired_model: nextModel,
       tier: nextTier,
       cli: nextCli,
       state: 'working',
@@ -699,10 +778,11 @@ export async function handleSwarmAction(args = {}, options = {}) {
         meta: { model_switch: { model: nextModel, tier: nextTier, cli: nextCli } },
       }, { sessionsDir: ctx.sessionsDir });
       await markDelivered(swarmId, [notice.seq], workerName, { sessionsDir: ctx.sessionsDir });
-      const resumeCwd = worker.worktree_path || worker.source_cwd || overview.swarm.cwd || ctx.cwd;
+      const resumeCwd = (worker.workspace === 'branch' ? worker.source_cwd : worker.worktree_path)
+        || worker.source_cwd || overview.swarm.cwd || ctx.cwd;
       run = await ctx.dispatchRunImpl({
         run_id: runId,
-        goal: `[Board #${notice.seq} from @${actor}]\n${notice.text}`,
+        goal: await withHeadNudge(`[Board #${notice.seq} from @${actor}]\n${notice.text}`, swarmId, worker, ctx.sessionsDir),
         cwd: resumeCwd,
         access: worker.access || 'change',
         workspace: worker.worktree_path ? 'inherit' : (worker.workspace || 'inherit'),
@@ -735,6 +815,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
         state: worker.state,
         run_id: worker.run_id,
         model: worker.model,
+        desired_model: worker.desired_model,
         tier: worker.tier,
         cli: worker.cli,
         parked_on: worker.parked_on,
@@ -746,6 +827,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
       run_id: run.run_id,
       session_id: run.session_id || worker.session_id,
       worktree_path: run.worktree_path || worker.worktree_path,
+      applied_model: run.model || nextModel, desired_runtime: null,
     }, { sessionsDir: ctx.sessionsDir, expectedRun: runId }) || await getWorker(swarmId, workerName, storage);
     return {
       ok: true,
@@ -766,16 +848,38 @@ export async function handleSwarmAction(args = {}, options = {}) {
     if (parent && targets.some((w) => w.added_by !== actor)) throw new Error('Cannot kill a helper added by another member.');
     let interrupted = false;
     const workers = [];
+    const cleaned_workspaces = [];
     for (const worker of targets) {
+      const killed = await killWorkerRecord(swarmId, worker.name, {
+        ...storage, expectedState: worker.state, expectedRun: worker.run_id,
+      });
+      if (!killed) throw new Error(`Worker '${worker.name}' changed state concurrently; retry kill.`);
+      let safeToClean = !['working', 'waiting_reply'].includes(worker.state);
       if (worker.run_id && ['working', 'waiting_reply'].includes(worker.state)) {
         try {
-          await ctx.interruptRunImpl(worker.run_id, { configPath: ctx.configPath, sessionsDir: ctx.sessionsDir, env: ctx.env });
+          const result = await ctx.interruptRunImpl(worker.run_id, { configPath: ctx.configPath, sessionsDir: ctx.sessionsDir, env: ctx.env });
+          let settled = result;
+          if (result?.cleared_unconfirmed) {
+            try { settled = ctx.readRunImpl(worker.run_id, ctx.sessionsDir, { readonly: true }); }
+            catch { /* Remote acknowledgement alone cannot prove that the workspace is idle. */ }
+          }
+          safeToClean = settled && !settled.remote_turn_unconfirmed && ['finished', 'failed', 'interrupted', 'stopped'].includes(settled.state);
           interrupted = true;
         } catch { /* A completed run can still be marked killed. */ }
       }
-      workers.push(compactRosterItem(await killWorkerRecord(swarmId, worker.name, storage)));
+      if (safeToClean && worker.worktree_path && worker.source_cwd && ['share', 'branch'].includes(worker.workspace)) {
+        try {
+          const clean = worker.workspace === 'branch' ? removeBranchWorkspace : removeShareWorktree;
+          if (clean(worker.source_cwd, worker.worktree_path, ctx.env, storage)) {
+            cleaned_workspaces.push(worker.worktree_path);
+            killed.worktree_path = null;
+            await updateWorker(swarmId, worker.name, { worktree_path: null }, storage);
+          }
+        } catch { /* Keep isolation data when ownership or Git cleanliness cannot be verified. */ }
+      }
+      workers.push(compactRosterItem(killed));
     }
-    return { ok: true, swarm_id: swarmId, worker: workers[0], workers, interrupted };
+    return { ok: true, swarm_id: swarmId, worker: workers[0], workers, interrupted, cleaned_workspaces };
   }
 }
 
@@ -806,7 +910,12 @@ export async function handleBoardAction(args = {}, options = {}) {
       meta: args.meta,
     }, { sessionsDir: ctx.sessionsDir,
       ...(!options.actor || options.actor === 'coordinator' ? { hostConversationId: ctx.hostConversationId, cwd: ctx.cwd } : {}) });
-    const deliveries = await routeBoardDeliveries(swarmId, { ...options, configPath: ctx.configPath, sessionsDir: ctx.sessionsDir, env: ctx.env });
+    const deliveryOptions = { ...options, configPath: ctx.configPath, sessionsDir: ctx.sessionsDir, env: ctx.env };
+    const deliveries = await routeBoardDeliveries(swarmId, deliveryOptions);
+    // A dormant monitor has no live model turn or daemon tick. An incoming
+    // post still lets its persisted state wake immediately.
+    await sweepSwarmMonitors({ swarmId, sessionsDir: ctx.sessionsDir, env: ctx.env,
+      dispatchAlert: async (id) => { deliveries.push(...await routeBoardDeliveries(id, deliveryOptions)); } });
     return { ok: true, swarm_id: swarmId, message, head: message.seq, deliveries, ...(message.warnings ? { warnings: message.warnings } : {}) };
   }
 
@@ -818,7 +927,7 @@ export async function handleBoardAction(args = {}, options = {}) {
     const messages = await readBoardMessages(swarmId, {
       since: args.since,
       channel: args.channel,
-      viewer: args.viewer || args.from,
+      viewer: args.viewer || args.from || 'coordinator',
       seqs: args.seqs,
       limit: args.limit ?? 20,
       sessionsDir: ctx.sessionsDir,
@@ -829,6 +938,9 @@ export async function handleBoardAction(args = {}, options = {}) {
 
   if (action === 'wait') {
     const head = await getBoardHead(swarmId, { sessionsDir: ctx.sessionsDir });
+    if (args.since != null && (!Number.isSafeInteger(args.since) || args.since < 0 || args.since > head)) {
+      throw new Error('Pass a sequence actually read, at or below the current board head.');
+    }
     const since = args.since !== undefined && args.since !== null
       ? Math.max(0, Math.trunc(Number(args.since) || 0))
       : head;
@@ -843,12 +955,13 @@ export async function handleBoardAction(args = {}, options = {}) {
       const messages = await listUndeliveredForWorker(swarmId, viewer, { ...storage, since, channel, includeDelivered: true });
       if (messages.length) {
         const seq = messages.at(-1).seq;
-        await markRead(swarmId, viewer, seq, storage);
         await updateWorker(swarmId, viewer, { last_park_blocked_seq: seq, parked_on: null }, storage);
       }
       return { ok: true, swarm_id: swarmId, head, since, mentions_only: mentionsOnly, parked: !messages.length,
         park_blocked: !!messages.length, messages };
     }
+    await updateWorker(swarmId, 'coordinator', { state: 'waiting', wake_mode: mentionsOnly ? 'mentions' : 'anything', wait_since: since },
+      { sessionsDir: ctx.sessionsDir });
     const wait_command = buildBoardWaitCommand(swarmId, { since, mentionsOnly, env: ctx.env })
       + (channel ? ` --channel "${channel}"` : '');
     return { ok: true, swarm_id: swarmId, since, head, mentions_only: mentionsOnly, wait_command };

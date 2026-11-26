@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { lstatSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { listActiveRoster } from './runs.mjs';
@@ -75,7 +75,7 @@ export function recordInWorkspace(record, roots) {
   return inWorkspace(record.cwd, roots) || inWorkspace(recordSourceCwd(record), roots);
 }
 
-export function workspaceFileRoots(record, roots) {
+export function workspaceFileRoots(record, roots, env = process.env) {
   const cwd = inWorkspace(record.cwd, null) ? resolvePath(record.cwd) : null;
   if (!roots) {
     if (!cwd) return [];
@@ -87,7 +87,7 @@ export function workspaceFileRoots(record, roots) {
   if (record.worktree_path) {
     if (!inWorkspace(record.worktree_path, null) || !inWorkspace(record.source_cwd, roots)) return allowed;
     const tree = resolvePath(record.worktree_path);
-    const managed = worktreesRoot();
+    const managed = worktreesRoot(env);
     if ((sameOrWithin(tree, managed) && !samePath(tree, managed))
         || inWorkspace(resolveExternalWorktreeSourceCwd(tree), roots)) allowed.push(tree);
     // The tree already covers its cwd and must never grant access to a sibling cwd.
@@ -133,6 +133,10 @@ export function assertShareWorktree(sourceCwd, path, env = process.env) {
 }
 
 export function ensureShareWorktree(cwd, sessionId, env = process.env) {
+  // The run dispatcher has a single isolated-workspace allocation path.
+  // Swarm marks an independent clone here while keeping normal resumable
+  // worktree metadata in run and session records.
+  if (env.GEMPT_SWARM_WORKSPACE_MODE === 'branch') return ensureBranchWorkspace(cwd, sessionId, env);
   const sid = validateSessionId(sessionId);
   const sourceCwd = resolvePath(cwd);
   if (!statSync(sourceCwd, { throwIfNoEntry: false })?.isDirectory()) {
@@ -271,4 +275,44 @@ export function pruneShareWorktrees(sourceRepo, { activePaths = new Set(), maxAg
   }
   git(repoRoot, ['worktree', 'prune'], env);
   return { removed, kept };
+}
+
+export function ensureBranchWorkspace(cwd, sessionId, env = process.env) {
+  const sid = validateSessionId(sessionId);
+  const sourceCwd = resolvePath(cwd);
+  const repo = gitPath(sourceCwd, '--show-toplevel', env);
+  if (!repo) throw new Error(`workspace='branch' requires a Git repository: ${sourceCwd}`);
+  const root = join(worktreesRoot(env), 'branches');
+  mkdirSync(root, { recursive: true });
+  if (resolvePath(root) !== root) throw new Error('Invalid branch workspace root.');
+  const target = join(root, sid);
+  mkdirSync(target);
+  try {
+    const cloned = git(repo, ['clone', '--no-local', '--no-checkout', '--', repo, target], env, 60_000);
+    if (cloned.status !== 0) throw new Error(`Failed to clone isolated git repository: ${cloned.stderr.trim()}`);
+    const head = git(repo, ['rev-parse', 'HEAD'], env);
+    const checkout = head.status === 0 && git(target, ['checkout', '--detach', head.stdout.trim()], env);
+    if (!checkout || checkout.status !== 0) throw new Error('Failed to check out the source Git revision.');
+    const subdirectory = resolvePath(join(target, relative(repo, sourceCwd)));
+    return { worktree_root: target, cwd: withinPath(subdirectory, target) &&
+      statSync(subdirectory, { throwIfNoEntry: false })?.isDirectory() ? subdirectory : target, source_cwd: sourceCwd };
+  } catch (error) {
+    rmSync(target, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+export function removeBranchWorkspace(sourceCwd, workspace, env = process.env, { sessionsDir } = {}) {
+  const root = join(worktreesRoot(env), 'branches');
+  const target = resolvePath(workspace);
+  const source = gitPath(sourceCwd, '--show-toplevel', env);
+  if (!source || dirname(target) !== root || target !== workspace || gitPath(target, '--show-toplevel', env) !== target) return false;
+  const origin = git(target, ['remote', 'get-url', 'origin'], env);
+  const status = git(target, ['status', '--porcelain', '--untracked-files=all', '--ignored=matching'], env);
+  const head = git(target, ['rev-parse', 'HEAD'], env);
+  if (origin.status !== 0 || origin.stdout.trim() !== source || status.status !== 0 || status.stdout || head.status !== 0 ||
+      git(source, ['merge-base', '--is-ancestor', head.stdout.trim(), 'HEAD'], env).status !== 0) return false;
+  rmSync(target, { recursive: true });
+  syncPrunedWorktreeSessions(source, target, sessionsDir ?? resolveSessionsDir(env.GEMPT_SESSIONS_DIR));
+  return true;
 }
