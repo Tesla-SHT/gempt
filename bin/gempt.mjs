@@ -7,11 +7,11 @@ import { installAgy } from '../core/agy-install.mjs';
 import { agyInstallPaths } from '../core/bundle-paths.mjs';
 import { CLI_CHOICES } from '../core/config.mjs';
 import { handleTool, serveStdio } from '../core/mcp-server.mjs';
-import { ACTIVE_STATES, buildWaitCommand, compactReceiptText, dispatchRun, interruptRun, replyToolCall,
-  steerRun, tryDelegateDispatch, validateExecTimeoutSec } from '../core/runs.mjs';
+import { ACTIVE_STATES, buildReplyCommand, buildWaitCommand, compactReceiptText, dispatchRun, interruptRun, pendingToolCalls,
+  readRun, replyToolCall, steerRun, tryDelegateDispatch, validateExecTimeoutSec } from '../core/runs.mjs';
 import { resolvePath } from '../core/state.mjs';
 import { handleBoardAction, handleSwarmAction } from '../core/swarm-engine.mjs';
-import { runWait } from '../core/wait.mjs';
+import { runWait, STATUS_USAGE, waitUsage } from '../core/wait.mjs';
 import { pruneShareWorktrees } from '../core/worktrees.mjs';
 import { findCodexCli } from '../magpie_plugin/lib/app-server-manager.mjs';
 import {
@@ -28,17 +28,68 @@ const commands = {
   'install-agy': { target: string, source: string, force: flag },
   run: { ...goalOptions, access: string, workspace: string, title: string, timeout: string, cli: string },
   ask: { ...goalOptions, file: { ...string, multiple: true } },
-  mcp: {}, discover: {}, status: { 'run-id': string, 'run-ids': string, wait: flag, 'wait-all': flag },
+  mcp: {}, discover: {}, status: { 'run-id': string, 'run-ids': string, wait: flag, 'wait-all': flag,
+    'heartbeat-sec': string, 'stale-sec': string },
   init: { 'non-interactive': flag, failover: string, sandbox: string,
     'utility-model': string, 'dry-run': flag },
   tier: {}, sandbox: {}, effort: { tier: string }, steer: {}, interrupt: {},
-  'reply-tool': { failure: flag }, 'prune-worktrees': { 'max-age-hours': string },
+  'reply-tool': { failure: flag, text: string, message: string }, 'prune-worktrees': { 'max-age-hours': string },
   'print-mcp': { installed: flag, target: string },
-  board: { swarm: string, from: string, kind: string, text: string, since: string, seqs: string, limit: string, 'reply-to': string },
+  board: { swarm: string, from: string, kind: string, text: string, since: string, seqs: string, limit: string,
+    'reply-to': string, channel: string },
   swarm: { swarm: string, cwd: string, title: string, brief: string, 'brief-file': string, access: string, workspace: string,
     cli: string, model: string, tier: string, n: string, task: { ...string, multiple: true }, reason: string,
     'goal-title': string, 'goal-line': string, 'plan-json': string, host: string, family: string, timeout: string },
 };
+const goalUsage = '[--goal TEXT|- | --goal-file PATH] [--cwd PATH] [--tier TIER] [--family FAMILY] [--session ID] [--host ID]';
+const usages = {
+  'install-agy': '[--target PATH] [--source PATH] [--force]',
+  run: `${goalUsage} [--access change|inspect] [--workspace inherit|share] [--title TITLE] [--timeout SECONDS] [--cli CLI]`,
+  ask: `${goalUsage} [--file PATH ...]`,
+  mcp: '',
+  discover: '',
+  init: '[--non-interactive] [--failover MODE] [--sandbox MODE] [--utility-model MODEL] [--dry-run]',
+  tier: '[TIER]',
+  sandbox: '[MODE]',
+  effort: '[low|medium|high|xhigh|auto] [--tier TIER]',
+  steer: 'RUN_ID MESSAGE',
+  interrupt: 'RUN_ID',
+  'reply-tool': 'RUN_ID CALL_ID TEXT|- [--failure]\n       gempt reply-tool RUN_ID [CALL_ID] (--text | --message) TEXT|- [--failure]',
+  'prune-worktrees': '[REPO_PATH] [--max-age-hours N]',
+  'print-mcp': '[--installed] [--target PATH]',
+  board: {
+    post: '[TEXT|- | --text TEXT|-] [--from NAME] [--kind KIND] [--channel NAME] [--reply-to SEQ]',
+    read: '[--since SEQ] [--seqs SEQ[,SEQ...]] [--limit N] [--channel NAME]',
+    roster: '',
+  },
+  swarm: {
+    title: '[TITLE | --title TITLE]',
+    plan: '[--plan-json JSON] [--goal-title TITLE] [--goal-line TEXT]',
+    add: 'NAME [--brief TEXT|- | --brief-file PATH] [--access change|inspect] [--workspace inherit|share]'
+      + ' [--cli CLI] [--model MODEL] [--tier TIER] [--n N] [--task TEXT ...] [--family FAMILY] [--timeout SECONDS]',
+    status: '',
+    kill: 'NAME',
+    model: 'NAME [--model MODEL] [--tier TIER] [--cli CLI] [--reason TEXT]',
+  },
+};
+
+function usage(command, action) {
+  if (command === 'wait') return waitUsage('gempt wait');
+  if (command === 'status') return STATUS_USAGE;
+  const syntax = Object.hasOwn(usages, command) ? usages[command] : undefined;
+  if (syntax === undefined) return `Usage: gempt <${[...Object.keys(commands), 'wait'].join('|')}> [options]\n       gempt COMMAND --help`;
+  if (typeof syntax === 'string') return `Usage: gempt ${command}${syntax ? ` ${syntax}` : ''} [--config PATH] [--json]`;
+  const actions = Object.hasOwn(syntax, action) ? [action] : Object.keys(syntax);
+  const shared = command === 'swarm' ? ' [--cwd PATH] [--host ID]' : '';
+  return actions.map((name, i) => `${i ? '       ' : 'Usage: '}gempt ${command} ${name}${syntax[name] ? ` ${syntax[name]}` : ''}`
+    + ` [--swarm SWARM_ID]${shared} [--config PATH] [--json]`).join('\n');
+}
+
+async function readStdin() {
+  let text = '';
+  for await (const chunk of process.stdin.setEncoding('utf8')) text += chunk;
+  return text;
+}
 const print = (value) => console.log(JSON.stringify(value, null, 2));
 
 function choose(value, allowed, label) {
@@ -55,8 +106,7 @@ async function goalArgs(values, tiers) {
   if (goalFile !== undefined) {
     goal = readFileSync(resolvePath(goalFile), 'utf8');
   } else if (values.goal === '-' || (values.goal === undefined && !process.stdin.isTTY)) {
-    goal = '';
-    for await (const chunk of process.stdin.setEncoding('utf8')) goal += chunk;
+    goal = await readStdin();
   }
   goal = goal.trim();
   if (!goal) throw new Error('goal is required and must be a non-empty string.');
@@ -78,16 +128,20 @@ async function settings(options) {
 
 async function main([command, ...args]) {
   if (!command || command === '--help' || command === '-h') {
-    console.log(`Usage: gempt <${[...Object.keys(commands), 'wait'].join('|')}> [options]`);
-    console.log('Run: --goal - reads stdin. --timeout SECONDS accepts 30–7200 (default 3600).');
+    console.log(usage());
     return;
   }
-  if (command === 'wait') return runWait(args);
+  if (command === 'wait') return runWait(args, { command: 'gempt wait' });
   if (!Object.hasOwn(commands, command)) throw new Error(`Unknown command '${command}'.`);
   const { values, positionals } = parseArgs({ args, allowPositionals: true,
-    options: { ...commands[command], config: string, json: flag } });
+    options: { ...commands[command], config: string, json: flag, help: { ...flag, short: 'h' } } });
+  if (values.help) {
+    console.log(usage(command, positionals[0]));
+    return;
+  }
   const sizes = {
-    tier: [0, 1], sandbox: [0, 1], effort: [0, 1], steer: [2], interrupt: [1], 'reply-tool': [3], 'prune-worktrees': [0, 1],
+    tier: [0, 1], sandbox: [0, 1], effort: [0, 1], steer: [2], interrupt: [1], status: [0, 1],
+    'reply-tool': [1, 2, 3], 'prune-worktrees': [0, 1],
     board: [1, 2], swarm: [1, 2],
   };
   if (!(sizes[command] || [0]).includes(positionals.length)) throw new Error(`Unexpected arguments for gempt ${command}.`);
@@ -118,8 +172,10 @@ async function main([command, ...args]) {
       const receipt = { run_id, session_id, state, worktree_path, cwd, tier, execution_timeout_sec };
       if (ACTIVE_STATES.has(state) || state === 'interrupted') {
         const wait_command = buildWaitCommand(run_id);
-        print({ ...receipt, wait_command,
-          ...(state === 'waiting_gemini' ? { pending_tool_call: run.pending_tool_call } : {}) });
+        const pending = pendingToolCalls(run)[0];
+        print({ ...receipt, wait_command, ...(pending && {
+          pending_tool_call: pending, reply_command: buildReplyCommand(run_id, pending.call_id),
+        }) });
         return Number(state === 'interrupted');
       }
       const { model, reasoning_effort, verification, usage, text } = run;
@@ -130,6 +186,7 @@ async function main([command, ...args]) {
       const args = await goalArgs(values, ['chore', ...TIER_ORDER]);
       const response = await handleTool('gpt_ask', { ...args, file_paths: values.file }, process.env, { configPath });
       console.log(response.content[0].text);
+      if (response.isError) console.error(usage(command));
       return Number(Boolean(response.isError));
     }
     case 'install-agy':
@@ -139,13 +196,18 @@ async function main([command, ...args]) {
       result = values.installed ? JSON.parse(readFileSync(join(target, 'mcp_config.json'), 'utf8'))
         : buildMcpSnippet({ antigravityPluginDir: target, preferInstalled: false }).config;
       break;
-    case 'status':
-      if (values['run-id'] || values['run-ids'] || values.wait || values['wait-all']) {
+    case 'status': {
+      if (value !== undefined && (values['run-id'] !== undefined || values['run-ids'] !== undefined)) {
+        throw new Error('Use a positional RUN_ID or a run ID option.');
+      }
+      if (value !== undefined) values['run-id'] = value;
+      if (Object.keys(values).some((key) => !['config', 'json'].includes(key))) {
         return runWait(['status', ...Object.entries(values).filter(([key]) => !['config', 'json'].includes(key))
           .flatMap(([key, entry]) => entry === true ? [`--${key}`] : [`--${key}`, entry])], { readOnly: true });
       }
       result = await readState({ configPath });
       break;
+    }
     case 'discover': {
       const [state, codex] = await Promise.all([readState({ configPath }), findCodexCli(config?.codex?.cli_path)]);
       const magpieCli = findMagpieCli(config?.magpie?.cli_path);
@@ -192,9 +254,24 @@ async function main([command, ...args]) {
     case 'interrupt':
       result = await interruptRun(value, { configPath });
       break;
-    case 'reply-tool':
-      result = replyToolCall(value, second, third, { success: !values.failure });
+    case 'reply-tool': {
+      if (values.text !== undefined && values.message !== undefined) throw new Error('Choose --text or --message.');
+      const optionText = values.text ?? values.message;
+      if ((optionText === undefined && third === undefined) || (optionText !== undefined && third !== undefined)) {
+        throw new Error('Expected a reply body once. Use CALL_ID TEXT or [CALL_ID] --text TEXT.');
+      }
+      let callId = second;
+      if (callId === undefined) {
+        const pending = pendingToolCalls(readRun(value));
+        if (pending.length !== 1) throw new Error(pending.length
+          ? `Run ${value} has multiple pending tool calls (${pending.map((call) => call.call_id).join(', ')}). Specify CALL_ID.`
+          : `Run ${value} has no pending waiting_gemini tool call.`);
+        callId = pending[0].call_id;
+      }
+      const body = optionText ?? third;
+      result = replyToolCall(value, callId, body === '-' ? await readStdin() : body, { success: !values.failure });
       break;
+    }
     case 'prune-worktrees': {
       const repoPath = resolvePath(value || process.cwd());
       const hours = values['max-age-hours'] !== undefined ? Number(values['max-age-hours']) : 168;
@@ -204,11 +281,13 @@ async function main([command, ...args]) {
     }
     case 'board': {
       const sub = choose(value, ['post', 'read', 'roster'], 'board action');
+      if (second !== undefined && (sub !== 'post' || values.text !== undefined)) {
+        throw new Error(`Unexpected arguments for gempt board ${sub}.`);
+      }
       const swarmId = values.swarm || process.env.GEMPT_SWARM_ID;
       let text = values.text ?? second;
       if (sub === 'post' && (text === '-' || (text === undefined && !process.stdin.isTTY))) {
-        text = '';
-        for await (const chunk of process.stdin.setEncoding('utf8')) text += chunk;
+        text = await readStdin();
       }
       const seqs = values.seqs ? values.seqs.split(',').map((s) => Number(s.trim())).filter(Boolean) : undefined;
       result = await handleBoardAction({
@@ -216,6 +295,7 @@ async function main([command, ...args]) {
         swarm_id: swarmId,
         from: values.from || process.env.GEMPT_AGENT_NAME || 'coordinator',
         kind: values.kind,
+        channel: values.channel,
         text,
         since: values.since !== undefined ? Number(values.since) : undefined,
         seqs,
@@ -226,6 +306,10 @@ async function main([command, ...args]) {
     }
     case 'swarm': {
       const sub = choose(value, ['title', 'plan', 'add', 'status', 'kill', 'model'], 'swarm action');
+      const requiresName = ['add', 'kill', 'model'].includes(sub);
+      if ((requiresName && !second) || (!requiresName && second !== undefined && (sub !== 'title' || values.title !== undefined))) {
+        throw new Error(`Unexpected arguments for gempt swarm ${sub}.`);
+      }
       const swarmId = values.swarm || process.env.GEMPT_SWARM_ID;
       const cwd = values.cwd ? resolvePath(values.cwd) : process.cwd();
       if (sub === 'title') {
@@ -243,8 +327,7 @@ async function main([command, ...args]) {
         let brief = values.brief;
         if (values['brief-file']) brief = readFileSync(resolvePath(values['brief-file']), 'utf8');
         else if (brief === '-' || (brief === undefined && !process.stdin.isTTY)) {
-          brief = '';
-          for await (const chunk of process.stdin.setEncoding('utf8')) brief += chunk;
+          brief = await readStdin();
         }
         result = await handleSwarmAction({
           action: 'add',
@@ -284,5 +367,7 @@ try {
   process.exitCode = (await main(process.argv.slice(2))) || 0;
 } catch (error) {
   console.error(error.message);
+  const [, , command, firstArgument] = process.argv;
+  console.error(usage(command, firstArgument));
   process.exitCode = 1;
 }

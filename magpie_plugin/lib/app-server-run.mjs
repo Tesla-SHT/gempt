@@ -140,6 +140,8 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
       armTimeout();
     }
     record.pending_tool_call = pending || null;
+    if (tools.size > 1) record.pending_tool_calls = [...tools.values()];
+    else delete record.pending_tool_calls;
     progress.phase = record.state = pending ? 'waiting_gemini' : 'running';
     save(true);
   };
@@ -276,6 +278,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
         tools.clear();
         record.state = 'running';
         record.pending_tool_call = null;
+        delete record.pending_tool_calls;
         progress.phase = terminal.status;
         save(true);
         complete(terminal);
@@ -377,9 +380,8 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
 
     acceptTurn = true;
     poll = setInterval(() => {
-      try {
-        const [id, pending] = tools.entries().next().value || [];
-        if (!pending || client.disconnected) return;
+      if (client.disconnected) return;
+      for (const [id, pending] of tools) try {
         const reply = JSON.parse(readFileSync(toolReplyPath(directory, pending.call_id), 'utf8'));
         if (typeof reply.answer !== 'string' || typeof reply.success !== 'boolean') throw new Error('Invalid ask_gemini reply.');
         client.reply(id, { success: reply.success, contentItems: [{ type: 'inputText', text: reply.answer }] });
@@ -392,7 +394,10 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
           })());
         }
       } catch (err) {
-        if (!['ENOENT', 'EPERM', 'EBUSY'].includes(err.code)) fail(err);
+        if (!['ENOENT', 'EPERM', 'EBUSY'].includes(err.code)) {
+          fail(err);
+          return;
+        }
       }
     }, 100);
     armTimeout();

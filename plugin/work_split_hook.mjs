@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
 import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
-import { basename, dirname, extname, join, resolve } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path';
 
 const runtime = existsSync(new URL('./runtime/core/host-context.mjs', import.meta.url)) ? './runtime/' : '../';
-const [{ WORKLOAD }, { bindToolCwd, readHostContext, updateHostContext }, { atomicJson, resolvePath, withLock }, backend, { GEMPT_VERSION }, { resolveRunnerId }] = await Promise.all([
+const [{ WORKLOAD }, { bindToolCwd, readHostContext, updateHostContext }, { atomicJson, resolvePath, withLock, withinPath }, backend, { GEMPT_VERSION }, { resolveRunnerId }] = await Promise.all([
   import(`${runtime}core/assets.mjs`), import(`${runtime}core/host-context.mjs`),
   import(`${runtime}core/state.mjs`), import(`${runtime}magpie_plugin/lib/backend.mjs`), import(`${runtime}core/config.mjs`), import(`${runtime}core/runners/registry.mjs`),
 ]);
@@ -41,9 +41,57 @@ function metadataSegment(segment) {
     || (args.includes('--list') || args.includes('-l')) && !arg.startsWith('-'));
 }
 
-function exploreCommand(command) {
+function outsideWorkspace(target, roots, cwd) {
+  if (!target || !roots.length || (!isAbsolute(target) && !cwd)) return false;
+  try {
+    const path = resolvePath(isAbsolute(target) ? target : resolve(cwd, target));
+    return roots.every((root) => !withinPath(path, resolvePath(root)));
+  } catch {
+    return false;
+  }
+}
+
+function externalReadSegment(segment, outside) {
+  // Exempt only statically identifiable operands. Expansions, redirections,
+  // and options with unknown operands keep the normal exploration gate.
+  if (/[`$(){}<>*?]/.test(segment)) return false;
+  const words = segment.match(/"[^"]*"|'[^']*'|[^\s"']+/g);
+  if (!words?.length || words.some((word) => word.includes('\\') && process.platform !== 'win32')) return false;
+  const [verb, ...args] = words.map((word) => word.replace(/^(['"])(.*)\1$/, '$2'));
+  if (/^sed(?:\.exe)?$/i.test(verb)) {
+    const [quiet, script, ...paths] = args;
+    return quiet === '-n' && /^\d+(?:,\d+)?p$/.test(script)
+      && paths.length > 0 && paths.every((path) => !path.startsWith('-') && outside(path));
+  }
+  const read = /^(?:cat|head|tail|wc|Get-Content|gc|type)(?:\.exe)?$/i.test(verb);
+  const search = /^(?:rg|ripgrep|grep)(?:\.exe)?$/i.test(verb);
+  if (!read && !search) return false;
+  const paths = [];
+  let flags = true;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (flags && arg === '--') {
+      flags = false;
+    } else if (flags && arg.startsWith('-')) {
+      if (/^(?:head|tail)(?:\.exe)?$/i.test(verb) && ['-n', '-c', '--lines', '--bytes'].includes(arg)) {
+        if (!/^[+-]?\d+$/.test(args[++i])) return false;
+        continue;
+      }
+      const known = search ? /^(?:-[inlFvwrHUS]+|--(?:hidden|no-ignore|line-number|ignore-case|fixed-strings))$/
+        : /^(?:-\d+|-[lwc]+|--(?:lines|bytes)=\d+)$/;
+      if (!known.test(arg)) return false;
+    } else {
+      paths.push(arg);
+    }
+  }
+  if (search) paths.shift(); // The first operand is the pattern.
+  return paths.length > 0 && paths.every((path) => path !== '-' && outside(path));
+}
+
+function exploreCommand(command, outside) {
   const segments = command.split(/[;&|\r\n]+/).map(part => part.trim()).filter(Boolean);
-  return segments.some(segment => readCommand.test(segment)) && !segments.every(metadataSegment);
+  return segments.some(segment => readCommand.test(segment))
+    && !segments.every((segment) => metadataSegment(segment) || externalReadSegment(segment, outside));
 }
 
 const reviewRoute = 'For review or analysis of 1–5 known files, use synchronous gpt_ask(file_paths) (fast, cached).';
@@ -288,12 +336,21 @@ async function handle(payload) {
       if (!sourceWrite(target, input) || !healthy(family)) return allow;
       return { decision: 'deny', reason: `[GemPT ${pct}% Write Gate] Source edit (${basename(target)}) routed to GemPT execution. `
         + `Use call_mcp_tool(ServerName="gempt_gempt", ToolName="gpt_swarm", Arguments={"action": "add", "name": "worker", "brief": "Edit ${target}: <change & verify>", "cwd": "${cwd}", "access": "change"}) (or single-task gpt_run) `
-        + 'then run the returned `gempt-wait` command via run_command(WaitMsBeforeAsync=500). (User can say "自己改" to bypass.)' };
+        + 'then run the returned `gempt-wait` command via run_command(WaitMsBeforeAsync=500, NotificationTimeoutSeconds=180). (User can say "自己改" to bypass.)' };
     }
     if (ordinary === 'balanced') return allow;
+    const host = readHostContext(configPath);
+    const context = Object.values(host.by_workspace || {}).find((entry) => entry?.conversation_id === conversationId)
+      || (host.conversation_id === conversationId ? host : null);
+    const roots = [workspacePaths, context?.workspace_paths, [text(process.env.GEMPT_WORKSPACE_ROOT)], [text(payload.cwd)]]
+      .map((paths) => Array.isArray(paths) ? paths.map(text).filter(Boolean) : []).find((paths) => paths.length) || [];
+    const readCwd = text(input.Cwd) || text(input.WorkingDirectory) || text(payload.cwd) || roots[0];
+    const outside = (path) => outsideWorkspace(path, roots, readCwd);
+    const targets = ['Path', 'TargetFile', 'AbsolutePath', 'SearchPath', 'DirectoryPath']
+      .map((key) => text(input[key])).filter(Boolean);
     const command = String(input.CommandLine || '').trim();
-    if (!(readTools.has(name) && !exemptPath(target)) &&
-        !(name === 'run_command' && exploreCommand(command))) return allow;
+    if (!(readTools.has(name) && (!targets.length || targets.some((path) => !exemptPath(path) && !outside(path)))) &&
+        !(name === 'run_command' && exploreCommand(command, outside))) return allow;
     if (!healthy(family)) return allow;
     const limit = ordinary === 'gpt' ? 5 : 2;
     const count = await updateState(conversationId, (state) => setCount(state, key,

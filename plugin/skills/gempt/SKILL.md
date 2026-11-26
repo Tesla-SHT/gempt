@@ -61,7 +61,7 @@ GemPT v0.10.1 使用 Node.js（`>= 22.13.0`）。Antigravity 的 `gempt_gempt` M
 普通对话中的 `gpt_run` 和 `gpt_swarm` 共用当前会话的工作台。单工位显示任务卡；增加工位、收到消息或需要回复时自动展开。
 
 - 用 `gpt_swarm(action="title"|"plan"|"add"|"status"|"model"|"kill", cli?, ...)` 规划与拉起多 CLI 工位（不消耗 AGY 原生外壳 token），并行写入用 `workspace="share"` 自动创建 worktree。
-- 用 `gpt_board(action="post"|"read"|"wait"|"roster")` 在共享 SQLite 消息板上协同与自动唤醒；通过 `run_command(WaitMsBeforeAsync=500)` 执行返回的 `gempt-wait --board <swarm_id>` 零轮询等待。
+- 用 `gpt_board(action="post"|"read"|"wait"|"roster")` 在共享 SQLite 消息板上协同与自动唤醒。通过 `run_command(WaitMsBeforeAsync=500, NotificationTimeoutSeconds=180)` 执行返回的 `gempt-wait --board <swarm_id>`。
 - 可通过 `cli` 参数或控制台 `execution.default_cli` 选择 `auto`（按模型亲和匹配已安装 CLI）或任意 11 种受支持 CLI。
 - **提示词缓存纪律（对齐原生 Swarm）**：
   - **热上下文分叉**：新工位需继承某成员已读代码与推理时传 `fork="<member>"`（同 CLI/模型下 Codex 走原生 `thread/fork`、Claude 走 `--resume --fork-session`，其余场景自动回退板贴摘要）。
@@ -74,7 +74,7 @@ GemPT v0.10.1 使用 Node.js（`>= 22.13.0`）。Antigravity 的 `gempt_gempt` M
 
 ## 4. AI-to-AI Steering & Review Loop（内部纠偏闭环）
 
-1. `gpt_run` 返回 `wait_command` 时，原样通过 `run_command(WaitMsBeforeAsync=500)` 后台等待唤醒。用 `gpt_ctl` 随时查看或介入，收到 `ask_gemini` 时用 `action="reply"` 原回合续跑。
+1. `gpt_run` 或 `gpt_swarm` 返回 `wait_command` 时，原样通过 `run_command(WaitMsBeforeAsync=500, NotificationTimeoutSeconds=180)` 后台等待唤醒。等待心跳在 stderr，stdout 返回 JSON。等待结果给出 `reply_command` 时，替换 `<answer>` 并执行，再运行等待命令。工具回复可用 `gempt reply-tool RUN_ID CALL_ID "答复"`、`gempt reply-tool RUN_ID CALL_ID --text "答复"`（`--message` 同义），或用 `-` 从 stdin 读取原文。只有一个待回复工具调用时可省略 `CALL_ID`，使用 `gempt reply-tool RUN_ID --text "答复"`。也可用 `gpt_ctl` 的 `action="reply"` 接续原回合。
    - 核对实际文件、命令和结果。证据不足时安排有针对性的独立复核。
 2. **发现漏项、逻辑漏洞或测试未过**：
    - 不要把半成品甩给人类；带着具体技术证据和返回的 `session_id` 继续追问/返工。

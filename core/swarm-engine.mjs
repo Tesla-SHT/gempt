@@ -57,7 +57,8 @@ export function buildWorkerInstructions({ swarmId, workerName, brief, seq, regis
   const reporting = [
     `- Use \`board_post\` as the main channel for Swarm coordination and delivery. Before ending a completed assignment, you must post \`@${owner} [done] <concise summary>\`.`,
     '- For a direct handoff, tag only the next actor and use `@peer [handoff] <next action>`. After a doorbell, call `board_read` with the referenced #seq in `seqs`.',
-    '- Use `ask_gemini` only when a coordinator decision, clarification, or visual check blocks progress.',
+    '- Handle routine companion edits within scope, including matching .h/.hpp files, local tests, and non-architectural edge cases. Record decisions in the final report.',
+    '- Use `ask_gemini` only for high-risk or destructive actions that need a decision, or a product or requirements ambiguity the repository cannot resolve.',
   ];
   const protocol = [
     'Shared message board protocol:',

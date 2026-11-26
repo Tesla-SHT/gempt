@@ -7,12 +7,13 @@ export const UNAVAILABLE = '未检测到 Magpie 插件托管的共享 codex app-
 export const PROVIDER = 'gempt_gateway';
 export const TERMINAL_INTERRUPT_ERR = /not found|no active|already (?:completed|finished|interrupted|stopped|ended)|unknown turn|invalid turn/i;
 export const SANDBOX_TYPES = { 'read-only': 'readOnly', 'workspace-write': 'workspaceWrite', 'danger-full-access': 'dangerFullAccess' };
-export const DEVELOPER_INSTRUCTIONS = 'Use ask_gemini for visual checks, clarifications, decisions, or blockers that require the coordinating Gemini. Provide a specific question and include the relevant context and local media paths when appropriate.';
+const ASK_GEMINI_THRESHOLD = 'Pause only for a high-risk or destructive action that needs a decision, or a product or requirements ambiguity that the repository cannot resolve.';
+export const DEVELOPER_INSTRUCTIONS = `${ASK_GEMINI_THRESHOLD} Use ask_gemini with a specific question, relevant context, and local media paths when appropriate. Handle routine companion edits such as matching .h/.hpp files, local test updates, and non-architectural edge cases directly. Record those decisions in your final report.`;
 export const SWARM_DEVELOPER_INSTRUCTIONS = 'You are a worker on a shared GemPT Swarm message board. Use board_post to coordinate with peers (@peer-name) and report final results (@coordinator [done] ...), board_read to read board messages, and board_roster to inspect teammates.';
 export const ASK_GEMINI = {
   type: 'function',
   name: 'ask_gemini',
-  description: 'Ask the coordinating Gemini for input and continue this turn when it replies.',
+  description: `Ask the coordinating Gemini for input and resume when it replies. ${ASK_GEMINI_THRESHOLD} Make routine companion edits and report them at completion.`,
   inputSchema: {
     type: 'object',
     properties: {

@@ -26,6 +26,8 @@ import { runLiveOperation, workspaceRun } from '../core/live-service.mjs';
 import { handleTool, TOOLS } from '../core/mcp-server.mjs';
 import { buildWaitCommand, dispatchRun, interruptRun, isRecentUnconfirmedRun, listActiveRoster, readRun,
   reconcileRunState, replyToolCall, runDirectory, runWithinRoot, saveRun, steerRun, waitForRun, waitForRuns } from '../core/runs.mjs';
+import { waitForBoard } from '../core/wait.mjs';
+import { handleBoardMcpTool } from '../core/board-mcp.mjs';
 import { DEFAULT_LOCK_STALE_MS, isValidSessionId, lockStaleMsForBudget, validateSessionId, withLock } from '../core/state.mjs';
 import { linkTarget, listArguments, streamRenderKey, timelineMessages } from '../mcp_app/live-state.js';
 import { assertShareWorktree, ensureShareWorktree, pruneShareWorktrees,
@@ -260,6 +262,15 @@ test('Node hook applies write and explore gates with exemptions, resets and fail
       ['run_command', { CommandLine: 'git branch && git log --oneline || git rev-parse HEAD; git tag\nls | dir; Get-ChildItem; gci; tree' }],
     ];
     for (const probe of probes) assert.equal(allow(...probe, turn).decision, 'allow');
+    const external = join(f.root, 'repo-sibling', 'app.mjs');
+    for (const probe of [
+      ['read_file', { Path: external }],
+      ['grep_search', { SearchPath: dirname(external) }],
+      ['view_file_outline', { AbsolutePath: external }],
+      ['run_command', { CommandLine: `git status && cat "${external}"` }],
+      ['run_command', { CommandLine: `rg -n pattern "${dirname(external)}"` }],
+      ['run_command', { CommandLine: `head -n 40 "${external}" && sed -n '1,10p' "${external}"` }],
+    ]) assert.equal(allow(...probe, turn).decision, 'allow');
     const read = () => allow('read_file', { Path: join(f.cwd, 'app.mjs') }, { lastUserInput: profile });
     for (let count = 0; count < limit; count++) assert.equal(read().decision, 'allow');
     for (const probe of probes) assert.equal(allow(...probe, turn).decision, 'allow');
@@ -275,6 +286,8 @@ test('Node hook applies write and explore gates with exemptions, resets and fail
     assert.ok(reason.startsWith(`[GemPT ${share}% Explore Stop-Loss] `));
     assert.match(reason, new RegExp(`limit ${limit}`));
     if (profile === 'gpt_first') assert.match(reason, /1–5 known files.*synchronous gpt_ask\(file_paths\).*single-track gpt_swarm or gpt_run/);
+    assert.equal(allow('read_file', { Path: external }, turn).decision, 'allow');
+    assert.equal(allow('run_command', { CommandLine: `cat "${external}" app.mjs` }, turn).decision, 'deny');
     assert.equal(allow('run_command', { CommandLine: 'gempt status --run-id 123 --wait' }).decision, 'allow');
     for (const delegation of [
       ['call_mcp_tool', { ServerName: 'gempt_gempt', ToolName: 'gpt_run' }],
@@ -792,6 +805,9 @@ async function appFixture(t, f, controls = {}) {
         if (params.input[0].text.includes('Request a cross-check')) {
           send({ id: 'ask-rpc', method: 'item/tool/call', params: { threadId, turnId, callId: 'ask_1',
             tool: 'ask_gemini', arguments: { reason: 'decision', question: 'Proceed?' } } });
+          if (controls.parallelAsk) send({ id: 'ask-second', method: 'item/tool/call', params: {
+            threadId, turnId, callId: 'ask_2', tool: 'ask_gemini', arguments: { reason: 'decision', question: 'Second question?' },
+          } });
         } else if (!params.input[0].text.includes('Hold this turn')) turns.get(turnId)('completed');
         return;
       } else if (method === 'turn/interrupt') {
@@ -800,6 +816,8 @@ async function appFixture(t, f, controls = {}) {
         else send({ method: 'turn/completed', params: { threadId: params.threadId, turn: { id: params.turnId, status: 'interrupted' } } });
       } else if (id === 'ask-rpc') {
         turns.get(activeTurn)?.('completed');
+        return;
+      } else if (id === 'ask-second') {
         return;
       }
       send({ id, result });
@@ -1233,6 +1251,31 @@ test('steer and interrupt send turn identity over WebSocket and ask_gemini relay
   assert.equal(finished.pending_tool_call, null);
   assert.deepEqual(packets.find(({ id, method }) => id === 'ask-rpc' && !method).result,
     { success: true, contentItems: [{ type: 'inputText', text: 'Confirmed.' }] });
+});
+
+test('parallel ask_gemini calls accept explicit out-of-order replies and resume the live worker', async (t) => {
+  const f = fixture(t);
+  const packets = await appFixture(t, f, { parallelAsk: true });
+  const run = await dispatchRun({ goal: 'Request a cross-check', cwd: f.cwd, background: true }, f);
+  const pending = await until(() => readRun(run.run_id, f.sessionsDir).pending_tool_calls);
+  const thread = packets.find((p) => p.method === 'thread/start').params;
+  assert.match(thread.developerInstructions, /matching \.h\/\.hpp files.*final report/);
+  assert.match(thread.dynamicTools.find((tool) => tool.name === 'ask_gemini').description, /high-risk or destructive.*ambiguity/);
+  assert.deepEqual(pending.map((call) => call.call_id), ['ask_1', 'ask_2']);
+  const answer = (callId, text) => jsonProcess(process.execPath,
+    [cliPath, 'reply-tool', run.run_id, callId, '--text', text], { env: f.env });
+  answer('ask_2', 'Second question answered first');
+  const remaining = await until(() => {
+    const record = readRun(run.run_id, f.sessionsDir);
+    return !record.pending_tool_calls && packets.some((p) => p.id === 'ask-second' && p.result) && record;
+  });
+  assert.equal(remaining.state, 'waiting_gemini');
+  assert.equal(remaining.pending_tool_call.call_id, 'ask_1');
+  assert.equal(remaining.pending_tool_calls, undefined);
+  answer('ask_1', 'First question answered second');
+  await until(() => readRun(run.run_id, f.sessionsDir).state === 'finished');
+  assert.deepEqual(packets.find(({ id, result }) => id === 'ask-second' && result).result,
+    { success: true, contentItems: [{ type: 'inputText', text: 'Second question answered first' }] });
 });
 
 test('local turn errors interrupt, while transport loss probes without cancelling the turn', async (t) => {
@@ -2281,6 +2324,193 @@ test('gempt-wait batch returns non-zero when first-ready item fails and session_
     assert.equal(isValidSessionId(bad), false, bad);
     assert.throws(() => validateSessionId(bad), /Invalid session_id/);
   }
+});
+
+test('CLI prints exact usage and accepts status selectors and all reply forms', (t) => {
+  const f = fixture(t);
+  const cli = (args, input) => spawnSync(process.execPath, [cliPath, ...args], {
+    env: f.env, encoding: 'utf8', timeout: 5000, input,
+  });
+  assert.match(cli(['-h']).stdout, /^Usage: gempt </);
+  for (const command of ['install-agy', 'run', 'ask', 'mcp', 'discover', 'status', 'init', 'tier',
+    'sandbox', 'effort', 'steer', 'interrupt', 'reply-tool', 'prune-worktrees', 'print-mcp', 'board', 'swarm', 'wait']) {
+    for (const flag of ['--help', '-h']) {
+      const result = cli([command, flag]);
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stdout, new RegExp(`^Usage: gempt ${command}(?: |$)`));
+    }
+    const bad = cli([command, '--unrecognized-option']);
+    assert.equal(bad.status, 1);
+    assert.ok(bad.stderr.includes(cli([command, '-h']).stdout.trim()), bad.stderr);
+  }
+  const badBoard = cli(['board', 'read', 'extra']);
+  assert.equal(badBoard.status, 1);
+  assert.match(badBoard.stderr, /Usage: gempt board read/);
+  assert.match(cli(['swarm', 'add', '-h']).stdout, /Usage: gempt swarm add NAME/);
+
+  const runId = 'a'.repeat(32);
+  const call = { tool: 'ask_gemini', call_id: 'call_a' };
+  state(f, runId, { state: 'waiting_gemini', pending_tool_call: call });
+  const status = cli(['status', runId]);
+  assert.equal(status.status, 0, status.stderr);
+  assert.deepEqual(JSON.parse(status.stdout), JSON.parse(cli(['status', '--run-id', runId]).stdout));
+  assert.equal(JSON.parse(status.stdout).reply_command, `gempt reply-tool ${runId} call_a "<answer>"`);
+  assert.match(cli(['status', runId, '--run-id', runId]).stderr, /Usage: gempt status/);
+
+  for (const [index, [args, input, expected]] of [
+    [['call_a', 'plain answer'], undefined, 'plain answer'],
+    [['call_a', '--text', 'flag answer'], undefined, 'flag answer'],
+    [['call_a', '--message', 'alias answer'], undefined, 'alias answer'],
+    [['call_a', '-'], 'line 1\nline 2\n', 'line 1\nline 2\n'],
+    [['call_a', '--text', '-'], '多行\n\n', '多行\n\n'],
+    [['--text', 'only pending call'], undefined, 'only pending call'],
+  ].entries()) {
+    const id = (index + 1).toString(16).repeat(32);
+    state(f, id, { state: 'waiting_gemini', pending_tool_call: call });
+    const reply = cli(['reply-tool', id, ...args], input);
+    assert.equal(reply.status, 0, reply.stderr);
+    assert.equal(JSON.parse(reply.stdout).call_id, 'call_a');
+    assert.deepEqual(JSON.parse(readFileSync(join(runDirectory(id, f.sessionsDir), 'tool_replies', 'call_a.json'))),
+      { answer: expected, success: true });
+  }
+  const secondCall = { ...call, call_id: 'call_b' };
+  state(f, runId, { state: 'waiting_gemini', pending_tool_call: call, pending_tool_calls: [call, secondCall] });
+  const ambiguous = cli(['reply-tool', runId, '--text', 'Which call?']);
+  assert.equal(ambiguous.status, 1);
+  assert.match(ambiguous.stderr, /multiple pending tool calls \(call_a, call_b\).*\nUsage: gempt reply-tool/);
+  assert.equal(cli(['reply-tool', runId, 'call_b', '--text', 'Second reply']).status, 0);
+  assert.match(cli(['reply-tool', runId, 'call_a']).stderr, /Expected a reply body.*\nUsage: gempt reply-tool/);
+  state(f, runId, { state: 'finished' });
+  assert.match(cli(['reply-tool', runId, '--text', 'Late']).stderr, /no pending.*\nUsage: gempt reply-tool/);
+});
+
+test('wait surfaces reply commands for a single run and returns early for pending asks in a batch', (t) => {
+  const f = fixture(t);
+  const asking = 'a'.repeat(32), running = 'b'.repeat(32);
+  const call = { tool: 'ask_gemini', call_id: 'ask_1', arguments: { question: 'Proceed?' } };
+  state(f, asking, { state: 'waiting_gemini', pending_tool_call: call });
+  state(f, running, { state: 'running' });
+  const wait = (...args) => jsonProcess(process.execPath, [cliPath, 'wait', ...args], { env: f.env, timeout: 2000 });
+  const expected = `gempt reply-tool ${asking} ask_1 "<answer>"`;
+  assert.equal(wait(asking).reply_command, expected);
+  for (const options of [[], ['--all']]) {
+    const batch = wait(...options, `${asking},${running}`);
+    assert.deepEqual(batch.ready, [asking]);
+    assert.deepEqual(batch.active, [running]);
+    assert.equal(batch.runs[asking].reply_command, expected);
+  }
+});
+
+test('wait keeps heartbeats on stderr and uses journal, progress and state activity before stalling', async (t) => {
+  const f = fixture(t);
+  const id = 'd'.repeat(32);
+  const file = join(runDirectory(id, f.sessionsDir), 'state.json');
+  const journal = join(dirname(file), 'events.jsonl');
+  const stale = new Date(Date.now() - 60_000);
+  for (const signal of ['journal', 'progress', 'state']) {
+    const now = new Date();
+    state(f, id, { progress: { phase: 'testing', updated_at: (signal === 'progress' ? now : stale).toISOString(),
+      ...(signal === 'journal' ? {} : { recent_commands: [{ command: 'npm test' }] }) } });
+    if (signal !== 'state') utimesSync(file, stale, stale);
+    writeFileSync(journal, JSON.stringify({ method: 'item/started', params: { item: { command: 'npm test' } } }) + '\n');
+    if (signal !== 'journal') utimesSync(journal, stale, stale);
+    const child = spawn(process.execPath, [cliPath, 'wait', id, '--heartbeat-sec', '.02', '--stale-sec', '5'], {
+      env: f.env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 8000,
+    });
+    let stdout = '', stderr = '', finished = false;
+    child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding('utf8').on('data', (chunk) => {
+      stderr += chunk;
+      if (!finished && /last_cmd="npm test"/.test(stderr)) {
+        finished = true;
+        state(f, id, { state: 'finished' });
+      }
+    });
+    const writer = signal === 'journal'
+      ? setInterval(() => appendFileSync(journal, '{"method":"item/commandExecution/outputDelta"}\n'), 30) : null;
+    try {
+      assert.deepEqual(await once(child, 'close'), [0, null], stderr);
+    } finally {
+      clearInterval(writer);
+    }
+    assert.equal(JSON.parse(stdout).state, 'finished');
+    assert.match(stderr, /^\[gempt-wait \d+m\d+s\] .*running · phase=testing · last_cmd="npm test" · updated \d+s ago/m, signal);
+  }
+
+  const wait = (...options) => spawnSync(process.execPath, [cliPath, 'wait', id, '--stale-sec', '.5', '--heartbeat-sec', '0',
+    ...options], { env: f.env, encoding: 'utf8', timeout: 2000 });
+  utimesSync(journal, stale, stale);
+  state(f, id, { progress: { updated_at: stale.toISOString() } });
+  utimesSync(file, stale, stale);
+  const stalled = wait();
+  assert.equal(stalled.status, 1, stalled.stderr);
+  assert.equal(stalled.stderr, '');
+  const { state: active, stalled: stoppedWaiting, stale_sec, reason } = JSON.parse(stalled.stdout);
+  assert.deepEqual([active, stoppedWaiting, stale_sec, reason], ['running', true, .5, 'no_progress']);
+
+  state(f, id, { source: 'magpie_exec', pid: 2147483000, cli: 'claude' });
+  const exited = wait('--stale-sec', '300');
+  assert.equal(exited.status, 1, exited.stderr);
+  assert.equal(JSON.parse(exited.stdout).reason, 'worker_pid_exited');
+  assert.equal(JSON.parse(exited.stdout).stalled, true);
+  assert.equal(readRun(id, f.sessionsDir).state, 'failed');
+});
+
+test('board wait surfaces live tool and board replies after the message cursor', async (t) => {
+  const f = fixture(t);
+  const swarmId = 'reply-board';
+  const run_id = 'c'.repeat(32);
+  const ask = { tool: 'ask_gemini', call_id: 'ask_1', arguments: { question: 'Proceed with the release?' } };
+  await ensureSwarm({ swarmId, cwd: f.cwd, sessionsDir: f.sessionsDir });
+  await upsertWorker(swarmId, { name: 'alpha', state: 'working', run_id }, f);
+  state(f, run_id, { state: 'waiting_gemini', pending_tool_call: ask });
+  const post = await postBoardMessage(swarmId, { from: 'alpha', kind: 'question',
+    text: '@coordinator Proceed with the release?', meta: { run_id, call_id: ask.call_id } }, f);
+  const expected = `gempt reply-tool ${run_id} ask_1 "<answer>"`;
+  const first = await waitForBoard(swarmId, { ...f, timeoutMs: 1000 });
+  assert.equal(first.messages[0].reply_command, expected);
+  const after = await waitForBoard(swarmId, { ...f, since: post.seq, timeoutMs: 1000 });
+  assert.deepEqual(after.messages, []);
+  assert.deepEqual(after.pending_questions, [{ agent: 'alpha', run_id, state: 'waiting_gemini',
+    call_id: 'ask_1', question: 'Proceed with the release?', reply_command: expected }]);
+  assert.equal(after.roster[0].reply_command, expected);
+
+  state(f, run_id, { state: 'finished' });
+  await upsertWorker(swarmId, { name: 'beta', state: 'working' }, f);
+  const question = await handleBoardMcpTool('board_ask', { question: 'Which scope?' }, f.env,
+    { ...f, swarmId, agentName: 'beta' });
+  const { message } = JSON.parse(question.content[0].text);
+  const board = await waitForBoard(swarmId, { ...f, since: message.seq, timeoutMs: 1000 });
+  assert.deepEqual(board.pending_questions, [{ agent: 'beta', state: 'waiting_reply', seq: message.seq,
+    question: '@coordinator Which scope?', reply_command:
+      `gempt board post --swarm ${swarmId} --from coordinator --channel main --reply-to ${message.seq} --text "@beta <answer>"` }]);
+  const reply = await execFileAsync(process.execPath, [cliPath, 'board', 'post', '--swarm', swarmId, '--from', 'coordinator',
+    '--channel', 'main', '--reply-to', String(message.seq), '--text', '@beta Scope A.'], { env: f.env });
+  assert.equal(JSON.parse(reply.stdout).message.reply_to_seq, message.seq);
+});
+
+test('board wait emits active worker and head on stderr and detects silent and dead workers', async (t) => {
+  const f = fixture(t);
+  const swarmId = 'board-watchdog';
+  const run_id = 'b'.repeat(32);
+  state(f, run_id, { progress: { phase: 'testing' } });
+  await upsertWorker(swarmId, { name: 'alpha', state: 'working', run_id }, f);
+  const child = spawn(process.execPath, [cliPath, 'wait', '--board', swarmId, '--heartbeat-sec', '.02', '--stale-sec', '.5'],
+    { env: f.env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 });
+  let stdout = '', stderr = '';
+  child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
+  child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
+  assert.deepEqual(await once(child, 'close'), [1, null], stderr);
+  assert.match(stderr, /^\[gempt-wait \d+m\d+s\] board head=#0 · alpha running · phase=testing/m);
+  const stalled = JSON.parse(stdout);
+  assert.equal(stalled.reason, 'no_progress');
+  assert.equal(stalled.roster[0].stalled, true);
+
+  state(f, run_id, { source: 'magpie_exec', pid: 2147483000, cli: 'claude' });
+  const exited = await waitForBoard(swarmId, { ...f, timeoutMs: 1000 });
+  assert.equal(exited.stalled, true);
+  assert.equal(exited.reason, 'worker_pid_exited');
+  assert.equal(exited.roster[0].state, 'stopped');
 });
 
 test('runAppServer interrupt confirmation window distinguishes confirmed vs unconfirmed timeout', async (t) => {

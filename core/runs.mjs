@@ -87,6 +87,7 @@ export function saveRun(file, record) {
 
 // Commit final identity before exposing a terminal receipt to waiters or recovery readers.
 export function saveCompletedRun(file, record, sessionsDir) {
+  delete record.pending_tool_calls;
   const result = record.result;
   const cli = result?.cli || record.cli || (record.codex_thread_id ? 'codex' : undefined);
   upsertRunLineage({ run_id: record.run_id, session_id: record.session_id, swarm_id: record.swarm_id,
@@ -128,6 +129,7 @@ function applyTerminal(record, turn, evidence = {}) {
   record.finished_at = Number.isFinite(turn.completedAt) ? new Date(turn.completedAt * 1000).toISOString()
     : record.finished_at || new Date().toISOString();
   record.waiting_since = record.pending_tool_call = null;
+  delete record.pending_tool_calls;
   record.progress = { ...record.progress, phase: record.state, updated_at: record.finished_at };
   if (record.state === 'finished') {
     const text = turn.items?.filter((item) => item.type === 'agentMessage').map((item) => item.text).filter(Boolean).join('\n\n')
@@ -140,6 +142,7 @@ function applyTerminal(record, turn, evidence = {}) {
   }
   delete record.remote_turn_unconfirmed;
   delete record.unconfirmed_at;
+  delete record.worker_pid_exited;
   return record;
 }
 
@@ -190,6 +193,7 @@ export function reconcileRunState(record, modifiedAt, deferToWorker = false) {
     record.state = 'failed';
     record.error = record.cli + ' worker exited without saving its result.';
     record.pending_tool_call = null;
+    delete record.pending_tool_calls;
     delete record.remote_turn_unconfirmed;
     delete record.unconfirmed_at;
   }
@@ -211,9 +215,11 @@ export function reconcileRunState(record, modifiedAt, deferToWorker = false) {
   const threadId = threadOf(record);
   const turnId = turnOf(record);
   record.pending_tool_call = null;
+  delete record.pending_tool_calls;
   if (['completed', 'interrupted', 'failed'].includes(phase)) {
     return applyTerminal(record, { id: turnId, status: phase, error: { message: record.error } });
   }
+  if (deadPid && record.state === 'running') record.worker_pid_exited = true;
   if (!codexRun(record)) {
     record.state = 'failed';
     record.error = record.cli + (deadPid ? ' worker exited without saving its result.' : ' worker timed out.');
@@ -363,7 +369,9 @@ export function buildBoardWaitCommand(swarmId, { since = 0, mentionsOnly = true,
   return formatWaitInvocation(parts.join(' '), env);
 }
 
-export async function waitForRuns(runIds, { waitAll = false, timeoutSec, sessionsDir, env, configPath, pollInterval = 0.25 } = {}) {
+export async function waitForRuns(runIds, {
+  waitAll = false, timeoutSec, sessionsDir, env, configPath, pollInterval = 0.25, shouldReturn,
+} = {}) {
   const ids = normalizeRunIds(runIds);
   if (timeoutSec != null && !Number.isFinite(timeoutSec) && timeoutSec !== Infinity) throw new Error('Invalid wait timeout.');
   const deadline = timeoutSec == null ? Infinity : performance.now() + timeoutSec * 1000;
@@ -373,7 +381,8 @@ export async function waitForRuns(runIds, { waitAll = false, timeoutSec, session
     const active = ids.filter((id) => pending(runs[id].state));
     const ready = ids.filter((id) => !pending(runs[id].state));
     const remaining = deadline - performance.now();
-    if ((waitAll ? !active.length : ready.length) || remaining <= 0) return { ready, active, runs };
+    const snapshot = { ready, active, runs };
+    if (shouldReturn?.(snapshot) || (waitAll ? !active.length : ready.length) || remaining <= 0) return snapshot;
     await sleep(Math.min(pollInterval * 1000, remaining));
   }
 }
@@ -496,13 +505,26 @@ export function toolReplyPath(directory, callId) {
   return join(directory, 'tool_replies', `${callId}.json`);
 }
 
+export function pendingToolCalls(record) {
+  if (record?.state !== 'waiting_gemini') return [];
+  const calls = Array.isArray(record.pending_tool_calls) ? record.pending_tool_calls : [record.pending_tool_call];
+  return calls
+    .filter((call) => typeof call?.call_id === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(call.call_id));
+}
+
+export function buildReplyCommand(runId, callId) {
+  runDirectory(runId);
+  toolReplyPath('', callId);
+  return `gempt reply-tool ${runId} ${callId} "<answer>"`;
+}
+
 export function replyToolCall(runId, callId, answer, { success = true, sessionsDir } = {}) {
   const path = toolReplyPath(runDirectory(runId, sessionsDir), callId);
   if (typeof answer !== 'string' || typeof success !== 'boolean') {
     throw new Error('Tool reply requires a text answer and boolean success.');
   }
   const record = readRun(runId, sessionsDir);
-  if (record.state !== 'waiting_gemini' || record.pending_tool_call?.call_id !== callId) {
+  if (!pendingToolCalls(record).some((call) => call.call_id === callId)) {
     throw new Error(`Run ${runId} is not waiting for tool call ${callId}.`);
   }
   try {
