@@ -802,6 +802,7 @@ export function createExecutionTools({
   swarmAgent,
   swarmFork,
   swarmWake,
+  hostCwdBound,
   env = process.env,
   probeTimeoutMs = 2000,
 } = {}) {
@@ -1024,6 +1025,8 @@ export function createExecutionTools({
           ...(priorSession || {}),
           title: explicitTitle(args.title) || (priorSession ? normalizeTitle(priorSession.title, sessionGoal(priorSession), cwd) : title),
           host_conversation_id: hostId,
+          host_cwd_bound: (hostCwdBound || (hostId === priorSession?.host_conversation_id
+            && cwd === priorSession?.cwd && priorSession?.host_cwd_bound)) || undefined,
           paired_model: paired,
           session_id: sessionId,
           mode: 'consult',
@@ -1290,10 +1293,12 @@ export function createExecutionTools({
         const boardId = args.swarm_id || swarmId || env?.GEMPT_SWARM_ID || null;
         const boardAgent = args.swarm_agent || swarmAgent || env?.GEMPT_AGENT_NAME || null;
         const explicitWorker = Boolean(boardId && boardAgent);
+        const priorHasDynamicBoardTools = Boolean(canResumeRunner && priorSession?.codex_dynamic_board_tools === true);
+        const forkSourceHasDynamicBoardTools = Boolean(swarmFork?.source?.dynamic_board_tools === true);
         const session = {
           ...(priorSession || {}),
           ...(resolvedCli === 'codex' ? { codex_dynamic_board_tools:
-            canResumeRunner ? priorSession.codex_dynamic_board_tools ?? explicitWorker : explicitWorker } : {}),
+            canResumeRunner ? priorHasDynamicBoardTools : explicitWorker } : {}),
           title: explicitTitle(args.title) || (priorSession ? normalizeTitle(priorSession.title, sessionGoal(priorSession), workdir) : title),
           host_conversation_id: hostId,
           paired_model: paired, session_id: sessionId, mode: 'exec', cli: resolvedCli, tier: resolved.tier, model: targetModel,
@@ -1317,8 +1322,8 @@ export function createExecutionTools({
         try {
           res = await runner.runTurn({
             nativeFork,
-            useBoardMcp: resolvedCli === 'codex' && explicitWorker && (nativeFork
-              ? source.dynamic_board_tools === false : canResumeRunner && !session.codex_dynamic_board_tools),
+            useBoardMcp: Boolean(resolvedCli === 'codex' && explicitWorker && (nativeFork
+              ? !forkSourceHasDynamicBoardTools : (canResumeRunner && !priorHasDynamicBoardTools))),
             onSessionMissing() {
               prompt = promptForTurn(false);
               return prompt;
@@ -1326,7 +1331,7 @@ export function createExecutionTools({
             async onForkMode(mode) {
               recordIdentity({ fork_mode: mode });
               if (resolvedCli === 'codex') session.codex_dynamic_board_tools = mode === 'native'
-                ? source.dynamic_board_tools ?? explicitWorker : explicitWorker;
+                ? (explicitWorker && forkSourceHasDynamicBoardTools) : explicitWorker;
               if (!swarmId || !swarmAgent) return;
               const { updateWorker } = await import('../../core/swarm-bus.mjs');
               await updateWorker(swarmId, swarmAgent, { fork_mode: mode }, { sessionsDir: resolvedSessionsDir, expectedRun: args.run_id });
@@ -1379,8 +1384,19 @@ export function createExecutionTools({
 
         const turn = priorTurns.filter((entry) => !entry.role || entry.role === 'user').length + 1;
         const timestamp = nowIso();
+        const boardToolMode = !explicitWorker ? 'none'
+          : (res.boardToolMode || (resolvedCli === 'codex'
+            ? (session.codex_dynamic_board_tools ? 'dynamic' : 'mcp')
+            : (runner.capabilities.boardMcp ? 'mcp' : 'cli')));
+        const boardCapable = boardToolMode !== 'none';
+        const boardTelemetry = {
+          board_tool_mode: boardToolMode,
+          board_capable: boardCapable,
+          ...(Number.isInteger(res.boardToolErrors) && res.boardToolErrors > 0 ? { board_tool_errors: res.boardToolErrors } : {}),
+        };
         saveSession(resolvedSessionsDir, {
           ...session,
+          ...boardTelemetry,
           cli: resolvedCli,
           sandbox: res.sandbox,
           codex_thread_id: res.threadId,
@@ -1391,7 +1407,7 @@ export function createExecutionTools({
             ...priorSession?.turn_details,
             [turn]: {
               goal, title, host_conversation_id: hostId, timestamp, cwd: workdir, agent, cli: resolvedCli, tier: resolved.tier, model: targetModel,
-              reasoning_effort: effort, codex_thread_id: res.threadId, run_id: args.run_id,
+              reasoning_effort: effort, codex_thread_id: res.threadId, run_id: args.run_id, ...boardTelemetry,
               elapsed_sec: res.elapsedSec, usage: res.usage, verification: args.verification, commands: res.commands,
             },
           },
@@ -1415,6 +1431,7 @@ export function createExecutionTools({
         });
         return {
           summary,
+          ...boardTelemetry,
           ...(swarmFork ? { fork_mode: res.forkMode || 'summary_fallback' } : {}),
           text: `${summary}\n\n${res.text}`,
           session_id: sessionId,

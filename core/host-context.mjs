@@ -3,6 +3,8 @@ import { dirname, join } from 'node:path';
 import { resolveConfigPath } from '../magpie_plugin/lib/backend.mjs';
 import { atomicJson, resolvePath, withLock, withinPath } from './state.mjs';
 
+const TOOL_CWD_TTL_MS = 60_000;
+
 export function contextPath(config) {
   return join(dirname(resolveConfigPath(config)), 'host-context.json');
 }
@@ -21,6 +23,12 @@ function workspaceKey(path) {
   }
 }
 
+function freshToolContext(context, now) {
+  const age = now - context?.recorded_at_ms;
+  return typeof context?.conversation_id === 'string' && Number.isFinite(context.recorded_at_ms)
+    && age >= 0 && age < TOOL_CWD_TTL_MS;
+}
+
 export function readHostContext(config, cwd) {
   try {
     const data = JSON.parse(readFileSync(contextPath(config), 'utf8'));
@@ -31,11 +39,42 @@ export function readHostContext(config, cwd) {
       .filter(([root, context]) => isObject(context) && withinPath(key, root))
       .sort(([left], [right]) => right.length - left.length)[0]?.[1];
     if (indexed) return indexed;
+    const binding = data.by_tool_cwd?.[key];
+    if (freshToolContext(binding, Date.now()) && !data.subagent_conversations?.includes(binding.conversation_id)) {
+      return binding;
+    }
     const roots = Array.isArray(data.workspace_paths) ? data.workspace_paths.map(workspaceKey).filter(Boolean) : [];
     if (roots.some((root) => withinPath(key, root))) return data;
     return !roots.length && !Object.keys(data.by_workspace || {}).length ? data : {};
   } catch {
     return {};
+  }
+}
+
+export async function bindToolCwd(conversationId, cwd, { geminiFamily, configPath } = {}) {
+  const key = workspaceKey(cwd);
+  if (!key || typeof conversationId !== 'string' || !conversationId.trim()) return;
+  const path = contextPath(configPath);
+  try {
+    await withLock(join(dirname(path), 'host-context.lock'), () => {
+      const data = readHostContext(configPath);
+      if (data.subagent_conversations?.includes(conversationId)) return;
+      const now = Date.now();
+      const bindings = Object.fromEntries(Object.entries(data.by_tool_cwd || {})
+        .filter(([, binding]) => freshToolContext(binding, now)));
+      const context = Object.values(data.by_workspace || {}).find((entry) => entry?.conversation_id === conversationId)
+        ?? (data.conversation_id === conversationId ? data : {});
+      bindings[key] = {
+        conversation_id: conversationId,
+        workspace_paths: context.workspace_paths ?? [],
+        gemini_family: geminiFamily || context.gemini_family,
+        recorded_at_ms: now,
+      };
+      data.by_tool_cwd = bindings;
+      atomicJson(path, data);
+    });
+  } catch {
+    // Tool context is best-effort, just like workspace context.
   }
 }
 

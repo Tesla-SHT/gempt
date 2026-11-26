@@ -6,7 +6,9 @@ import {
 } from 'node:fs';
 import { basename, delimiter, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { agyInstallPaths, RUNTIME_ROOT, resolvePluginRoot } from './bundle-paths.mjs';
+import { LAUNCHER_META, LAUNCHER_PATH, LAUNCHER_TOOLS, LAUNCHER_TYPE, LAUNCHER_URI } from './mcp-app.mjs';
 import { resolveNodeExecutable } from './node-executable.mjs';
 import { atomicJson, resolvePath, withLock, withinPath } from './state.mjs';
 
@@ -116,6 +118,7 @@ export async function validatePluginBundle(staged, nodeBin, env = process.env, {
   for (const file of ['README.md', 'LICENSE', 'THIRD_PARTY_LICENSES.txt', 'assets/logo.svg',
     'hooks.json', 'mcp_config.json', 'rules/AGENTS.md',
     'skills/gempt/SKILL.md', 'runtime/bin/gempt.mjs', 'runtime/core/assets/workload.json',
+    `runtime/core/${LAUNCHER_PATH}`,
     'sidecars/gempt_live/sidecar.json', 'sidecars/gempt_live/main.mjs',
     ...['index.html', 'styles.css', 'app.js'].map((file) => `runtime/core/assets/http-ui/${file}`)]) {
     if (!statSync(join(staged, file), { throwIfNoEntry: false })?.isFile() || !statSync(join(staged, file)).size) {
@@ -155,6 +158,8 @@ export async function validatePluginBundle(staged, nodeBin, env = process.env, {
     { id: 2, method: 'tools/list' },
     { id: 3, method: 'resources/list' },
     { id: 4, method: 'tools/call', params: { name: 'gpt_ctl', arguments: { action: 'status' } } },
+    { id: 5, method: 'resources/read', params: { uri: LAUNCHER_URI } },
+    { id: 6, method: 'resources/read', params: { uri: 'ui://gempt/live.html' } },
   ].map((request) => ({ jsonrpc: '2.0', ...request }));
   try {
     const [packets, [hook]] = await Promise.all([
@@ -164,18 +169,29 @@ export async function validatePluginBundle(staged, nodeBin, env = process.env, {
     ]);
     const results = new Map(packets.map(({ id, result }) => [id, result]));
     if (results.get(1)?.serverInfo?.name !== 'gempt') throw new Error('Staged MCP server did not identify itself as gempt.');
-    if (results.get(1)?.capabilities?.resources) throw new Error('Staged MCP server must not advertise legacy MCP App resources.');
+    if (!isDeepStrictEqual(results.get(1)?.capabilities?.resources, {})) {
+      throw new Error('Staged MCP server must declare launcher resource capabilities.');
+    }
     const tools = results.get(2)?.tools;
     const expected = ['gpt_ask', 'gpt_board', 'gpt_ctl', 'gpt_run', 'gpt_swarm'];
     if (JSON.stringify(tools?.map(({ name }) => name).sort()) !== JSON.stringify(expected)) {
       throw new Error(`Staged MCP server did not advertise the expected set of ${expected.length} GemPT tools.`);
     }
-    if (tools.some(({ _meta }) => _meta?.ui || _meta?.['com.google.antigravity/ui'])) {
-      throw new Error('Staged MCP server tools must not carry legacy MCP App UI metadata.');
+    if (tools.some(({ name, _meta, meta }) => meta !== undefined || !isDeepStrictEqual(_meta,
+      LAUNCHER_TOOLS.includes(name) ? { ui: { resourceUri: LAUNCHER_URI } } : undefined))) {
+      throw new Error('Staged MCP server must attach only inline launcher metadata to gpt_run and gpt_swarm.');
     }
     const resources = results.get(3)?.resources;
-    if (!Array.isArray(resources) || resources.length !== 0) {
-      throw new Error('Staged MCP server must not advertise legacy MCP App resources.');
+    if (!isDeepStrictEqual(resources, [{
+      uri: LAUNCHER_URI, name: 'GemPT launcher', mimeType: LAUNCHER_TYPE, _meta: LAUNCHER_META,
+    }])) {
+      throw new Error('Staged MCP server must advertise only the inline launcher resource.');
+    }
+    const launcherText = readFileSync(join(staged, 'runtime', 'core', LAUNCHER_PATH), 'utf8');
+    if (!isDeepStrictEqual(results.get(5)?.contents, [{
+      uri: LAUNCHER_URI, mimeType: LAUNCHER_TYPE, _meta: LAUNCHER_META, text: launcherText,
+    }]) || packets.find(({ id }) => id === 6)?.error?.code !== -32002) {
+      throw new Error('Staged MCP server must serve the inline launcher and reject the legacy MCP App URI.');
     }
     const statusResponse = packets.find(({ id }) => id === 4);
     const statusResult = statusResponse?.result;

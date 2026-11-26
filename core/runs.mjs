@@ -47,6 +47,25 @@ export function isRunOccupying(record, nowMs = Date.now(), modifiedAtMs = null) 
   return Boolean(record) && (ACTIVE_STATES.has(record.state) || isRecentUnconfirmedRun(record, nowMs, modifiedAtMs));
 }
 
+export function runBoardTelemetry(record) {
+  const implicit = record?.implicit_swarm_worker === true;
+  const explicit = Boolean(!implicit && record?.swarm_id && record?.swarm_agent);
+  const rawMode = record?.board_tool_mode ?? record?.result?.board_tool_mode;
+  const board_tool_mode = !explicit ? 'none'
+    : (['dynamic', 'mcp', 'cli', 'none'].includes(rawMode) ? rawMode : 'none');
+  const board_capable = explicit && board_tool_mode !== 'none';
+  const workerPosts = record?.board_posts_worker ?? record?.result?.board_posts_worker;
+  const autoPosts = record?.board_posts_auto ?? record?.result?.board_posts_auto;
+  const toolErrors = record?.board_tool_errors ?? record?.result?.board_tool_errors;
+  return {
+    board_tool_mode,
+    board_capable,
+    ...(Number.isInteger(workerPosts) ? { board_posts_worker: workerPosts } : {}),
+    ...(Number.isInteger(autoPosts) ? { board_posts_auto: autoPosts } : {}),
+    ...(Number.isInteger(toolErrors) && toolErrors > 0 ? { board_tool_errors: toolErrors } : {}),
+  };
+}
+
 export function runDirectory(runId, sessionsDir) {
   if (typeof runId !== 'string' || !/^[a-f0-9]{32}$/.test(runId)) {
     throw runError('Invalid run_id: expected 32 lowercase hexadecimal characters.', 400);
@@ -226,9 +245,20 @@ export function reconcileRunState(record, modifiedAt, deferToWorker = false) {
 async function notifyRecovered(record, options) {
   if (!record.swarm_id || !record.swarm_agent) return;
   const { onWorkerTurnFinished } = await import('./swarm-engine.mjs');
+  const file = join(runDirectory(record.run_id, options.sessionsDir), 'state.json');
   await onWorkerTurnFinished({ ...options, swarmId: record.swarm_id, swarmAgent: record.swarm_agent,
     runId: record.run_id, sessionId: record.session_id, startedAt: record.started_at,
-    outcome: record, result: record.result, error: record.error, recovered: true });
+    outcome: record, result: record.result, error: record.error, recovered: true,
+    beforeDelivery(boardStats) {
+      if (!existsSync(file)) return;
+      const latest = readJsonSafe(file) || record;
+      const next = {
+        ...latest,
+        ...boardStats,
+        ...(latest.result ? { result: { ...latest.result, ...boardStats } } : {}),
+      };
+      saveRun(file, next);
+    } });
 }
 
 async function settleTurn(record, turn, options, evidence) {
@@ -626,6 +656,10 @@ export async function dispatchRun(args, {
         sourceCwd = resolveExternalWorktreeSourceCwd(cwd) || cwd;
       }
       hostContext = readHostContext(config, sourceCwd);
+      if (!samePath(sourceCwd, requestedCwd)) {
+        const requestedContext = readHostContext(config, requestedCwd);
+        if (requestedContext.recorded_at_ms || !hostContext.conversation_id) hostContext = requestedContext;
+      }
       hostId = args.host_conversation_id?.trim() || prior?.host_conversation_id || hostContext.conversation_id || null;
       const cfg = readJsonSafe(config);
       const executionTimeout = resolveExecTimeoutSec({ codex: cfg?.codex, timeoutSec, effort: getMcpEffort(cfg?.routing_policy) });
@@ -634,6 +668,7 @@ export async function dispatchRun(args, {
         worktree_path: worktreePath, source_cwd: worktreePath || sourceCwd !== cwd ? sourceCwd : null, goal: args.goal,
         title: normalizeTitle(args.title, args.goal, sourceCwd), tier: args.tier, agent,
         host_conversation_id: hostId, session_id: sessionId, config_path: config, progress: null,
+        ...(hostContext.recorded_at_ms && hostId === hostContext.conversation_id ? { host_cwd_bound: true } : {}),
         verification: args.verification, execution_timeout_sec: executionTimeout, deadline: now() + executionTimeout,
         ...(args.swarm_id ? { swarm_id: String(args.swarm_id) } : {}),
         ...(args.swarm_agent ? { swarm_agent: String(args.swarm_agent) } : {}),
@@ -682,10 +717,12 @@ export async function dispatchRun(args, {
   if (args.swarm_id) {
     launchEnv.GEMPT_SWARM_ID = String(args.swarm_id);
     if (args.swarm_agent) launchEnv.GEMPT_AGENT_NAME = String(args.swarm_agent);
+    launchEnv.GEMPT_RUN_ID = id;
     launchEnv.GEMPT_SESSIONS_DIR = sessions;
   } else if (record.implicit_swarm_worker) {
     delete launchEnv.GEMPT_SWARM_ID;
     delete launchEnv.GEMPT_AGENT_NAME;
+    delete launchEnv.GEMPT_RUN_ID;
   }
   const packetPath = join(directory, 'dispatch.json');
   try {

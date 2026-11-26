@@ -11,7 +11,13 @@ let outcome;
 let saved = false;
 
 function terminalRecord(latest, outcome) {
-  const finished = { ...latest, ...outcome, pending_tool_call: null, waiting_since: null, finished_at: new Date().toISOString() };
+  const board = outcome?.result ? {
+    ...(outcome.result.board_tool_mode ? { board_tool_mode: outcome.result.board_tool_mode } : {}),
+    ...(typeof outcome.result.board_capable === 'boolean' ? { board_capable: outcome.result.board_capable } : {}),
+    ...(Number.isInteger(outcome.result.board_tool_errors) && outcome.result.board_tool_errors > 0
+      ? { board_tool_errors: outcome.result.board_tool_errors } : {}),
+  } : {};
+  const finished = { ...latest, ...outcome, ...board, pending_tool_call: null, waiting_since: null, finished_at: new Date().toISOString() };
   if (outcome.state === 'finished') delete finished.error;
   if (!outcome.remote_turn_unconfirmed) {
     delete finished.remote_turn_unconfirmed;
@@ -101,6 +107,11 @@ if (outcome) {
         sessionsDir: host.sessionsDir,
         configPath: host.configPath,
         env: process.env,
+        beforeDelivery(boardStats) {
+          Object.assign(finished, boardStats);
+          if (finished.result) Object.assign(finished.result, boardStats);
+          saveRun(file, finished);
+        },
       });
     } catch (error) { diagnose(`Failed to sync completed run: ${error.message}`); }
   }

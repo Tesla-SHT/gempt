@@ -26,7 +26,7 @@ export const BOARD_TOOLS = [
     'Post a message to the shared GemPT Swarm board and notify @mentioned workers.',
     {
       text: { type: 'string', description: 'Message content. Use @name or @coordinator to wake/address targets.' },
-      kind: { type: 'string', enum: ['message', 'summary', 'question', 'system'], default: 'message' },
+      kind: { type: 'string', enum: ['message', 'summary', 'handoff', 'question', 'system'], default: 'message' },
       channel: { type: 'string' },
       request_id: { type: 'string' },
       reply_to_seq: { type: 'integer', description: 'Optional sequence number being replied to.' },
@@ -72,11 +72,12 @@ export async function handleBoardMcpTool(name, args = {}, env = process.env, ove
   const configPath = resolveConfigPath(overrides.configPath || env.GEMPT_CONFIG);
 
   const options = { ...overrides, sessionsDir, configPath, env, actor: agentName };
+  const runId = overrides.runId || env.GEMPT_RUN_ID || null;
   if (['board_post', 'board_read', 'board_wait'].includes(name)) {
     const result = await handleBoardAction({
       text: args.text, kind: args.kind, reply_to_seq: args.reply_to_seq, request_id: args.request_id, channel: args.channel,
       since: args.since, seqs: args.seqs, limit: args.limit, status: args.status, mentions_only: args.mentions_only,
-      meta: overrides.runId ? { run_id: overrides.runId } : undefined,
+      meta: runId ? { run_id: runId } : undefined,
       action: name.slice(6), swarm_id: swarmId, from: agentName,
     }, options);
     return textResult(result);
@@ -101,7 +102,7 @@ export async function handleBoardMcpTool(name, args = {}, env = process.env, ove
       from: agentName,
       kind: 'question',
       text: `@coordinator ${q}${ctxLine}${mediaLines}`,
-      meta: { reason: args.reason || 'clarification' },
+      meta: { ...(runId ? { run_id: runId } : {}), reason: args.reason || 'clarification' },
     }, { sessionsDir });
     try {
       await updateWorker(swarmId, agentName, { state: 'waiting_reply', parked_on: `board_ask:${message.seq}` }, { sessionsDir });

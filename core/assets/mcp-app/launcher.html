@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GemPT</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --surface: light-dark(#f6f7f9, #22252a);
+      --ink: light-dark(#20242b, #eef0f4);
+      --muted: light-dark(#505967, #b7bfcd);
+      --line: light-dark(#dce0e6, #3a404a);
+      --badge: light-dark(#e9ecf1, #363c47);
+      --button: light-dark(#244ab0, #a9bfff);
+      --button-ink: light-dark(#fff, #101d40);
+    }
+    :root[data-theme="light"] { color-scheme: light; }
+    :root[data-theme="dark"] { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--color-text-primary, var(--ink));
+      font: 13px/1.35 var(--font-sans, system-ui, sans-serif);
+    }
+    main {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      height: 48px;
+      padding: 0 8px 0 11px;
+      border: 1px solid var(--color-border-primary, var(--line));
+      border-radius: 8px;
+      background: var(--color-background-secondary, var(--surface));
+    }
+    #title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+    #badge {
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: var(--color-background-tertiary, var(--badge));
+      color: var(--color-text-secondary, var(--muted));
+      font-size: 11px;
+      white-space: nowrap;
+    }
+    #hint { flex: 1; min-width: 0; color: var(--color-text-secondary, var(--muted)); font-size: 11px; }
+    main[data-fallback] #title { flex: 0 1 auto; }
+    main[data-fallback] #badge { display: none; }
+    button {
+      flex: none;
+      margin-inline-start: auto;
+      padding: 6px 10px;
+      border: 0;
+      border-radius: 5px;
+      background: var(--color-background-inverse, var(--button));
+      color: var(--color-text-inverse, var(--button-ink));
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { filter: brightness(0.94); }
+    button:focus-visible { outline: 2px solid var(--color-ring-primary, var(--button)); outline-offset: 2px; }
+  </style>
+</head>
+<body>
+  <main id="card" aria-label="GemPT">
+    <span id="title">GemPT</span>
+    <span id="badge" hidden></span>
+    <span id="hint" role="status" hidden></span>
+    <button type="button" id="open">Open GemPT</button>
+  </main>
+  <script>
+    (() => {
+      const protocolVersion = '2026-01-26';
+      const sidecarUri = 'sidecar://gempt/gempt_live/';
+      const toggleMethod = 'com.google.antigravity/toggle-aux-pane';
+      const root = document.documentElement;
+      const card = document.getElementById('card');
+      const title = document.getElementById('title');
+      const badge = document.getElementById('badge');
+      const hint = document.getElementById('hint');
+      const button = document.getElementById('open');
+      const strings = {
+        en: {
+          open: 'Open GemPT', fallback: 'Open GemPT from the side panel’s + menu.', swarm: 'GemPT Swarm',
+          members: (count) => count === 1 ? '1 member' : count + ' members',
+          states: {
+            queued: 'Queued', running: 'Running', waiting_gemini: 'Waiting for Gemini',
+            finished: 'Finished', interrupted: 'Interrupted', failed: 'Failed', working: 'Working', idle: 'Idle',
+          },
+        },
+        zh: {
+          open: '打开 GemPT', fallback: '请在侧边栏的 + 菜单中打开 GemPT。', swarm: 'GemPT Swarm',
+          members: (count) => count + ' 名成员',
+          states: {
+            queued: '排队中', running: '运行中', waiting_gemini: '等待 Gemini',
+            finished: '已完成', interrupted: '已中断', failed: '失败', working: '进行中', idle: '空闲',
+          },
+        },
+      };
+      let copy = strings.en;
+      let input = {};
+      let summary;
+      let fallback = false;
+      let autoOpened = false;
+      let initialized = false;
+      let pendingClick = false;
+      let openId;
+      let openTimer;
+      let nextId = 1;
+      let styleKeys = [];
+      const initId = nextId++;
+      const send = (message) => window.parent.postMessage({ jsonrpc: '2.0', ...message }, '*');
+
+      function render() {
+        const label = summary?.title || input.title || (summary?.kind === 'swarm' ? copy.swarm : 'GemPT');
+        title.textContent = label;
+        title.title = label;
+        badge.textContent = summary?.kind === 'swarm' && Number.isInteger(summary.member_count)
+          ? copy.members(summary.member_count) : (copy.states[summary?.state] || '');
+        badge.hidden = !badge.textContent;
+        button.textContent = copy.open;
+        hint.hidden = !fallback;
+        hint.textContent = fallback ? copy.fallback : '';
+        card.toggleAttribute('data-fallback', fallback);
+      }
+
+      function applyContext(context) {
+        if (context.theme === 'light' || context.theme === 'dark') root.dataset.theme = context.theme;
+        if (typeof context.locale === 'string') {
+          root.lang = /^zh(?:-|$)/i.test(context.locale) ? 'zh' : 'en';
+          copy = strings[root.lang];
+        }
+        if (context.styles?.variables) {
+          for (const key of styleKeys) root.style.removeProperty(key);
+          styleKeys = [];
+          for (const [key, value] of Object.entries(context.styles.variables)) {
+            if (/^--[\w-]+$/.test(key) && typeof value === 'string') {
+              root.style.setProperty(key, value);
+              styleKeys.push(key);
+            }
+          }
+        }
+        render();
+      }
+
+      function showFallback() {
+        fallback = true;
+        render();
+      }
+
+      function openPanel() {
+        const id = openId = nextId++;
+        clearTimeout(openTimer);
+        openTimer = setTimeout(showFallback, 4000);
+        send({ id, method: toggleMethod, params: { tabType: 'sidecarView', uri: sidecarUri } });
+      }
+
+      button.addEventListener('click', () => {
+        if (initialized) openPanel();
+        else pendingClick = true;
+      });
+
+      window.addEventListener('message', ({ source, data }) => {
+        if (source !== window.parent || data?.jsonrpc !== '2.0') return;
+        const { id, method, params, result, error } = data;
+        if (method === 'ping' && id != null) {
+          send({ id, result: {} });
+        } else if (!method && id === initId && !initialized) {
+          if (error || !result?.protocolVersion) {
+            showFallback();
+            return;
+          }
+          initialized = true;
+          applyContext(result.hostContext ?? {});
+          send({ method: 'ui/notifications/initialized' });
+          send({ method: 'ui/notifications/size-changed', params: { height: card.offsetHeight } });
+          if (pendingClick) openPanel();
+        } else if (!method && openId != null && id === openId) {
+          clearTimeout(openTimer);
+          openId = undefined;
+          fallback = Boolean(error || result?.isError);
+          render();
+        } else if (method === 'ui/notifications/host-context-changed') {
+          applyContext(params ?? {});
+        } else if (method === 'ui/notifications/tool-input') {
+          input = params?.arguments ?? {};
+          render();
+        } else if (method === 'ui/notifications/tool-result') {
+          summary = params?.structuredContent;
+          render();
+          const age = Date.now() - summary?.created_at_ms;
+          if (initialized && !autoOpened && !params?.isError && summary?.auto_open_panel === true
+              && Number.isFinite(summary.created_at_ms) && age >= 0 && age < 30_000) {
+            autoOpened = true;
+            openPanel();
+          }
+        }
+      });
+
+      send({ id: initId, method: 'ui/initialize', params: {
+        protocolVersion, appInfo: { name: 'GemPT launcher', version: '1.0.0' }, appCapabilities: {},
+      } });
+    })();
+  </script>
+</body>
+</html>

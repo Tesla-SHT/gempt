@@ -109,10 +109,14 @@ function workspaceScope({ root, workspaceRoots }) {
   return (workspaceRoots ?? (root ? [root] : null))?.map((path) => resolvePath(path)) ?? null;
 }
 
+function recordBoundAcrossWorkspaces(record, conversationId) {
+  return Boolean(conversationId && record.host_cwd_bound === true && record.host_conversation_id === conversationId);
+}
+
 function workspaceRun(id, options) {
   const record = readRun(id, options.sessionsDir);
   const roots = workspaceScope(options);
-  if (!recordInWorkspace(record, roots)) {
+  if (!recordInWorkspace(record, roots) && !recordBoundAcrossWorkspaces(record, options.conversationId)) {
     throw Object.assign(new Error('Run outside host workspace'), { status: 403 });
   }
   return record;
@@ -126,13 +130,15 @@ async function listRuns(args, options) {
   const active = conversationId === undefined ? context.conversation_id || null : conversationId;
   const bound = args.host_conversation_id || active || null;
   const scope = args.scope ?? 'session';
+  const sidecarConversation = scope === 'session' && bound === conversationId ? conversationId : null;
+  const inScope = (record) => recordInWorkspace(record, roots) || recordBoundAcrossWorkspaces(record, sidecarConversation);
   const workspace = bound && bound === active ? workspaceName(roots?.[0] ?? array(context.workspace_paths)[0]) : '';
   let sessionCount = 0;
   const items = [];
   for (const { id, stat } of stateEntries(sessionsDir)) {
     try {
       const record = readRun(id, sessionsDir, { stat, readonly: true });
-      if (!recordInWorkspace(record, roots)) continue;
+      if (!inScope(record)) continue;
       const matches = Boolean(bound && record.host_conversation_id === bound);
       if (matches) sessionCount++;
       if ((!args.session_id || record.session_id === args.session_id) && (scope === 'all' || matches)) items.push(record);
@@ -158,7 +164,7 @@ async function listRuns(args, options) {
     ...(args.include_consults ? {
       consult_sessions: listConsultSessions(sessionsDir, {
         limit: Math.min(limit, 50),
-        matches: (record) => (!roots || recordInWorkspace(record, roots))
+        matches: (record) => inScope(record)
           && (scope === 'all' || Boolean(bound && record.host_conversation_id === bound)),
       }),
     } : {}),
@@ -424,7 +430,9 @@ export async function runLiveOperation(operation, args, options) {
       try { record = readRun(args.run_id, options.sessionsDir); } catch (error) {
         if (error.status !== 404) throw error;
       }
-      if (record && (!recordInWorkspace(record, workspaceScope(options)) ||
+      const sidecarConversation = data.scope === 'session' && data.bound_conversation_id === options.conversationId
+        ? options.conversationId : null;
+      if (record && ((!recordInWorkspace(record, workspaceScope(options)) && !recordBoundAcrossWorkspaces(record, sidecarConversation)) ||
           (data.scope === 'session' && (!data.bound_conversation_id ||
            record.host_conversation_id !== data.bound_conversation_id)))) record = null;
       if (record) record = await refreshRun(record, options);

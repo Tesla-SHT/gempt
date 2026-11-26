@@ -1,9 +1,11 @@
 import { WORKLOAD } from './assets.mjs';
 import { CLI_CHOICES } from './config.mjs';
+import { LAUNCHER_TOOLS, LAUNCHER_URI } from './mcp-app.mjs';
 
 function tool(name, description, properties, required) {
   return { name, description, inputSchema: { type: 'object', properties, additionalProperties: false,
-    ...(required ? { required } : {}) } };
+    ...(required ? { required } : {}) },
+    ...(LAUNCHER_TOOLS.includes(name) ? { _meta: { ui: { resourceUri: LAUNCHER_URI } } } : {}) };
 }
 
 export const TOOLS = [

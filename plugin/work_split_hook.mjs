@@ -1,14 +1,15 @@
 import { createHash } from 'node:crypto';
 import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, readSync, statSync } from 'node:fs';
-import { basename, dirname, extname, join } from 'node:path';
+import { basename, dirname, extname, join, resolve } from 'node:path';
 
 const runtime = existsSync(new URL('./runtime/core/host-context.mjs', import.meta.url)) ? './runtime/' : '../';
-const [{ WORKLOAD }, { readHostContext, updateHostContext }, { atomicJson, resolvePath, withLock }, backend, { GEMPT_VERSION }, { resolveRunnerId }] = await Promise.all([
+const [{ WORKLOAD }, { bindToolCwd, readHostContext, updateHostContext }, { atomicJson, resolvePath, withLock }, backend, { GEMPT_VERSION }, { resolveRunnerId }] = await Promise.all([
   import(`${runtime}core/assets.mjs`), import(`${runtime}core/host-context.mjs`),
   import(`${runtime}core/state.mjs`), import(`${runtime}magpie_plugin/lib/backend.mjs`), import(`${runtime}core/config.mjs`), import(`${runtime}core/runners/registry.mjs`),
 ]);
 const { readJsonSafe, resolveConfigPath, resolveSessionsDir } = backend;
 const configPath = resolveConfigPath();
+const gemptTools = new Set(['gpt_run', 'gpt_swarm', 'gpt_ask', 'gpt_ctl', 'gpt_board']);
 const readTools = new Set('read_file view_file view_file_outline view_code_item grep_search'.split(' '));
 const assetExts = new Set('png jpg jpeg webp gif bmp ico svg mp4 mov webm wav mp3 pdf'.split(' '));
 const docExts = new Set('md mdx txt rst adoc'.split(' '));
@@ -77,8 +78,8 @@ function workerSignal(payload) {
   const role = [payload.swarmRole, payload.swarm_role, payload.agentRole, payload.agent_role, payload.role, process.env.GEMPT_SWARM_ROLE]
     .map((value) => text(value).toLowerCase()).find(Boolean);
   return payload.isSubagent === true || payload.is_subagent === true || Boolean(text(payload.subagentType) || text(payload.subagent_type))
-    || Boolean(parent && parent !== payload.conversationId) || ['worker', 'verifier', 'narrator', 'subagent', 'member'].includes(role)
-    || (!role && envSwarmSignal()) || hostSubagentSignal(payload.conversationId);
+    || Boolean(parent && parent !== (payload.conversationId || payload.conversation_id)) || ['worker', 'verifier', 'narrator', 'subagent', 'member'].includes(role)
+    || (!role && envSwarmSignal()) || hostSubagentSignal(payload.conversationId || payload.conversation_id);
 }
 
 function hostSubagentSignal(conversation) {
@@ -212,10 +213,13 @@ function contextTokens(path) {
 }
 
 async function handle(payload) {
-  const { conversationId, workspacePaths, modelName, hookEventName, toolCall } = payload;
+  const { workspacePaths = payload.workspace_paths, modelName, hookEventName = payload.hook_event_name, toolCall } = payload;
+  const conversationId = text(payload.conversationId) || text(payload.conversation_id);
   const family = modelName === 'gemini-pro-orchestrator' ? 'carbon'
     : /(?:^|[^a-z0-9])(hydrogen|neon|carbon)(?:$|[^a-z0-9])/i.exec(String(modelName))?.[1]?.toLowerCase();
-  await updateHostContext(conversationId, workspacePaths, { geminiFamily: family, configPath });
+  if (hookEventName !== 'PreToolUse' || workspacePaths?.length) {
+    await updateHostContext(conversationId, workspacePaths, { geminiFamily: family, configPath });
+  }
   const ordinary = workSplit();
   let isWorker = workerSignal(payload);
   let existing;
@@ -249,19 +253,33 @@ async function handle(payload) {
   }
   if (Object.hasOwn(payload, 'toolCall') || hookEventName === 'PreToolUse') {
     const allow = { decision: 'allow' };
-    const { name, args = {} } = toolCall || {};
+    const { name, args = {} } = toolCall || { name: payload.tool_name, args: payload.tool_input };
     const input = args || {};
-    if (name === 'call_mcp_tool') {
-      if (input.ServerName !== 'gempt_gempt') return allow;
-      if (['gpt_run', 'gpt_ask', 'gpt_swarm', 'gpt_board'].includes(input.ToolName)) {
+    const toolName = name === 'call_mcp_tool' && input.ServerName === 'gempt_gempt' ? input.ToolName : name;
+    if (gemptTools.has(toolName)) {
+      const toolInput = name === 'call_mcp_tool' ? input.Arguments : input;
+      const parentId = text(toolInput?.host_conversation_id);
+      if (toolName !== 'gpt_ctl') {
         await updateState(conversationId, (state) => setCount(state, key, 0));
-        const parentId = text(input.Arguments?.host_conversation_id);
         if (parentId && parentId !== conversationId) {
           await updateHostContext(conversationId, workspacePaths, { parentId, geminiFamily: family, configPath });
         }
       }
+      if (conversationId && !isWorker && (!parentId || parentId === conversationId) && text(toolInput?.cwd)) {
+        const root = text(process.env.GEMPT_WORKSPACE_ROOT);
+        const cwd = root ? resolve(root, text(toolInput.cwd)) : text(toolInput.cwd);
+        let validatedCwd;
+        try {
+          const { normalizeWorkspaceCwd } = await import(`${runtime}magpie_plugin/lib/tools.mjs`);
+          validatedCwd = normalizeWorkspaceCwd(cwd, { configPath });
+        } catch {
+          // Invalid working directories must not create a conversation binding.
+        }
+        if (validatedCwd) await bindToolCwd(conversationId, validatedCwd, { geminiFamily: family, configPath });
+      }
       return allow;
     }
+    if (name === 'call_mcp_tool') return allow;
     if (['gemini', 'gemini_first'].includes(ordinary) || bypass) return allow;
     if (isWorker && name === 'run_command' && /\bgempt\s+run\b/i.test(String(input.CommandLine || ''))) return allow;
     const target = ['Path', 'TargetFile', 'AbsolutePath', 'SearchPath', 'DirectoryPath'].map((key) => text(input[key])).find(Boolean) || '';

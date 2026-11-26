@@ -1,4 +1,4 @@
-import { ACTIVE_STATES, readRun, refreshRun } from './runs.mjs';
+import { ACTIVE_STATES, readRun, refreshRun, runBoardTelemetry } from './runs.mjs';
 import { pidAlive } from '../magpie_plugin/lib/app-server-process.mjs';
 import { createHash, randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
@@ -312,6 +312,7 @@ function formatWorker(row) {
   return {
     swarm_id: row.swarm_id,
     name: row.name,
+    implicit: isImplicitSwarmId(row.swarm_id) && /^solo-[a-f0-9]{12}$/.test(row.name),
     cli: row.cli ?? 'codex',
     model: row.model ?? null,
     tier: row.tier ?? null,
@@ -616,10 +617,10 @@ export async function listRoster(swarmId, { includeKilled = true, sessionsDir, d
       ? 'SELECT * FROM roster WHERE swarm_id = ? ORDER BY created_at ASC, name ASC'
       : "SELECT * FROM roster WHERE swarm_id = ? AND state != 'killed' ORDER BY created_at ASC, name ASC";
     const roster = conn.all(sql, id).map(formatWorker);
-    let changed = false;
     const options = { sessionsDir: sessionsDir || dirname(conn.filePath) };
-    for (const worker of roster) {
-      if (!worker.run_id || !['working', 'waiting_reply', 'stopped'].includes(worker.state)) continue;
+    for (const [index, worker] of roster.entries()) {
+      worker.board_capable = false;
+      if (!worker.run_id) continue;
       let record;
       try { record = readRun(worker.run_id, options.sessionsDir, { readonly: true }); }
       catch (error) {
@@ -629,16 +630,17 @@ export async function listRoster(swarmId, { includeKilled = true, sessionsDir, d
       if (record.swarm_id && record.swarm_id !== id || record.swarm_agent && record.swarm_agent !== worker.name) continue;
       if (record.remote_turn_unconfirmed) {
         record = await refreshRun(record, options);
-        changed ||= !record.remote_turn_unconfirmed;
+        Object.assign(worker, formatWorker(conn.get('SELECT * FROM roster WHERE swarm_id = ? AND name = ?', id, worker.name)));
       }
-      if (ACTIVE_STATES.has(record.state) || pidAlive(record.pid)) continue;
+      worker.implicit ||= record.implicit_swarm_worker === true;
+      worker.board_capable = !worker.implicit && runBoardTelemetry(record).board_capable;
+      if (!['working', 'waiting_reply'].includes(worker.state) || ACTIVE_STATES.has(record.state) || pidAlive(record.pid)) continue;
       const next = record.state === 'finished' ? 'waiting' : 'stopped';
-      if (worker.state === 'stopped') continue;
-      changed = true;
-      await updateWorker(id, worker.name, { state: next, parked_on: null, error: record.error || null },
+      const updated = await updateWorker(id, worker.name, { state: next, parked_on: null, error: record.error || null },
         { db: conn, expectedState: worker.state, expectedRun: worker.run_id });
+      if (updated) roster[index] = { ...worker, ...updated, implicit: worker.implicit };
     }
-    return changed ? conn.all(sql, id).map(formatWorker) : roster;
+    return roster;
   }, db);
 }
 
@@ -866,6 +868,15 @@ export async function readBoardMessages(swarmId, {
     if (worker && rows.length) advanceRead(conn, id, viewer, rows.at(-1).seq);
     return rows;
   }, db);
+}
+
+export async function readWorkerTurnPosts(swarmId, workerName, { runId, startedAt, sessionsDir } = {}) {
+  const start = Date.parse(startedAt);
+  return withDb(sessionsDir, (conn) => conn.all(`SELECT * FROM messages
+    WHERE swarm_id = ? AND from_agent = ? AND (json_extract(meta_json, '$.run_id') = ? OR created_at >= ?)
+    ORDER BY seq`, validateSwarmId(swarmId), validateWorkerName(workerName), runId ?? null,
+  Number.isFinite(start) ? new Date(start).toISOString() : null).map(formatMessage).filter((msg) =>
+    msg.meta?.run_id && runId ? msg.meta.run_id === runId : Date.parse(msg.created_at) >= start));
 }
 
 export async function getBoardHead(swarmId, { sessionsDir, db } = {}) {

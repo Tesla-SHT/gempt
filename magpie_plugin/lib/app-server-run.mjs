@@ -65,6 +65,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
   const tools = new Map();
   let usage = {};
   let usageBaseline;
+  let boardToolErrors = 0;
   let lastWrite = 0;
   let client;
   let acceptTurn = false;
@@ -247,6 +248,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
                 client.reply(id, { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(payload) }] });
               }
             } catch (toolErr) {
+              boardToolErrors += 1;
               if (!client.disconnected) {
                 client.reply(id, { success: false, contentItems: [{ type: 'inputText', text: String(toolErr?.message || toolErr) }] });
               }
@@ -308,6 +310,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     const text = [...messages.values()].map((value) => value.trim()).filter(Boolean).join('\n\n');
     if (!text) throw new Error('Codex finished without an assistant message.');
     return { forkMode: record.fork_mode, threadId: progress.thread_id, turnId: progress.turn_id, sandbox: record.sandbox,
+      boardToolMode: record.board_tool_mode, boardToolErrors,
       text, elapsedSec: (Date.now() - start) / 1000, commands: [...commands.values()], usage };
   }
 
@@ -337,6 +340,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
       return actual;
     }
     let thread;
+    let usedFreshStart = false;
     if (nativeFork) {
       try {
         // Dynamic tools are persisted with the parent. ThreadForkParams does not accept dynamicTools.
@@ -353,9 +357,12 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     }
     if (nativeFork) await onForkMode?.(record.fork_mode);
     if (!thread) {
-      thread = threadId
-        ? await client.request('thread/resume', { ...inherited, threadId, excludeTurns: true }, remaining())
-        : await client.request('thread/start', { ...common, dynamicTools, allowProviderModelFallback: false }, remaining());
+      if (threadId) {
+        thread = await client.request('thread/resume', { ...inherited, threadId, excludeTurns: true }, remaining());
+      } else {
+        usedFreshStart = true;
+        thread = await client.request('thread/start', { ...common, dynamicTools, allowProviderModelFallback: false }, remaining());
+      }
     }
     if (threadId && thread.thread.id !== threadId) throw new Error('Codex returned a different thread on resume.');
     const actual = confirmedSandbox(thread);
@@ -363,6 +370,8 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     await registerCache(thread.thread.id, parentThreadId, Boolean(threadId));
     record.sandbox = Object.keys(SANDBOX_TYPES)[actual];
     record.model = model;
+    record.board_tool_mode = !isSwarm ? 'none' : (usedFreshStart ? 'dynamic' : (spec ? 'mcp' : 'dynamic'));
+    record.board_capable = record.board_tool_mode !== 'none';
     if (sandboxUpgraded) record.sandbox_upgraded = true;
     identity(thread.thread.id);
 

@@ -10,7 +10,7 @@ import {
 import {
   addWorkerBriefs, archiveChannel, createChannel, listChannels, subscribeChannels, markRead, parkWorker, QUOTA_ERROR,
   ensureSwarm, getBoardHead, getSwarmOverview, getWorker, killWorkerRecord, listRoster,
-  listUndeliveredForWorker, markDelivered, postBoardMessage, readBoardMessages, resolveSwarmId,
+  listUndeliveredForWorker, markDelivered, postBoardMessage, readBoardMessages, readWorkerTurnPosts, resolveSwarmId,
   setSwarmPlan, setSwarmTitle, updateWorker, validateWorkerName,
 } from './swarm-bus.mjs';
 
@@ -50,14 +50,18 @@ function resolveEngineContext(args = {}, options = {}) {
 }
 
 export function buildWorkerInstructions({ swarmId, workerName, brief, seq, registry = [], channels, role, forkContext, nativeParent, shardInstruction, owner = 'coordinator' }) {
+  const reporting = [
+    `- Use \`board_post\` as the main channel for Swarm coordination and delivery. Before ending a completed assignment, you must post \`@${owner} [done] <concise summary>\`.`,
+    '- For a direct handoff, tag only the next actor and use `@peer [handoff] <next action>`. After a doorbell, call `board_read` with the referenced #seq in `seqs`.',
+    '- Use `ask_gemini` only when a coordinator decision, clarification, or visual check blocks progress.',
+  ];
   const protocol = [
     'Shared message board protocol:',
-    '- Use `board_post` to report progress, hand off to peers (`@peer-name`), or finish (`@coordinator [done] <concise summary>`).',
+    ...reporting,
     '- Use `board_read` to inspect recent messages or specific `#seq` posts, and `board_roster` to see teammates and states.',
-    '- Use `ask_gemini` when you need a blocking coordinator decision, clarification, or visual check (it also posts to the board).',
     '- To attach screenshots on the board, include lines formatted as: `Screenshot: /absolute/path/to/file.png | caption`.',
     '- CLI fallback (if needed): `gempt board post/read/roster` (GEMPT_SWARM_ID, GEMPT_AGENT_NAME, GEMPT_SESSIONS_DIR are set in env).',
-    '- @name is a wakeup doorbell, never a CC. Tag only the next peer on handoffs. Tag @coordinator for a final [done] deliverable, a blocker or decision, or when no next peer exists.',
+    '- @name is a wakeup doorbell, never a CC. Label interim updates [progress].',
     '- Refer to earlier posts by #seq. Keep posts short, ignore your own posts, and never greet or acknowledge ("ready", "acknowledged").',
     '- When idle call board_wait with the highest seq you actually read. End the turn when parked. mentions_only defaults to true. Set it to false to wake on visible work.',
     '- Use board_swarm to add and manage your own helpers. Ownership is recorded in added_by. Kill your helpers when finished. Killing a parent leaves its helpers running.',
@@ -78,6 +82,7 @@ export function buildWorkerInstructions({ swarmId, workerName, brief, seq, regis
     `Swarm: ${swarmId}`,
     `Opening brief: #${seq}`,
     ...(shardInstruction ? [shardInstruction] : []),
+    ...(nativeParent ? ['', 'Shared message board protocol:', ...reporting] : []),
   ].join('\n');
 }
 
@@ -103,6 +108,8 @@ function compactRosterItem(worker) {
     cli: worker.cli,
     model: worker.model,
     tier: worker.tier,
+    implicit: worker.implicit,
+    board_capable: worker.board_capable ?? false,
     access: worker.access,
     workspace: worker.workspace,
     worktree_path: worker.worktree_path,
@@ -150,7 +157,7 @@ export async function routeBoardDeliveries(swarmId, options = {}) {
   const deliveries = [];
 
   for (let worker of roster) {
-    if (worker.state === 'killed' || (worker.state === 'working' && worker.parked_on?.startsWith('board_wait'))) continue;
+    if (worker.implicit || worker.state === 'killed' || (worker.state === 'working' && worker.parked_on?.startsWith('board_wait'))) continue;
     const unread = await listUndeliveredForWorker(swarmId, worker.name, { since: 0, sessionsDir: ctx.sessionsDir });
     if (!unread.length) continue;
 
@@ -253,7 +260,7 @@ export async function routeBoardDeliveries(swarmId, options = {}) {
       const wakeGoal = [
         formatBoardMessagesForWorker(remainingUnread),
         '',
-        'Respond on the board via `board_post` (tag the relevant peer or `@coordinator [done] ...` when finished).',
+        `Read the referenced #seqs with \`board_read\`. Reply via \`board_post\` (tag only the next actor for a handoff, or \`@${worker.added_by} [done] ...\` when finished).`,
       ].join('\n');
       const prevState = currentState;
       const runId = randomUUID().replaceAll('-', '');
@@ -320,7 +327,7 @@ export async function routeBoardDeliveries(swarmId, options = {}) {
 
 export async function onWorkerTurnFinished({
   swarmId, swarmAgent, runId, sessionId, startedAt, outcome, result, error, recovered = false,
-  sessionsDir, configPath, env = process.env, dispatchRunImpl, steerRunImpl, replyToolCallImpl, readRunImpl,
+  sessionsDir, configPath, env = process.env, dispatchRunImpl, steerRunImpl, replyToolCallImpl, readRunImpl, beforeDelivery,
 }) {
   if (!swarmId || !swarmAgent) return null;
   const resolvedSessions = resolveSessionsDir(sessionsDir || env.GEMPT_SESSIONS_DIR);
@@ -333,24 +340,22 @@ export async function onWorkerTurnFinished({
   const nextState = finishedOk ? 'waiting' : 'stopped';
   const errText = finishedOk ? null : String(error?.message || error || outcome?.error?.message || outcome?.error || outcome?.state || 'failed');
 
-  // Check whether the worker already posted a board message during this turn.
-  const recent = outcome?.implicit_swarm_worker ? [] : await readBoardMessages(swarmId, { limit: 100, sessionsDir: resolvedSessions });
-  const startMs = startedAt ? Date.parse(startedAt) : NaN;
-  const postedDuringTurn = recent.some((msg) => {
-    if (msg.from_agent !== swarmAgent || (recovered && finishedOk && msg.meta?.auto_summary && msg.kind === 'error')) return false;
-    if (msg.meta?.run_id && runId && msg.meta.run_id === runId) return true;
-    if (Number.isFinite(startMs)) {
-      const msgMs = Date.parse(msg.created_at);
-      if (Number.isFinite(msgMs) && msgMs >= startMs - 1000) return true;
-    }
-    return false;
+  const implicit = outcome?.implicit_swarm_worker === true || worker.implicit;
+  const posts = implicit ? [] : await readWorkerTurnPosts(swarmId, swarmAgent, {
+    runId, startedAt, sessionsDir: resolvedSessions,
   });
+  const authored = posts.filter((msg) => !msg.meta?.auto_summary);
+  const lastReport = authored.findLast((msg) => ['message', 'summary', 'handoff'].includes(msg.kind)
+    && !/\[progress\]/i.test(msg.text));
+  const reported = lastReport && (/\[done\]/i.test(lastReport.text) || lastReport.kind === 'summary'
+    || (lastReport.mentions.length > 0 && (lastReport.kind === 'handoff' || /\[handoff\]/i.test(lastReport.text))));
 
   let autoPost = null;
-  if (!outcome?.implicit_swarm_worker && !postedDuringTurn && !(finishedOk && worker.parked_on?.startsWith('board_wait'))) {
+  if (!implicit && !reported && !(finishedOk && worker.parked_on?.startsWith('board_wait'))
+      && !posts.some((msg) => msg.meta?.auto_summary && msg.kind === (finishedOk ? 'summary' : 'error'))) {
     const summaryText = finishedOk
       ? `@${worker.added_by} [done] ${truncateText(stripSummaryHeader(result?.text) || 'Turn finished.', 600)}`
-      : `@coordinator [${outcome?.state || 'failed'}] ${truncateText(errText, 400)}`;
+      : `@${worker.added_by} [${outcome?.state || 'failed'}] ${truncateText(errText, 400)}`;
     autoPost = await postBoardMessage(swarmId, {
       from: swarmAgent,
       kind: finishedOk ? 'summary' : 'error',
@@ -360,6 +365,11 @@ export async function onWorkerTurnFinished({
     }, { sessionsDir: resolvedSessions, skipRateLimit: true });
   }
 
+  const boardStats = {
+    board_posts_worker: authored.length,
+    board_posts_auto: posts.length - authored.length + Number(Boolean(autoPost)),
+  };
+  await beforeDelivery?.(boardStats);
   const finished = await updateWorker(swarmId, swarmAgent, {
     state: nextState,
     ...(result?.fork_mode ? { fork_mode: result.fork_mode } : {}),
@@ -372,7 +382,7 @@ export async function onWorkerTurnFinished({
   if (!finished) return { skipped: true, reason: 'state changed' };
 
   let deliveries = [];
-  if (nextState === 'waiting') {
+  if (!implicit && nextState === 'waiting') {
     const pending = await listUndeliveredForWorker(swarmId, swarmAgent, { since: 0, sessionsDir: resolvedSessions });
     if (pending.length) {
       await updateWorker(swarmId, swarmAgent, { last_park_blocked_seq: pending.at(-1).seq }, { sessionsDir: resolvedSessions });
@@ -387,7 +397,7 @@ export async function onWorkerTurnFinished({
       });
     }
   }
-  return { state: nextState, auto_post: autoPost, deliveries };
+  return { state: nextState, auto_post: autoPost, deliveries, ...boardStats };
 }
 
 function expandWorkerSpecs(args) {
@@ -566,7 +576,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
         const cli = session.cli || 'codex';
         const id = cli === 'codex' ? session.codex_thread_id : session.runner_session_id;
         if (id && session.model) forkSource = { cli, model: session.model, id,
-          ...(cli === 'codex' ? { dynamic_board_tools: session.codex_dynamic_board_tools ?? !session.implicit_swarm_worker } : {}) };
+          ...(cli === 'codex' ? { dynamic_board_tools: session.codex_dynamic_board_tools === true } : {}) };
       }
       const recent = await readBoardMessages(swarmId, { ...storage, limit: Infinity });
       const memory = recent.filter((m) => m.from_agent === args.fork || m.meta?.worker === args.fork).slice(-8);

@@ -1657,3 +1657,76 @@ test('model switch dispatch failure restores the prior worker runtime and state'
   const [notice] = await readBoardMessages(swarmId, { sessionsDir });
   assert.match(notice.text, /Switching runtime/);
 });
+
+test('native fork instructions append concise board reporting protocol after shared assignment', () => {
+  const text = buildWorkerInstructions({
+    swarmId: 'sw-fork-prompt',
+    workerName: 'auditor',
+    brief: 'Audit the parser',
+    seq: 12,
+    nativeParent: 'scout',
+    owner: 'lead',
+  });
+  const briefIdx = text.indexOf('Audit the parser');
+  const protoIdx = text.indexOf('Shared message board protocol:');
+  assert.ok(briefIdx >= 0 && protoIdx > briefIdx, 'board protocol should follow the shared assignment');
+  assert.match(text, /board_post/);
+  assert.match(text, /@lead \[done\]/);
+  assert.match(text, /@peer \[handoff\]/);
+  assert.match(text, /board_read/);
+  assert.match(text, /ask_gemini/);
+});
+
+test('auto_summary runs after interim [progress] posts, skips after [done] or [handoff], and records turn board telemetry', async (t) => {
+  const dir = makeTmp(t);
+  const sessionsDir = join(dir, 'sessions');
+  const swarmId = 'sw-turn-summary';
+  await ensureSwarm({ swarmId, cwd: dir, sessionsDir });
+
+  // 1) Interim [progress] post should NOT suppress end-of-turn auto_summary.
+  const run1 = 'a'.repeat(32);
+  const t1 = new Date(Date.now() - 1000).toISOString();
+  await upsertWorker(swarmId, { name: 'builder', state: 'working', run_id: run1, session_id: 's1' }, { sessionsDir });
+  await postBoardMessage(swarmId, { from: 'builder', text: '[progress] halfway through files', meta: { run_id: run1 } }, { sessionsDir });
+  let captured1 = null;
+  const fin1 = await onWorkerTurnFinished({
+    swarmId, swarmAgent: 'builder', runId: run1, sessionId: 's1', startedAt: t1,
+    outcome: { state: 'finished', cli: 'codex', model: 'codex/gpt-6.2-sol' },
+    result: { text: 'Finished implementing parser.' },
+    sessionsDir,
+    beforeDelivery: (stats) => { captured1 = stats; },
+  });
+  assert.ok(fin1.auto_post, 'interim [progress] post must not suppress auto_summary');
+  assert.equal(fin1.auto_post.meta.auto_summary, true);
+  assert.deepEqual(captured1, { board_posts_worker: 1, board_posts_auto: 1 });
+
+  // 2) Explicit [done] post SHOULD suppress duplicate auto_summary.
+  const run2 = 'b'.repeat(32);
+  const t2 = new Date(Date.now() - 1000).toISOString();
+  await upsertWorker(swarmId, { name: 'builder', state: 'working', run_id: run2, session_id: 's1' }, { sessionsDir });
+  await postBoardMessage(swarmId, { from: 'builder', text: '@coordinator [done] Parser passes tests.', meta: { run_id: run2 } }, { sessionsDir });
+  const fin2 = await onWorkerTurnFinished({
+    swarmId, swarmAgent: 'builder', runId: run2, sessionId: 's1', startedAt: t2,
+    outcome: { state: 'finished', cli: 'codex', model: 'codex/gpt-6.2-sol' },
+    result: { text: 'Done.' },
+    sessionsDir,
+  });
+  assert.equal(fin2.auto_post, null);
+  assert.equal(fin2.board_posts_worker, 1);
+  assert.equal(fin2.board_posts_auto, 0);
+
+  // 3) Direct peer [handoff] post SHOULD suppress auto_summary.
+  const run3 = 'c'.repeat(32);
+  const t3 = new Date(Date.now() - 1000).toISOString();
+  await upsertWorker(swarmId, { name: 'builder', state: 'working', run_id: run3, session_id: 's1' }, { sessionsDir });
+  await postBoardMessage(swarmId, { from: 'builder', text: '@verifier [handoff] Check #2', meta: { run_id: run3 } }, { sessionsDir });
+  const fin3 = await onWorkerTurnFinished({
+    swarmId, swarmAgent: 'builder', runId: run3, sessionId: 's1', startedAt: t3,
+    outcome: { state: 'finished', cli: 'codex', model: 'codex/gpt-6.2-sol' },
+    result: { text: 'Handed off.' },
+    sessionsDir,
+  });
+  assert.equal(fin3.auto_post, null);
+  assert.equal(fin3.board_posts_worker, 1);
+  assert.equal(fin3.board_posts_auto, 0);
+});

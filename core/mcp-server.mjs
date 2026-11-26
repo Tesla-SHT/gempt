@@ -1,21 +1,25 @@
 import { createInterface } from 'node:readline';
+import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
 import { GEMPT_VERSION } from './config.mjs';
 import { readHostContext } from './host-context.mjs';
+import { LAUNCHER_META, LAUNCHER_PATH, LAUNCHER_TYPE, LAUNCHER_URI, SIDECAR_URI } from './mcp-app.mjs';
 import { runLiveOperation } from './live-service.mjs';
 import { ACTIVE_STATES, buildWaitCommand, compactReceiptText, dispatchRun, interruptRun, readRun, refreshRun, replyToolCall, runWithinRoot, steerRun, validateExecTimeoutSec } from './runs.mjs';
 import { lockStaleMsForBudget, resolvePath, validateSessionId, withLock } from './state.mjs';
 import { handleBoardAction, handleSwarmAction } from './swarm-engine.mjs';
-import { boardPostPreview } from './swarm-bus.mjs';
+import { boardPostPreview, getSwarmOverview } from './swarm-bus.mjs';
 import { TOOLS } from './tool-schemas.mjs';
+import { normalizeTitle } from '../magpie_plugin/lib/activity.mjs';
 export { TOOLS };
 
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const short = (value, limit) => Array.from(String(value || '')).slice(0, limit).join('');
 const bytes = (value) => Buffer.byteLength(JSON.stringify(value));
 const textResult = (data, extras) => ({ content: [{ type: 'text', text: JSON.stringify(data) }], ...extras });
+const launcherSummary = (fields) => ({ ...fields, sidecar_uri: SIDECAR_URI, created_at_ms: Date.now() });
 function compact(payload) {
   const data = { ...payload };
   for (const key of ['recent', 'active']) {
@@ -83,10 +87,19 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
   };
   if (name === 'gpt_ctl') return control(args, options);
   if (name === 'gpt_swarm') {
-    return textResult(await handleSwarmAction(args, {
+    const data = await handleSwarmAction(args, {
       ...options,
       agent: typeof callCtx?.agent === 'string' ? callCtx.agent : undefined,
-    }));
+    });
+    const action = String(args.action || 'status').trim();
+    const overview = action === 'status' ? null
+      : await getSwarmOverview(data.swarm_id, { sessionsDir: options.sessionsDir, messageLimit: 0 }).catch(() => null);
+    const roster = (data.roster ?? overview?.roster ?? data.workers ?? []).filter(({ state }) => state !== 'killed');
+    return textResult(data, { structuredContent: launcherSummary({
+      kind: 'swarm', action, title: data.title ?? overview?.swarm.title ?? data.goal?.title ?? null,
+      state: roster.some(({ state }) => state === 'working' || state === 'waiting_reply') ? 'working' : 'idle',
+      swarm_id: data.swarm_id, member_count: roster.length, auto_open_panel: action === 'add',
+    }) });
   }
   if (name === 'gpt_board') {
     const board = await handleBoardAction(args, {
@@ -101,14 +114,15 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
   const goal = String(args.goal || '').trim();
   if (!goal) throw new Error('`goal` is required.');
   const cwd = options.root && (args.cwd == null || typeof args.cwd === 'string')
-    ? resolve(options.root, args.cwd || '.') : args.cwd;
+    ? resolve(options.root, args.cwd?.trim() || '.') : typeof args.cwd === 'string' ? args.cwd.trim() : args.cwd;
   const sessionId = String(args.session_id || '').trim();
   if (name === 'gpt_ask') {
     const context = readHostContext(options.configPath, cwd);
     const hostId = args.host_conversation_id || context.conversation_id;
     const family = args.gemini_family || context.gemini_family;
     const { createExecutionTools } = await import('../magpie_plugin/lib/tools.mjs');
-    const consult = createExecutionTools(options).consult;
+    const consult = createExecutionTools({ ...options,
+      hostCwdBound: Boolean(context.recorded_at_ms && hostId === context.conversation_id) }).consult;
     if (!cwd && args.file_paths != null) throw new Error('cwd is required when providing file_paths.');
     const execute = () => consult.execute({ goal, tier: args.tier, cwd, file_paths: args.file_paths,
       session_id: sessionId, gemini_family: family, mcp: true, host_conversation_id: hostId }, callCtx);
@@ -136,6 +150,12 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
     background: args.background ?? waitSec === 0, sandbox: access === 'inspect' ? 'read-only' : undefined,
     expected_report: 'Report concisely: changed files, verification commands/results, and any remaining blockers. Omit verbose raw logs.',
   }, { ...options, waitSec, agent: typeof callCtx?.agent === 'string' ? callCtx.agent : undefined });
+  const launcherResult = (isError) => ({ isError, ...(!isError ? {
+    structuredContent: launcherSummary({
+      kind: 'run', action: 'start', title: res.title ?? normalizeTitle(args.title, goal, cwd),
+      state: res.state, run_id: res.run_id, member_count: 1, auto_open_panel: true,
+    }),
+  } : {}) });
   if (ACTIVE_STATES.has(res.state) || res.state === 'interrupted') {
     const wait = buildWaitCommand(res.run_id, options);
     return textResult({ run_id: res.run_id, session_id: res.session_id, state: res.state, wait_command: wait,
@@ -144,11 +164,11 @@ export async function handleTool(name, args, env = process.env, overrides = {}, 
         ? `Run ${res.run_id} is waiting for ask_gemini reply (use gpt_ctl action='reply').`
         : `Run ${res.run_id} started. Execute \`${wait}\` via run_command(WaitMsBeforeAsync=500) for zero-poll wakeup.`,
       ...(res.worktree_path ? { worktree_path: res.worktree_path } : {}),
-    }, { isError: res.state === 'interrupted' });
+    }, launcherResult(res.state === 'interrupted'));
   }
   const { run_id, session_id, cli, model, tier, reasoning_effort, worktree_path, verification, usage, text } = res;
   return textResult({ run_id, session_id, ...(cli ? { cli } : {}), model, tier, reasoning_effort, worktree_path, verification, usage,
-    text: compactReceiptText(text, session_id) }, { isError: ['failed', 'unverified'].includes(verification?.status) });
+    text: compactReceiptText(text, session_id) }, launcherResult(['failed', 'unverified'].includes(verification?.status)));
 }
 
 const errorResponse = (id, code, message, data) => ({ jsonrpc: '2.0', id, error: { code, message, data } });
@@ -161,13 +181,16 @@ async function dispatch(request, env) {
     switch (method) {
       case 'initialize':
         return response({ protocolVersion: params?.protocolVersion || '2024-11-05',
-          capabilities: { tools: { listChanged: false } },
+          capabilities: { tools: { listChanged: false }, resources: {} },
           serverInfo: { name: 'gempt', version: GEMPT_VERSION } });
       case 'ping': return response({});
       case 'tools/list': return response({ tools: TOOLS });
-      case 'resources/list': return response({ resources: [] });
+      case 'resources/list':
+        return response({ resources: [{ uri: LAUNCHER_URI, name: 'GemPT launcher', mimeType: LAUNCHER_TYPE, _meta: LAUNCHER_META }] });
       case 'resources/read':
-        return errorResponse(id, -32002, 'Resource not found', { uri: params?.uri });
+        if (params?.uri !== LAUNCHER_URI) return errorResponse(id, -32002, 'Resource not found', { uri: params?.uri });
+        return response({ contents: [{ uri: LAUNCHER_URI, mimeType: LAUNCHER_TYPE, _meta: LAUNCHER_META,
+          text: await readFile(new URL(LAUNCHER_PATH, import.meta.url), 'utf8') }] });
       case 'tools/call': {
         const name = String(params?.name || '');
         const args = params?.arguments ?? {};

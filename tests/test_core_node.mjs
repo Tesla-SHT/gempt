@@ -15,6 +15,7 @@ import { test } from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { runInNewContext } from 'node:vm';
 import { installAgy, resolveNodeExecutable, stagePluginBundle, syncInPlace, validatePluginBundle } from '../core/agy-install.mjs';
 import { buildTierView, GEMPT_VERSION, setEffortSettings } from '../core/config.mjs';
 import { assertSafeOutDir } from '../scripts/build-agy-plugin.mjs';
@@ -38,6 +39,78 @@ import { runAppServer } from '../magpie_plugin/lib/app-server-run.mjs';
 const execFileAsync = promisify(execFile);
 const hookPath = fileURLToPath(new URL('../plugin/work_split_hook.mjs', import.meta.url));
 const cliPath = fileURLToPath(new URL('../bin/gempt.mjs', import.meta.url));
+const launcherUrl = new URL('../core/assets/mcp-app/launcher.html', import.meta.url);
+const launcherResource = { uri: 'ui://gempt/launcher.html', mimeType: 'text/html;profile=mcp-app',
+  _meta: { ui: { prefersBorder: false } } };
+
+test('inline launcher negotiates the Hub bridge, opens once for fresh results and shows recovery on errors', () => {
+  const source = readFileSync(launcherUrl, 'utf8').match(/<script>([\s\S]+)<\/script>/)[1];
+  const toggle = 'com.google.antigravity/toggle-aux-pane';
+  const now = 90_000;
+  const messages = [];
+  const callbacks = {};
+  const elements = Object.fromEntries(['card', 'title', 'badge', 'hint', 'open'].map((id) => [id, {
+    offsetHeight: 48,
+    toggleAttribute() {},
+    addEventListener: (name, handler) => { callbacks[name] = handler; },
+  }]));
+  const variables = new Map();
+  const root = { dataset: {}, style: { setProperty: variables.set.bind(variables), removeProperty: variables.delete.bind(variables) } };
+  const parent = { postMessage(message, origin) { assert.equal(origin, '*'); messages.push(JSON.parse(JSON.stringify(message))); } };
+  runInNewContext(source, {
+    window: { parent, addEventListener: (name, handler) => { callbacks[name] = handler; } },
+    document: { documentElement: root, getElementById: (id) => elements[id] },
+    Date: { now: () => now }, setTimeout() {}, clearTimeout() {},
+  });
+  const emit = (data, sender = parent) => callbacks.message({ source: sender, data: { jsonrpc: '2.0', ...data } });
+  const opens = () => messages.filter(({ method }) => method === toggle);
+  assert.deepEqual(messages[0], {
+    jsonrpc: '2.0', id: 1, method: 'ui/initialize',
+    params: { protocolVersion: '2026-01-26', appInfo: { name: 'GemPT launcher', version: '1.0.0' }, appCapabilities: {} },
+  });
+  emit({ id: 1, result: { protocolVersion: '2026-01-26', hostInfo: { name: 'Antigravity', version: 'test' },
+    hostCapabilities: {}, hostContext: { theme: 'dark', locale: 'zh-CN', styles: { variables: { '--color-text-primary': '#eee' } } } } });
+  assert.deepEqual(messages.slice(1), [
+    { jsonrpc: '2.0', method: 'ui/notifications/initialized' },
+    { jsonrpc: '2.0', method: 'ui/notifications/size-changed', params: { height: 48 } },
+  ]);
+  assert.equal(root.dataset.theme, 'dark');
+  assert.equal(elements.open.textContent, '打开 GemPT');
+  assert.equal(variables.get('--color-text-primary'), '#eee');
+  emit({ method: 'ui/notifications/tool-input', params: { arguments: { title: 'Starting work' } } });
+  assert.equal(elements.title.textContent, 'Starting work');
+  const result = (structuredContent, sender) => emit({
+    method: 'ui/notifications/tool-result', params: { content: [], structuredContent },
+  }, sender);
+  const fresh = { kind: 'swarm', title: 'Actual work', member_count: 2, auto_open_panel: true, created_at_ms: now - 1 };
+  result({ ...fresh, created_at_ms: now - 30_000 });
+  result({ ...fresh, created_at_ms: now + 1 });
+  result({ ...fresh, auto_open_panel: false });
+  result(fresh, {});
+  assert.equal(opens().length, 0);
+  result(fresh);
+  result(fresh);
+  assert.equal(opens().length, 1);
+  assert.deepEqual(opens()[0].params, { tabType: 'sidecarView', uri: 'sidecar://gempt/gempt_live/' });
+  assert.equal(elements.title.textContent, 'Actual work');
+  assert.equal(elements.badge.textContent, '2 名成员');
+  emit({ id: opens()[0].id, result: { isError: true } });
+  assert.match(elements.hint.textContent, /侧边栏/);
+  emit({ method: 'ui/notifications/host-context-changed', params: { theme: 'light', locale: 'en-US', styles: { variables: {} } } });
+  assert.equal(root.dataset.theme, 'light');
+  assert.equal(variables.size, 0);
+  assert.match(elements.hint.textContent, /side panel/);
+  callbacks.click();
+  assert.equal(opens().length, 2);
+  assert.deepEqual(opens()[1].params, opens()[0].params);
+  emit({ id: opens()[1].id, error: { code: -32601, message: 'Method not found' } });
+  assert.equal(elements.hint.hidden, false);
+  callbacks.click();
+  emit({ id: opens()[2].id, result: {} });
+  assert.equal(elements.hint.hidden, true);
+  emit({ id: 'hub-ping', method: 'ping' });
+  assert.deepEqual(messages.at(-1), { jsonrpc: '2.0', id: 'hub-ping', result: {} });
+});
 
 test('Live builds the split pane and preserves host scope, safe link routes and exact transcript text', () => {
   const html = readFileSync(new URL('../core/assets/http-ui/index.html', import.meta.url), 'utf8');
@@ -298,11 +371,11 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
     jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' },
   }) });
   assert.equal(initialized.result.serverInfo.version, '0.10.1');
-  assert.equal(initialized.result.capabilities.resources, undefined);
+  assert.deepEqual(initialized.result.capabilities.resources, {});
   const listedResources = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'resources/list',
   }) });
-  assert.deepEqual(listedResources.result.resources, []);
+  assert.deepEqual(listedResources.result.resources, [{ ...launcherResource, name: 'GemPT launcher' }]);
   const ctlStatus = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'tools/call',
     params: { name: 'gpt_ctl', arguments: { action: 'status' } },
@@ -465,6 +538,17 @@ test('portable Antigravity bundle validates and a shim failure reports a partial
   const bundleDir = join(f.root, 'bundle');
   stagePluginBundle(bundleDir, { portable: true });
   await validatePluginBundle(bundleDir, resolveNodeExecutable(), f.env, { portable: true });
+  const launcher = join(bundleDir, 'runtime', 'core', 'assets', 'mcp-app', 'launcher.html');
+  rmSync(launcher);
+  await assert.rejects(validatePluginBundle(bundleDir, resolveNodeExecutable(), f.env, { portable: true }),
+    /Missing or empty Antigravity plugin asset: .*launcher\.html/);
+  copyFileSync(launcherUrl, launcher);
+  const schemas = join(bundleDir, 'runtime', 'core', 'tool-schemas.mjs');
+  const originalSchemas = readFileSync(schemas, 'utf8');
+  writeFileSync(schemas, originalSchemas + '\nTOOLS[0]._meta["com.google.antigravity/ui"] = { entrypoints: [{ type: "aux_pane" }] };\n');
+  await assert.rejects(validatePluginBundle(bundleDir, resolveNodeExecutable(), f.env, { portable: true }),
+    /only inline launcher metadata/);
+  writeFileSync(schemas, originalSchemas);
   writeFileSync(join(bundleDir, 'rules', 'AGENTS.md'), ' \n');
   await assert.rejects(validatePluginBundle(bundleDir, resolveNodeExecutable(), f.env, { portable: true }),
     /Empty Antigravity plugin rules text/);
@@ -1577,6 +1661,52 @@ test('Live binds normalized workspaces and never selects another run for a filte
 });
 
 
+test('PreToolUse binds exact cross-repo directories briefly while preserving interleaved workspace ownership', async (t) => {
+  const f = fixture(t);
+  const env = { ...f.env, GEMPT_WORKSPACE_ROOT: '' };
+  const workspaceB = join(f.root, 'workspace-b');
+  const crossA = join(f.root, 'cross-a');
+  const crossB = join(f.root, 'cross-b');
+  const nested = join(crossA, 'nested');
+  const file = join(f.root, 'plain-file');
+  for (const dir of [workspaceB, crossA, crossB, nested]) mkdirSync(dir);
+  writeFileSync(file, '');
+  await updateHostContext('conversation-a', [f.cwd], { ...f, geminiFamily: 'neon' });
+  await updateHostContext('conversation-b', [workspaceB], { ...f, geminiFamily: 'carbon' });
+  const hook = (payload) => jsonProcess(process.execPath, [hookPath], { env, input: JSON.stringify(payload) });
+  const invoke = (conversation_id, tool_name, cwd) => hook({
+    hook_event_name: 'PreToolUse', conversation_id, tool_name, tool_input: { cwd },
+  });
+  for (const [tool, conversation, cwd] of [
+    ['gpt_run', 'conversation-a', crossA], ['gpt_swarm', 'conversation-b', crossB],
+    ['gpt_ask', 'conversation-a', crossA], ['gpt_ctl', 'conversation-b', crossB],
+    ['gpt_board', 'conversation-a', crossA],
+  ]) {
+    assert.deepEqual(invoke(conversation, tool, cwd), { decision: 'allow' });
+    assert.equal(readHostContext(f.configPath, cwd).conversation_id, conversation);
+  }
+  assert.equal(readHostContext(f.configPath, crossA).gemini_family, 'neon');
+  assert.equal(readHostContext(f.configPath, crossB).gemini_family, 'carbon');
+  assert.deepEqual(readHostContext(f.configPath, nested), {});
+  assert.deepEqual(invoke('conversation-a', 'gpt_run', workspaceB), { decision: 'allow' });
+  assert.equal(readHostContext(f.configPath, workspaceB).conversation_id, 'conversation-b');
+  assert.equal(readHostContext(f.configPath, f.cwd).conversation_id, 'conversation-a');
+  assert.equal(readHostContext(f.configPath).conversation_id, 'conversation-b');
+  assert.deepEqual(invoke('conversation-a', 'gpt_run', file), { decision: 'allow' });
+  assert.deepEqual(readHostContext(f.configPath, file), {});
+  hook({ hookEventName: 'PreToolUse', conversationId: 'conversation-a',
+    toolCall: { name: 'call_mcp_tool', args: { ServerName: 'other', ToolName: 'gpt_run', Arguments: { cwd: nested } } } });
+  assert.deepEqual(readHostContext(f.configPath, nested), {});
+  const path = contextPath(f.configPath);
+  const data = JSON.parse(readFileSync(path, 'utf8'));
+  const binding = Object.values(data.by_tool_cwd).find((entry) => entry.conversation_id === 'conversation-b');
+  binding.recorded_at_ms = Date.now() - 60_000;
+  writeFileSync(path, JSON.stringify(data));
+  assert.deepEqual(readHostContext(f.configPath, crossB), {});
+  assert.equal(readHostContext(f.configPath, crossA).conversation_id, 'conversation-a');
+  assert.equal(readHostContext(f.configPath, workspaceB).conversation_id, 'conversation-b');
+});
+
 test('Live run index sees new directories, worker updates and removed state files', async (t) => {
   const f = fixture(t);
   const first = '1'.repeat(32);
@@ -1653,7 +1783,7 @@ test('Live journal filters other turns, bounds events, and pages stable Unicode 
   assert.equal((await call({})).full_text, 'rotated');
 });
 
-test('standalone NDJSON MCP exposes only core tools without legacy MCP App resources or UI metadata', async (t) => {
+test('standalone NDJSON MCP serves the inline launcher and preserves cross-directory tool receipts and ownership', async (t) => {
   const f = fixture(t);
   await appFixture(t, f);
   await updateHostContext('host', [f.cwd], f);
@@ -1661,7 +1791,14 @@ test('standalone NDJSON MCP exposes only core tools without legacy MCP App resou
   const linkedCore = join(f.root, 'linked core');
   symlinkSync(fileURLToPath(new URL('../core/', import.meta.url)), linkedCore, process.platform === 'win32' ? 'junction' : 'dir');
   const file = join(linkedCore, 'mcp-server.mjs');
-  const child = spawn(process.execPath, [file], { env: f.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const env = { ...f.env, GEMPT_WORKSPACE_ROOT: '' };
+  const cross = join(f.root, 'cross-repo');
+  mkdirSync(cross);
+  assert.deepEqual(jsonProcess(process.execPath, [hookPath], { env, input: JSON.stringify({
+    hookEventName: 'PreToolUse', conversationId: 'host', workspacePaths: [f.cwd],
+    toolCall: { name: 'call_mcp_tool', args: { ServerName: 'gempt_gempt', ToolName: 'gpt_run', Arguments: { cwd: cross } } },
+  }) }), { decision: 'allow' });
+  const child = spawn(process.execPath, [file], { env, stdio: ['pipe', 'pipe', 'pipe'] });
   t.after(() => child.kill());
   const exited = once(child, 'exit');
   const responses = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
@@ -1679,13 +1816,17 @@ test('standalone NDJSON MCP exposes only core tools without legacy MCP App resou
   assert.equal(started.result.protocolVersion, '2026-test');
   assert.equal(started.result.serverInfo.name, 'gempt');
   assert.equal(started.result.serverInfo.version, '0.10.1');
-  assert.deepEqual(started.result.capabilities, { tools: { listChanged: false } });
+  assert.deepEqual(started.result.capabilities, { tools: { listChanged: false }, resources: {} });
   send({ method: 'notifications/initialized' });
   assert.deepEqual((await request('ping')).result, {});
   const { tools } = (await request('tools/list')).result;
   assert.deepEqual(tools.map(({ name }) => name), ['gpt_run', 'gpt_ask', 'gpt_ctl', 'gpt_swarm', 'gpt_board']);
-  assert.deepEqual(tools.filter(({ _meta }) => _meta?.ui || _meta?.['com.google.antigravity/ui']), []);
-  assert.deepEqual((await request('resources/list')).result.resources, []);
+  assert.deepEqual(tools.filter(({ _meta }) => _meta).map(({ name, _meta }) => ({ name, _meta })),
+    ['gpt_run', 'gpt_swarm'].map((name) => ({ name, _meta: { ui: { resourceUri: launcherResource.uri } } })));
+  assert.ok(tools.every((tool) => !Object.hasOwn(tool, 'meta')));
+  assert.deepEqual((await request('resources/list')).result.resources, [{ ...launcherResource, name: 'GemPT launcher' }]);
+  assert.deepEqual((await request('resources/read', { uri: launcherResource.uri })).result.contents,
+    [{ ...launcherResource, text: readFileSync(launcherUrl, 'utf8') }]);
   assert.equal((await request('resources/read', { uri: 'ui://unknown' })).error.code, -32002);
   assert.equal((await request('resources/read', { uri: 'ui://gempt/live.html' })).error.code, -32002);
   const { result } = await request('tools/call', { name: 'gpt_ctl', arguments: {} });
@@ -1700,19 +1841,58 @@ test('standalone NDJSON MCP exposes only core tools without legacy MCP App resou
   const detail = (await request('tools/call', { name: 'gpt_ctl', arguments: { run_id: oversized } })).result;
   assert.ok(Buffer.byteLength(detail.content[0].text) <= 500);
   assert.equal(JSON.parse(detail.content[0].text).id, oversized);
-  const asked = await request('tools/call', { name: 'gpt_ask', arguments: { goal: 'Summarize the fixture.' } });
+  const asked = await request('tools/call', { name: 'gpt_ask', arguments: { goal: 'Summarize the fixture.', cwd: cross } });
   assert.equal(asked.result.isError, undefined, asked.result.content[0].text);
   assert.equal(JSON.parse(asked.result.content[0].text).text.includes('Consult answer.'), true);
-  const consults = await runLiveOperation('runs', { include_consults: true }, { ...f, root: f.cwd });
+  const panel = { ...f, workspaceRoots: [f.cwd], conversationId: 'host' };
+  const consults = await runLiveOperation('runs', { include_consults: true }, panel);
   assert.equal(consults.consult_sessions[0].session_id,
     JSON.parse(asked.result.content[0].text).session_id);
-  const launch = await request('tools/call', { name: 'gpt_run', arguments: { goal: 'Inspect the fixture.', access: 'inspect' } });
+  const startedAt = Date.now();
+  const launch = await request('tools/call', { name: 'gpt_run', arguments: {
+    goal: 'Inspect the fixture.', title: 'Cross-repo inspection', access: 'inspect', cwd: cross,
+  } });
   assert.equal(launch.result.isError, false, launch.result.content[0].text);
   const run = JSON.parse(launch.result.content[0].text);
   assert.match(run.wait_command, new RegExp(`${run.run_id}$`));
+  assert.equal(run.text, `Run ${run.run_id} started. Execute \`${run.wait_command}\` via run_command(WaitMsBeforeAsync=500) for zero-poll wakeup.`);
+  const { created_at_ms: runTime, ...runSummary } = launch.result.structuredContent;
+  assert.ok(Number.isInteger(runTime) && runTime >= startedAt && runTime <= Date.now());
+  assert.deepEqual(runSummary, { kind: 'run', action: 'start', title: 'Cross-repo inspection', state: run.state,
+    run_id: run.run_id, member_count: 1, sidecar_uri: 'sidecar://gempt/gempt_live/', auto_open_panel: true });
   const complete = await waitForRun(run.run_id, { ...f, timeoutSec: 5 });
   assert.equal(complete.result?.sandbox, 'read-only', complete.error);
   assert.equal(complete.execution_timeout_sec, 3600);
+  assert.equal(complete.host_conversation_id, 'host');
+  assert.equal((await runLiveOperation('open', { run_id: run.run_id }, panel)).run_id, run.run_id);
+  const otherPanel = { ...panel, conversationId: 'other' };
+  assert.ok(!(await runLiveOperation('runs', { host_conversation_id: 'host' }, otherPanel))
+    .runs.some((entry) => entry.run_id === run.run_id));
+  await assert.rejects(runLiveOperation('stream', { run_id: run.run_id }, otherPanel), /Run outside host workspace/);
+
+  const swarm = (action, args = {}) => request('tools/call', { name: 'gpt_swarm', arguments: { action, cwd: cross, ...args } });
+  const titled = await swarm('title', { title: 'Cross-repo workers' });
+  assert.equal(titled.result.structuredContent.auto_open_panel, false);
+  const added = await swarm('add', { name: 'reader', brief: 'Inspect the fixture.', access: 'inspect', cli: 'codex' });
+  assert.notEqual(added.result.isError, true, added.result.content[0].text);
+  const addReceipt = JSON.parse(added.result.content[0].text);
+  assert.equal(addReceipt.ok, true);
+  assert.equal(addReceipt.workers[0].name, 'reader');
+  assert.match(addReceipt.wait_command, /--board .* --since \d+$/);
+  const swarmId = 'conversation-' + createHash('sha256').update('host').digest('hex');
+  assert.equal(addReceipt.swarm_id, swarmId);
+  const { created_at_ms: swarmTime, state: swarmState, ...swarmSummary } = added.result.structuredContent;
+  assert.ok(Number.isInteger(swarmTime) && swarmTime >= runTime && swarmTime <= Date.now());
+  assert.ok(['working', 'idle'].includes(swarmState));
+  assert.deepEqual(swarmSummary, { kind: 'swarm', action: 'add', title: 'Cross-repo workers',
+    swarm_id: swarmId, member_count: 2, sidecar_uri: 'sidecar://gempt/gempt_live/', auto_open_panel: true });
+  const statusResult = (await swarm('status')).result;
+  const statusReceipt = JSON.parse(statusResult.content[0].text);
+  assert.equal(statusReceipt.swarm_id, swarmId);
+  assert.equal(statusReceipt.roster.length, 2);
+  assert.equal(statusResult.structuredContent.auto_open_panel, false);
+  assert.equal(statusResult.structuredContent.member_count, 2);
+  assert.equal((await waitForRun(addReceipt.workers[0].run_id, { ...f, timeoutSec: 5 })).host_conversation_id, 'host');
   child.stdin.end();
   assert.deepEqual(await exited, [0, null]);
 });
@@ -2456,4 +2636,68 @@ test('switching a swarm worker from Claude to Codex carries its last result into
   assert.equal(run.state, 'finished');
   assert.ok(packets.some((p) => p.method === 'thread/start'));
   assert.match(packets.find((p) => p.method === 'turn/start').params.input[0].text, /Carryover[\s\S]*The issue is in initialization/);
+});
+
+test('legacy Codex resume and fork without explicit dynamic board marker attach gempt_board MCP and expose board telemetry', async (t) => {
+  const f = fixture(t);
+  const packets = await appFixture(t, f);
+  const context = { cwd: f.cwd, host_conversation_id: 'conversation-board-compat' };
+
+  // 1) Implicit solo gpt_run remains non-board-capable and marked implicit in swarm status.
+  const soloRes = await handleTool('gpt_run', { ...context, cli: 'codex', goal: 'Solo task' }, f.env, f);
+  const soloReceipt = JSON.parse(soloRes.content[0].text);
+  const soloRun = await waitForRun(soloReceipt.run_id, { ...f, timeoutSec: 10 });
+  assert.equal(soloRun.state, 'finished', soloRun.error);
+  assert.equal(soloRun.implicit_swarm_worker, true);
+  assert.equal(soloRun.board_tool_mode, 'none');
+  assert.equal(soloRun.board_capable, false);
+  const status1 = await handleSwarmAction({ ...context, action: 'status' }, f);
+  const soloWorker = status1.roster.find((w) => w.session_id === soloReceipt.session_id);
+  assert.equal(soloWorker.implicit, true);
+  assert.equal(soloWorker.board_capable, false);
+
+  // 2) Explicit swarm add gets dynamic tools and board_capable=true.
+  const added = await handleSwarmAction({ ...context, action: 'add', name: 'scout', brief: 'Inspect module' }, f);
+  const scoutRun = await waitForRun(added.workers[0].run_id, { ...f, timeoutSec: 10 });
+  assert.equal(scoutRun.state, 'finished', scoutRun.error);
+  assert.equal(scoutRun.board_tool_mode, 'dynamic');
+  assert.equal(scoutRun.board_capable, true);
+  const scoutFinished = await until(() => {
+    const r = readRun(scoutRun.run_id, f.sessionsDir);
+    return Number.isInteger(r.board_posts_auto) && r;
+  });
+  assert.equal(scoutFinished.board_posts_auto, 1);
+  assert.equal(scoutFinished.board_posts_worker, 0);
+
+  // 3) Simulate legacy session lacking codex_dynamic_board_tools marker: resume MUST attach gempt_board MCP fallback.
+  const scoutSessionFile = join(f.sessionsDir, `${scoutRun.session_id}.json`);
+  const scoutSession = JSON.parse(readFileSync(scoutSessionFile, 'utf8'));
+  delete scoutSession.codex_dynamic_board_tools;
+  writeFileSync(scoutSessionFile, JSON.stringify(scoutSession));
+  const resumed = await dispatchRun({
+    cli: 'codex', model: scoutRun.model, cwd: f.cwd, session_id: scoutRun.session_id,
+    swarm_id: added.swarm_id, swarm_agent: 'scout', goal: 'Continue with board MCP fallback',
+  }, f);
+  assert.equal(resumed.state, 'finished', resumed.error);
+  const resumedState = readRun(resumed.run_id, f.sessionsDir);
+  assert.equal(resumedState.board_tool_mode, 'mcp');
+  assert.equal(resumedState.board_capable, true);
+  const resumePacket = packets.filter((p) => p.method === 'thread/resume').at(-1);
+  assert.equal(resumePacket.params.config.mcp_servers.gempt_board.env.GEMPT_AGENT_NAME, 'scout');
+
+  // 4) Native fork from a legacy parent session lacking codex_dynamic_board_tools MUST also attach gempt_board MCP fallback.
+  const legacySession = JSON.parse(readFileSync(scoutSessionFile, 'utf8'));
+  delete legacySession.codex_dynamic_board_tools;
+  writeFileSync(scoutSessionFile, JSON.stringify(legacySession));
+  const forked = await handleSwarmAction({ ...context, action: 'add', name: 'child', brief: 'Follow up', fork: 'scout' }, f);
+  const childRun = await waitForRun(forked.workers[0].run_id, { ...f, timeoutSec: 10 });
+  assert.equal(childRun.fork_mode, 'native', childRun.error);
+  assert.equal(childRun.board_tool_mode, 'mcp');
+  assert.equal(childRun.board_capable, true);
+  const forkPacket = packets.filter((p) => p.method === 'thread/fork').at(-1);
+  assert.equal(forkPacket.params.config.mcp_servers.gempt_board.env.GEMPT_AGENT_NAME, 'child');
+  const status2 = await handleSwarmAction({ ...context, action: 'status' }, f);
+  const childWorker = status2.roster.find((w) => w.name === 'child');
+  assert.equal(childWorker.implicit, false);
+  assert.equal(childWorker.board_capable, true);
 });
