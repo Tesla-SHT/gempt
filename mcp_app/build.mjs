@@ -69,9 +69,11 @@ try {
   const nodeModules = join(temporary, "node_modules");
   esbuild = require("esbuild");
   const consoleSource = new URL('../magpie_plugin/ui/', source);
-  const [template, styles, consoleHtml, consoleCss] = await Promise.all([
+  const [template, styles, swarmCss, hiveCss, consoleHtml, consoleCss] = await Promise.all([
     readFile(new URL("index.html", source), "utf8"),
     readFile(new URL("styles.css", source), "utf8"),
+    readFile(new URL("swarm.css", source), "utf8"),
+    readFile(new URL("hive.css", source), "utf8"),
     readFile(new URL("index.html", consoleSource), "utf8"),
     readFile(new URL("styles.css", consoleSource), "utf8"),
   ]);
@@ -93,7 +95,7 @@ try {
     .replace(/\r?\n[ \t]*<meta http-equiv="Content-Security-Policy"[^>]*>/, "")
     .replace(/<style>[\s\S]*?<\/style>/, '<link rel="stylesheet" href="./styles.css">')
     .replace('<script>/* SCRIPT */</script>', '<script defer src="./app.js"></script>');
-  const splitCss = styles + "\n" + consoleCss;
+  const splitCss = [styles, swarmCss, hiveCss, consoleCss].join("\n");
   await mkdir(httpOutput, { recursive: true });
   await Promise.all([
     writeFile(new URL("index.html", httpOutput), splitHtml.replace(/\r\n/g, "\n"), "utf8"),

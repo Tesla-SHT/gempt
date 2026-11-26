@@ -563,8 +563,10 @@ function gifFilename(title) {
 
 // Resolve recipients at the post's sequence, including historical subscriptions.
 export function graphSnapshot(overview, board) {
-  const members = [{ name: "coordinator", role: "coordinator", status: "working" },
-    ...(overview.roster || []).filter(w => w.name !== "coordinator").map(w => ({ ...w, status: w.state }))];
+  const members = (overview.roster || []).map(worker => ({ ...worker, status: worker.state ?? worker.status }));
+  if (!members.some(({ name }) => name === "coordinator")) {
+    members.unshift({ name: "coordinator", role: "coordinator", status: "waiting" });
+  }
   const names = members.map(w => w.name);
   const active = activeAt(overview.channels, board);
   const subscriptions = members.map(w => channelsAt(w.name, w.channels, board));
@@ -644,13 +646,17 @@ export function renderMentions(svg, snapshot, { step, expandAll, hideInactive })
   const upto = step ?? snapshot.messages.length;
   const key = [width, expandAll, hideInactive].join("/");
   let view = graphViews.get(svg);
+  const sequence = snapshot.messages[upto - 1]?.seq;
+  const animate = sequence != null && (step != null
+    ? view?.step !== step || view?.sequence !== sequence
+    : view?.step == null && view?.sequence != null && sequence > view.sequence);
   if (!view || view.snapshot !== snapshot || view.key !== key || upto < view.upto) {
     view = { snapshot, key, acc: createGraphAccumulator(snapshot, snapshot.messages, { expandAll, hideInactive, width }) };
     graphViews.set(svg, view);
   }
   view.acc.advanceTo(upto);
-  view.upto = upto;
-  const g = view.acc.snapshot({ replaying: step != null });
+  view.upto = upto; view.sequence = sequence; view.step = step;
+  const g = view.acc.snapshot({ replaying: step != null || animate });
   svg.setAttribute("viewBox", `0 0 ${width} ${g.height}`);
   const defs = svgNode("defs");
   const marker = svgNode("marker", { id: "swarm-edge-arrow", viewBox: "0 0 10 10", refX: 8.5, refY: 5, markerUnits: "userSpaceOnUse", markerWidth: 8, markerHeight: 8, orient: "auto" });
@@ -674,7 +680,7 @@ export function renderMentions(svg, snapshot, { step, expandAll, hideInactive })
     }
     if (current) {
       const dot = svgNode("circle", { r: 4, class: "sw-moving-dot" });
-      if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      if (!animate || matchMedia("(prefers-reduced-motion: reduce)").matches) {
         dot.setAttribute("cx", p.end.x); dot.setAttribute("cy", p.end.y);
       } else dot.append(svgNode("animateMotion", { path: p.d, dur: "0.9s", begin: "indefinite", fill: "freeze" }));
       layers[3].append(dot);
