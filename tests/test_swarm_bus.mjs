@@ -199,8 +199,8 @@ test('external linked worktree Swarm scopes the board and verifies swarm and wor
   git('worktree', 'add', '--detach', tree);
   git('worktree', 'add', '--detach', workerTree);
 
-  const opts = { sessionsDir, workspaceRoots: [repo] };
-  const unrelated = { sessionsDir, workspaceRoots: [other] };
+  const opts = { sessionsDir, configPath: join(dir, 'config.json'), workspaceRoots: [repo] };
+  const unrelated = { ...opts, workspaceRoots: [other] };
   const swarm_id = 'sw-linked';
   await ensureSwarm({ swarmId: swarm_id, cwd: tree, sessionsDir });
   await upsertWorker(swarm_id, { name: 'builder', worktree_path: workerTree, source_cwd: repo }, opts);
@@ -1411,7 +1411,7 @@ test('board_wait and turn-finish guard deliver racing posts; quota resumes only 
 test('shared HTTP and sidecar routes expose channel actions, filtered history, raw files and scoped access', async (t) => {
   const sessionsDir = makeTmp(t), id = 'api-native', ws = join(sessionsDir, 'repo');
   mkdirSync(ws);
-  const opts = { sessionsDir, workspaceRoots: [ws] };
+  const opts = { sessionsDir, configPath: join(sessionsDir, 'c.json'), workspaceRoots: [ws] };
   await ensureSwarm({ swarmId: id, title: 'Native', cwd: ws, sessionsDir });
   await upsertWorker(id, { name: 'w-1', state: 'waiting', task_summary: 'test' }, opts);
   const route = async (operation, args, post = false, options = opts) => {
@@ -1437,7 +1437,7 @@ test('shared HTTP and sidecar routes expose channel actions, filtered history, r
   assert.equal(JSON.parse((await raw('members')).content).members['w-1'].added_by, 'coordinator');
   assert.equal(JSON.parse((await raw('plan')).content).tasks['w-1'], 'test');
   await assert.rejects(route('raw', { swarm_id: id, kind: 'board' }, false, { ...opts, workspaceRoots: [join(sessionsDir, 'elsewhere')] }), (e) => e.status === 403);
-  const server = await startServer({ sessionsDir, configPath: join(sessionsDir, 'c.json'),
+  const server = await startServer({ sessionsDir, configPath: opts.configPath,
     magpieConfigDir: join(sessionsDir, 'magpie'), manageAppServer: false, port: 0 });
   t.after(() => server.close());
   const base = 'http://127.0.0.1:' + server.port;
@@ -1749,6 +1749,36 @@ test('auto_summary runs after interim [progress] posts, skips after [done] or [h
   assert.equal(fin3.auto_post, null);
   assert.equal(fin3.board_posts_worker, 1);
   assert.equal(fin3.board_posts_auto, 0);
+});
+
+test('Raw tab snapshot flags require an explicit true in either environment variable', async (t) => {
+  const sessionsDir = makeTmp(t);
+  const options = { sessionsDir, conversationId: 'raw-tab-owner' };
+  await ensureSwarm({ swarmId: 'raw-tab', hostConversationId: options.conversationId, cwd: sessionsDir, sessionsDir });
+  const keys = ['SWARM_RAW_TAB', 'GEMPT_SWARM_RAW_TAB'];
+  for (const key of keys) {
+    const previous = process.env[key];
+    t.after(() => {
+      if (previous === undefined) delete process.env[key];
+      else process.env[key] = previous;
+    });
+    delete process.env[key];
+  }
+  const snapshot = async (enabled, query = {}) => {
+    const snap = await runSwarmOperation('snapshot', query, options);
+    assert.equal(snap.rawTab, enabled);
+    assert.equal(snap.flags.rawTab, enabled);
+    return snap;
+  };
+  const initial = await snapshot(false);
+  for (const key of keys) {
+    process.env[key] = 'true';
+    const enabled = await snapshot(true, { etag: initial.etag });
+    process.env[key] = 'TRUE';
+    await snapshot(false, { etag: enabled.etag });
+    process.env[key] = '1';
+  }
+  await snapshot(false);
 });
 
 test('native snapshot aliases resolve a conversation and preserve sparse cursor, tail, delta, reset and raw contracts', async (t) => {

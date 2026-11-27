@@ -111,7 +111,11 @@ test("bundle inputs include scoped styles and the inline narrator bootstrap", ()
   const html = readFileSync(new URL("index.html", bundleDir), "utf8");
   const css = readFileSync(new URL("styles.css", bundleDir), "utf8");
   const js = readFileSync(new URL("app.js", bundleDir), "utf8");
-  for (const [, name] of template.matchAll(/id="swarm-subtab-([^"]+)"/g)) assert.ok(html.includes(`id="swarm-subtab-${name}"`));
+  for (const [, name] of template.matchAll(/id="swarm-subtab-([^"]+)"/g)) {
+    const button = html.match(new RegExp(`<button\\b[^>]* id="swarm-subtab-${name}"[^>]*>`))?.[0];
+    assert.ok(button, name);
+    assert.equal(/\shidden(?=[\s>])/.test(button), name === "raw", name);
+  }
   assert.doesNotMatch(html, /<meta\b[^>]*http-equiv\s*=\s*["']?Content-Security-Policy/i);
   assert.match(css, /#swarm-panel\s*\{\s*#swarm-hive-view/);
   assert.match(js, /FEEDBACK_INTENT/);

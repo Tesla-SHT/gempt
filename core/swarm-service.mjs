@@ -928,7 +928,8 @@ async function getSnapshot(args, options) {
   const members = membersFor(snap, options.env);
   const rosterKey = rosterKeyFor(snap);
   const plan = snap.plan ?? makePlan(snap);
-  const flags = { builtinOverview: true, graphTab: true, rawTab: true };
+  const flags = { builtinOverview: true, graphTab: true,
+    rawTab: process.env.SWARM_RAW_TAB === 'true' || process.env.GEMPT_SWARM_RAW_TAB === 'true' };
   const hasCursor = args.known !== undefined && args.since !== undefined;
   const count = snap.messages.length;
   const timeline = snap.native ? timelineKey(snap.messages) : null;
@@ -942,7 +943,7 @@ async function getSnapshot(args, options) {
   const allowedFiles = allowedViewFiles(snap, view, narrator, options);
   const raw = args.omitRaw ? undefined : snapshotRaw(snap, view);
   const etag = digest([snap.swarm.id, title, snap.self, rosterKey, snap.head, members, view, plan, frameLists,
-    snap.attention, snap.swarms, allowedFiles, args.tail || 0, !!args.omitRaw,
+    snap.attention, snap.swarms, allowedFiles, args.tail || 0, !!args.omitRaw, flags.rawTab,
     ...(snap.native ? [snap.source, snap.edges, snap.channels, snap.unseen, snap.rawKey, raw] : [])]) + (timeline ? '/' + timeline : '');
   const common = { ok: true, empty: false, conversationId: snap.conversationId,
     swarm: snap.swarm.id, swarm_id: snap.swarm.id, self: snap.self, member: snap.self,

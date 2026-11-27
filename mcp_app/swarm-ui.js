@@ -492,6 +492,15 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     if (latest) freshness.textContent = tr("最新消息 {0}", formatStamp(latest));
     const subtabs = $("swarm-subtabs");
     subtabs.hidden = false;
+    const rawTab = $("swarm-subtab-raw");
+    const showRaw = Boolean(overview?.rawTab || overview?.flags?.rawTab);
+    if (!showRaw && subtab === "raw") {
+      subtab = "board";
+      if (document.activeElement === rawTab || $("swarm-sub-raw").contains(document.activeElement)) {
+        $("swarm-subtab-board").focus();
+      }
+    }
+    rawTab.hidden = !showRaw;
     for (const name of tabs) {
       const tab = $(`swarm-subtab-${name}`);
       tab.setAttribute("aria-selected", String(subtab === name));
@@ -1413,7 +1422,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
   }
 
   function setSubtab(next, { focus = false } = {}) {
-    if (!tabs.includes(next)) return;
+    if (!tabs.includes(next) || $(`swarm-subtab-${next}`).hidden) return;
     if (next !== "graph") stopReplay();
     if (next !== "overview") removeNarratorFrame();
     subtab = next;
@@ -1771,9 +1780,10 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
     btn?.addEventListener("keydown", (event) => {
       if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
         event.preventDefault();
-        const next = event.key === "Home" ? "overview"
-          : event.key === "End" ? tabs.at(-1)
-            : tabs[(tabs.indexOf(name) + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length];
+        const visible = tabs.filter(tab => !$(`swarm-subtab-${tab}`).hidden);
+        const next = event.key === "Home" ? visible[0]
+          : event.key === "End" ? visible.at(-1)
+            : visible[(visible.indexOf(name) + (event.key === "ArrowRight" ? 1 : -1) + visible.length) % visible.length];
         setSubtab(next, { focus: true });
       }
     });
