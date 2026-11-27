@@ -54,21 +54,24 @@ function resolveEngineContext(args = {}, options = {}) {
 }
 
 export function buildWorkerInstructions({ swarmId, workerName, brief, seq, registry = [], channels, role, forkContext, nativeParent, shardInstruction, owner = 'coordinator' }) {
+  const cliRead = '- If board tools are unavailable, the CLI uses the swarm and worker identity from your environment. Use `gempt board read` for posts (`--seqs N` for a doorbell) and `gempt board roster` for members.';
+  const cliWait = '- When idle, call board_wait or run `gempt board wait --since N` with the highest seq you actually read. The default wakes on mentions. Use `--no-mentions-only` to wake on visible posts. End your turn when the result contains `parked: true`.';
   const reporting = [
     `- Use \`board_post\` as the main channel for Swarm coordination and delivery. Before ending a completed assignment, you must post \`@${owner} [done] <concise summary>\`.`,
     '- For a direct handoff, tag only the next actor and use `@peer [handoff] <next action>`. After a doorbell, call `board_read` with the referenced #seq in `seqs`.',
     '- Handle routine companion edits within scope, including matching .h/.hpp files, local tests, and non-architectural edge cases. Record decisions in the final report.',
     '- Use `ask_gemini` only for high-risk or destructive actions that need a decision, or a product or requirements ambiguity the repository cannot resolve.',
+    cliRead,
+    '- Use `gempt board post "TEXT"` to report. `gempt board ask "QUESTION"` asks the coordinator and parks you for a reply. Manage helpers with `gempt board swarm ACTION [--args-json JSON]`.',
+    cliWait,
   ];
   const protocol = [
     'Shared message board protocol:',
     ...reporting,
     '- Use `board_read` to inspect recent messages or specific `#seq` posts, and `board_roster` to see teammates and states.',
     '- To attach screenshots on the board, include lines formatted as: `Screenshot: /absolute/path/to/file.png | caption`.',
-    '- CLI fallback (if needed): `gempt board post/read/roster` (GEMPT_SWARM_ID, GEMPT_AGENT_NAME, GEMPT_SESSIONS_DIR are set in env).',
     '- @name is a wakeup doorbell, never a CC. Label interim updates [progress].',
     '- Refer to earlier posts by #seq. Keep posts short, ignore your own posts, and never greet or acknowledge ("ready", "acknowledged").',
-    '- When idle call board_wait with the highest seq you actually read. End the turn when parked. mentions_only defaults to true. Set it to false to wake on visible work.',
     '- Use board_swarm to add and manage your own helpers. Ownership is recorded in added_by. Kill your helpers when finished. Killing a parent leaves its helpers running.',
     '- Never poll the board.',
     '- Start your assigned slice immediately. Claim only unassigned work, and read the board before claiming it.',
@@ -82,6 +85,9 @@ export function buildWorkerInstructions({ swarmId, workerName, brief, seq, regis
   return [
     ...(role === 'narrator' ? [
       'Narrator role: observe only. Use board_read and board_wait. Publish Overview data through board_publish_view (view object and optional html). Never post on the board or take on worker work. Use feedback_ack.through_seq and feedback_ack.text to acknowledge feedback in the view.',
+      cliRead,
+      '- Inspect the swarm with `gempt board swarm status` or `gempt board swarm models`. Publish by piping {"view": {...}, "html": "..."} to `gempt board publish-view --args-json -`. The html field is optional.',
+      cliWait,
     ] : nativeParent ? [`Everything before this turn is @${nativeParent}'s context. Do not redo its work or answer its old requests.`] : protocol),
     '',
     '## Assignment',

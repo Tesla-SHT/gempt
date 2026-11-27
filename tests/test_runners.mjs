@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { getExecutionConfig, RUNNER_IDS } from '../core/config.mjs';
 import { runSwarmOperation } from '../core/swarm-service.mjs';
 import { handleTool } from '../core/mcp-server.mjs';
+import { createBoardMcpConfigFile, getBoardMcpSpec } from '../core/runners/journal.mjs';
 import { runLiveOperation } from '../core/live-service.mjs';
 import {
   buildRunnerBaseEnv, findExecutable, getExecutableSearchDirs, resolveExecutableInvocation,
@@ -166,6 +167,18 @@ test('Windows Gemini detection skips a stale Unix shim and continues searching P
   assert.equal(resolveRunnerId(request).path, windowsShim);
   const cfg = { execution: { cli_paths: { gemini: staleShim } } };
   assert.equal(resolveRunnerId({ ...request, cfg }).path, windowsShim);
+});
+
+test('board MCP config and spec omit empty run IDs and forward the supplied run ID', (t) => {
+  const options = { runDir: makeTmp(t), swarmId: 'sw-config', swarmAgent: 'analyst' };
+  for (const id of ['run-1', undefined, '', '  ']) {
+    const input = { ...options, env: id === undefined ? {} : { GEMPT_RUN_ID: id } };
+    const config = JSON.parse(readFileSync(createBoardMcpConfigFile(input), 'utf8'));
+    const environment = getBoardMcpSpec(input).environment;
+    assert.deepEqual(config.mcpServers.gempt_board.env, environment);
+    if (id?.trim()) assert.equal(environment.GEMPT_RUN_ID, id);
+    else assert.ok(!Object.hasOwn(environment, 'GEMPT_RUN_ID'));
+  }
 });
 
 test('claude adapter runs stream-json end-to-end with ANTHROPIC_BASE_URL, --permission-mode, --mcp-config, --resume, and Live journal', async (t) => {
@@ -333,6 +346,7 @@ console.log(JSON.stringify({
   assert.equal(childCall.swarmAgent, 'claude-child');
   assert.ok(childCall.mcpContent.mcpServers.gempt_board);
   assert.equal(invocations[1].mcpContent, null);
+  assert.ok(!invocations[1].args.includes('--allowedTools'));
   assert.equal(invocations[1].swarmId, null);
   assert.doesNotMatch(invocations[1].stdinText, /board_post|Shared message board protocol/);
   assert.equal(invocations.length, 2);
@@ -342,6 +356,9 @@ console.log(JSON.stringify({
   assert.equal(invocations[0].swarmId, 'sw-claude');
   assert.equal(invocations[0].swarmAgent, 'analyst');
   assert.ok(invocations[0].mcpContent?.mcpServers?.gempt_board?.args?.[0]?.endsWith('board-mcp.mjs'));
+  assert.equal(invocations[0].mcpContent.mcpServers.gempt_board.env.GEMPT_RUN_ID, r1.run_id);
+  const allowIndex = invocations[0].args.indexOf('--allowedTools');
+  assert.deepEqual(invocations[0].args.slice(allowIndex, allowIndex + 2), ['--allowedTools', 'mcp__gempt_board__*']);
   assert.ok(invocations[1].args.includes('--resume') && invocations[1].args.includes('claude-sess-777'));
 });
 
@@ -575,7 +592,8 @@ if (sub === 'serve') {
   assert.equal(ocBoard.roster[0].cli, 'opencode');
 
   const events = readFileSync(logFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
-  assert.ok(events.some((e) => e.mode === 'serve' && e.action === 'create_session' && e.ocConfig?.mcp?.gempt_board));
+  const firstSession = events.find((e) => e.mode === 'serve' && e.action === 'create_session');
+  assert.equal(firstSession.ocConfig.mcp.gempt_board.environment.GEMPT_RUN_ID, r1.run_id);
   assert.ok(events.some((e) => e.mode === 'serve' && e.action === 'steer'));
   assert.ok(events.some((e) => e.mode === 'serve' && e.action === 'abort'));
   assert.ok(events.some((e) => e.mode === 'run' && e.args.includes('--format') && e.args.includes('json')));
@@ -650,7 +668,7 @@ const summary = {
   sessionsDir: process.env.GEMPT_SESSIONS_DIR || '',
 };
 if (id === 'gemini') {
-  summary.prompt = process.argv[process.argv.indexOf('-p') + 1];
+  summary.prompt = process.argv[process.argv.indexOf('-p') + 1] || stdinText;
   summary.resume = process.argv.includes('--resume') && process.argv[process.argv.indexOf('--resume') + 1];
   if (summary.prompt === 'temporary failure') {
     console.log(JSON.stringify({ type: 'result', status: 'error', error: { message: 'transient error' } }));

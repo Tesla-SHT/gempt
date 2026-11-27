@@ -4,13 +4,16 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
 import { installAgy } from '../core/agy-install.mjs';
+import { handleBoardMcpTool } from '../core/board-mcp.mjs';
 import { agyInstallPaths } from '../core/bundle-paths.mjs';
 import { CLI_CHOICES } from '../core/config.mjs';
+import { readHostContext } from '../core/host-context.mjs';
 import { handleTool, serveStdio } from '../core/mcp-server.mjs';
 import { ACTIVE_STATES, buildReplyCommand, buildWaitCommand, dispatchRun, interruptRun, pendingToolCalls,
   readRun, replyToolCall, steerRun, tryDelegateDispatch, validateExecTimeoutSec } from '../core/runs.mjs';
 import { resolvePath } from '../core/state.mjs';
-import { handleBoardAction, handleSwarmAction } from '../core/swarm-engine.mjs';
+import { resolveSwarmId } from '../core/swarm-bus.mjs';
+import { handleSwarmAction } from '../core/swarm-engine.mjs';
 import { runWait, STATUS_USAGE, waitUsage } from '../core/wait.mjs';
 import { pruneShareWorktrees } from '../core/worktrees.mjs';
 import { findCodexCli } from '../magpie_plugin/lib/app-server-manager.mjs';
@@ -36,7 +39,8 @@ const commands = {
   'reply-tool': { failure: flag, text: string, message: string }, 'prune-worktrees': { 'max-age-hours': string },
   'print-mcp': { installed: flag, target: string },
   board: { swarm: string, from: string, kind: string, text: string, since: string, seqs: string, limit: string,
-    'reply-to': string, channel: string },
+    'reply-to': string, channel: string, 'request-id': string, status: flag, 'no-mentions-only': flag,
+    reason: string, context: string, media: { ...string, multiple: true }, 'args-json': string },
   swarm: { swarm: string, cwd: string, title: string, brief: string, 'brief-file': string, access: string, workspace: string,
     cli: string, model: string, tier: string, n: string, task: { ...string, multiple: true }, reason: string,
     'goal-title': string, 'goal-line': string, 'plan-json': string, host: string, family: string, timeout: string },
@@ -58,9 +62,13 @@ const usages = {
   'prune-worktrees': '[REPO_PATH] [--max-age-hours N]',
   'print-mcp': '[--installed] [--target PATH]',
   board: {
-    post: '[TEXT|- | --text TEXT|-] [--from NAME] [--kind KIND] [--channel NAME] [--reply-to SEQ]',
-    read: '[--since SEQ] [--seqs SEQ[,SEQ...]] [--limit N] [--channel NAME]',
+    post: '[TEXT|- | --text TEXT|-] [--from NAME] [--kind KIND] [--channel NAME] [--reply-to SEQ] [--request-id ID]',
+    read: '[--since SEQ] [--seqs SEQ[,SEQ...]] [--limit N] [--channel NAME] [--status]',
     roster: '',
+    wait: '--since N [--no-mentions-only] [--channel NAME]',
+    ask: 'QUESTION|- [--reason visual_check|clarification|decision|blocked] [--context TEXT] [--media PATH ...]',
+    'publish-view': '[- | --args-json JSON|-]',
+    swarm: '<status|add|kill|model|models|channel> [--args-json JSON|-]',
   },
   swarm: {
     title: '[TITLE | --title TITLE]',
@@ -132,6 +140,81 @@ function parseTimeout(value) {
   return validateExecTimeoutSec(value.trim() ? Number(value) : NaN);
 }
 
+async function readBoardJson(source) {
+  const args = JSON.parse(source === '-' ? await readStdin() : source);
+  if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Expected a JSON object.');
+  return args;
+}
+
+async function boardToolArgs(action, operand, values) {
+  if (operand !== undefined && ['read', 'roster', 'wait'].includes(action)) {
+    throw new Error(`Unexpected arguments for gempt board ${action}.`);
+  }
+  switch (action) {
+    case 'post': {
+      if (operand !== undefined && values.text !== undefined) throw new Error('Choose TEXT or --text.');
+      let text = values.text ?? operand;
+      if (text === '-' || (text === undefined && !process.stdin.isTTY)) text = await readStdin();
+      return { text, kind: values.kind, channel: values.channel, request_id: values['request-id'],
+        reply_to_seq: values['reply-to'] !== undefined ? Number(values['reply-to']) : undefined };
+    }
+    case 'read':
+      return { since: values.since !== undefined ? Number(values.since) : undefined,
+        seqs: values.seqs ? values.seqs.split(',').map((s) => Number(s.trim())).filter(Boolean) : undefined,
+        limit: values.limit !== undefined ? Number(values.limit) : undefined, channel: values.channel, status: values.status };
+    case 'roster':
+      return {};
+    case 'wait':
+      if (!values.since?.trim()) throw new Error('board wait requires --since N.');
+      return { since: Number(values.since), channel: values.channel, mentions_only: !values['no-mentions-only'] };
+    case 'ask':
+      return { question: operand === '-' ? await readStdin() : operand,
+        reason: choose(values.reason, ['visual_check', 'clarification', 'decision', 'blocked'], '--reason'),
+        context: values.context, media_paths: values.media };
+    case 'publish-view': {
+      if (operand !== undefined && (operand !== '-' || values['args-json'] !== undefined)) throw new Error('Use --args-json JSON or stdin.');
+      const source = values['args-json'] ?? operand;
+      if (source === undefined && process.stdin.isTTY) throw new Error('A narrator view is required.');
+      return readBoardJson(source ?? '-');
+    }
+    case 'swarm': {
+      if (!operand) throw new Error('A swarm action is required.');
+      const args = values['args-json'] === undefined ? {} : await readBoardJson(values['args-json']);
+      return { ...args, action: operand };
+    }
+  }
+}
+
+async function runBoard(action, operand, values, configPath) {
+  choose(action, Object.keys(usages.board), 'board action');
+  const env = process.env;
+  const options = { configPath };
+  if (env.GEMPT_SWARM_ID && env.GEMPT_AGENT_NAME) {
+    if (values.from !== undefined && values.from.trim().toLowerCase() !== env.GEMPT_AGENT_NAME.trim().toLowerCase()) {
+      throw new Error('--from must match GEMPT_AGENT_NAME for a swarm worker.');
+    }
+    if (values.swarm !== undefined && values.swarm.trim() !== env.GEMPT_SWARM_ID.trim()) {
+      throw new Error('--swarm must match GEMPT_SWARM_ID for a swarm worker.');
+    }
+  } else {
+    const swarmId = (values.swarm || env.GEMPT_SWARM_ID)?.trim();
+    if (!swarmId) options.hostConversationId = readHostContext(configPath).conversation_id;
+    options.swarmId = swarmId || await resolveSwarmId({
+      hostConversationId: options.hostConversationId, sessionsDir: env.GEMPT_SESSIONS_DIR });
+    const from = values.from || env.GEMPT_AGENT_NAME || 'coordinator';
+    // Manual post/read/roster historically run as coordinator, with a selectable sender or viewer.
+    if (['post', 'read', 'roster'].includes(action)) {
+      options.agentName = 'coordinator';
+      options.defaultFrom = from;
+    } else {
+      options.agentName = from;
+    }
+  }
+  const args = await boardToolArgs(action, operand, values);
+  const response = await handleBoardMcpTool(`board_${action.replace('-', '_')}`, args, env, options);
+  return JSON.parse(response.content[0].text);
+}
+
 async function main([command, ...args]) {
   if (!command || command === '--help' || command === '-h') {
     console.log(usage());
@@ -139,11 +222,26 @@ async function main([command, ...args]) {
   }
   if (command === 'wait') return runWait(args, { command: 'gempt wait' });
   if (!Object.hasOwn(commands, command)) throw new Error(`Unknown command '${command}'.`);
-  const { values, positionals } = parseArgs({ args, allowPositionals: true,
+  const { values, positionals, tokens } = parseArgs({ args, allowPositionals: true, tokens: command === 'board',
     options: { ...commands[command], config: string, json: flag, help: { ...flag, short: 'h' } } });
   if (values.help) {
     console.log(usage(command, positionals[0]));
     return;
+  }
+  // parseArgs collects repeated --media flags. Also collect consecutive paths after each flag.
+  if (command === 'board' && positionals[0] === 'ask' && values.media && positionals.length > 2) {
+    values.media = [];
+    positionals.length = 0;
+    let readingMedia = false;
+    for (const token of tokens) {
+      if (token.kind === 'positional') {
+        if (readingMedia && positionals.length >= 2) values.media.push(token.value);
+        else positionals.push(token.value);
+      } else {
+        readingMedia = token.name === 'media';
+        if (readingMedia) values.media.push(token.value);
+      }
+    }
   }
   const sizes = {
     tier: [0, 1], sandbox: [0, 1], effort: [0, 1], steer: [2], interrupt: [1], status: [0, 1],
@@ -286,31 +384,9 @@ async function main([command, ...args]) {
       result = pruneShareWorktrees(repoPath, { maxAgeMs: hours * 3600 * 1000 });
       break;
     }
-    case 'board': {
-      const sub = choose(value, ['post', 'read', 'roster'], 'board action');
-      if (second !== undefined && (sub !== 'post' || values.text !== undefined)) {
-        throw new Error(`Unexpected arguments for gempt board ${sub}.`);
-      }
-      const swarmId = values.swarm || process.env.GEMPT_SWARM_ID;
-      let text = values.text ?? second;
-      if (sub === 'post' && (text === '-' || (text === undefined && !process.stdin.isTTY))) {
-        text = await readStdin();
-      }
-      const seqs = values.seqs ? values.seqs.split(',').map((s) => Number(s.trim())).filter(Boolean) : undefined;
-      result = await handleBoardAction({
-        action: sub,
-        swarm_id: swarmId,
-        from: values.from || process.env.GEMPT_AGENT_NAME || 'coordinator',
-        kind: values.kind,
-        channel: values.channel,
-        text,
-        since: values.since !== undefined ? Number(values.since) : undefined,
-        seqs,
-        limit: values.limit !== undefined ? Number(values.limit) : undefined,
-        reply_to_seq: values['reply-to'] !== undefined ? Number(values['reply-to']) : undefined,
-      }, { configPath });
+    case 'board':
+      result = await runBoard(value, second, values, configPath);
       break;
-    }
     case 'swarm': {
       const sub = choose(value, ['title', 'plan', 'add', 'status', 'kill', 'model'], 'swarm action');
       const requiresName = ['add', 'kill', 'model'].includes(sub);

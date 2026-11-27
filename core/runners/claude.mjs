@@ -131,7 +131,7 @@ export const claudeRunner = {
       env,
     });
     if (mcpConfigPath) {
-      args.push('--mcp-config', mcpConfigPath);
+      args.push('--mcp-config', mcpConfigPath, '--allowedTools', 'mcp__gempt_board__*');
     }
 
     const childEnv = buildRunnerBaseEnv({

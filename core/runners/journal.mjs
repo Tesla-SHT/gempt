@@ -22,24 +22,14 @@ export function isRunInterruptRequested(runDir) {
   return existsSync(interruptMarkerPath(runDir));
 }
 
-export function createBoardMcpConfigFile({ runDir, swarmId, swarmAgent, sessionsDir, configPath, env = process.env }) {
-  if (!swarmId || !swarmAgent) return '';
+export function createBoardMcpConfigFile({ runDir, ...options }) {
+  const spec = getBoardMcpSpec(options);
+  if (!spec) return '';
   mkdirSync(runDir, { recursive: true });
-  const nodeBin = resolveNodeExecutable({ env });
   const mcpPath = join(runDir, 'board-mcp.json');
+  const [command, ...args] = spec.command;
   const payload = {
-    mcpServers: {
-      gempt_board: {
-        command: nodeBin,
-        args: [BOARD_MCP_PATH],
-        env: {
-          GEMPT_SWARM_ID: String(swarmId),
-          GEMPT_AGENT_NAME: String(swarmAgent),
-          ...(sessionsDir ? { GEMPT_SESSIONS_DIR: String(sessionsDir) } : {}),
-          ...(configPath ? { GEMPT_CONFIG: String(configPath) } : {}),
-        },
-      },
-    },
+    mcpServers: { gempt_board: { command, args, env: spec.environment } },
   };
   writeFileSync(mcpPath, JSON.stringify(payload, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
   return mcpPath;
@@ -54,6 +44,7 @@ export function getBoardMcpSpec({ swarmId, swarmAgent, sessionsDir, configPath, 
     environment: {
       GEMPT_SWARM_ID: String(swarmId),
       GEMPT_AGENT_NAME: String(swarmAgent),
+      ...(env.GEMPT_RUN_ID?.trim() ? { GEMPT_RUN_ID: env.GEMPT_RUN_ID } : {}),
       ...(sessionsDir ? { GEMPT_SESSIONS_DIR: String(sessionsDir) } : {}),
       ...(configPath ? { GEMPT_CONFIG: String(configPath) } : {}),
     },

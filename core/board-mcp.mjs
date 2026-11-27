@@ -91,7 +91,8 @@ export async function handleBoardMcpTool(name, args = {}, env = process.env, ove
       text: args.text, kind: args.kind, reply_to_seq: args.reply_to_seq, request_id: args.request_id, channel: args.channel,
       since: args.since, seqs: args.seqs, limit: args.limit, status: args.status, mentions_only: args.mentions_only,
       meta: runId ? { run_id: runId } : undefined,
-      action: name.slice(6), swarm_id: swarmId, from: agentName,
+      action: name.slice(6), swarm_id: swarmId,
+      from: agentName === 'coordinator' ? options.defaultFrom || agentName : agentName,
     }, options);
     return textResult(result);
   }
@@ -116,7 +117,7 @@ export async function handleBoardMcpTool(name, args = {}, env = process.env, ove
       kind: 'question',
       text: `@coordinator ${q}${ctxLine}${mediaLines}`,
       meta: { ...(runId ? { run_id: runId } : {}), reason: args.reason || 'clarification' },
-    }, { sessionsDir });
+    }, { sessionsDir, hostConversationId: overrides.hostConversationId });
     try {
       await updateWorker(swarmId, agentName, { state: 'waiting_reply', parked_on: `board_ask:${message.seq}` }, { sessionsDir });
     } catch { /* Sender may not be a roster worker (e.g., external helper). */ }

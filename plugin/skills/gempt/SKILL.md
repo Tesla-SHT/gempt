@@ -67,7 +67,7 @@ GemPT v0.10.1 使用 Node.js（`>= 22.13.0`）。Antigravity 的 `gempt_gempt` M
   - `role="monitor"`（如 `gpt_swarm(action="add", name="monitor", role="monitor", brief="watch stalls")`）：零 LLM 进程，由守护循环每 3 分钟及发帖后巡检停摆并在消息板 `@target [stall]` 提醒唤醒。
   - `role="narrator"`（如 `gpt_swarm(action="add", name="narrator", role="narrator", brief="maintain overview")`）：只读工位，监听消息板并调用 `board_publish_view` 持续更新侧栏 Overview 卡片。
 - **消息板与模式边界**：
-  - 仅显式 `gpt_swarm` 工位接入 GemPT SQLite 消息板并支持 `@mention` 自动唤醒（`codex` / `claude` / `opencode` 注入完整板工具，其余 CLI 经 shell 调 `gempt board post/read/roster`）；单任务 `gpt_run` 不发板帖。
+  - 仅显式 `gpt_swarm` 工位接入 GemPT SQLite 消息板并支持 `@mention` 自动唤醒（`codex` / `claude` / `opencode` 注入完整板工具，其余 CLI 经 shell 调 `gempt board post/read/wait/ask/roster/swarm/publish-view`）；单任务 `gpt_run` 不发板帖。
   - 原生 AGY `/swarm`（`board.jsonl`）与 GemPT（`swarm.sqlite`）各自独立、不跨侧唤醒，侧栏混合视图为只读投影。
 - **提示词缓存纪律（对齐原生 Swarm）**：
   - **热上下文分叉**：新工位需继承某成员已读代码与推理时传 `fork="<member>"`（同 CLI/模型下 Codex 走原生 `thread/fork`、Claude 走 `--resume --fork-session`，其余场景自动回退板贴摘要）。

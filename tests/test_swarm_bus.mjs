@@ -1,6 +1,6 @@
 import { createGifEncoder } from '../mcp_app/swarm-gif.js';
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer, get as httpGet } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -22,7 +22,7 @@ import {
   activeAt, channelMentions, channelRegistry, channelsAt, countsUnread, currentChannels, effectiveChannels,
   homeChannelOf, memberView, mentions, mentionsIn, mentionsOf, seesIn, validateChannelName, validateTopic, visibleUnread,
 } from '../core/swarm-channels.mjs';
-import { handleBoardMcpTool } from '../core/board-mcp.mjs';
+import { BOARD_TOOLS, handleBoardMcpTool } from '../core/board-mcp.mjs';
 import { buildWorkerInstructions, handleBoardAction, handleSwarmAction, onWorkerTurnFinished } from '../core/swarm-engine.mjs';
 import { ensureBranchWorkspace, ensureShareWorktree } from '../core/worktrees.mjs';
 import { narratorDirectory, publishNarratorView, readNarratorView } from '../core/swarm-narrator.mjs';
@@ -702,6 +702,123 @@ test('MCP tools, Magpie plugin tools, and CLI subcommands expose gpt_swarm / gpt
   ], { env, encoding: 'utf8' }));
   assert.equal(cliStatus.title, 'CLI Swarm');
   assert.equal(cliStatus.head, 1);
+});
+
+function boardCli(t) {
+  const sessionsDir = makeTmp(t);
+  const configPath = join(sessionsDir, 'config.json');
+  const run = (args, { agent, input, error } = {}) => {
+    const env = { ...process.env, GEMPT_CONFIG: configPath, GEMPT_SESSIONS_DIR: sessionsDir,
+      GEMPT_SWARM_ID: agent ? 'sw-cli' : '', GEMPT_AGENT_NAME: agent || '', GEMPT_RUN_ID: agent ? 'cli-run' : '' };
+    const result = spawnSync(process.execPath, [join(REPO_ROOT, 'bin/gempt.mjs'), 'board', ...args], {
+      cwd: sessionsDir, env, input, encoding: 'utf8', timeout: 10000,
+    });
+    assert.equal(result.status, error ? 1 : 0, result.error?.message || result.stderr);
+    if (error) {
+      assert.equal(result.stdout, '');
+      assert.match(result.stderr, error);
+    } else {
+      return args.includes('--help') ? result.stdout : JSON.parse(result.stdout);
+    }
+  };
+  return { sessionsDir, run };
+}
+
+test('board CLI exposes seven tools and preserves manual sender, host resolution and stdin', async (t) => {
+  const { sessionsDir, run } = boardCli(t);
+  const help = run(['--help']);
+  assert.deepEqual([...help.matchAll(/gempt board ([\w-]+)/g)].map((m) => m[1]).sort(),
+    BOARD_TOOLS.map(({ name }) => name.slice(6).replace('_', '-')).sort());
+  writeFileSync(join(sessionsDir, 'host-context.json'), JSON.stringify({ conversation_id: 'host-cli' }));
+  const swarmId = await resolveSwarmId({ hostConversationId: 'host-cli', sessionsDir });
+  const post = ['post', '--from', 'human', '--request-id', 'submit-1'];
+  const first = run(post, { input: 'From stdin' });
+  assert.equal(first.swarm_id, swarmId);
+  assert.equal(first.message.from_agent, 'human');
+  assert.equal(first.message.request_id, 'submit-1');
+  assert.deepEqual(run([...post, '--text', '-'], { input: 'Retry' }).message, first.message);
+  const reply = run(['post', '-', '--swarm', swarmId, '--reply-to', String(first.head)], { input: 'Reply' });
+  assert.equal(reply.message.reply_to_seq, first.head);
+  assert.equal(reply.message.from_agent, 'coordinator');
+  assert.deepEqual(run(['read', '--since', '0', '--limit', '1']).messages, [first.message]);
+  assert.deepEqual(run(['read', '--seqs', String(reply.head)]).messages, [reply.message]);
+  assert.deepEqual(run(['read', '--status']), run(['roster', '--from', 'human']));
+  assert.equal(run(['swarm', 'status']).swarm_id, swarmId);
+  assert.match(run(['wait', '--since', String(reply.head)]).wait_command, /--since 2/);
+  writeFileSync(join(sessionsDir, 'host-context.json'), JSON.stringify({ conversation_id: 'next-host' }));
+  const asked = run(['ask', 'Which scope?', '--from', 'reviewer']);
+  assert.equal(asked.swarm_id, await resolveSwarmId({ hostConversationId: 'next-host', sessionsDir }));
+  assert.equal(asked.message.from_agent, 'reviewer');
+});
+
+test('board CLI binds worker identity, parks at the read cursor and asks with attachments', async (t) => {
+  const { sessionsDir, run } = boardCli(t);
+  const agent = 'helper';
+  const opts = { sessionsDir };
+  await upsertWorker('sw-cli', { name: agent, state: 'working' }, opts);
+  const post = run(['post', 'progress', '--from', agent], { agent });
+  assert.equal(post.message.from_agent, agent);
+  assert.equal(post.message.meta.run_id, 'cli-run');
+  run(['post', 'wrong sender', '--from', 'coordinator'], { agent, error: /--from/ });
+  run(['read', '--swarm', 'other'], { agent, error: /--swarm/ });
+  assert.deepEqual(run(['read', '--status'], { agent }), run(['roster'], { agent }));
+  const read = run(['read'], { agent });
+  const since = String(read.messages.at(-1).seq);
+  run(['wait'], { agent, error: /requires --since/ });
+  run(['wait', '--since', '99'], { agent, error: /actually read/ });
+  assert.equal(run(['wait', '--since', since], { agent }).parked, true);
+  const note = await postBoardMessage('sw-cli', { from: 'coordinator', text: 'Visible update' }, opts);
+  const waiting = run(['wait', '--since', since, '--no-mentions-only', '--channel', 'main'], { agent });
+  assert.equal(waiting.mentions_only, false);
+  assert.equal(waiting.parked, false);
+  assert.deepEqual(waiting.messages.map((m) => m.seq), [note.seq]);
+  const media = ['/tmp/one.png', '/tmp/two views.png', '/tmp/three.png'];
+  const ask = run(['ask', '-', '--reason', 'decision', '--context', 'Shipping tomorrow',
+    '--media', media[0], media[1], '--media', media[2]], { agent, input: 'Which layout?' });
+  assert.equal(ask.message.from_agent, agent);
+  assert.equal(ask.message.kind, 'question');
+  assert.match(ask.message.text, /^@coordinator Which layout\?\n\nContext: Shipping tomorrow/);
+  assert.deepEqual(ask.message.meta, { reason: 'decision', run_id: 'cli-run' });
+  assert.deepEqual(ask.message.screenshots.map((s) => s.path), media);
+  assert.equal((await getWorker('sw-cli', agent, opts)).parked_on, `board_ask:${ask.message.seq}`);
+  run(['ask', 'question', '--reason', 'typo'], { agent, error: /Invalid --reason/ });
+});
+
+test('board CLI preserves helper ownership and narrator restrictions for swarm and publish-view', async (t) => {
+  const { sessionsDir, run } = boardCli(t);
+  const opts = { sessionsDir };
+  for (const worker of [
+    { name: 'owner' }, { name: 'peer' }, { name: 'child', added_by: 'owner' }, { name: 'observer', role: 'narrator' },
+  ]) await upsertWorker('sw-cli', { state: 'stopped', ...worker }, opts);
+  const peer = { agent: 'peer' };
+  const owner = { agent: 'owner' };
+  const narrator = { agent: 'observer' };
+  const target = ['--args-json', '{"name":"child","actor":"coordinator","added_by":"peer","swarm_id":"other"}'];
+  run(['swarm', 'kill', ...target], { ...peer, error: /Cannot kill/ });
+  run(['swarm', 'model', ...target], { ...peer, error: /Cannot switch/ });
+  run(['swarm', 'add', '--args-json', '{"name":"child2","brief":"review","fork":"missing"}'], { ...peer, error: /unknown member/ });
+  assert.equal(run(['swarm', 'model', '--args-json', '{"name":"child","model":"new"}'], owner).worker.desired_model, 'new');
+  assert.equal(run(['swarm', 'kill', ...target], owner).worker.state, 'killed');
+  const channels = run(['swarm', 'channel', '--args-json', '-'], { ...owner, input: '{"op":"create","channel":"review","action":"kill"}' });
+  assert.ok(channels.channels.some((c) => c.name === 'review' && c.created_by === 'owner'));
+  run(['swarm', 'title'], { ...owner, error: /Unsupported worker swarm action/ });
+  run(['swarm', 'status', '--args-json', '[]'], { ...owner, error: /JSON object/ });
+  assert.ok(run(['swarm', 'models'], narrator).models.length);
+  assert.equal(run(['swarm', 'status'], narrator).swarm_id, 'sw-cli');
+  for (const args of [['post', 'write'], ['ask', 'write?'], ['swarm', 'channel', '--args-json', '{"op":"create","channel":"other"}']]) {
+    run(args, { ...narrator, error: /read-only/ });
+  }
+  run(['post', 'write', '--from', 'owner'], { ...narrator, error: /--from/ });
+  const payload = JSON.stringify({ view: { headline: 'Review' }, html: '<p>Review</p>' });
+  run(['publish-view', '--args-json', payload], { ...owner, error: /Only a live narrator/ });
+  run(['publish-view', '--from', 'observer', '--args-json', payload], { ...owner, error: /--from/ });
+  for (const args of [['--args-json', payload], ['--args-json', '-'], ['-'], []]) {
+    const published = run(['publish-view', ...args], { ...narrator, input: payload });
+    assert.equal(published.view.json.headline, 'Review');
+  }
+  assert.equal(readNarratorView(sessionsDir, 'sw-cli').html, '<p>Review</p>');
+  await killWorkerRecord('sw-cli', 'observer', opts);
+  run(['publish-view', '--args-json', payload], { ...narrator, error: /Only a live narrator/ });
 });
 
 test('runAppServer registers board_post/board_read/board_roster dynamic tools and bridges ask_gemini to board', async (t) => {
@@ -1771,6 +1888,15 @@ test('native fork instructions append concise board reporting protocol after sha
   assert.match(text, /@peer \[handoff\]/);
   assert.match(text, /board_read/);
   assert.match(text, /ask_gemini/);
+});
+
+test('board CLI instructions cover worker and narrator commands and the park contract', () => {
+  for (const role of [{}, { nativeParent: 'parent' }, { role: 'narrator' }]) {
+    const prompt = buildWorkerInstructions({ workerName: 'member', swarmId: 'test', brief: 'Review', seq: 1, ...role });
+    const commands = role.role === 'narrator' ? ['read', 'roster', 'swarm status', 'publish-view'] : ['read', 'roster', 'post', 'ask', 'swarm'];
+    for (const command of commands) assert.ok(prompt.includes(`gempt board ${command}`), command);
+    assert.match(prompt, /gempt board wait --since N.*highest seq you actually read.*End your turn.*parked: true/);
+  }
 });
 
 test('auto_summary runs after interim [progress] posts, skips after [done] or [handoff], and records turn board telemetry', async (t) => {

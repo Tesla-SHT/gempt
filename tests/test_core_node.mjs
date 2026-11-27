@@ -2870,12 +2870,15 @@ test('legacy Swarm config routes ordinary gpt_run to the implicit board, preserv
   const childMcp = packets.find((p) => p.method === 'thread/fork').params.config.mcp_servers.gempt_board;
   assert.equal(childMcp.env.GEMPT_SWARM_ID, swarm_id);
   assert.equal(childMcp.env.GEMPT_AGENT_NAME, 'reviewer');
+  assert.equal(childMcp.env.GEMPT_RUN_ID, child.run_id);
   assert.equal(childMcp.env.GEMPT_SESSIONS_DIR, f.sessionsDir);
   assert.match(childMcp.args[0], /board-mcp\.mjs$/);
   const wake = await handleBoardAction({ ...context, action: 'post', text: '@reviewer verify the board' }, f);
   const woke = await waitForRun(wake.deliveries[0].run_id, { ...f, timeoutSec: 10 });
   assert.equal(woke.state, 'finished', woke.error);
-  assert.deepEqual(packets.filter((p) => p.method === 'thread/resume').at(-1).params.config.mcp_servers.gempt_board, childMcp);
+  assert.deepEqual(packets.filter((p) => p.method === 'thread/resume').at(-1).params.config.mcp_servers.gempt_board, {
+    ...childMcp, env: { ...childMcp.env, GEMPT_RUN_ID: woke.run_id },
+  });
   controls.rejectForkConfig = true;
   const fallback = await handleSwarmAction({ ...context, action: 'add', name: 'fallback', brief: 'Review', fork: source }, f);
   const fresh = await waitForRun(fallback.workers[0].run_id, { ...f, timeoutSec: 10 });
