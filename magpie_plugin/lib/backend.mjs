@@ -9,7 +9,7 @@ import { GEMPT_VERSION } from '../../core/config.mjs';
 import { readRun, refreshRun } from '../../core/runs.mjs';
 import { resolveNodeExecutable } from '../../core/node-executable.mjs';
 import {
-  CLI_CHOICES, DEFAULT_CONSULT_TIMEOUT_SEC, DEFAULT_TIERS, DEFAULT_UTILITY, FEATURES, TIER_ORDER, VALID_FAILOVER_MODES, VALID_SANDBOXES,
+  CLI_CHOICES, configuredConsultTimeoutSec, DEFAULT_TIERS, DEFAULT_UTILITY, FEATURES, TIER_ORDER, VALID_FAILOVER_MODES, VALID_SANDBOXES,
   buildTierView, editAdvancedSettings, editDefaultSandbox, editEffortSettings, editPairing, editWorkSplit, expandUser,
   getExecutionConfig, getMcpEffort, getPairing, getUiLanguage, hasApiSnapshot, hasRuntimeConfig,
   isCodexModelId, normalizeDefaultTier, readJsonSafe, readPluginExecOption, readPluginMcpToolsOption,
@@ -363,7 +363,7 @@ export async function readState({ configPath, sessionsDir, magpieConfigDir, anti
     runners,
     available_runners: availableRunners,
     has_any_runner: availableRunners.length > 0,
-    consult_timeout_sec: rawCfg?.limits?.consult_timeout_sec ?? DEFAULT_CONSULT_TIMEOUT_SEC,
+    consult_timeout_sec: configuredConsultTimeoutSec(rawCfg?.limits),
     work_split: workSplit,
     codex_timeout_sec: configuredExecTimeoutSec(rawCfg?.codex),
     work_profiles: WORKLOAD.profiles,
@@ -478,10 +478,10 @@ export async function initSubscriptionConfig({ configPath, probeTimeoutMs = 2000
     ui: { language: getUiLanguage(existing) },
     limits: {
       max_internal_rounds: 3,
-      max_context_file_bytes: 131072,
-      max_total_context_bytes: 393216,
-      consult_timeout_sec: DEFAULT_CONSULT_TIMEOUT_SEC,
+      max_context_file_bytes: null,
+      max_total_context_bytes: null,
       ...existingLimits,
+      consult_timeout_sec: configuredConsultTimeoutSec(existingLimits),
     },
   };
 
@@ -532,7 +532,7 @@ export async function updateSettings(settings, { configPath, probeTimeoutMs = 20
       } catch (error) {
         return { ok: false, status: 400, error: error.message };
       }
-      return { next: { ...loaded.data, codex: { ...loaded.data.codex, timeout_sec: value, timeout_sec_customized: true } } };
+      return { next: { ...loaded.data, codex: { ...loaded.data.codex, timeout_sec: validateExecTimeoutSec(value), timeout_sec_customized: true } } };
     },
     default_sandbox: editDefaultSandbox,
     pairing: (loaded, value) => {
@@ -593,8 +593,11 @@ export async function updateSettings(settings, { configPath, probeTimeoutMs = 20
       draft.data = result.next;
       Object.assign(response, result.response);
     }
-    if (Number(draft.data.codex?.timeout_sec) === 600 && draft.data.codex?.timeout_sec_customized !== true) {
+    if ([600, 3600].includes(draft.data.codex?.timeout_sec) && draft.data.codex?.timeout_sec_customized !== true) {
       draft.data = { ...draft.data, codex: { ...draft.data.codex, timeout_sec: configuredExecTimeoutSec(draft.data.codex) } };
+    }
+    if (draft.data.limits?.consult_timeout_sec === 180 && draft.data.limits.consult_timeout_customized !== true) {
+      draft.data = { ...draft.data, limits: { ...draft.data.limits, consult_timeout_sec: null } };
     }
     if (candidate) return { ok: true, config: draft.data };
     return { next: draft.data, response: hasMode || hasEffort || keys.includes('default_sandbox') ? response : undefined };

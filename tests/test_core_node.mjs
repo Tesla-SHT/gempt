@@ -35,7 +35,8 @@ import { assertShareWorktree, ensureShareWorktree, pruneShareWorktrees,
 import { createAppServerManager } from '../magpie_plugin/lib/app-server-manager.mjs';
 import { probeGatewaySettings, readOverview, readRoutingSummary, readState, resetSettings, updateSettings } from '../magpie_plugin/lib/backend.mjs';
 import { dispatchPageApi } from '../magpie_plugin/lib/page-api.mjs';
-import { resolveExecTimeoutSec } from '../magpie_plugin/lib/routing.mjs';
+import { deadlineForTimeout, scheduleTimeout } from '../core/timeout.mjs';
+import { resolveExecTimeoutSec, validateExecTimeoutSec } from '../magpie_plugin/lib/routing.mjs';
 import { runAppServer } from '../magpie_plugin/lib/app-server-run.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -896,7 +897,16 @@ test('gempt run and ask accept shell input and share execution and consult sessi
 
   writeFileSync(join(repoSubdir, 'second.txt'), 'second attachment');
   const askArgs = ['ask', '--cwd', repoSubdir, '--tier', 'sonnet', '--host', 'coordinator', '--file', 'readme.txt', '--file', 'second.txt'];
-  const answer = await cli(askArgs, 'Summarize these files.');
+  const answer = await cli([...askArgs, '--max-output-tokens', '7'], 'Summarize these files.');
+  assert.equal(run.execution_timeout_sec, 90);
+  for (const flag of ['0', 'none', 'unlimited']) {
+    const unlimited = await cli(['run', '--goal', 'Inspect', '--access', 'inspect', '--timeout', flag]);
+    assert.equal(unlimited.execution_timeout_sec, null);
+    assert.equal(unlimited.deadline, null);
+    const finished = await waitForRun(unlimited.run_id, { ...f, timeoutSec: 5 });
+    assert.equal(finished.state, 'finished', finished.error);
+    assert.equal(finished.deadline, null);
+  }
   assert.match(answer.text, /Consult answer/);
   const consulted = JSON.parse(readFileSync(join(f.sessionsDir, answer.session_id + '.json'), 'utf8'));
   assert.equal(consulted.host_conversation_id, 'coordinator');
@@ -1887,7 +1897,6 @@ test('standalone NDJSON MCP serves the inline launcher and preserves cross-direc
   assert.equal((await request('resources/read', { uri: 'ui://unknown' })).error.code, -32002);
   assert.equal((await request('resources/read', { uri: 'ui://gempt/live.html' })).error.code, -32002);
   const { result } = await request('tools/call', { name: 'gpt_ctl', arguments: {} });
-  assert.ok(Buffer.byteLength(result.content[0].text) <= 500);
   const status = JSON.parse(result.content[0].text);
   assert.equal(status.active.length, 1);
   assert.equal(status.active[0].id, 'd'.repeat(32));
@@ -1896,7 +1905,7 @@ test('standalone NDJSON MCP serves the inline launcher and preserves cross-direc
   state(f, oversized, { state: 'failed', host_conversation_id: 'host', title: '🚦'.repeat(40),
     error: '🚧'.repeat(500) });
   const detail = (await request('tools/call', { name: 'gpt_ctl', arguments: { run_id: oversized } })).result;
-  assert.ok(Buffer.byteLength(detail.content[0].text) <= 500);
+  assert.equal(JSON.parse(detail.content[0].text).err, '🚧'.repeat(500));
   assert.equal(JSON.parse(detail.content[0].text).id, oversized);
   const asked = await request('tools/call', { name: 'gpt_ask', arguments: { goal: 'Summarize the fixture.', cwd: cross } });
   assert.equal(asked.result.isError, undefined, asked.result.content[0].text);
@@ -1919,7 +1928,7 @@ test('standalone NDJSON MCP serves the inline launcher and preserves cross-direc
     run_id: run.run_id, member_count: 1, sidecar_uri: 'sidecar://gempt/gempt_live/', auto_open_panel: true });
   const complete = await waitForRun(run.run_id, { ...f, timeoutSec: 5 });
   assert.equal(complete.result?.sandbox, 'read-only', complete.error);
-  assert.equal(complete.execution_timeout_sec, 3600);
+  assert.equal(complete.execution_timeout_sec, null);
   assert.equal(complete.host_conversation_id, 'host');
   assert.equal((await runLiveOperation('open', { run_id: run.run_id }, panel)).run_id, run.run_id);
   const otherPanel = { ...panel, conversationId: 'other' };
@@ -2011,15 +2020,44 @@ test('waiting_gemini pauses execution timeout and deadline, and gpt_run validate
 
   // Verify gpt_run timeout_sec schema, bounds validation, and forwarding.
   const runSchema = TOOLS.find((tool) => tool.name === 'gpt_run').inputSchema.properties.timeout_sec;
-  assert.equal(runSchema.minimum, 30);
-  assert.equal(runSchema.maximum, 7200);
-  for (const bad of [29, 7201, NaN, Infinity, '60', null]) {
+  assert.deepEqual(runSchema.type, ['number', 'null']);
+  assert.equal(runSchema.minimum, 0);
+  assert.equal(runSchema.maximum, undefined);
+  for (const bad of [-1, NaN, Infinity, '60']) {
     await assert.rejects(handleTool('gpt_run', { goal: 'Check timeout', cwd: f.cwd, timeout_sec: bad }, f.env, f), /Invalid timeout_sec/);
   }
-  const custom = await dispatchRun({ goal: 'Custom timeout run', cwd: f.cwd, timeout_sec: 7200, background: true }, f);
-  assert.equal(custom.execution_timeout_sec, 7200);
-  assert.ok(Math.abs(custom.deadline - Date.parse(custom.created_at) / 1000 - 7200) < 0.01);
+  const custom = await dispatchRun({ goal: 'Custom timeout run', cwd: f.cwd, timeout_sec: 9000, background: true }, f);
+  assert.equal(custom.execution_timeout_sec, 9000);
+  assert.ok(Math.abs(custom.deadline - Date.parse(custom.created_at) / 1000 - 9000) < 0.01);
   assert.equal((await waitForRun(custom.run_id, { ...f, timeoutSec: 5 })).state, 'finished');
+});
+
+test('unlimited defaults, explicit overrides and segmented timers preserve the entire budget', (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000 });
+  assert.equal(validateExecTimeoutSec(undefined), undefined);
+  for (const timeoutSec of [0, null]) {
+    assert.equal(validateExecTimeoutSec(timeoutSec), null);
+    assert.equal(deadlineForTimeout(timeoutSec), null);
+    assert.equal(scheduleTimeout(() => assert.fail('unexpected timer'), timeoutSec), undefined);
+    assert.equal(resolveExecTimeoutSec({ codex: { timeout_sec: 600, timeout_sec_customized: true }, timeoutSec }), null);
+  }
+  for (const legacy of [600, 3600]) {
+    assert.equal(resolveExecTimeoutSec({ codex: { timeout_sec: legacy }, effort: 'high' }), null);
+    assert.equal(resolveExecTimeoutSec({ codex: { timeout_sec: legacy, timeout_sec_customized: true } }), legacy);
+  }
+  assert.equal(resolveExecTimeoutSec(), null);
+  const maxMs = 2 ** 31 - 1;
+  let calls = 0;
+  const seconds = (maxMs + 100) / 1000;
+  const cancel = scheduleTimeout(() => assert.fail('cancelled timer fired'), seconds);
+  scheduleTimeout(() => calls++, seconds);
+  t.mock.timers.tick(maxMs);
+  assert.equal(calls, 0);
+  cancel();
+  t.mock.timers.tick(99);
+  assert.equal(calls, 0);
+  t.mock.timers.tick(1);
+  assert.equal(calls, 1);
 });
 
 test('execution clock survives 600s and early ask_gemini pauses before the start acknowledgement', async (t) => {
@@ -2037,12 +2075,15 @@ test('execution clock survives 600s and early ask_gemini pauses before the start
     });
   };
   const defaultId = 'a'.repeat(32);
-  const defaultRun = assert.rejects(start(defaultId, 'Hold this turn', resolveExecTimeoutSec()), /timed out after 3600s/);
+  const defaultRun = assert.rejects(start(defaultId, 'Hold this turn', resolveExecTimeoutSec()), /interrupt/i);
   await until(() => readRun(defaultId, f.sessionsDir).turn_id);
   t.mock.timers.tick(601_000);
   assert.equal(readRun(defaultId, f.sessionsDir).state, 'running');
   assert.equal(packets.some(({ method }) => method === 'turn/interrupt'), false);
   t.mock.timers.tick(2_999_000);
+  assert.equal(readRun(defaultId, f.sessionsDir).deadline, null);
+  assert.equal(packets.some(({ method }) => method === 'turn/interrupt'), false);
+  await interruptRun(defaultId, f);
   await defaultRun;
 
   const earlyId = 'b'.repeat(32);
@@ -2066,7 +2107,7 @@ test('execution clock survives 600s and early ask_gemini pauses before the start
   assert.equal(replyPacket.result.contentItems[0].text, 'Approved.');
   const resumed = readRun(earlyId, f.sessionsDir);
   assert.equal(resumed.waiting_gemini_sec, 60.1);
-  assert.equal(resumed.deadline - Date.now() / 1000, 25);
+  assert.equal(Math.round(resumed.deadline * 1000) - Date.now(), 25_000);
   t.mock.timers.tick(24_999);
   assert.equal(readRun(earlyId, f.sessionsDir).state, 'running');
   assert.equal(packets.filter(({ method }) => method === 'turn/interrupt').length, 1);
@@ -2080,16 +2121,21 @@ test('Console migrates the legacy timeout and preserves a deliberately saved 600
   const options = { ...f, root: f.cwd };
   const cfg = JSON.parse(readFileSync(f.configPath, 'utf8'));
   cfg.codex.timeout_sec = 600;
+  cfg.limits = { consult_timeout_sec: 180 };
   writeFileSync(f.configPath, JSON.stringify(cfg));
-  assert.equal((await readState(f)).codex_timeout_sec, 3600);
-  assert.equal(resolveExecTimeoutSec({ codex: cfg.codex, effort: 'high' }), 3600);
+  const migrated = await readState(f);
+  assert.equal(migrated.codex_timeout_sec, null);
+  assert.equal(migrated.consult_timeout_sec, null);
+  assert.equal(resolveExecTimeoutSec({ codex: cfg.codex, effort: 'high' }), null);
   assert.equal(resolveExecTimeoutSec({ codex: { timeout_sec: 300 }, effort: 'high' }), 900);
   assert.equal(resolveExecTimeoutSec({ codex: cfg.codex, effort: 'high', timeoutSec: 30 }), 30);
   const run = await dispatchRun({ goal: 'Check migrated timeout', cwd: f.cwd, background: true }, f);
-  assert.equal(run.execution_timeout_sec, 3600);
-  assert.equal((await waitForRun(run.run_id, { ...f, timeoutSec: 5 })).execution_timeout_sec, 3600);
+  assert.equal(run.execution_timeout_sec, null);
+  assert.equal((await waitForRun(run.run_id, { ...f, timeoutSec: 5 })).execution_timeout_sec, null);
   assert.equal((await updateSettings({ work_split: 'balanced' }, f)).ok, true);
-  assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).codex.timeout_sec, 3600);
+  const persisted = JSON.parse(readFileSync(f.configPath, 'utf8'));
+  assert.equal(persisted.codex.timeout_sec, null);
+  assert.equal(persisted.limits.consult_timeout_sec, null);
   const api = async (method, path, body) => dispatchPageApi({
     method, url: new URL(path, 'http://localhost'), rawPath: path.split('?', 1)[0], readBody: () => body,
   }, { ...options, appServer });
@@ -2101,11 +2147,18 @@ test('Console migrates the legacy timeout and preserves a deliberately saved 600
   assert.equal(saved.status, 200);
   const overview = (await api('GET', '/api/overview')).body;
   assert.equal(overview.codex_timeout_sec, 600);
+  for (const value of [180, 0, null]) {
+    assert.equal((await api('POST', '/api/settings', { limits: { consult_timeout_sec: value } })).status, 200);
+    const savedLimits = JSON.parse(readFileSync(f.configPath, 'utf8')).limits;
+    assert.equal(savedLimits.consult_timeout_sec, value || null);
+    assert.equal(savedLimits.consult_timeout_customized, true);
+    assert.equal((await readState(f)).consult_timeout_sec, value || null);
+  }
   assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).codex.timeout_sec_customized, true);
   const customized = await dispatchRun({ goal: 'Check saved timeout', cwd: f.cwd, background: true }, f);
   assert.equal(customized.execution_timeout_sec, 600);
   assert.equal((await waitForRun(customized.run_id, { ...f, timeoutSec: 5 })).execution_timeout_sec, 600);
-  assert.equal((await api('POST', '/api/settings', { codex_timeout_sec: 29 })).status, 400);
+  assert.equal((await api('POST', '/api/settings', { codex_timeout_sec: -1 })).status, 400);
   assert.equal((await api('POST', '/api/tier', { tier: 'invalid' })).status, 400);
   const unsafeRestart = await api('POST', '/api/app-server/restart', { force: true });
   assert.equal(unsafeRestart.status, 409);
@@ -2401,20 +2454,40 @@ test('wait surfaces reply commands for a single run and returns early for pendin
   }
 });
 
+test('wait receipts preserve full text, changes, commands and failed verification output', (t) => {
+  const f = fixture(t);
+  const id = 'a'.repeat(32);
+  const text = '检查😀'.repeat(3000);
+  const files = Array.from({ length: 31 }, (_, i) => 'M file-' + i);
+  const commands = Array.from({ length: 7 }, (_, i) => ({ command: i + text, exit_code: 1 }));
+  state(f, id, { state: 'finished', goal: text, text, before: { status: '' }, after: { status: files.join('\n') },
+    progress: { last_message: text, recent_commands: commands },
+    result: { text, verification: { status: 'failed', checks: [{ command: 'verify', exit_code: 1, output: text }] } } });
+  const receipt = jsonProcess(process.execPath, [cliPath, 'wait', id], { env: f.env });
+  assert.deepEqual([receipt.text, receipt.goal, receipt.progress.last_message, receipt.result.text], Array(4).fill(text));
+  assert.deepEqual(receipt.changed_files, files);
+  assert.deepEqual(receipt.progress.recent_commands, commands);
+  assert.equal(receipt.result.verification.checks[0].output_tail, text);
+});
+
 test('wait keeps heartbeats on stderr and uses journal, progress and state activity before stalling', async (t) => {
   const f = fixture(t);
   const id = 'd'.repeat(32);
   const file = join(runDirectory(id, f.sessionsDir), 'state.json');
   const journal = join(dirname(file), 'events.jsonl');
-  const stale = new Date(Date.now() - 60_000);
-  for (const signal of ['journal', 'progress', 'state']) {
+  const stale = new Date(Date.now() - 600_000);
+  for (const signal of ['journal', 'progress', 'state', 'reconnect']) {
     const now = new Date();
     state(f, id, { progress: { phase: 'testing', updated_at: (signal === 'progress' ? now : stale).toISOString(),
       ...(signal === 'journal' ? {} : { recent_commands: [{ command: 'npm test' }] }) } });
     if (signal !== 'state') utimesSync(file, stale, stale);
     writeFileSync(journal, JSON.stringify({ method: 'item/started', params: { item: { command: 'npm test' } } }) + '\n');
+    if (signal === 'reconnect') appendFileSync(journal, JSON.stringify({
+      method: 'error', params: { error: { message: 'Reconnecting to server…' }, willRetry: true },
+    }) + '\n');
     if (signal !== 'journal') utimesSync(journal, stale, stale);
-    const child = spawn(process.execPath, [cliPath, 'wait', id, '--heartbeat-sec', '.02', '--stale-sec', '5'], {
+    const child = spawn(process.execPath, [cliPath, 'wait', id, '--heartbeat-sec', '.02',
+      ...(signal === 'reconnect' ? [] : ['--stale-sec', '5'])], {
       env: f.env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 8000,
     });
     let stdout = '', stderr = '', finished = false;
@@ -2434,7 +2507,8 @@ test('wait keeps heartbeats on stderr and uses journal, progress and state activ
       clearInterval(writer);
     }
     assert.equal(JSON.parse(stdout).state, 'finished');
-    assert.match(stderr, /^\[gempt-wait \d+m\d+s\] .*running · phase=testing · last_cmd="npm test" · updated \d+s ago/m, signal);
+    if (signal === 'reconnect') assert.match(stderr, /error="Reconnecting to server…" · updated \d+s ago/);
+    else assert.match(stderr, /^\[gempt-wait \d+m\d+s\] .*running · phase=testing · last_cmd="npm test" · updated \d+s ago/m, signal);
   }
 
   const wait = (...options) => spawnSync(process.execPath, [cliPath, 'wait', id, '--stale-sec', '.5', '--heartbeat-sec', '0',
@@ -2696,7 +2770,7 @@ test('Console API saves nested preferences and supports gateway actions', async 
     magpie: { base_url: url + '/', api_key: secret, api_key_env: '' },
     routing_policy: { excluded_models: ['  model-to-skip  '] },
     utility: { model: 'vendor/model:small', reasoning_effort: 'high' },
-    limits: { consult_timeout_sec: 1800 },
+    limits: { consult_timeout_sec: 18000.5 },
     codex: { cli_path: '', extra_args: [' --strict-config '] },
     ui: { language: 'en' },
   });
@@ -2709,13 +2783,13 @@ test('Console API saves nested preferences and supports gateway actions', async 
   assert.equal(state.utility.reasoning_effort, 'high');
   assert.deepEqual(state.excluded_models, ['model-to-skip']);
   assert.deepEqual(state.codex_extra_args, ['--strict-config']);
-  assert.equal(state.consult_timeout_sec, 1800);
+  assert.equal(state.consult_timeout_sec, 18000.5);
   assert.equal(state.ui.language, 'en');
   assert.ok(!JSON.stringify(state).includes(secret));
   assert.equal(readRoutingSummary(f).ui.language, 'en');
   assert.equal((await set({ swarm_shell_model: 'shell bad' })).ok, false);
   assert.equal((await set({ codex: { extra_args: [1] } })).ok, false);
-  assert.equal((await set({ limits: { consult_timeout_sec: 14 } })).ok, false);
+  assert.equal((await set({ limits: { consult_timeout_sec: -1 } })).ok, false);
   assert.equal((await set({ ui: { language: 'de' } })).ok, false);
   assert.equal((await set({ codex: { extra_args: ['bad\nflag'] } })).ok, false);
   const probe = await probeGatewaySettings({ base_url: url, api_key: 'draft-secret' }, f);

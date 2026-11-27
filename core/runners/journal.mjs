@@ -1,3 +1,4 @@
+import { deadlineForTimeout } from '../timeout.mjs';
 import { cacheHitRatio, normalizeUsage } from '../token-usage.mjs';
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -81,8 +82,8 @@ export function createRunJournal({
   record.cli = cli;
   record.model = model;
   record.sandbox = sandbox;
-  record.execution_timeout_sec = timeoutSec;
-  record.deadline = (startMs + timeoutSec * 1000) / 1000;
+  record.execution_timeout_sec = timeoutSec || null;
+  record.deadline = deadlineForTimeout(timeoutSec, startMs);
   record.codex_thread_id = resolvedThreadId;
   record.runner_session_id = threadId || null;
   record.turn_id = resolvedTurnId;
@@ -156,7 +157,7 @@ export function createRunJournal({
     const id = String(itemId || 'msg-1');
     const next = (messages.get(id) || '') + delta;
     messages.set(id, next);
-    progress.last_message = next.slice(-1500);
+    progress.last_message = next;
     emit('item/agentMessage/delta', { itemId: id, delta });
     save(false);
   };
@@ -166,7 +167,7 @@ export function createRunJournal({
     if (!clean) return;
     const id = String(itemId || `msg-${messages.size + 1}`);
     messages.set(id, clean);
-    progress.last_message = clean.slice(-1500);
+    progress.last_message = clean;
     emit('item/completed', { item: { id, type: 'agentMessage', text: clean } });
     save(true);
   };
@@ -184,7 +185,7 @@ export function createRunJournal({
     const next = {
       command: String(command || prev.command || ''),
       exit_code: Number.isInteger(exitCode) ? exitCode : prev.exit_code,
-      output: String(output || prev.output || '').slice(-4000),
+      output: String(output || prev.output || ''),
     };
     commands.set(cmdId, next);
     progress.recent_commands = [...commands.values()].slice(-5);

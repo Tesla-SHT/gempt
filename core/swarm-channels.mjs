@@ -239,7 +239,6 @@ export function visibleUnread(name, role, current, msgs, lastRead, registry) {
   return n;
 }
 
-export const MAX_MESSAGE_BYTES = 65536;
 export const MAX_TOPIC_BYTES = 200;
 
 export function validateChannelName(name) {

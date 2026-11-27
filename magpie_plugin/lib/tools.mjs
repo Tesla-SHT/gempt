@@ -1,3 +1,4 @@
+import { scheduleTimeout } from '../../core/timeout.mjs';
 /**
  * Zero-dependency native Magpie tool definitions for GemPT.
  *
@@ -19,11 +20,11 @@ import { detectAvailableRunners, getRunner, resolveRunnerId } from '../../core/r
 import { listActiveRoster } from '../../core/runs.mjs';
 import { upsertRunLineage } from '../../core/swarm-bus.mjs';
 import { validateSessionId } from '../../core/state.mjs';
-import { TOOLS } from '../../core/tool-schemas.mjs';
-import { CLI_CHOICES, codexAppServerExtraArgs, getMcpEffort, getPairing, hasRuntimeConfig, isPairingModelId } from '../../core/config.mjs';
+import { TOOLS, outputTokensSchema, timeoutSchema } from '../../core/tool-schemas.mjs';
+import { configuredConsultTimeoutSec, CLI_CHOICES, codexAppServerExtraArgs, getMcpEffort, getPairing, hasRuntimeConfig, isPairingModelId } from '../../core/config.mjs';
 import { pickDelegatePlan } from '../../core/magpie.mjs';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, openSync, readSync, realpathSync, rmSync, statSync, closeSync } from 'node:fs';
+import { existsSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, closeSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import { homedir } from 'node:os';
@@ -65,8 +66,7 @@ const CONSULT_TIERS = ['chore', ...TIER_ORDER];
 const VALID_EFFORTS_SET = new Set(VALID_EFFORTS);
 const VALID_API_MODES = new Set(['responses', 'chat']);
 const SANDBOX_RANK = Object.freeze({ 'read-only': 0, 'workspace-write': 1, 'danger-full-access': 2 });
-const MAX_CONTEXT_FILE_BYTES = 131072;
-const MAX_TOTAL_CONTEXT_BYTES = 393216;
+const MAX_GATEWAY_RESPONSE_BYTES = 128 * 1024 * 1024;
 const EXEC_STRIP_ENV = [
   'CODEX_WINDOWS_REGISTERED_CORE',
   'CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY',
@@ -182,7 +182,10 @@ function isSecretPath(relPath) {
   return false;
 }
 
-function readContextFiles(filePaths, cwd, { maxFileBytes = MAX_CONTEXT_FILE_BYTES, maxTotalBytes = MAX_TOTAL_CONTEXT_BYTES } = {}) {
+function readContextFiles(filePaths, cwd, limits = {}) {
+  const byteLimit = (value) => Number.isFinite(value) && value > 0 ? Math.floor(value) : Infinity;
+  const maxFileBytes = byteLimit(limits.max_context_file_bytes);
+  const maxTotalBytes = byteLimit(limits.max_total_context_bytes);
   const list = Array.isArray(filePaths) ? filePaths : [];
   const blocks = [];
   const warnings = [];
@@ -227,19 +230,25 @@ function readContextFiles(filePaths, cwd, { maxFileBytes = MAX_CONTEXT_FILE_BYTE
     const remaining = maxTotalBytes - totalUsed;
     if (remaining <= 0) {
       warnings.push(`Total context budget (${maxTotalBytes} bytes) reached; skipped ${resolvedFile}`);
-      break;
+      continue;
     }
 
     const limit = Math.min(maxFileBytes, remaining);
-    const buf = Buffer.alloc(limit + 1);
-    let bytesRead = 0;
+    let buf;
     let fd;
     try {
-      fd = openSync(resolvedFile, 'r');
-      while (bytesRead < buf.length) {
-        const n = readSync(fd, buf, bytesRead, buf.length - bytesRead, bytesRead);
-        if (n <= 0) break;
-        bytesRead += n;
+      if (st.size <= limit) {
+        buf = readFileSync(resolvedFile);
+      } else {
+        fd = openSync(resolvedFile, 'r');
+        buf = Buffer.alloc(limit + 1);
+        let offset = 0;
+        while (offset < buf.length) {
+          const n = readSync(fd, buf, offset, buf.length - offset, null);
+          if (!n) break;
+          offset += n;
+        }
+        buf = buf.subarray(0, offset);
       }
     } catch (err) {
       warnings.push(`Failed to read ${resolvedFile}: ${err.message}`);
@@ -250,21 +259,23 @@ function readContextFiles(filePaths, cwd, { maxFileBytes = MAX_CONTEXT_FILE_BYTE
       }
     }
 
-    const sampleEnd = Math.min(bytesRead, 4096);
-    if (buf.subarray(0, sampleEnd).includes(0)) {
+    if (buf.includes(0)) {
       warnings.push(`Skipped binary file: ${resolvedFile}`);
       continue;
     }
 
-    const truncated = bytesRead > limit;
-    const sliceLen = truncated ? limit : bytesRead;
+    const truncated = buf.length > limit;
+    let sliceLen = Math.min(buf.length, limit);
+    while (truncated && sliceLen > 0 && (buf[sliceLen] & 0xc0) === 0x80) sliceLen--;
     const sliced = buf.subarray(0, sliceLen);
     totalUsed += sliceLen;
     const text = sliced.toString('utf-8');
     const lines = text.split(/\r?\n/);
     let numbered = lines.map((line, idx) => `${idx + 1}: ${line}`).join('\n');
     if (truncated) {
-      numbered += `\n... [truncated at ${limit} bytes of ${st.size} total bytes]`;
+      const warning = `truncated at ${sliceLen} bytes of ${Math.max(st.size, buf.length)} total bytes`;
+      numbered += `\n... [${warning}]`;
+      warnings.push(`${resolvedFile}: ${warning}`);
     }
     blocks.push({ path: resolvedFile, content: numbered });
   }
@@ -322,7 +333,7 @@ function buildExecPrompt({
   return sections.join('\n\n');
 }
 
-function postGatewayJson(url, { apiKey = '', payload = {}, timeoutMs = 180000 } = {}) {
+function postGatewayJson(url, { apiKey = '', payload = {}, timeoutSec = null } = {}) {
   let parsed;
   try {
     parsed = new URL(url);
@@ -342,10 +353,12 @@ function postGatewayJson(url, { apiKey = '', payload = {}, timeoutMs = 180000 } 
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
   return new Promise((resolveReq, rejectReq) => {
+    let cancelIdleTimer;
     let settled = false;
     const finish = (err, val) => {
       if (settled) return;
       settled = true;
+      cancelIdleTimer?.();
       if (err) rejectReq(err);
       else resolveReq(val);
     };
@@ -356,16 +369,25 @@ function postGatewayJson(url, { apiKey = '', payload = {}, timeoutMs = 180000 } 
         finish(Object.assign(new Error(`Magpie HTTP ${res.statusCode} redirect rejected at ${url}`), { statusCode: res.statusCode }));
         return;
       }
+      const tooLarge = () => {
+        const error = Object.assign(new Error(`Magpie response exceeds ${MAX_GATEWAY_RESPONSE_BYTES} bytes at ${url}`),
+          { code: 'ERR_GEMPT_RESPONSE_TOO_LARGE' });
+        finish(error);
+        res.destroy(error);
+      };
+      res.on('error', (err) => finish(err));
+      if (Number(res.headers['content-length']) > MAX_GATEWAY_RESPONSE_BYTES) return tooLarge();
       const chunks = [];
       let total = 0;
       res.on('data', (chunk) => {
         total += chunk.length;
-        if (total <= 8 * 1024 * 1024) chunks.push(chunk);
+        if (total > MAX_GATEWAY_RESPONSE_BYTES) return tooLarge();
+        chunks.push(chunk);
       });
       res.on('end', () => {
         const raw = Buffer.concat(chunks).toString('utf-8');
         if (res.statusCode < 200 || res.statusCode >= 300) {
-          finish(Object.assign(new Error(`Magpie HTTP ${res.statusCode} at ${url}: ${raw.slice(0, 800)}`), { statusCode: res.statusCode }));
+          finish(Object.assign(new Error(`Magpie HTTP ${res.statusCode} at ${url}: ${raw}`), { statusCode: res.statusCode }));
           return;
         }
         try {
@@ -381,9 +403,21 @@ function postGatewayJson(url, { apiKey = '', payload = {}, timeoutMs = 180000 } 
       });
     });
 
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error(`Magpie request timed out after ${Math.round(timeoutMs / 1000)}s at ${url}`));
-    });
+    if (timeoutSec > 0) {
+      const timedOut = () => req.destroy(new Error(`Magpie request timed out after ${timeoutSec}s at ${url}`));
+      // Track socket inactivity in safe timer segments, including budgets longer than 24.85 days.
+      const reset = () => {
+        cancelIdleTimer?.();
+        if (!settled) cancelIdleTimer = scheduleTimeout(timedOut, timeoutSec);
+      };
+      req.on('socket', (socket) => {
+        reset();
+        socket.on('data', reset);
+        req.once('close', () => socket.off('data', reset));
+      });
+      req.on('drain', reset);
+      req.on('finish', reset);
+    }
     req.on('error', (err) => finish(err));
     req.write(bodyStr);
     req.end();
@@ -423,48 +457,53 @@ function extractChatText(data) {
   return '';
 }
 
-async function callResponses({ cacheKey, baseUrl, apiKey, model, messages, reasoningEffort = '', instructions = '', maxOutputTokens = 16384, timeoutMs = 180000 }) {
+async function callResponses({ cacheKey, baseUrl, apiKey, model, messages, reasoningEffort = '', instructions = '', maxOutputTokens = null, timeoutSec = null }) {
   const url = `${baseUrl.replace(/\/+$/, '')}/v1/responses`;
-  const payload = { model, input: messages, max_output_tokens: maxOutputTokens };
+  const payload = { model, input: messages };
+  if (maxOutputTokens != null) payload.max_output_tokens = maxOutputTokens;
   if (String(instructions || '').trim()) payload.instructions = String(instructions).trim();
   if (reasoningEffort && reasoningEffort !== 'none') payload.reasoning = { effort: reasoningEffort };
 
   let data;
   try {
-    data = await postGatewayJson(url, { apiKey, timeoutMs,
+    data = await postGatewayJson(url, { apiKey, timeoutSec,
       payload: cacheKey ? { ...payload, prompt_cache_key: cacheKey } : payload });
   } catch (err) {
     if (!cacheKey || ![400, 422].includes(err.statusCode) || !/prompt_cache_key/i.test(err.message)) throw err;
-    data = await postGatewayJson(url, { apiKey, payload, timeoutMs });
+    data = await postGatewayJson(url, { apiKey, payload, timeoutSec });
   }
   if (data.error) {
     throw new Error(`Model error from ${model}: ${typeof data.error === 'string' ? data.error : JSON.stringify(data.error)}`);
   }
   const text = extractResponsesText(data);
   const usage = data.usage || {};
-  if (!text) {
+  const warning = data.status === 'incomplete'
+    ? `Model output incomplete (${data.incomplete_details?.reason || 'upstream output limit'}).` : null;
+  if (!text && !warning) {
     const rTokens = usage?.output_tokens_details?.reasoning_tokens;
     throw new Error(`Empty output from '${model}' on /v1/responses (status=${data.status}, reasoning_tokens=${rTokens ?? '-'}). Try increasing max_output_tokens.`);
   }
   return {
     text,
+    warning,
     servedModel: String(data.model || model),
     usage,
     responseId: data.id || '',
   };
 }
 
-async function callChat({ baseUrl, apiKey, model, messages, reasoningEffort = '', instructions = '', maxOutputTokens = 16384, timeoutMs = 180000 }) {
+async function callChat({ baseUrl, apiKey, model, messages, reasoningEffort = '', instructions = '', maxOutputTokens = null, timeoutSec = null }) {
   const url = `${baseUrl.replace(/\/+$/, '')}/v1/chat/completions`;
   const fullMessages = String(instructions || '').trim()
     ? [{ role: 'system', content: String(instructions).trim() }, ...messages]
     : [...messages];
-  const payload = { model, messages: fullMessages, max_tokens: maxOutputTokens };
+  const payload = { model, messages: fullMessages };
+  if (maxOutputTokens != null) payload.max_tokens = maxOutputTokens;
   if (reasoningEffort && reasoningEffort !== 'none') payload.reasoning_effort = reasoningEffort;
 
   let data;
   try {
-    data = await postGatewayJson(url, { apiKey, payload, timeoutMs });
+    data = await postGatewayJson(url, { apiKey, payload, timeoutSec });
   } catch (err) {
     const roleError = /\b(?:user|roles?|messages?)\b/i.test(err.message)
       && /\b(?:alternat(?:e|ing|ion)|consecutive|in a row|back.to.back)\b/i.test(err.message);
@@ -473,19 +512,22 @@ async function callChat({ baseUrl, apiKey, model, messages, reasoningEffort = ''
     const count = end < 0 ? messages.length : end;
     const merged = { role: 'user', content: messages.slice(0, count).map((m) => m.content).join('\n\n') };
     const retry = [...fullMessages.slice(0, fullMessages.length - messages.length), merged, ...messages.slice(count)];
-    data = await postGatewayJson(url, { apiKey, payload: { ...payload, messages: retry }, timeoutMs });
+    data = await postGatewayJson(url, { apiKey, payload: { ...payload, messages: retry }, timeoutSec });
   }
   if (data.error) {
     throw new Error(`Model error from ${model}: ${typeof data.error === 'string' ? data.error : JSON.stringify(data.error)}`);
   }
   const text = extractChatText(data);
   const usage = data.usage || {};
-  if (!text) {
+  const warning = data.choices?.[0]?.finish_reason === 'length'
+    ? 'Model output reached the upstream token limit (finish_reason=length).' : null;
+  if (!text && !warning) {
     const rTokens = usage?.completion_tokens_details?.reasoning_tokens;
     throw new Error(`Empty output from '${model}' on /v1/chat/completions (reasoning_tokens=${rTokens ?? '-'}). Try increasing max_output_tokens.`);
   }
   return {
     text,
+    warning,
     servedModel: String(data.model || model),
     usage,
     responseId: data.id || '',
@@ -592,16 +634,13 @@ async function resolveRuntimeConfig({ configPath, tierForProbe, allowUtilityOnly
       routing_policy: { default_tier: 'sonnet', failover_mode: 'paired' },
       tiers: synthTiers,
       utility: { ...DEFAULT_UTILITY, model: utilityModel },
-      limits: {
-        max_context_file_bytes: MAX_CONTEXT_FILE_BYTES,
-        max_total_context_bytes: MAX_TOTAL_CONTEXT_BYTES,
-        consult_timeout_sec: 180,
-      },
+      limits: {},
     },
   };
 }
 
 function shouldRetryFallback(err) {
+  if (err?.code === 'ERR_GEMPT_RESPONSE_TOO_LARGE') return false;
   const code = err?.statusCode;
   if (code === 429) return true;
   if (Number.isFinite(code) && code >= 500) return true;
@@ -650,7 +689,7 @@ function resolveTierTarget(cfg, requestedTier, { allowChore, escalate, effortOve
       model: String(util.model || DEFAULT_UTILITY.model),
       effort: effortOverride || String(util.reasoning_effort ?? 'low'),
       apiMode: String(util.api_mode || 'chat'),
-      maxOutputTokens: Number(util.max_output_tokens || 4096),
+      maxOutputTokens: util.max_output_tokens ?? null,
       fallbackModels: Array.isArray(util.fallback_models) ? util.fallback_models.filter(Boolean).map(String) : [],
       escalated: false,
     };
@@ -694,7 +733,7 @@ function resolveTierTarget(cfg, requestedTier, { allowChore, escalate, effortOve
     execModel: escalated ? model : (String(tierCfg.exec_model || '').trim() || model),
     effort,
     apiMode: String(tierCfg.api_mode || 'responses'),
-    maxOutputTokens: Number(tierCfg.max_output_tokens || 16384),
+    maxOutputTokens: tierCfg.max_output_tokens ?? null,
     fallbackModels,
     escalated,
   };
@@ -722,7 +761,7 @@ async function resolveGptTarget(runtime, args, priorSession, { allowChore = fals
         fallbackModels: [],
         effort: hasAstraFloor && EFFORT_RANK[effort] < EFFORT_RANK.medium ? 'medium' : effort,
         apiMode: 'responses',
-        maxOutputTokens: 16384,
+        maxOutputTokens: null,
         escalated: false,
       },
       autoEffortInfo: null,
@@ -740,7 +779,7 @@ async function resolveGptTarget(runtime, args, priorSession, { allowChore = fals
       ...paired,
       effort: hasAstraFloor && EFFORT_RANK[effort] < EFFORT_RANK.medium ? 'medium' : effort,
       apiMode: 'responses',
-      maxOutputTokens: 16384,
+      maxOutputTokens: null,
       escalated: false,
     };
   };
@@ -907,7 +946,7 @@ export function createExecutionTools({
           expected_output: { type: 'string', description: 'Required response structure.' },
           session_id: { type: 'string', description: 'Optional consult session_id to continue prior dialogue.' },
           reasoning_effort: { type: 'string', enum: [...VALID_EFFORTS_SET] },
-          max_output_tokens: { type: 'number', description: 'Max output tokens (256-128000).' },
+          max_output_tokens: outputTokensSchema,
           api_mode: { type: 'string', enum: ['responses', 'chat'] },
         },
         required: ['goal'],
@@ -941,9 +980,10 @@ export function createExecutionTools({
         const apiMode = args?.api_mode
           ? (VALID_API_MODES.has(args.api_mode) ? args.api_mode : (() => { throw new Error(`Invalid api_mode '${args.api_mode}'.`); })())
           : resolved.apiMode;
-        const maxTokens = args?.max_output_tokens !== undefined
-          ? Math.max(256, Math.min(128000, Number(args.max_output_tokens) || resolved.maxOutputTokens))
-          : resolved.maxOutputTokens;
+        const maxTokens = args.max_output_tokens === undefined ? resolved.maxOutputTokens : args.max_output_tokens;
+        if (maxTokens != null && !(Number.isInteger(maxTokens) && maxTokens > 0)) {
+          throw new Error('Invalid max_output_tokens: expected null or a positive integer.');
+        }
 
         let validatedCwd = '';
         if (args?.cwd || fileList.length) {
@@ -955,10 +995,7 @@ export function createExecutionTools({
         }
 
         const limits = runtime.cfg?.limits || {};
-        const { blocks, warnings } = readContextFiles([...fileList].sort(), validatedCwd, {
-          maxFileBytes: Number(limits.max_context_file_bytes) || MAX_CONTEXT_FILE_BYTES,
-          maxTotalBytes: Number(limits.max_total_context_bytes) || MAX_TOTAL_CONTEXT_BYTES,
-        });
+        const { blocks, warnings } = readContextFiles([...fileList].sort(), validatedCwd, limits);
 
         const priorTurns = Array.isArray(priorSession?.turns) ? priorSession.turns : [];
         blocks.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
@@ -970,9 +1007,9 @@ export function createExecutionTools({
           expectedOutput: args?.expected_output || '',
         }, !priorTurns.length);
         const messages = [...priorTurns, ...newMessages];
-        const configuredTimeout = Number(limits.consult_timeout_sec) || 180;
-        const timeoutMs = (limits.consult_timeout_customized === true ? configuredTimeout
-          : Math.max(10, configuredTimeout, effortTimeoutFloor(effort, { mode: 'consult' }))) * 1000;
+        const configuredTimeout = configuredConsultTimeoutSec(limits);
+        const timeoutSec = configuredTimeout === null || limits.consult_timeout_customized === true ? configuredTimeout
+          : Math.max(configuredTimeout, effortTimeoutFloor(effort, { mode: 'consult' }));
         const caller = apiMode === 'chat' ? callChat : callResponses;
         const sessionId = priorSession?.session_id || generateSessionId('consult');
         const keyParts = blocks.length ? [validatedCwd, ...blocks.map((block) => block.path)] : sessionId;
@@ -996,7 +1033,7 @@ export function createExecutionTools({
               reasoningEffort: effort,
               instructions: resolved.tier === 'chore' ? 'Be concise, faithful to exact facts, and omit conversational filler.' : CONSULT_SYSTEM_PROMPT,
               maxOutputTokens: maxTokens,
-              timeoutMs,
+              timeoutSec,
             });
             usedModel = cand;
             break;
@@ -1014,6 +1051,7 @@ export function createExecutionTools({
           }
         }
         if (!reply) throw lastErr || new Error('All consult candidates failed.');
+        if (reply.warning) warnings.push(reply.warning);
         const elapsedSec = (Date.now() - t0) / 1000;
 
         const agent = callingAgent(callCtx) || priorSession?.agent || '';
@@ -1043,7 +1081,7 @@ export function createExecutionTools({
               goal, title, host_conversation_id: hostId, timestamp: nowIso(), cwd, agent,
               tier: resolved.tier, served_model: reply.servedModel || usedModel,
               requested_model: resolved.model, sent_model: usedModel, reasoning_effort: effort,
-              attempted_models: attemptedModels, elapsed_sec: elapsedSec, usage: reply.usage, response_id: reply.responseId,
+              warnings, attempted_models: attemptedModels, elapsed_sec: elapsedSec, usage: reply.usage, response_id: reply.responseId,
             },
           },
         });
@@ -1105,7 +1143,7 @@ export function createExecutionTools({
           reasoning_effort: { type: 'string', enum: [...VALID_EFFORTS_SET] },
           background: { type: 'boolean', description: 'Return a run_id immediately. Use gempt-wait to await completion or gempt_ctl for a status snapshot.' },
           run_id: { type: 'string', pattern: '^[a-f0-9]{32}$', description: 'Optional caller-generated ID; repeat delivery of the same job will not start another worker.' },
-          timeout_sec: { type: 'number', minimum: 30, maximum: 7200, description: 'Execution timeout seconds (30-7200).' },
+          timeout_sec: timeoutSchema,
         },
         required: ['goal', 'cwd'],
       },
@@ -1246,37 +1284,31 @@ export function createExecutionTools({
         const effort = resolved.effort;
 
         const limits = runtime.cfg?.limits || {};
-        const { blocks, warnings } = readContextFiles(args?.file_paths, workdir, {
-          maxFileBytes: Number(limits.max_context_file_bytes) || MAX_CONTEXT_FILE_BYTES,
-          maxTotalBytes: Number(limits.max_total_context_bytes) || MAX_TOTAL_CONTEXT_BYTES,
-        });
+        const { blocks, warnings } = readContextFiles(args?.file_paths, workdir, limits);
 
         const priorTurns = Array.isArray(priorSession?.turns) ? priorSession.turns : [];
         const sameCli = priorSession && (priorSession.cli || 'codex') === resolvedCli;
         const resumeId = resolvedCli !== 'codex' && priorSession && Object.hasOwn(priorSession, 'runner_session_id')
           ? priorSession.runner_session_id : priorSession?.codex_thread_id;
         const canResumeRunner = Boolean(sameCli && !sandboxUpgraded && runner.capabilities.resume && resumeId);
+        const promptFields = { goal, context: args.context, fileBlocks: blocks, constraints: args.constraints,
+          verification: args.verification, expectedReport: args.expected_report };
+        let turnContent;
         function promptForTurn(resume) {
-          if (resume && swarmWake) return goal;
-          let carryover = '';
-          if (priorSession && !resume) {
-            const latest = priorTurns.slice(-2).flatMap((entry) => {
-              if (typeof entry?.content === 'string') return [`${entry.role || 'Prior turn'}: ${entry.content.slice(0, 1200)}`];
-              return [entry?.goal, entry?.reply ?? entry?.text].filter((text) => typeof text === 'string').map((text) => text.slice(0, 1200));
-            });
-            carryover = [
-              sandboxUpgraded
-                ? 'Carryover from the prior read-only Codex thread (for context):'
-                : 'Carryover from the prior execution thread (for context):',
-              ...latest,
-            ].join('\n');
-          }
-          return buildExecPrompt({
-            goal, context: [carryover, args.context].filter(Boolean).join('\n\n'), fileBlocks: blocks,
-            constraints: args.constraints, verification: args.verification, expectedReport: args.expected_report, isResume: resume,
+          // Persist each turn's own input. Replaying a prompt that already contains the
+          // transcript would duplicate the entire history on every session fallback.
+          turnContent = resume && swarmWake ? goal : buildExecPrompt({ ...promptFields, isResume: resume });
+          if (resume || !priorTurns.length) return turnContent;
+          const history = priorTurns.flatMap((entry) => {
+            if (typeof entry?.content === 'string') return [`${entry.role || 'Prior turn'}: ${entry.content}`];
+            return [entry?.goal, entry?.reply ?? entry?.text].filter((text) => typeof text === 'string');
           });
+          const heading = sandboxUpgraded ? 'Carryover from the prior read-only Codex thread (for context):'
+            : 'Carryover from the prior execution thread (for context):';
+          return buildExecPrompt({ ...promptFields, context: [[heading, ...history].join('\n'), args.context]
+            .filter(Boolean).join('\n\n') });
         }
-        let prompt = promptForTurn(canResumeRunner);
+        const prompt = promptForTurn(canResumeRunner);
 
         const timeoutSec = resolveExecTimeoutSec({ codex: runtime.cfg?.codex, timeoutSec: args.timeout_sec, effort });
 
@@ -1324,10 +1356,7 @@ export function createExecutionTools({
             nativeFork,
             useBoardMcp: Boolean(resolvedCli === 'codex' && explicitWorker && (nativeFork
               ? !forkSourceHasDynamicBoardTools : (canResumeRunner && !priorHasDynamicBoardTools))),
-            onSessionMissing() {
-              prompt = promptForTurn(false);
-              return prompt;
-            },
+            onSessionMissing: () => promptForTurn(false),
             async onForkMode(mode) {
               recordIdentity({ fork_mode: mode });
               if (resolvedCli === 'codex') session.codex_dynamic_board_tools = mode === 'native'
@@ -1402,7 +1431,7 @@ export function createExecutionTools({
           codex_thread_id: res.threadId,
           ...(res.runnerSessionId ? { runner_session_id: res.runnerSessionId } : {}),
           turn_id: res.turnId,
-          turns: [...priorTurns, { role: 'user', content: res.forkMode === 'native' ? nativeFork.prompt : prompt }, { role: 'assistant', content: res.text }],
+          turns: [...priorTurns, { role: 'user', content: res.forkMode === 'native' ? nativeFork.prompt : turnContent }, { role: 'assistant', content: res.text }],
           turn_details: {
             ...priorSession?.turn_details,
             [turn]: {

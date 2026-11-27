@@ -84,8 +84,8 @@ export function runSummary(record, compact = false) {
     cli, swarm_id: record.swarm_id ?? null,
     cwd: bounded(record.cwd, 8192), worktree_path: bounded(record.worktree_path, 8192) || null,
     source_cwd: bounded(record.source_cwd, 8192) || null,
-    execution_timeout_sec: number(record.execution_timeout_sec),
-    deadline: timestamp(record.deadline),
+    execution_timeout_sec: Number.isFinite(record.execution_timeout_sec) ? record.execution_timeout_sec : null,
+    deadline: Number.isFinite(record.deadline) ? record.deadline : timestamp(record.deadline),
     title: record.title, workspace_name: bounded(workspaceName(record.source_cwd || record.cwd), 512),
     host_conversation_id: record.host_conversation_id ?? null,
     can_control: isNonCodex
@@ -122,7 +122,7 @@ function workspaceRun(id, options) {
   return record;
 }
 
-async function listRuns(args, options) {
+export function scopedRunRecords(args, options) {
   const { root, workspaceRoots, conversationId, configPath, sessionsDir } = options;
   const roots = workspaceScope({ root, workspaceRoots });
   const { routing } = readRoutingSummary({ configPath });
@@ -147,6 +147,11 @@ async function listRuns(args, options) {
     }
   }
   items.sort((left, right) => Number(ACTIVE_STATES.has(right.state)) - Number(ACTIVE_STATES.has(left.state)));
+  return { items, active, bound, scope, workspace, sessionCount, routing, inScope };
+}
+
+async function listRuns(args, options) {
+  const { items, active, bound, scope, workspace, sessionCount, routing, inScope } = scopedRunRecords(args, options);
   const offset = args.offset ?? 0;
   const limit = args.limit ?? (scope === 'all' ? Infinity : 20);
   let budget = TEXT_BYTES;
@@ -162,7 +167,7 @@ async function listRuns(args, options) {
     bound_workspace_name: workspace, session_count: sessionCount, routing,
     runs, next_offset: runs.length && offset + runs.length < items.length ? offset + runs.length : null,
     ...(args.include_consults ? {
-      consult_sessions: listConsultSessions(sessionsDir, {
+      consult_sessions: listConsultSessions(options.sessionsDir, {
         limit: Math.min(limit, 50),
         matches: (record) => inScope(record)
           && (scope === 'all' || Boolean(bound && record.host_conversation_id === bound)),

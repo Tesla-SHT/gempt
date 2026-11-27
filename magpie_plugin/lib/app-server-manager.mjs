@@ -173,17 +173,18 @@ export function createAppServerManager({
             break;
           } catch (err) {
             if (err.code !== 'EEXIST') throw err;
-            let recInfo;
             try {
               const recContent = readFileSync(recovery, 'utf8');
-              const recStat = statSync(recovery);
               const recPid = Number(recContent.split(' ')[0]);
-              recInfo = { stale: !alive(recPid) || (Date.now() - recStat.mtimeMs > 5000) };
+              // An empty/incomplete claim may still be getting written.
+              if (Number.isInteger(recPid) && recPid > 0) {
+                if (alive(recPid)) return false;
+              } else if (Date.now() - statSync(recovery).mtimeMs <= 5000) return false;
+              if (readFileSync(recovery, 'utf8') !== recContent) continue;
             } catch (readErr) {
               if (readErr.code === 'ENOENT') continue;
               return false;
             }
-            if (!recInfo.stale) return false;
             try { unlinkSync(recovery); } catch (uErr) { if (uErr.code !== 'ENOENT') return false; }
           }
         }

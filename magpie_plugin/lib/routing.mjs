@@ -2,31 +2,31 @@
  * Deterministic, auditable effort routing, timeout floors, and escalation hints.
  */
 
-export const DEFAULT_EXEC_TIMEOUT_SEC = 3600;
-export const EXEC_TIMEOUT_MIN_SEC = 30;
-export const EXEC_TIMEOUT_MAX_SEC = 7200;
+export const DEFAULT_EXEC_TIMEOUT_SEC = null;
+export const EXEC_TIMEOUT_MIN_SEC = 0;
+export const EXEC_TIMEOUT_MAX_SEC = Infinity;
 
 export function validateExecTimeoutSec(value) {
   if (value === undefined) return undefined;
-  if (!Number.isFinite(value) || value < EXEC_TIMEOUT_MIN_SEC || value > EXEC_TIMEOUT_MAX_SEC) {
-    throw Object.assign(new Error(
-      `Invalid timeout_sec: expected a finite number between ${EXEC_TIMEOUT_MIN_SEC} and ${EXEC_TIMEOUT_MAX_SEC}.`,
-    ), { status: 400 });
+  if (value === null || value === 0) return null;
+  if (!Number.isFinite(value) || value < EXEC_TIMEOUT_MIN_SEC) {
+    throw Object.assign(new Error('Invalid timeout_sec: expected null or a nonnegative finite number.'), { status: 400 });
   }
   return value;
 }
 
 export function configuredExecTimeoutSec(codex) {
-  const value = Number(codex?.timeout_sec);
-  if (value === 600 && codex?.timeout_sec_customized !== true) return DEFAULT_EXEC_TIMEOUT_SEC;
-  return value >= EXEC_TIMEOUT_MIN_SEC && value <= EXEC_TIMEOUT_MAX_SEC ? value : DEFAULT_EXEC_TIMEOUT_SEC;
+  const value = codex?.timeout_sec;
+  if (codex?.timeout_sec_customized !== true && [600, 3600].includes(value)) return null;
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_EXEC_TIMEOUT_SEC;
 }
 
 export function resolveExecTimeoutSec({ codex, timeoutSec, effort } = {}) {
   const explicit = validateExecTimeoutSec(timeoutSec);
   if (explicit !== undefined) return explicit;
   const configured = configuredExecTimeoutSec(codex);
-  return codex?.timeout_sec_customized === true ? configured : Math.max(configured, effortTimeoutFloor(effort));
+  return configured === null || codex?.timeout_sec_customized === true
+    ? configured : Math.max(configured, effortTimeoutFloor(effort));
 }
 
 export const AUTO_EFFORT_CANDIDATES = Object.freeze(['low', 'medium', 'high', 'xhigh']);

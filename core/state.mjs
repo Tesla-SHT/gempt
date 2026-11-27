@@ -48,8 +48,7 @@ export function validateSessionId(sessionId) {
 }
 
 export function lockStaleMsForBudget(timeoutSec) {
-  const budgetSec = Number(timeoutSec);
-  const budgetMs = Number.isFinite(budgetSec) && budgetSec > 0 ? Math.ceil(budgetSec * 1000) + 60_000 : 0;
+  const budgetMs = Number.isFinite(timeoutSec) && timeoutSec > 0 ? Math.ceil(timeoutSec * 1000) + 60_000 : 0;
   return Math.max(DEFAULT_LOCK_STALE_MS, budgetMs);
 }
 

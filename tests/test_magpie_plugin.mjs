@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { execFile } from 'node:child_process';
-import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -545,7 +545,7 @@ function startMockMagpie(modelsData, { onRequest } = {}) {
         if (onRequest) {
           const custom = onRequest(req.url, body, requests.length);
           if (custom) {
-            res.writeHead(custom.status || 200, { 'Content-Type': 'application/json' });
+            res.writeHead(custom.status || 200, { 'Content-Type': 'application/json', ...custom.headers });
             res.end(JSON.stringify(custom.json));
             return;
           }
@@ -3417,8 +3417,8 @@ test('advanced HTTP settings validate, protect credentials, probe drafts and res
     { magpie: { api_key_env: 'bad-env' } }, { magpie: { api_key: 'invalid\nkey' } },
     { utility: { model: '' } }, { utility: { reasoning_effort: 'ultra' } },
     { routing_policy: { excluded_models: ['\t'] } }, { codex: { extra_args: ['bad\narg'] } },
-    { codex: { cli_path: 'bin\0codex' } }, { limits: { consult_timeout_sec: 15.5 } },
-    { limits: { consult_timeout_sec: 1801 } }, { ui: { language: 'fr' } },
+    { codex: { cli_path: 'bin\0codex' } }, { limits: { consult_timeout_sec: -1 } },
+    { limits: { consult_timeout_sec: '1800' } }, { ui: { language: 'fr' } },
   ]) {
     assert.equal((await call('settings', { default_sandbox: 'read-only', ...invalid }))[0], 400);
     assert.deepEqual(config(), prev);
@@ -3434,7 +3434,7 @@ test('advanced HTTP settings validate, protect credentials, probe drafts and res
   assert.equal((await call('reset-settings', {}))[1].keep_gateway, true);
   assert.deepEqual(config().magpie, { cli_path: '', ...prev.magpie });
   assert.equal(config().ui.language, 'auto');
-  assert.equal(config().limits.consult_timeout_sec, 180);
+  assert.equal(config().limits.consult_timeout_sec, null);
   assert.equal((await call('reset-settings', { keep_gateway: false }))[0], 200);
   assert.equal(config().magpie.base_url, 'http://127.0.0.1:3425');
   assert.equal(config().magpie.api_key, '');
@@ -3485,4 +3485,64 @@ test('independent consultations over the same files share a prefix and retry a r
   const before = magpie.requests.length;
   await assert.rejects(tools.consult.execute(chat), /Invalid model parameter/);
   assert.equal(magpie.requests.length, before + 1);
+});
+
+
+test('recovery lock held by a live PID survives an old mtime', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'gempt-recover-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const state = join(root, 'app.json'), lock = state + '.lock', recovery = lock + '.recover';
+  writeFileSync(lock, '2147483647 stale-manager');
+  const owner = process.pid + ' recovering';
+  writeFileSync(recovery, owner);
+  utimesSync(recovery, 1, 1);
+  const mgr = createAppServerManager({ configPath: join(root, 'config.json'), sessionsDir: root,
+    env: { ...process.env, GEMPT_APP_SERVER_STATE: state }, isPidAlive: (pid) => pid === process.pid });
+  t.after(() => mgr.stop());
+  await mgr.ensureRunning();
+  assert.equal(readFileSync(recovery, 'utf8'), owner);
+  assert.equal(readFileSync(lock, 'utf8'), '2147483647 stale-manager');
+});
+
+test('public ask preserves large responses, complete files and native output budgets', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'gempt-ask-limits-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const long = 'a'.repeat(8 * 1024 * 1024) + '🦋 end';
+  let reply = { output_text: long };
+  let headers;
+  const gateway = await startMockMagpie(undefined, { onRequest: () => ({ json: reply, headers }) });
+  t.after(() => gateway.close());
+  const configPath = join(root, 'config', 'config.json'), cwd = join(root, 'repo');
+  mkdirSync(dirname(configPath));
+  mkdirSync(cwd);
+  const cfg = { version: 1, magpie: { base_url: gateway.url }, tiers: { sonnet: { consult_model: 'codex/gpt-6.2-sol' } } };
+  const save = () => writeFileSync(configPath, JSON.stringify(cfg));
+  save();
+  const ask = createGemptTools({ configPath, sessionsDir: join(root, 'sessions') }).ask;
+  const content = 'é'.repeat(220000) + ' full file';
+  writeFileSync(join(cwd, 'input.txt'), content);
+  const question = { cwd, goal: 'Review file', tier: 'sonnet', file_paths: ['input.txt'] };
+  const received = await ask.execute(question);
+  assert.ok(received.text.endsWith(long));
+  assert.deepEqual(received.warnings, []);
+  assert.equal(Object.hasOwn(gateway.requests.at(-1).body, 'max_output_tokens'), false);
+  assert.ok(gateway.requests.at(-1).body.input[0].content.includes(content));
+  cfg.limits = { max_context_file_bytes: 5 };
+  save();
+  reply = { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output_text: 'partial' };
+  const partial = await ask.execute({ ...question, max_output_tokens: 7 });
+  assert.equal(gateway.requests.at(-1).body.max_output_tokens, 7);
+  assert.match(gateway.requests.at(-1).body.input[0].content, /1: éé\n/);
+  assert.ok(partial.warnings.some((w) => /truncated at 4 bytes/.test(w)));
+  assert.ok(partial.warnings.some((w) => /incomplete.*max_output_tokens/.test(w)));
+  reply = { choices: [{ finish_reason: 'length', message: { content: 'chat partial' } }] };
+  for (const max of [null, 250000]) {
+    const chat = await ask.execute({ goal: 'chat', tier: 'chore', max_output_tokens: max });
+    const body = gateway.requests.at(-1).body;
+    assert.equal(body.max_tokens, max ?? undefined);
+    assert.ok(chat.warnings.some((w) => /token limit.*length/.test(w)));
+  }
+  await assert.rejects(ask.execute({ ...question, max_output_tokens: 0 }), /Invalid max_output_tokens/);
+  headers = { 'content-length': 128 * 1024 * 1024 + 1 };
+  await assert.rejects(ask.execute(question), /response exceeds 134217728 bytes/);
 });

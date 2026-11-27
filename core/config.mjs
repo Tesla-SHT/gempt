@@ -20,11 +20,17 @@ export const DEFAULT_MAGPIE_URL = 'http://127.0.0.1:3425';
 export const DEFAULT_MCP_EFFORT = 'medium';
 export const UI_LANGUAGES = ['auto', 'zh', 'en'];
 export const UTILITY_EFFORTS = ['', 'low', 'medium', 'high'];
-export const DEFAULT_CONSULT_TIMEOUT_SEC = 180;
+export const DEFAULT_CONSULT_TIMEOUT_SEC = null;
 export const RUNNER_IDS = Object.freeze([
   'codex', 'opencode', 'claude', 'gemini', 'pi', 'cursor', 'kimi', 'grok', 'kilo', 'copilot', 'qoder',
 ]);
 export const CLI_CHOICES = Object.freeze(['auto', ...RUNNER_IDS]);
+
+export function configuredConsultTimeoutSec(limits) {
+  const value = limits?.consult_timeout_sec;
+  if (value === 180 && limits.consult_timeout_customized !== true) return DEFAULT_CONSULT_TIMEOUT_SEC;
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_CONSULT_TIMEOUT_SEC;
+}
 
 export function getExecutionConfig(cfg) {
   const exec = cfg?.execution && typeof cfg.execution === 'object' && !Array.isArray(cfg.execution) ? cfg.execution : {};
@@ -54,7 +60,7 @@ export const DEFAULT_TIERS = {
     exec_model: '',
     reasoning_effort: 'medium',
     api_mode: 'responses',
-    max_output_tokens: 16384,
+    max_output_tokens: null,
     fallback_models: [],
   },
   opus: {
@@ -67,7 +73,7 @@ export const DEFAULT_TIERS = {
     escalate_effort_threshold: 'xhigh',
     reasoning_effort: 'high',
     api_mode: 'responses',
-    max_output_tokens: 24576,
+    max_output_tokens: null,
     fallback_models: [],
   },
   fable: {
@@ -78,7 +84,7 @@ export const DEFAULT_TIERS = {
     exec_model: '',
     reasoning_effort: 'xhigh',
     api_mode: 'responses',
-    max_output_tokens: 32768,
+    max_output_tokens: null,
     fallback_models: [],
   },
 };
@@ -88,7 +94,7 @@ export const DEFAULT_UTILITY = {
   model: 'auto/deepseek-v4.1-flash',
   reasoning_effort: 'low',
   api_mode: 'chat',
-  max_output_tokens: 4096,
+  max_output_tokens: null,
   fallback_models: [],
   use_as_classifier: false,
 };
@@ -486,7 +492,7 @@ const settingRules = {
     cli_paths: (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value))
       && Object.entries(value).every(([k, v]) => RUNNER_IDS.includes(k) && cleanText(v)),
   },
-  limits: { consult_timeout_sec: (value) => Number.isInteger(value) && value >= 15 && value <= 1800 },
+  limits: { consult_timeout_sec: (value) => value === null || (Number.isFinite(value) && value >= 0) },
   ui: { language: (value) => UI_LANGUAGES.includes(value) },
 };
 
@@ -500,7 +506,10 @@ export function editAdvancedSettings({ data }, section, fields, fallbackUrl = DE
     patch[key] = Array.isArray(value) ? value.map((item) => item.trim())
       : typeof value === 'string' ? value.trim() : value;
   }
-  if (section === 'limits' && Object.hasOwn(patch, 'consult_timeout_sec')) patch.consult_timeout_customized = true;
+  if (section === 'limits' && Object.hasOwn(patch, 'consult_timeout_sec')) {
+    patch.consult_timeout_sec ||= null;
+    patch.consult_timeout_customized = true;
+  }
   if (section === 'magpie') {
     if (patch.base_url !== undefined) {
       patch.base_url = normalizeGatewayUrl(patch.base_url);

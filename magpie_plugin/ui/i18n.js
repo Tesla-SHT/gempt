@@ -535,6 +535,7 @@ const english = {
   "用逗号或换行分隔": "Separate with commas or new lines",
   "Codex 运行时与超时": "Codex Runtime & Timeouts",
   "Codex CLI 路径": "Codex CLI Path",
+  "留空或填 0 表示不限时": "Leave blank or enter 0 for no timeout",
   "咨询超时（秒）": "Consult Timeout (s)",
   "执行超时（秒）": "Exec Timeout (s)",
   "保存": "Save",

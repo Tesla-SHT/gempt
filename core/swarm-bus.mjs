@@ -7,7 +7,7 @@ import { openDatabaseSync } from './sqlite.mjs';
 import { resolvePath } from './state.mjs';
 
 import {
-  ALL, MAIN, MAX_MESSAGE_BYTES, ROLE_WORKER_RE, activeAt, channelMentions, channelRegistry,
+  ALL, MAIN, ROLE_WORKER_RE, activeAt, channelMentions, channelRegistry,
   channelsAt, countsUnread, effectiveChannels, memberView, mentionsIn, mentionsOf, seesIn,
   validateChannelName, validateTopic, visibleUnread,
 } from './swarm-channels.mjs';
@@ -101,7 +101,7 @@ const migrations = {
   roster: {
     role: "TEXT DEFAULT 'worker'", added_by: "TEXT DEFAULT 'coordinator'", channels_json: 'TEXT',
     fork_mode: 'TEXT', desired_model: 'TEXT', applied_model: 'TEXT', tail_from_seq: 'INTEGER DEFAULT 0',
-    desired_runtime_json: 'TEXT',
+    desired_runtime_json: 'TEXT', timeout_sec: 'REAL',
     wake_mode: "TEXT DEFAULT 'mentions'", wait_since: 'INTEGER DEFAULT 0', last_read_seq: 'INTEGER DEFAULT 0',
     last_nudged_seq: 'INTEGER DEFAULT 0', last_park_blocked_seq: 'INTEGER DEFAULT 0', quota_paused_seq: 'INTEGER DEFAULT 0',
   },
@@ -327,6 +327,8 @@ function formatWorker(row) {
     tier: row.tier ?? null,
     desired_model: row.desired_model ?? row.model ?? null,
     applied_model: row.applied_model ?? row.model ?? null,
+    // SQL NULL inherits configuration. Zero records an explicitly unlimited worker.
+    ...(row.timeout_sec != null ? { timeout_sec: row.timeout_sec || null } : {}),
     desired_runtime: safeJsonParse(row.desired_runtime_json, null),
     tail_from_seq: Number(row.tail_from_seq || 0),
     access: row.access ?? 'change',
@@ -356,12 +358,6 @@ function formatWorker(row) {
   };
 }
 
-export function boardPostPreview(message) {
-  if (message.text.length <= 2000) return message;
-  const text = message.text.slice(0, 2000).replace(/[\uD800-\uDBFF]$/, '');
-  return { ...message, text, truncated: true,
-    hint: `Read #${message.seq} with gpt_board(action="read", swarm_id=${JSON.stringify(message.swarm_id)}, seqs=[${message.seq}]).` };
-}
 
 function formatMessage(row) {
   if (!row) return null;
@@ -550,6 +546,8 @@ function saveWorker(conn, id, name, worker, { hostConversationId, cwd }) {
 function serializeWorkerPatch(worker) {
   return {
     ...worker,
+    // Undefined resets a newly added worker to inherit. Null pins it to unlimited.
+    ...(Object.hasOwn(worker, 'timeout_sec') ? { timeout_sec: worker.timeout_sec === null ? 0 : worker.timeout_sec ?? null } : {}),
     ...(worker.channels === undefined ? {} : { channels_json: worker.channels === null ? null : JSON.stringify(worker.channels) }),
     ...(worker.desired_runtime === undefined ? {} : { desired_runtime_json: worker.desired_runtime === null ? null : JSON.stringify(worker.desired_runtime) }),
   };
@@ -570,7 +568,7 @@ export async function addWorkerBriefs(swarmId, specs, options = {}) {
       }
       const message = appendMessage(conn, id, { from: worker.added_by, kind: 'brief', channel,
         text: `@${name} ${worker.brief}`, meta: { worker: name } }, { skipRateLimit: true });
-      saveWorker(conn, id, name, { ...worker, run_id: worker.run_id ?? null, session_id: null, worktree_path: null,
+      saveWorker(conn, id, name, { ...worker, timeout_sec: worker.timeout_sec, run_id: worker.run_id ?? null, session_id: null, worktree_path: null,
         last_seq: message.seq, last_read_seq: message.seq, tail_from_seq: message.seq, wait_since: 0, last_nudged_seq: 0,
         last_park_blocked_seq: 0, quota_paused_seq: 0, wake_mode: 'mentions' }, options);
       conn.run('INSERT INTO deliveries VALUES (?, ?, ?, ?)', message.seq, id, name, nowIso());
@@ -735,7 +733,6 @@ function appendMessage(conn, id, {
       return withWarnings(message, message.channel_mentions.length ? registryInDb(conn, id, message.seq) : []);
     }
   }
-  if (Buffer.byteLength(String(text ?? '')) > MAX_MESSAGE_BYTES) throw Object.assign(new Error('Board message exceeds 65536 bytes.'), { status: 400 });
   const body = String(text ?? '').trim();
   if (!body) throw new Error('Board message text must be non-empty.');
   const sender = String(from || 'coordinator').trim().toLowerCase();

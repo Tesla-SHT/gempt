@@ -221,7 +221,7 @@ console.log(JSON.stringify({
 }));
 console.log(JSON.stringify({
   type: 'user',
-  message: { content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'claude-ok', is_error: false }] },
+  message: { content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'claude-ok'.repeat(1000), is_error: false }] },
 }));
 console.log(JSON.stringify({
   type: 'result',
@@ -264,6 +264,10 @@ console.log(JSON.stringify({
   const lineage = getRunLineage(r1.run_id, { sessionsDir });
   assert.equal(lineage.protocol, 'anthropic-messages');
   assert.equal(lineage.native_session_id, done1.runner_session_id);
+
+  const commandEvents = readFileSync(join(sessionsDir, 'runs', r1.run_id, 'events.jsonl'), 'utf8').trim()
+    .split('\n').map((line) => JSON.parse(line).params?.item).filter((item) => item?.type === 'commandExecution');
+  assert.equal(commandEvents.at(-1).aggregatedOutput, 'claude-ok'.repeat(1000));
 
   // Verify Live stream parses Claude's journaled events.
   const liveStream = await runLiveOperation('stream', { run_id: r1.run_id }, { configPath, sessionsDir, env });
@@ -507,7 +511,8 @@ if (sub === 'serve') {
   assert.equal(done1.result.usage.input_tokens, 120);
   assert.equal(done1.result.usage.cache_write_tokens, 8);
   assert.equal(done1.result.usage.cache_hit_ratio, .2);
-  const resumed = await dispatchRun({ session_id: done1.session_id, cwd, goal: 'Continue in the same session' },
+  const priorGoal = 'Continue in the same session ' + '语'.repeat(1800) + ' 完整尾部';
+  const resumed = await dispatchRun({ session_id: done1.session_id, cwd, goal: priorGoal },
     { configPath, sessionsDir, env });
   assert.equal(resumed.runner_session_id, 'oc-srv-1');
   const lineage = getRunLineage(resumed.run_id, { sessionsDir });
@@ -527,6 +532,13 @@ if (sub === 'serve') {
   const repaired = readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse).slice(outageLog.length);
   assert.ok(repaired.some((e) => e.action === 'create_session'));
   assert.match(repaired.find((e) => e.action === 'message').text, /Carryover[\s\S]*Serve streaming reply/);
+
+  await dispatchRun({ ...resumeArgs, goal: 'Another new session' }, { configPath, sessionsDir,
+    env: { ...env, MOCK_LOOKUP_STATUS: '404' } });
+  const replay = readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse).findLast((e) => e.action === 'message').text;
+  for (const goal of ['HOLD_FOR_STEER test opencode serve', priorGoal, resumeArgs.goal]) {
+    assert.equal(replay.split(goal).length, 2, 'each prior goal occurs exactly once');
+  }
 
   // 2. Serve mode + interrupt/abort
   const r2 = await dispatchRun({

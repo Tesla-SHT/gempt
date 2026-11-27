@@ -1,3 +1,4 @@
+import { scheduleTimeout } from '../../core/timeout.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { expandUser, resolveConfigPath } from './backend.mjs';
@@ -118,15 +119,15 @@ export async function connectAppServer(state, onEvent = () => {}, { timeoutMs = 
   };
   const request = async (method, params, limit = 4000) => {
     const requestId = ++id;
-    let timer;
+    let cancelTimeout;
     try {
       return await new Promise((resolve, reject) => {
         pending.set(requestId, { resolve, reject });
-        timer = setTimeout(() => reject(new Error(`${method} timed out.`)), limit);
+        cancelTimeout = scheduleTimeout(() => reject(new Error(`${method} timed out.`)), limit / 1000);
         send({ id: requestId, method, params });
       });
     } finally {
-      clearTimeout(timer);
+      cancelTimeout?.();
       pending.delete(requestId);
     }
   };

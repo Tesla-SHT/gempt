@@ -1,3 +1,4 @@
+import { deadlineForTimeout, scheduleTimeout } from '../../core/timeout.mjs';
 import { getBoardMcpSpec } from '../../core/runners/journal.mjs';
 import { cacheHitRatio, normalizeUsage } from '../../core/token-usage.mjs';
 import { appendFileSync, readFileSync } from 'node:fs';
@@ -29,12 +30,12 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     });
   };
   const start = Date.now();
-  let deadline = start + timeoutSec * 1000;
+  let deadline = deadlineForTimeout(timeoutSec, start);
   let pausedAt = null;
   let pausedMs = 0;
   let observeTurn;
   const observedTurn = new Promise((resolve) => { observeTurn = resolve; });
-  const remaining = () => Math.max(1, deadline - (pausedAt ?? Date.now()));
+  const remaining = () => deadline === null ? Infinity : Math.max(1, Math.round(deadline * 1000 - (pausedAt ?? Date.now())));
   const directory = dirname(runFile);
   const record = JSON.parse(readFileSync(runFile, 'utf8'));
   const cacheSwarmId = swarmId || record.swarm_id;
@@ -53,8 +54,8 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     if (!response.ok) throw new Error(`Codex proxy registration failed (HTTP ${response.status}).`);
   }
   record.cli = 'codex';
-  record.execution_timeout_sec = timeoutSec;
-  record.deadline = deadline / 1000;
+  record.execution_timeout_sec = timeoutSec || null;
+  record.deadline = deadline;
   const state = readAppServerState(configPath, env);
   if (state.gateway_url?.replace(/\/+$/, '') !== gatewayUrl) {
     throw new Error('共享 codex app-server 的 Magpie 网关与 GemPT 配置不一致。');
@@ -80,22 +81,22 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
   const progress = { phase: 'connecting', thread_id: threadId || null, turn_id: null, last_message: '',
     recent_commands: [], touched_files: [], token_usage: {} };
   let poll;
-  let timeout;
+  let cancelTimeout;
   const armTimeout = () => {
-    clearTimeout(timeout);
-    timeout = undefined;
-    if (pausedAt !== null || terminal) return;
-    timeout = setTimeout(() => fail(new Error(`Codex turn timed out after ${timeoutSec}s.`)), remaining());
+    cancelTimeout?.();
+    cancelTimeout = undefined;
+    if (deadline === null || pausedAt !== null || terminal) return;
+    cancelTimeout = scheduleTimeout(() => fail(new Error(`Codex turn timed out after ${timeoutSec}s.`)), remaining() / 1000);
   };
   const finishPause = () => {
     if (pausedAt === null) return;
     const deltaMs = Math.max(0, Date.now() - pausedAt);
     pausedAt = null;
     pausedMs += deltaMs;
-    deadline += deltaMs;
+    if (deadline !== null) deadline += deltaMs / 1000;
     record.waiting_since = null;
     record.waiting_gemini_sec = Math.round((pausedMs / 1000) * 1000) / 1000;
-    record.deadline = deadline / 1000;
+    record.deadline = deadline;
   };
   const notifyTerminal = (turn) => {
     terminal = turn;
@@ -132,8 +133,8 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     const pending = tools.values().next().value;
     if (pending && pausedAt === null) {
       pausedAt = Date.now();
-      clearTimeout(timeout);
-      timeout = undefined;
+      cancelTimeout?.();
+      cancelTimeout = undefined;
       record.waiting_since = new Date(pausedAt).toISOString();
     } else if (!pending && pausedAt !== null) {
       finishPause();
@@ -148,10 +149,10 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
   const item = (entry) => {
     if (entry.type === 'agentMessage') {
       messages.set(entry.id, entry.text);
-      progress.last_message = entry.text.slice(-1500);
+      progress.last_message = entry.text;
     } else if (entry.type === 'commandExecution') {
       commands.set(entry.id, { command: entry.command, exit_code: entry.exitCode ?? null,
-        output: (entry.aggregatedOutput || '').slice(-4000) });
+        output: entry.aggregatedOutput || '' });
       progress.recent_commands = [...commands.values()].slice(-5);
     } else if (entry.type === 'fileChange') {
       for (const change of entry.changes) touched.add(change.path);
@@ -272,8 +273,8 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
         break;
       case 'turn/completed':
         finishPause();
-        clearTimeout(timeout);
-        timeout = undefined;
+        cancelTimeout?.();
+        cancelTimeout = undefined;
         identity(params.threadId, eventTurn);
         tools.clear();
         record.state = 'running';
@@ -294,7 +295,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
       case 'item/agentMessage/delta': {
         const text = (messages.get(params.itemId) || '') + params.delta;
         messages.set(params.itemId, text);
-        progress.last_message = text.slice(-1500);
+        progress.last_message = text;
         save();
         break;
       }
@@ -347,7 +348,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     if (nativeFork) {
       try {
         // Dynamic tools are persisted with the parent. ThreadForkParams does not accept dynamicTools.
-        thread = await client.request('thread/fork', { ...inherited, threadId: nativeFork.id, excludeTurns: true }, remaining());
+        thread = await client.request('thread/fork', { ...inherited, threadId: nativeFork.id, excludeTurns: true }, deadline === null ? undefined : remaining());
         if (!thread?.thread?.id || thread.thread.id === nativeFork.id) throw new Error('Missing child thread identity.');
         confirmedSandbox(thread);
         if (thread.model && thread.model !== model) throw new Error('Fork model mismatch.');
@@ -361,10 +362,10 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     if (nativeFork) await onForkMode?.(record.fork_mode);
     if (!thread) {
       if (threadId) {
-        thread = await client.request('thread/resume', { ...inherited, threadId, excludeTurns: true }, remaining());
+        thread = await client.request('thread/resume', { ...inherited, threadId, excludeTurns: true }, deadline === null ? undefined : remaining());
       } else {
         usedFreshStart = true;
-        thread = await client.request('thread/start', { ...common, dynamicTools, allowProviderModelFallback: false }, remaining());
+        thread = await client.request('thread/start', { ...common, dynamicTools, allowProviderModelFallback: false }, deadline === null ? undefined : remaining());
       }
     }
     if (threadId && thread.thread.id !== threadId) throw new Error('Codex returned a different thread on resume.');
@@ -440,7 +441,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
         notifyTerminal(turn);
         return finishTurn(turn);
       } catch (err) {
-        if (terminal || (client && !client.disconnected && Date.now() >= deadline && pausedAt === null)) throw err;
+        if (terminal || (client && !client.disconnected && deadline !== null && Date.now() / 1000 >= deadline && pausedAt === null)) throw err;
         recoveryError = err;
         client?.close();
       }
@@ -448,8 +449,8 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     throw Object.assign(recoveryError, { transportLost: true });
   } catch (err) {
     clearInterval(poll);
-    clearTimeout(timeout);
-    timeout = undefined;
+    cancelTimeout?.();
+    cancelTimeout = undefined;
     const turnId = progress.turn_id ?? observedTurnId;
     // After acceptTurn, turn/start is the only outstanding RPC that can reject this try block.
     if (acceptTurn && err.rpcError && !turnId) throw err;
@@ -480,7 +481,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
     throw err;
   } finally {
     clearInterval(poll);
-    clearTimeout(timeout);
+    cancelTimeout?.();
     client?.close();
     if (swarmHooks.length) await Promise.allSettled([...swarmHooks]);
   }

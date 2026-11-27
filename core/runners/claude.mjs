@@ -1,3 +1,4 @@
+import { scheduleTimeout } from '../timeout.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { TurnInterrupted } from '../../magpie_plugin/lib/app-server-run.mjs';
@@ -77,7 +78,7 @@ export const claudeRunner = {
       threadId,
       gatewayUrl,
       apiKey,
-      timeoutSec = 3600,
+      timeoutSec = null,
       sessionsDir,
       configPath,
       swarmId,
@@ -163,13 +164,13 @@ export const claudeRunner = {
     let msgCounter = 0;
     const toolNames = new Map();
 
-    const timer = setTimeout(() => {
+    const timer = scheduleTimeout(() => {
       timedOut = true;
       terminateProcessTree(child);
-    }, Math.max(1000, timeoutSec * 1000));
+    }, timeoutSec);
 
-    child.stderr?.on('data', (chunk) => {
-      stderr = (stderr + String(chunk)).slice(-4096);
+    child.stderr?.setEncoding('utf8').on('data', (chunk) => {
+      stderr += chunk;
     });
 
     const handleEvent = (ev) => {
@@ -263,7 +264,7 @@ export const claudeRunner = {
       });
       child.once('close', (code, signal) => resolveExit({ code, signal }));
     }).finally(() => {
-      clearTimeout(timer);
+      timer?.();
     });
     await rlClosed;
     await forkRecorded;

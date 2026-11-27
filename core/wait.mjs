@@ -1,17 +1,18 @@
 #!/usr/bin/env node
-import { closeSync, existsSync, openSync, readSync, realpathSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, realpathSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { pidAlive } from '../magpie_plugin/lib/app-server-process.mjs';
-import { ACTIVE_STATES, buildReplyCommand, compactReceiptText, pendingToolCalls, readRun, runDirectory, waitForRuns } from './runs.mjs';
-import { boardPostPreview, detectSystemAttention, getBoardHead, listChannels, listRoster, mentionMatchesAgent, openSwarmDb, readBoardMessages } from './swarm-bus.mjs';
+import { buildReplyCommand, pendingToolCalls, readRun, runDirectory, waitForRuns } from './runs.mjs';
+import { detectSystemAttention, getBoardHead, listChannels, listRoster, mentionMatchesAgent, openSwarmDb, readBoardMessages } from './swarm-bus.mjs';
 
+import { visitJournal } from './run-journal.mjs';
 import { ALL, activeAt, countsUnread, mentionsIn } from './swarm-channels.mjs';
 
 const HEARTBEAT_SEC = 30;
-const STALE_SEC = 300;
+const STALE_SEC = 0;
 const monitorUsage = '[--heartbeat-sec N] [--stale-sec N]';
 export const waitUsage = (command) => `Usage: ${command} [--all] ${monitorUsage} RUN_ID[,RUN_ID...]\n`
   + `       ${command} --board SWARM_ID [--since SEQ] [--channel NAME] [--all-messages] ${monitorUsage}`;
@@ -41,31 +42,39 @@ function activity(record, sessionsDir, fallback) {
     timestamp(record.progress?.updated_at), timestamp(record.updated_at), timestamp(record.started_at), timestamp(record.created_at)) };
 }
 
-function latestJournalCommand({ journal, stats }) {
-  if (!stats?.size) return;
+function journalHeartbeat({ journal, stats }, cache) {
+  if (!stats?.size) return {};
+  let tail = cache.get(journal);
+  if (!tail || tail.inode !== stats.ino || tail.offset > stats.size) {
+    tail = { inode: stats.ino, offset: 0 };
+    cache.set(journal, tail);
+  }
+  if (tail.offset === stats.size) return tail;
   let fd;
   try {
     fd = openSync(journal, 'r');
-    const buffer = Buffer.alloc(Math.min(stats.size, 32 * 1024));
-    const size = readSync(fd, buffer, 0, buffer.length, stats.size - buffer.length);
-    for (const line of buffer.toString('utf8', 0, size).split('\n').reverse()) {
-      if (!line.includes('"command"')) continue;
-      try {
-        const { params, command } = JSON.parse(line);
-        const text = params?.item?.command ?? params?.command ?? command;
-        if (typeof text === 'string' && text) return text;
-      } catch { /* The bounded tail may start or end inside a line. */ }
-    }
+    tail.offset = visitJournal(fd, stats.size, tail.offset, (event) => {
+      const { method, params } = event;
+      const command = params?.item?.command ?? params?.command ?? event.command;
+      if (typeof command === 'string' && command) tail.command = command;
+      tail.error = undefined;
+      if ((method ?? event.type) === 'error') {
+        const detail = params?.error ?? event.error ?? params ?? event;
+        tail.error = detail.message ?? (typeof detail === 'string' ? detail : JSON.stringify(detail));
+      }
+    });
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
+  return tail;
 }
 
 function waitMonitor(heartbeatSec, staleSec, sessionsDir) {
   const started = performance.now();
   const wallStart = Date.now();
+  const journalCache = new Map();
   let nextHeartbeat = heartbeatSec * 1000;
   return {
     inspect(entries, boardHead) {
@@ -86,12 +95,14 @@ function waitMonitor(heartbeatSec, staleSec, sessionsDir) {
         if (staleSec > 0 && age >= staleSec * 1000) {
           stalls.set(label, { stalled: true, stale_sec: staleSec, reason: 'no_progress' });
         }
-        if (heartbeat && summaries.length < 6) {
+        if (heartbeat) {
           const phase = record?.progress?.phase || record?.state || 'working';
-          const command = (info.stats?.mtimeMs > timestamp(record?.progress?.updated_at) && latestJournalCommand(info))
+          const tail = journalHeartbeat(info, journalCache);
+          const command = (info.stats?.mtimeMs > timestamp(record?.progress?.updated_at) && tail.command)
             || record?.progress?.recent_commands?.at(-1)?.command;
           summaries.push(`${label ? `${label} ` : ''}${record?.state || 'working'} · phase=${phase}`
-            + (command ? ` · last_cmd=${JSON.stringify(command.slice(0, 160))}` : '')
+            + (command ? ` · last_cmd=${JSON.stringify(command)}` : '')
+            + (tail.error ? ` · error=${JSON.stringify(tail.error)}` : '')
             + ` · updated ${Math.floor(age / 1000)}s ago`);
         }
       }
@@ -106,32 +117,17 @@ function waitMonitor(heartbeatSec, staleSec, sessionsDir) {
   };
 }
 
-function compactRecord(record) {
-  const { before, after, goal, progress, result, config_path, source, pid, ...receipt } = record;
+function waitReceipt(record) {
+  const { before, after, config_path, source, pid, ...receipt } = record;
   if (after?.status?.trim() && after.status.trim() !== before?.status?.trim()) {
     const files = after.status.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-    receipt.changed_files = files.slice(0, 20);
-    if (files.length > 20) receipt.changed_files_omitted = files.length - 20;
+    receipt.changed_files = files;
   }
-  if (typeof goal === 'string') receipt.goal = goal.length <= 300 ? goal : `${goal.slice(0, 297)}...`;
-  if (progress) {
-    const { phase, thread_id, turn_id, last_message, recent_commands, token_usage } = progress;
-    receipt.progress = ACTIVE_STATES.has(record.state)
-      ? { phase, thread_id, turn_id, last_message: (last_message || '').slice(-300),
-        recent_commands: (recent_commands || []).slice(-3).map(({ command, exit_code }) =>
-          ({ command: String(command || '').slice(0, 160), exit_code })) }
-      : { phase, thread_id, turn_id, token_usage };
-  } else if (progress === null) {
-    receipt.progress = null;
-  }
-  if (typeof receipt.text === 'string') receipt.text = compactReceiptText(receipt.text, record.session_id);
-  if (result) {
-    const { formatted, commands, verification, text, ...summary } = result;
-    if (typeof text === 'string') summary.text = compactReceiptText(text, result.session_id || record.session_id);
-    if (verification) summary.verification = { status: verification.status, checks: (verification.checks || [])
-      .map(({ command, exit_code, output }) => ({ command, exit_code,
-        ...(exit_code && output ? { output_tail: String(output).slice(-400) } : {}) })) };
-    receipt.result = summary;
+  const verification = record.result?.verification;
+  if (Array.isArray(verification?.checks)) {
+    const checks = verification.checks.map((check) => check.exit_code && check.output
+      ? { ...check, output_tail: check.output } : check);
+    receipt.result = { ...record.result, verification: { ...verification, checks } };
   }
   return { ...receipt, ...replyFields(record) };
 }
@@ -185,10 +181,10 @@ export async function waitForBoard(swarmId, {
           if (countsUnread(message)) lastPostByWorker.set(message.from_agent, message.created_at);
           if (message.kind === 'question') questionsBySeq.set(message.seq, message);
         }
-        messages = messages.concat(fresh.filter(visible)).slice(0, 100);
+        messages = messages.concat(fresh.filter(visible));
         matching = allMessages ? messages : fresh.filter((m, i) => visible(m) && m.from_agent !== 'coordinator' &&
           (m.kind === 'question' || mentionMatchesAgent(m.mentions, 'coordinator') ||
-            mentionsIn(m.text, 'coordinator', [ALL], active[i]))).slice(0, 100);
+            mentionsIn(m.text, 'coordinator', [ALL], active[i])));
       }
       const records = new Map();
       for (const worker of roster) {
@@ -237,13 +233,12 @@ export async function waitForBoard(swarmId, {
         return {
           swarm_id: swarmId,
           head: previousHead,
-          messages: (allMessages || !matching.length ? messages : matching).map((message) => {
-            const preview = boardPostPreview(message);
-            if (message.kind !== 'question') return preview;
+          messages: messages.map((message) => {
+            if (message.kind !== 'question') return message;
             const ask = pending.find((item) => item.agent === message.from_agent && item.call_id
               && item.call_id === message.meta?.call_id && item.run_id === message.meta?.run_id);
-            if (ask) return { ...preview, reply_command: ask.reply_command };
-            return message.meta?.call_id ? preview : { ...preview, ...boardQuestion(message) };
+            if (ask) return { ...message, reply_command: ask.reply_command };
+            return message.meta?.call_id ? message : { ...message, ...boardQuestion(message) };
           }),
           roster: compactRoster(roster).map((worker) => ({
             ...worker, ...replyFields(records.get(worker.name)), ...stalls.get(worker.name),
@@ -260,7 +255,7 @@ export async function waitForBoard(swarmId, {
 }
 
 function boardQuestion(message) {
-  return { seq: message.seq, question: boardPostPreview(message).text,
+  return { seq: message.seq, question: message.text,
     reply_command: `gempt board post --swarm ${message.swarm_id} --from coordinator --channel ${message.channel}`
       + ` --reply-to ${message.seq} --text "@${message.from_agent} <answer>"` };
 }
@@ -330,7 +325,7 @@ export async function runWait(args, { sessionsDir, readOnly = false, command = '
       }),
     });
     const runs = Object.fromEntries(Object.entries(result.runs).map(([id, record]) =>
-      [id, { ...(wait ? compactRecord(record) : { ...record, ...replyFields(record) }), ...stalls.get(id) }]));
+      [id, { ...(wait ? waitReceipt(record) : { ...record, ...replyFields(record) }), ...stalls.get(id) }]));
     const records = Object.values(runs);
     const single = !values['run-ids'] && records.length === 1;
     console.log(JSON.stringify(single ? records[0] : { ...result, runs, ...stalls.values().next().value }));

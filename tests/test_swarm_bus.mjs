@@ -608,9 +608,8 @@ test('waitForBoard and gempt-wait --board wake on coordinator mentions and worke
   const snapshot = await waitForBoard('sw-wait', { sessionsDir, since: parsed.head, timeoutMs: 1000 });
   assert.equal(snapshot.messages.length, 1);
   const [preview] = snapshot.messages;
-  assert.equal(preview.truncated, true);
-  assert.equal(preview.text, 'x'.repeat(1999));
-  assert.ok(preview.hint.includes('#' + post.seq));
+  assert.equal(preview.text, text);
+  assert.equal(preview.seq, post.seq);
   const read = async (args) => JSON.parse((await handleTool('gpt_board',
     { swarm_id: 'sw-wait', action: 'read', ...args }, {}, { sessionsDir })).content[0].text).messages;
   assert.deepEqual((await read({ since: parsed.head }))[0], preview);
@@ -1193,12 +1192,13 @@ test('forks retain the logical root while cache keys follow the model and wire p
   for (const row of [root, child, chat, sibling, otherModel]) assert.ok(row.cache_group_key.length <= 64);
 });
 
-test('posts enforce byte and channel limits, idempotency and shared sliding rate windows', async (t) => {
+test('posts accept large text and enforce channel limits, idempotency and shared sliding rate windows', async (t) => {
   const db = await openSwarmDb(makeTmp(t));
   t.after(() => db.close());
   const id = 'limits', opts = { db };
   const post = (input, extra) => postBoardMessage(id, input, { ...opts, ...extra });
-  await assert.rejects(post({ text: 'é'.repeat(32769) }), /65536/);
+  const long = 'é'.repeat(65537);
+  assert.equal((await post({ text: long }, { skipRateLimit: true })).text, long);
   await assert.rejects(post({ text: '@#MAIN' }), /@#main is everyone; write @all/);
   await assert.rejects(post({ text: 'x', channel: 'uncreated' }), /channel/);
   assert.equal((await post({ text: 'é'.repeat(32768), channel: '' }, { skipRateLimit: true })).channel, 'main');
@@ -1461,7 +1461,10 @@ test('coordinator wait filters channel mentions, finds later matches and wakes f
   const output = execFileSync(process.execPath, ['core/wait.mjs', '--board', id, '--channel', 'qa'], {
     cwd: REPO_ROOT, env: { ...process.env, GEMPT_SESSIONS_DIR: opts.sessionsDir }, encoding: 'utf8', timeout: 8000,
   });
-  assert.deepEqual(JSON.parse(output).messages.map((m) => m.seq), [message.seq]);
+  const snapshot = JSON.parse(output);
+  assert.equal(snapshot.head, message.seq);
+  assert.deepEqual(snapshot.messages.map((m) => m.seq), Array.from({ length: 103 }, (_, i) => message.seq - 102 + i));
+  assert.ok(snapshot.messages.every((m) => m.channel === 'qa'));
   await updateWorker(id, 'qa', { state: 'waiting' }, opts);
   const stalled = await waitForBoard(id, { ...opts, since: message.seq, timeoutMs: 3000 });
   assert.ok(stalled.system_attention.some((item) => item.kind === 'stall'));
@@ -1977,6 +1980,29 @@ test('models tools expose installed-runner metadata and desired model switches a
   assert.equal(launches.length, 2);
   await handleBoardAction({ action: 'post', swarm_id: 'models', text: '@alice resume' }, opts);
   assert.equal((await getWorker('models', 'alice', opts)).applied_model, 'third');
+});
+
+test('workers keep explicit unlimited and finite timeouts on board wake and model switch', async (t) => {
+  const sessionsDir = makeTmp(t);
+  for (const [name, timeout] of [['unlimited', null], ['finite', 9000.5]]) {
+    const launches = [];
+    const opts = { sessionsDir, dispatchRunImpl: async (args) => {
+      launches.push(args);
+      return { run_id: args.run_id, session_id: name, model: args.model };
+    } };
+    const common = { swarm_id: name, name, cwd: sessionsDir };
+    const long = '完整内容😀'.repeat(800);
+    await handleSwarmAction({ ...common, action: 'add', brief: 'Initial work', timeout_sec: timeout }, opts);
+    assert.equal((await getWorker(name, name, opts)).timeout_sec, timeout);
+    const finish = (state) => onWorkerTurnFinished({ swarmId: name, swarmAgent: name, runId: launches.at(-1).run_id,
+      result: { text: long }, error: state === 'failed' ? long : null, outcome: { state }, ...opts });
+    assert.equal((await finish('finished')).auto_post.text, '@coordinator [done] ' + long);
+    await handleBoardAction({ ...common, action: 'post', text: '@' + name + ' resume' }, opts);
+    await finish('finished');
+    await handleSwarmAction({ ...common, action: 'model', model: 'next' }, opts);
+    assert.deepEqual(launches.map((args) => args.timeout_sec), [timeout, timeout, timeout]);
+    assert.equal((await finish('failed')).auto_post.text, '@coordinator [failed] ' + long);
+  }
 });
 
 test('monitor identifies all five native stalls, throttles retries, dormancy and resume', async (t) => {

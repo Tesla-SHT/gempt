@@ -8,6 +8,11 @@ function tool(name, description, properties, required) {
     ...(LAUNCHER_TOOLS.includes(name) ? { _meta: { ui: { resourceUri: LAUNCHER_URI } } } : {}) };
 }
 
+export const timeoutSchema = { type: ['number', 'null'], minimum: 0,
+  description: 'Execution timeout in seconds, excluding waiting_gemini. Omit to use configuration (default unlimited), or pass 0 or null for unlimited.' };
+export const outputTokensSchema = { type: ['integer', 'null'], minimum: 1,
+  description: 'Optional model output token limit. Null uses the model’s native limit.' };
+
 export const TOOLS = [
   tool('gpt_run',
     "Run a coding CLI (codex, opencode, claude, gemini, etc.) in cwd using the current Gemini pairing. Returns run_id, session_id, and wait_command (`gempt-wait <run_id>`). Execute wait_command via run_command(WaitMsBeforeAsync=500) for zero-poll wakeup; pass workspace='share' for parallel repo edits and session_id to resume.",
@@ -25,14 +30,14 @@ export const TOOLS = [
       session_id: { type: 'string', description: 'Optional GPT session_id to continue.' },
       title: { type: 'string', description: 'Optional short title for GemPT.' },
       tier: { type: 'string', description: 'Optional explicit Codex tier.' },
-      timeout_sec: { type: 'number', minimum: 30, maximum: 7200,
-        description: 'Execution timeout in seconds (30–7200, default 3600; excludes waiting_gemini time).' },
+      timeout_sec: timeoutSchema,
       background: { type: 'boolean' },
     }, ['goal']),
   tool('gpt_ask',
     "Fast synchronous GPT consultation through the current Gemini pairing. Pass file_paths for GPT to read directly; use tier='chore' for free/fast summarization.",
     {
       goal: { type: 'string', description: 'Question, review, summary, or reasoning prompt.' },
+      max_output_tokens: outputTokensSchema,
       file_paths: { type: 'array', items: { type: 'string' }, description: 'Optional workspace file paths for GPT to read directly.' },
       cwd: { type: 'string', description: 'Optional base directory for relative file_paths.' },
       gemini_family: WORKLOAD.schema.properties.gemini_family,
@@ -41,7 +46,7 @@ export const TOOLS = [
       session_id: { type: 'string', description: 'Optional consult session_id to continue.' },
     }, ['goal']),
   tool('gpt_ctl',
-    'Control runs (steer/interrupt/reply) or read a compact status snapshot (<=500B, no polling). Open the native GemPT panel at sidecar://gempt/gempt_live/.',
+    'Control runs (steer/interrupt/reply) or read a status snapshot. Open the native GemPT panel at sidecar://gempt/gempt_live/.',
     {
       action: { type: 'string', enum: ['status', 'steer', 'interrupt', 'reply'], default: 'status',
         description: 'Control action (default: status).' },
@@ -104,7 +109,7 @@ export const TOOLS = [
         description: 'Optional plan work threads (for action="plan").',
       },
       reason: { type: 'string', description: 'Reason for switching model (for action="model").' },
-      timeout_sec: { type: 'number', minimum: 30, maximum: 7200, description: 'Worker execution timeout in seconds.' },
+      timeout_sec: timeoutSchema,
     }),
   tool('gpt_board',
     'Interact with the shared GemPT Swarm message board: post messages (auto-delivering via steer/warm-wake/reply), read board history, inspect roster, or get a zero-poll `gempt-wait --board` command.',

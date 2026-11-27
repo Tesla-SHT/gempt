@@ -8,6 +8,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { connectAppServer, readAppServerState, readServerTurn, terminalTurn, TERMINAL_INTERRUPT_ERR, textInput, UNAVAILABLE } from '../magpie_plugin/lib/app-server-client.mjs';
 import { normalizeTitle, readJsonSafe, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
 import { getExecutionConfig, getMcpEffort } from './config.mjs';
+import { deadlineForTimeout } from './timeout.mjs';
 import { resolveExecTimeoutSec, validateExecTimeoutSec } from '../magpie_plugin/lib/routing.mjs';
 import { resolveNodeExecutable } from './node-executable.mjs';
 import { readHostContext } from './host-context.mjs';
@@ -209,7 +210,7 @@ export function reconcileRunState(record, modifiedAt, deferToWorker = false) {
   const deadPid = managed && !pidAlive(record.pid);
   // Give a live worker time to interrupt and save at its deadline. A hung
   // process can still time out to readers, but retains ownership of its file.
-  if (managed && !deadPid && deferToWorker && now() <= record.deadline + 10) return record;
+  if (managed && !deadPid && expired && deferToWorker && now() <= record.deadline + 10) return record;
   if (!expired && !deadPid) return record;
   const phase = record.progress?.phase;
   const threadId = threadOf(record);
@@ -390,13 +391,6 @@ export async function waitForRuns(runIds, {
 export async function waitForRun(runId, opts) {
   runDirectory(runId, opts?.sessionsDir);
   return (await waitForRuns([runId], opts)).runs[runId];
-}
-
-export function compactReceiptText(text, sessionId) {
-  const chars = Array.from(String(text || ''));
-  if (chars.length <= 3200) return chars.join('');
-  const ref = sessionId ? `session_id=${sessionId} / GemPT` : 'GemPT';
-  return `${chars.slice(0, 2176).join('').trimEnd()}\n\n...[omitted ${chars.length - 3080} chars; full output in ${ref}]...\n\n${chars.slice(-904).join('').trimStart()}`;
 }
 
 async function controlRun(runId, method, message, {
@@ -691,7 +685,7 @@ export async function dispatchRun(args, {
         title: normalizeTitle(args.title, args.goal, sourceCwd), tier: args.tier, agent,
         host_conversation_id: hostId, session_id: sessionId, config_path: config, progress: null,
         ...(hostContext.recorded_at_ms && hostId === hostContext.conversation_id ? { host_cwd_bound: true } : {}),
-        verification: args.verification, execution_timeout_sec: executionTimeout, deadline: now() + executionTimeout,
+        verification: args.verification, execution_timeout_sec: executionTimeout, deadline: deadlineForTimeout(executionTimeout),
         ...(args.swarm_id ? { swarm_id: String(args.swarm_id) } : {}),
         ...(args.swarm_agent ? { swarm_agent: String(args.swarm_agent) } : {}),
         ...(swarmFork ? { fork_mode: 'summary_fallback' } : {}),
@@ -712,6 +706,7 @@ export async function dispatchRun(args, {
       saveRun(file, record);
       if (record.implicit_swarm_worker) {
         await upsertWorker(record.swarm_id, {
+          timeout_sec: timeoutSec,
           name: record.swarm_agent, run_id: id, session_id: sessionId, state: 'working',
           cli: args.cli || prior?.cli || getExecutionConfig(cfg).default_cli,
           model: args.model || prior?.model || null, tier: args.tier || prior?.tier || null,
@@ -773,7 +768,7 @@ export async function dispatchRun(args, {
   const result = await waitForRun(id, { sessionsDir: sessions, timeoutSec: Math.max(0, deadline - performance.now()) / 1000 });
   if (legacyNative || ACTIVE_STATES.has(result.state) || result.state === 'interrupted') return result;
   if (!result.result) throw new Error(`${id}: ${result.error || result.state}`);
-  return { ...result.result, run_id: id, state: 'finished', execution_timeout_sec: result.execution_timeout_sec };
+  return { ...result.result, run_id: id, state: 'finished', execution_timeout_sec: result.execution_timeout_sec, deadline: result.deadline };
 }
 
 export async function tryDelegateDispatch(args, {

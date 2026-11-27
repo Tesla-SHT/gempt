@@ -1,3 +1,4 @@
+import { scheduleTimeout } from '../timeout.mjs';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createInterface } from 'node:readline';
@@ -192,9 +193,9 @@ async function runViaServe({ cliPath, ctx, journal, childEnv }) {
   }
 
   const abortController = new AbortController();
-  const timeoutTimer = setTimeout(() => {
+  const timeoutTimer = scheduleTimeout(() => {
     abortController.abort(new Error(`OpenCode turn timed out after ${ctx.timeoutSec}s.`));
-  }, Math.max(1000, (ctx.timeoutSec || 3600) * 1000));
+  }, ctx.timeoutSec);
   const onServerExit = (code, signal) => abortController.abort(
     new Error(`OpenCode serve exited unexpectedly (${(signal || code) ?? 'unknown'}).`),
   );
@@ -236,7 +237,7 @@ async function runViaServe({ cliPath, ctx, journal, childEnv }) {
       });
       if (!createRes.ok) {
         const body = await createRes.text().catch(() => '');
-        throw new Error(`OpenCode POST /session failed (${createRes.status}): ${body.slice(0, 300)}`);
+        throw new Error(`OpenCode POST /session failed (${createRes.status}): ${body}`);
       }
       const created = await createRes.json();
       ocSessionId = String(created?.id || created?.session?.id || '');
@@ -285,7 +286,7 @@ async function runViaServe({ cliPath, ctx, journal, childEnv }) {
       });
       if (!msgRes.ok) {
         const errBody = await msgRes.text().catch(() => '');
-        throw new Error(`OpenCode POST /session/${ocSessionId}/message failed (${msgRes.status}): ${errBody.slice(0, 400)}`);
+        throw new Error(`OpenCode POST /session/${ocSessionId}/message failed (${msgRes.status}): ${errBody}`);
       }
 
       let responseText = '';
@@ -316,7 +317,7 @@ async function runViaServe({ cliPath, ctx, journal, childEnv }) {
         throw new TurnInterrupted('OpenCode turn interrupted.');
       }
 
-      const finalText = streamError ? responseText : (journal.getText() || responseText);
+      const finalText = responseText || journal.getText();
       if (!finalText) {
         journal.finish('failed', 'OpenCode finished without an assistant message.');
         throw new Error('OpenCode finished without an assistant message.');
@@ -350,7 +351,7 @@ async function runViaServe({ cliPath, ctx, journal, childEnv }) {
     journal.finish('failed', String(err?.message || err));
     throw err;
   } finally {
-    clearTimeout(timeoutTimer);
+    timeoutTimer?.();
     serverChild?.off('exit', onServerExit);
     abortController.abort();
     if (serverChild) terminateProcessTree(serverChild);
@@ -374,12 +375,12 @@ async function runViaCliFallback({ cliPath, ctx, journal, childEnv }) {
   let timedOut = false;
   let stderr = '';
   let msgSeq = 0;
-  const timer = setTimeout(() => {
+  const timer = scheduleTimeout(() => {
     timedOut = true;
     terminateProcessTree(child);
-  }, Math.max(1000, (ctx.timeoutSec || 3600) * 1000));
+  }, ctx.timeoutSec);
 
-  child.stderr?.on('data', (chunk) => { stderr = (stderr + String(chunk)).slice(-4096); });
+  child.stderr?.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
 
   const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
   const rlClosed = new Promise((r) => rl.once('close', r));
@@ -414,7 +415,7 @@ async function runViaCliFallback({ cliPath, ctx, journal, childEnv }) {
     });
     child.once('close', (code, signal) => resolveExit({ code, signal }));
   }).finally(() => {
-    clearTimeout(timer);
+    timer?.();
   });
   await rlClosed;
 
@@ -497,7 +498,7 @@ export const opencodeRunner = {
       cli: this.id,
       model: ctx.model,
       sandbox: ctx.sandbox || 'workspace-write',
-      timeoutSec: ctx.timeoutSec || 3600,
+      timeoutSec: ctx.timeoutSec ?? null,
       threadId: ctx.runnerSessionId || ctx.threadId,
       onIdentity: ctx.onIdentity,
     });

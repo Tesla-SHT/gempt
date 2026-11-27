@@ -518,8 +518,8 @@
                   <span class="control-legend">已支持的 11 种执行 CLI</span>
                   <ul id="runner-cli-list" class="runner-cli-list"></ul>
                 </div>
-                <label class="advanced-field">咨询超时（秒）<input id="consult-timeout" type="number" min="15" max="1800" step="1" required></label>
-                <label class="advanced-field">执行超时（秒）<input id="codex-timeout" type="number" min="30" max="7200" step="any" required></label>
+                <label class="advanced-field">咨询超时（秒）<input id="consult-timeout" type="number" min="0" step="any" placeholder="留空或填 0 表示不限时"></label>
+                <label class="advanced-field">执行超时（秒）<input id="codex-timeout" type="number" min="0" step="any" placeholder="留空或填 0 表示不限时"></label>
                 <label class="advanced-field">附加 CLI 参数<textarea id="codex-extra-args" rows="2" placeholder="用空格或换行分隔标志"></textarea><span class="control-hint">附加参数需兼容 GemPT 的网关与沙箱设置。支持 --strict-config 和 --analytics-default-enabled。</span></label>
               </fieldset>
               <div class="advanced-actions">

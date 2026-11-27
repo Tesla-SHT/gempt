@@ -7,7 +7,7 @@ import { installAgy } from '../core/agy-install.mjs';
 import { agyInstallPaths } from '../core/bundle-paths.mjs';
 import { CLI_CHOICES } from '../core/config.mjs';
 import { handleTool, serveStdio } from '../core/mcp-server.mjs';
-import { ACTIVE_STATES, buildReplyCommand, buildWaitCommand, compactReceiptText, dispatchRun, interruptRun, pendingToolCalls,
+import { ACTIVE_STATES, buildReplyCommand, buildWaitCommand, dispatchRun, interruptRun, pendingToolCalls,
   readRun, replyToolCall, steerRun, tryDelegateDispatch, validateExecTimeoutSec } from '../core/runs.mjs';
 import { resolvePath } from '../core/state.mjs';
 import { handleBoardAction, handleSwarmAction } from '../core/swarm-engine.mjs';
@@ -27,7 +27,7 @@ const goalOptions = { goal: string, 'goal-file': string, cwd: string, tier: stri
 const commands = {
   'install-agy': { target: string, source: string, force: flag },
   run: { ...goalOptions, access: string, workspace: string, title: string, timeout: string, cli: string },
-  ask: { ...goalOptions, file: { ...string, multiple: true } },
+  ask: { ...goalOptions, 'max-output-tokens': string, file: { ...string, multiple: true } },
   mcp: {}, discover: {}, status: { 'run-id': string, 'run-ids': string, wait: flag, 'wait-all': flag,
     'heartbeat-sec': string, 'stale-sec': string },
   init: { 'non-interactive': flag, failover: string, sandbox: string,
@@ -44,8 +44,8 @@ const commands = {
 const goalUsage = '[--goal TEXT|- | --goal-file PATH] [--cwd PATH] [--tier TIER] [--family FAMILY] [--session ID] [--host ID]';
 const usages = {
   'install-agy': '[--target PATH] [--source PATH] [--force]',
-  run: `${goalUsage} [--access change|inspect] [--workspace inherit|share] [--title TITLE] [--timeout SECONDS] [--cli CLI]`,
-  ask: `${goalUsage} [--file PATH ...]`,
+  run: `${goalUsage} [--access change|inspect] [--workspace inherit|share] [--title TITLE] [--timeout SECONDS|none|unlimited] [--cli CLI]`,
+  ask: `${goalUsage} [--file PATH ...] [--max-output-tokens N]`,
   mcp: '',
   discover: '',
   init: '[--non-interactive] [--failover MODE] [--sandbox MODE] [--utility-model MODEL] [--dry-run]',
@@ -66,7 +66,7 @@ const usages = {
     title: '[TITLE | --title TITLE]',
     plan: '[--plan-json JSON] [--goal-title TITLE] [--goal-line TEXT]',
     add: 'NAME [--brief TEXT|- | --brief-file PATH] [--access change|inspect] [--workspace inherit|share]'
-      + ' [--cli CLI] [--model MODEL] [--tier TIER] [--n N] [--task TEXT ...] [--family FAMILY] [--timeout SECONDS]',
+      + ' [--cli CLI] [--model MODEL] [--tier TIER] [--n N] [--task TEXT ...] [--family FAMILY] [--timeout SECONDS|none|unlimited]',
     status: '',
     kill: 'NAME',
     model: 'NAME [--model MODEL] [--tier TIER] [--cli CLI] [--reason TEXT]',
@@ -126,6 +126,12 @@ async function settings(options) {
   }
 }
 
+function parseTimeout(value) {
+  if (value === undefined) return undefined;
+  if (/^(none|unlimited)$/i.test(value.trim())) return null;
+  return validateExecTimeoutSec(value.trim() ? Number(value) : NaN);
+}
+
 async function main([command, ...args]) {
   if (!command || command === '--help' || command === '-h') {
     console.log(usage());
@@ -157,7 +163,7 @@ async function main([command, ...args]) {
       const access = choose(values.access, ['change', 'inspect'], '--access') ?? 'change';
       const workspace = choose(values.workspace, ['inherit', 'share'], '--workspace') ?? 'inherit';
       const cliChoice = choose(values.cli, CLI_CHOICES, '--cli');
-      const timeoutSec = validateExecTimeoutSec(values.timeout === undefined ? undefined : Number(values.timeout));
+      const timeoutSec = parseTimeout(values.timeout);
       const args = await goalArgs(values, TIER_ORDER);
       const syncBudget = Number(process.env.GEMPT_GPT_RUN_SYNC_SEC);
       const waitSec = Number.isFinite(syncBudget) && syncBudget > 0 ? Math.min(syncBudget, 10) : 0;
@@ -168,8 +174,8 @@ async function main([command, ...args]) {
       };
       const runOpts = { configPath, waitSec };
       const run = (await tryDelegateDispatch(runPayload, runOpts)) ?? (await dispatchRun(runPayload, runOpts));
-      const { run_id, session_id, state, worktree_path = null, cwd, tier = null, execution_timeout_sec } = run;
-      const receipt = { run_id, session_id, state, worktree_path, cwd, tier, execution_timeout_sec };
+      const { run_id, session_id, state, worktree_path = null, cwd, tier = null, execution_timeout_sec, deadline } = run;
+      const receipt = { run_id, session_id, state, worktree_path, cwd, tier, execution_timeout_sec, deadline };
       if (ACTIVE_STATES.has(state) || state === 'interrupted') {
         const wait_command = buildWaitCommand(run_id);
         const pending = pendingToolCalls(run)[0];
@@ -179,12 +185,13 @@ async function main([command, ...args]) {
         return Number(state === 'interrupted');
       }
       const { model, reasoning_effort, verification, usage, text } = run;
-      print({ ...receipt, model, reasoning_effort, verification, usage, text: compactReceiptText(text, session_id) });
+      print({ ...receipt, model, reasoning_effort, verification, usage, text });
       return Number(['failed', 'unverified'].includes(verification?.status));
     }
     case 'ask': {
       const args = await goalArgs(values, ['chore', ...TIER_ORDER]);
-      const response = await handleTool('gpt_ask', { ...args, file_paths: values.file }, process.env, { configPath });
+      const response = await handleTool('gpt_ask', { ...args, file_paths: values.file,
+        max_output_tokens: values['max-output-tokens'] === undefined ? undefined : Number(values['max-output-tokens']) }, process.env, { configPath });
       console.log(response.content[0].text);
       if (response.isError) console.error(usage(command));
       return Number(Boolean(response.isError));
@@ -344,7 +351,7 @@ async function main([command, ...args]) {
           tier: values.tier,
           n: values.n !== undefined ? Number(values.n) : undefined,
           tasks: values.task?.length ? values.task : undefined,
-          timeout_sec: values.timeout !== undefined ? Number(values.timeout) : undefined,
+          timeout_sec: parseTimeout(values.timeout),
         }, { configPath });
       } else if (sub === 'status') {
         result = await handleSwarmAction({ action: 'status', swarm_id: swarmId, cwd, host_conversation_id: values.host }, { configPath });

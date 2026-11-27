@@ -115,12 +115,6 @@ function stripSummaryHeader(text) {
   return raw.replace(/^\[mode=[^\]]+\]\s*/i, '').trim();
 }
 
-function truncateText(text, limit = 600) {
-  const chars = Array.from(String(text || '').trim());
-  if (chars.length <= limit) return chars.join('');
-  return `${chars.slice(0, limit - 3).join('').trimEnd()}...`;
-}
-
 function compactRosterItem(worker) {
   return {
     name: worker.name,
@@ -130,6 +124,7 @@ function compactRosterItem(worker) {
     desired_model: worker.desired_model,
     applied_model: worker.applied_model,
     tail_from_seq: worker.tail_from_seq,
+    timeout_sec: worker.timeout_sec,
     conversation_id: worker.role === 'coordinator' ? worker.session_id : null,
     tier: worker.tier,
     implicit: worker.implicit,
@@ -299,6 +294,7 @@ export async function routeBoardDeliveries(swarmId, options = {}) {
         const run = await ctx.dispatchRunImpl({
           run_id: runId, goal: await withHeadNudge(wakeGoal, swarmId, worker, ctx.sessionsDir),
           cwd: wakeCwd,
+          timeout_sec: worker.timeout_sec,
           access: worker.access || 'change',
           workspace: worker.worktree_path ? 'inherit' : (worker.workspace || 'inherit'),
           cli: runtime.cli || 'auto',
@@ -383,8 +379,8 @@ export async function onWorkerTurnFinished({
   if (!implicit && !['monitor', 'narrator'].includes(worker.role) && !reported && !(finishedOk && worker.parked_on?.startsWith('board_wait'))
       && !posts.some((msg) => msg.meta?.auto_summary && msg.kind === (finishedOk ? 'summary' : 'error'))) {
     const summaryText = finishedOk
-      ? `@${worker.added_by} [done] ${truncateText(stripSummaryHeader(result?.text) || 'Turn finished.', 600)}`
-      : `@${worker.added_by} [${outcome?.state || 'failed'}] ${truncateText(errText, 400)}`;
+      ? `@${worker.added_by} [done] ${stripSummaryHeader(result?.text) || 'Turn finished.'}`
+      : `@${worker.added_by} [${outcome?.state || 'failed'}] ${errText}`;
     autoPost = await postBoardMessage(swarmId, {
       from: swarmAgent,
       kind: finishedOk ? 'summary' : 'error',
@@ -648,15 +644,16 @@ export async function handleSwarmAction(args = {}, options = {}) {
           ...(cli === 'codex' ? { dynamic_board_tools: session.codex_dynamic_board_tools === true } : {}) };
       }
       const recent = await readBoardMessages(swarmId, { ...storage, limit: Infinity });
-      const memory = recent.filter((m) => m.from_agent === args.fork || m.meta?.worker === args.fork).slice(-8);
+      const memory = recent.filter((m) => m.from_agent === args.fork || m.meta?.worker === args.fork);
       const lastReply = session?.turns?.findLast((turn) => turn.role === 'assistant')?.content || session?.result?.text;
-      forkContext = [source?.task_summary || source?.brief, !memory.length && truncateText(lastReply, 2000), ...memory.map((m) => `#${m.seq} ${truncateText(m.text)}`),
+      forkContext = [source?.brief || source?.task_summary, !memory.length && lastReply, ...memory.map((m) => `#${m.seq} ${m.text}`),
         `Everything before this turn is @${args.fork}'s memory. Do not redo its work or answer its old requests. Follow your own assignment.`].filter(Boolean).join('\n');
     }
     const runIds = specs.map(() => randomUUID().replaceAll('-', ''));
     const briefs = await addWorkerBriefs(swarmId, specs.map((spec, index) => ({
       channel: homeChannelOf(roleOf(spec.name), channels, registry),
       worker: { name: spec.name, run_id: runIds[index], cli, model, tier, access, workspace, source_cwd: ctx.cwd || null, state: 'working',
+        timeout_sec: timeoutSec,
         fork_mode: args.fork ? 'summary_fallback' : null,
         role: roleOf(spec.name), channels, added_by: owner, brief: spec.fullBrief, task_summary: spec.taskSummary, parked_on: null, error: null },
     })), storage);
@@ -791,6 +788,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
         run_id: runId,
         goal: await withHeadNudge(`[Board #${notice.seq} from @${actor}]\n${notice.text}`, swarmId, worker, ctx.sessionsDir),
         cwd: resumeCwd,
+        timeout_sec: worker.timeout_sec,
         access: worker.access || 'change',
         workspace: worker.worktree_path ? 'inherit' : (worker.workspace || 'inherit'),
         cli: nextCli,

@@ -114,8 +114,8 @@ export function mountAdvancedSettings($, { transport, showToast, refresh, refres
     stage('utility-effort', 'utility', 'reasoning_effort', $('utility-effort').value);
     stage('excluded-models', 'routing_policy', 'excluded_models', $('excluded-models').value.split(/[,\n]/).map((s) => s.trim()).filter(Boolean));
     stage('codex-cli-path', 'codex', 'cli_path', $('codex-cli-path').value.trim());
-    if (dirty.has('codex-timeout')) settings.codex_timeout_sec = $('codex-timeout').valueAsNumber;
-    stage('consult-timeout', 'limits', 'consult_timeout_sec', $('consult-timeout').valueAsNumber);
+    if (dirty.has('codex-timeout')) settings.codex_timeout_sec = $('codex-timeout').valueAsNumber || null;
+    stage('consult-timeout', 'limits', 'consult_timeout_sec', $('consult-timeout').valueAsNumber || null);
     stage('codex-extra-args', 'codex', 'extra_args', extraArgs($('codex-extra-args').value));
     return settings;
   }
