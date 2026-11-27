@@ -407,31 +407,35 @@ export async function onWorkerTurnFinished({
   }, { sessionsDir: resolvedSessions, expectedState: worker.state, expectedRun: worker.run_id });
   if (!finished) return { skipped: true, reason: 'state changed' };
 
+  const deliveryOptions = {
+    sessionsDir: resolvedSessions,
+    configPath,
+    env,
+    dispatchRunImpl,
+    steerRunImpl,
+    replyToolCallImpl,
+    readRunImpl,
+  };
   if (finished.desired_runtime && nextState === 'waiting') {
     const runtime = finished.desired_runtime;
     try {
-      await handleSwarmAction({ action: 'model', swarm_id: swarmId, name: swarmAgent, ...runtime }, {
-        sessionsDir: resolvedSessions, configPath, env, dispatchRunImpl, steerRunImpl, replyToolCallImpl, readRunImpl,
-      });
-      return { state: nextState, auto_post: autoPost, deliveries: [], ...boardStats };
+      await handleSwarmAction({ action: 'model', swarm_id: swarmId, name: swarmAgent, ...runtime }, deliveryOptions);
+      const deliveries = !implicit && autoPost ? await routeBoardDeliveries(swarmId, deliveryOptions) : [];
+      return { state: nextState, auto_post: autoPost, deliveries, ...boardStats };
     } catch {
       // The queued selection survives a failed dispatch and can apply on a later wake.
     }
   }
   let deliveries = [];
-  if (!implicit && nextState === 'waiting') {
-    const pending = await listUndeliveredForWorker(swarmId, swarmAgent, { since: 0, sessionsDir: resolvedSessions });
+  if (!implicit) {
+    const pending = nextState === 'waiting'
+      ? await listUndeliveredForWorker(swarmId, swarmAgent, { since: 0, sessionsDir: resolvedSessions })
+      : [];
     if (pending.length) {
       await updateWorker(swarmId, swarmAgent, { last_park_blocked_seq: pending.at(-1).seq }, { sessionsDir: resolvedSessions });
-      deliveries = await routeBoardDeliveries(swarmId, {
-        sessionsDir: resolvedSessions,
-        configPath,
-        env,
-        dispatchRunImpl,
-        steerRunImpl,
-        replyToolCallImpl,
-        readRunImpl,
-      });
+    }
+    if (pending.length || autoPost) {
+      deliveries = await routeBoardDeliveries(swarmId, deliveryOptions);
     }
   }
   return { state: nextState, auto_post: autoPost, deliveries, ...boardStats };

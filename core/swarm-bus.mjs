@@ -20,7 +20,7 @@ const RESERVED_WORKER_NAMES = new Set(['all', 'coordinator', 'human']);
 const MENTION_RE = /(?<![\p{L}\p{Nd}_-])@([a-z0-9][a-z0-9_-]{0,23})(?![\p{L}\p{Nd}_-])/giu;
 const SCREENSHOT_RE = /^[ \t]*(?:[-*][ \t]+)?Screenshot:[ \t]*([^|\r\n]+?)(?:[ \t]*\|[ \t]*([^\r\n]*))?[ \t]*$/gmi;
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS run_lineage (
   run_id TEXT PRIMARY KEY, swarm_id TEXT, worker_name TEXT, session_id TEXT,
@@ -132,12 +132,24 @@ export async function openSwarmDb(sessionsDir) {
   return openSwarmDbSync(sessionsDir);
 }
 
+function hasMissingMigrationColumn(db) {
+  for (const [table, columns] of Object.entries(migrations)) {
+    const existing = new Set(db.all(`PRAGMA table_info(${table})`).map((c) => c.name));
+    if (existing.size === 0) return true;
+    for (const column of Object.keys(columns)) {
+      if (!existing.has(column)) return true;
+    }
+  }
+  return false;
+}
+
 function openSwarmDbSync(sessionsDir) {
   const db = openDatabaseSync(resolveSwarmDbPath(sessionsDir));
   try {
     const { user_version } = db.get('PRAGMA user_version');
     if (user_version < SCHEMA_VERSION || !db.get("SELECT 1 FROM sqlite_master WHERE name='swarm_monitor_ticks'")
-        || !db.get("SELECT 1 FROM sqlite_master WHERE name='idx_swarm_request_id'")) {
+        || !db.get("SELECT 1 FROM sqlite_master WHERE name='idx_swarm_request_id'")
+        || hasMissingMigrationColumn(db)) {
       db.transaction(() => {
         db.exec(SCHEMA_SQL);
         for (const [table, columns] of Object.entries(migrations)) {

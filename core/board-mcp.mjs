@@ -7,7 +7,7 @@ import { resolvePath } from './state.mjs';
 import { getWorker, getSwarmOverview, postBoardMessage, updateWorker } from './swarm-bus.mjs';
 import { TOOLS } from './tool-schemas.mjs';
 import { publishNarratorView } from './swarm-narrator.mjs';
-import { handleBoardAction, handleSwarmAction } from './swarm-engine.mjs';
+import { handleBoardAction, handleSwarmAction, routeBoardDeliveries } from './swarm-engine.mjs';
 
 function tool(name, description, properties, required) {
   return {
@@ -120,7 +120,8 @@ export async function handleBoardMcpTool(name, args = {}, env = process.env, ove
     try {
       await updateWorker(swarmId, agentName, { state: 'waiting_reply', parked_on: `board_ask:${message.seq}` }, { sessionsDir });
     } catch { /* Sender may not be a roster worker (e.g., external helper). */ }
-    return textResult({ ok: true, swarm_id: swarmId, message, head: message.seq });
+    const deliveries = await routeBoardDeliveries(swarmId, options);
+    return textResult({ ok: true, swarm_id: swarmId, message, head: message.seq, deliveries });
   }
   if (name === 'board_roster') {
     return textResult(await handleBoardAction({ action: 'roster', swarm_id: swarmId }, options));

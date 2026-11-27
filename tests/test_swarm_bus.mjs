@@ -1148,14 +1148,14 @@ test('migration adds fork_mode to a v0.8.0 database with the request index', asy
   const db = await openSwarmDb(sessionsDir);
   try {
     await upsertWorker('legacy', { name: 'child', fork_mode: 'summary_fallback' }, { db });
-    assert.equal(db.get('PRAGMA user_version').user_version, 4);
+    assert.equal(db.get('PRAGMA user_version').user_version, 5);
   } finally {
     db.close();
   }
   assert.equal((await getWorker('legacy', 'child', { sessionsDir })).fork_mode, 'summary_fallback');
 });
 
-test('v2 to v4 preserves board data and creates the indexed lineage table once', async (t) => {
+test('v2 to v5 preserves board data and creates the indexed lineage table once', async (t) => {
   const sessionsDir = makeTmp(t);
   const old = await openSwarmDb(sessionsDir);
   await upsertWorker('migration', { name: 'scout', brief: 'read the code' }, { db: old });
@@ -1165,7 +1165,7 @@ test('v2 to v4 preserves board data and creates the indexed lineage table once',
   for (let i = 0; i < 2; i++) {
     const db = await openSwarmDb(sessionsDir);
     try {
-      assert.equal(db.get('PRAGMA user_version').user_version, 4);
+      assert.equal(db.get('PRAGMA user_version').user_version, 5);
       assert.equal(db.get("SELECT brief FROM roster WHERE name = 'scout'").brief, 'read the code');
       assert.equal(db.get('SELECT text FROM messages').text, 'found the entry point');
       assert.deepEqual(db.all("PRAGMA index_list(run_lineage)").filter((idx) => !idx.unique)
@@ -1173,6 +1173,79 @@ test('v2 to v4 preserves board data and creates the indexed lineage table once',
       ['cache_group_key', 'native_session_id', 'session_id', 'swarm_id,worker_name']);
     } finally { db.close(); }
   }
+});
+
+test('v4 database missing roster.timeout_sec migrates to v5 and accepts worker saves', async (t) => {
+  const sessionsDir = makeTmp(t);
+  const old = await openSwarmDb(sessionsDir);
+  try {
+    await upsertWorker('legacy-v4', { name: 'scout', brief: 'keep me' }, { db: old });
+    old.exec('ALTER TABLE roster DROP COLUMN timeout_sec; PRAGMA user_version = 4');
+    assert.equal(old.all('PRAGMA table_info(roster)').some((c) => c.name === 'timeout_sec'), false);
+  } finally {
+    old.close();
+  }
+
+  const migrated = await openSwarmDb(sessionsDir);
+  try {
+    assert.equal(migrated.get('PRAGMA user_version').user_version, 5);
+    assert.equal(migrated.all('PRAGMA table_info(roster)').some((c) => c.name === 'timeout_sec'), true);
+    await upsertWorker('legacy-v4', { name: 'solo', timeout_sec: null, brief: 'runs cleanly' }, { db: migrated });
+  } finally {
+    migrated.close();
+  }
+  const scout = await getWorker('legacy-v4', 'scout', { sessionsDir });
+  const solo = await getWorker('legacy-v4', 'solo', { sessionsDir });
+  assert.equal(scout.brief, 'keep me');
+  assert.equal(solo.timeout_sec, null);
+});
+
+test('helper auto-summary and board_ask route deliveries to waiting parents and peers', async (t) => {
+  const sessionsDir = makeTmp(t);
+  const id = 'helper-wake';
+  const wakes = [];
+  const opts = {
+    sessionsDir,
+    dispatchRunImpl: async (args) => {
+      wakes.push({ agent: args.swarmAgent, goal: args.goal });
+      return { run_id: `wake-${wakes.length}`, session_id: args.sessionId || `s-${wakes.length}` };
+    },
+  };
+  await ensureSwarm({ swarmId: id, cwd: sessionsDir, sessionsDir });
+  await upsertWorker(id, { name: 'lead', state: 'waiting', session_id: 'lead-sess', source_cwd: sessionsDir }, opts);
+  await upsertWorker(id, { name: 'helper-ok', added_by: 'lead', state: 'working', run_id: 'run-ok', session_id: 'h1', source_cwd: sessionsDir }, opts);
+  await upsertWorker(id, { name: 'helper-fail', added_by: 'lead', state: 'working', run_id: 'run-fail', session_id: 'h2', source_cwd: sessionsDir }, opts);
+  await upsertWorker(id, { name: 'reviewer', state: 'waiting', session_id: 'rev-sess', source_cwd: sessionsDir }, opts);
+
+  const okRes = await onWorkerTurnFinished({
+    ...opts, swarmId: id, swarmAgent: 'helper-ok', runId: 'run-ok',
+    outcome: { state: 'finished' }, result: { text: 'all checks green' },
+  });
+  assert.ok(okRes.auto_post);
+  assert.equal(okRes.deliveries.length, 1);
+  assert.equal(okRes.deliveries[0].worker, 'lead');
+  assert.equal(okRes.deliveries[0].mode, 'wake');
+
+  await updateWorker(id, 'lead', { state: 'waiting' }, opts);
+  const failRes = await onWorkerTurnFinished({
+    ...opts, swarmId: id, swarmAgent: 'helper-fail', runId: 'run-fail',
+    outcome: { state: 'failed', error: { message: 'boom' } },
+  });
+  assert.ok(failRes.auto_post);
+  assert.equal(failRes.deliveries.length, 1);
+  assert.equal(failRes.deliveries[0].worker, 'lead');
+
+  const askRes = JSON.parse((await handleBoardMcpTool(
+    'board_ask',
+    { question: 'Need approval; @reviewer please inspect too' },
+    {},
+    { ...opts, swarmId: id, agentName: 'helper-ok' },
+  )).content[0].text);
+  assert.equal(askRes.ok, true);
+  assert.equal((await getWorker(id, 'helper-ok', opts)).state, 'waiting_reply');
+  assert.equal(askRes.deliveries.length, 1);
+  assert.equal(askRes.deliveries[0].worker, 'reviewer');
+  assert.equal(askRes.deliveries[0].mode, 'wake');
 });
 
 test('forks retain the logical root while cache keys follow the model and wire protocol', (t) => {

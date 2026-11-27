@@ -63,6 +63,12 @@ GemPT v0.10.1 使用 Node.js（`>= 22.13.0`）。Antigravity 的 `gempt_gempt` M
 - 用 `gpt_swarm(action="title"|"plan"|"add"|"status"|"model"|"kill", cli?, ...)` 规划与拉起多 CLI 工位（不消耗 AGY 原生外壳 token），并行写入用 `workspace="share"` 自动创建 worktree。
 - 用 `gpt_board(action="post"|"read"|"wait"|"roster")` 在共享 SQLite 消息板上协同与自动唤醒。通过 `run_command(WaitMsBeforeAsync=500, NotificationTimeoutSeconds=180)` 执行返回的 `gempt-wait --board <swarm_id>`。
 - 可通过 `cli` 参数或控制台 `execution.default_cli` 选择 `auto`（按模型亲和匹配已安装 CLI）或任意 11 种受支持 CLI。
+- **角色工位（按需启用）**：
+  - `role="monitor"`（如 `gpt_swarm(action="add", name="monitor", role="monitor", brief="watch stalls")`）：零 LLM 进程，由守护循环每 3 分钟及发帖后巡检停摆并在消息板 `@target [stall]` 提醒唤醒。
+  - `role="narrator"`（如 `gpt_swarm(action="add", name="narrator", role="narrator", brief="maintain overview")`）：只读工位，监听消息板并调用 `board_publish_view` 持续更新侧栏 Overview 卡片。
+- **消息板与模式边界**：
+  - 仅显式 `gpt_swarm` 工位接入 GemPT SQLite 消息板并支持 `@mention` 自动唤醒（`codex` / `claude` / `opencode` 注入完整板工具，其余 CLI 经 shell 调 `gempt board post/read/roster`）；单任务 `gpt_run` 不发板帖。
+  - 原生 AGY `/swarm`（`board.jsonl`）与 GemPT（`swarm.sqlite`）各自独立、不跨侧唤醒，侧栏混合视图为只读投影。
 - **提示词缓存纪律（对齐原生 Swarm）**：
   - **热上下文分叉**：新工位需继承某成员已读代码与推理时传 `fork="<member>"`（同 CLI/模型下 Codex 走原生 `thread/fork`、Claude 走 `--resume --fork-session`，其余场景自动回退板贴摘要）。
   - 多 worktree 编辑时，先让短只读 `scout` 在 `workspace="inherit"` 勘查，再用 `fork="scout"` 派出 `access="change", workspace="share"` 的原生分叉。实测缓存命中约 98%，独立 worktree 冷启约 80%。父线程超过 120k token 时，优先写简短交接再分工。
