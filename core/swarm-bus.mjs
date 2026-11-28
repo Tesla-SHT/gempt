@@ -1,10 +1,10 @@
 import { ACTIVE_STATES, readRun, refreshRun, runBoardTelemetry } from './runs.mjs';
 import { pidAlive } from '../magpie_plugin/lib/app-server-process.mjs';
 import { createHash, randomBytes } from 'node:crypto';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
 import { openDatabaseSync } from './sqlite.mjs';
-import { resolvePath } from './state.mjs';
+import { resolvePath, withinPath } from './state.mjs';
 
 import {
   ALL, MAIN, ROLE_WORKER_RE, activeAt, channelMentions, channelRegistry,
@@ -302,12 +302,13 @@ export function parseMentions(text) {
   return out;
 }
 
-export function parseScreenshots(text) {
+export function parseScreenshots(text, { absoluteImagesOnly = false } = {}) {
   if (typeof text !== 'string' || !text) return [];
   const out = [];
   for (const match of text.matchAll(SCREENSHOT_RE)) {
     const path = match[1].trim().replace(/^`(.+)`$/, '$1');
     const caption = (match[2] || '').trim();
+    if (absoluteImagesOnly && (!/^(?:\/|[a-z]:[\\/])/i.test(path) || !/\.(?:png|jpe?g|webp)$/i.test(path))) continue;
     if (path) out.push({ path, caption });
   }
   return out;
@@ -404,9 +405,19 @@ export function soloWorkerName(sessionId) {
   return deterministicId('solo', sessionId);
 }
 
-export async function resolveSwarmId({ swarmId, hostConversationId, cwd, sessionsDir, db } = {}) {
+export async function resolveSwarmId({ swarmId, hostConversationId, cwd, sessionsDir, db, workspaceRoots, bindingCwd, envRoot } = {}) {
   if (typeof swarmId === 'string' && swarmId.trim()) {
-    return validateSwarmId(swarmId);
+    const id = validateSwarmId(swarmId);
+    if (workspaceRoots) {
+      const inScope = (path) => typeof path === 'string' && isAbsolute(path) &&
+        workspaceRoots.some((root) => withinPath(resolvePath(path), resolvePath(root))) &&
+        (!envRoot || withinPath(resolvePath(path), resolvePath(envRoot)));
+      const existing = await withDb(sessionsDir, (conn) => conn.get('SELECT cwd FROM swarms WHERE id = ?', id), db);
+      if (!inScope(existing ? existing.cwd : cwd) || (bindingCwd && !inScope(bindingCwd))) {
+        throw Object.assign(new Error('Swarm outside host workspace.'), { status: 403 });
+      }
+    }
+    return id;
   }
   const implicit = resolveImplicitSwarmId(hostConversationId);
   if (implicit) return implicit;
@@ -568,6 +579,7 @@ function serializeWorkerPatch(worker) {
 export async function addWorkerBriefs(swarmId, specs, options = {}) {
   const id = validateSwarmId(swarmId);
   return withDb(options.sessionsDir, (conn) => conn.transaction(() => {
+    checkWorkerTurn(conn, id, options.workerTurn);
     const live = conn.all("SELECT name FROM roster WHERE swarm_id = ? AND name != 'coordinator' AND state != 'killed'", id);
     if (live.length + specs.length > 32) throw new Error('At most 32 live workers are supported.');
     const registry = registryInDb(conn, id);
@@ -602,10 +614,10 @@ const WORKER_UPDATABLE_COLS = [
   'state', 'run_id', 'session_id', 'brief', 'task_summary', 'last_seq', 'parked_on', 'error',
 ];
 
-export async function updateWorker(swarmId, name, patch = {}, { sessionsDir, db, expectedState, expectedRun } = {}) {
+export async function updateWorker(swarmId, name, patch = {}, { sessionsDir, db, expectedState, expectedRun, workerTurn } = {}) {
   const id = validateSwarmId(swarmId);
   const workerName = name === 'coordinator' ? name : validateWorkerName(name);
-  return withDb(sessionsDir, (conn) => {
+  return withDb(sessionsDir, (conn) => withWorkerTurn(conn, id, workerTurn, () => {
     const existing = conn.get('SELECT * FROM roster WHERE swarm_id = ? AND name = ?', id, workerName);
     if (!existing) return null;
     patch = serializeWorkerPatch(patch);
@@ -625,11 +637,23 @@ export async function updateWorker(swarmId, name, patch = {}, { sessionsDir, db,
     if (expectedRun !== undefined) { where += ' AND run_id IS ?'; params.push(expectedRun); }
     if (!conn.run(`UPDATE roster SET ${sets.join(', ')} WHERE ${where}`, ...params).changes) return null;
     return formatWorker(conn.get('SELECT * FROM roster WHERE swarm_id = ? AND name = ?', id, workerName));
-  }, db);
+  }), db);
 }
 
 export async function killWorkerRecord(swarmId, name, { error = null, ...options } = {}) {
   return updateWorker(swarmId, name, { state: 'killed', parked_on: null, desired_runtime: null, error }, options);
+}
+
+export async function cleanKilledWorkspace(swarmId, killed, clean, { sessionsDir } = {}) {
+  // A worker name can be reused while the interrupt is in flight. Hold the
+  // roster write lock until this run's directory and its pointer are retired.
+  return withDb(sessionsDir, (conn) => conn.transaction(() => {
+    const worker = conn.get("SELECT * FROM roster WHERE swarm_id = ? AND name = ? AND state = 'killed' AND run_id = ? AND worktree_path = ?",
+      swarmId, killed.name, killed.run_id, killed.worktree_path);
+    if (!worker || !clean(worker)) return false;
+    conn.run('UPDATE roster SET worktree_path = NULL, updated_at = ? WHERE swarm_id = ? AND name = ?', nowIso(), swarmId, killed.name);
+    return true;
+  }));
 }
 
 export async function getWorker(swarmId, name, { sessionsDir, db } = {}) {
@@ -778,11 +802,45 @@ function appendMessage(conn, id, {
   return withWarnings(formatMessage(conn.get('SELECT * FROM messages WHERE seq = ?', res.lastInsertRowid)), registry);
 }
 
+export async function withLiveNarrator(swarmId, name, publish, { sessionsDir, workerTurn } = {}) {
+  return withDb(sessionsDir, (conn) => conn.transaction(() => {
+    const member = conn.get('SELECT role, run_id, state FROM roster WHERE swarm_id = ? AND name = ?', swarmId, name);
+    if (member?.role !== 'narrator' || member.state === 'killed') throw new Error('Only a live narrator can publish a view.');
+    if (workerTurn) requireWorkerTurn(member, workerTurn);
+    return publish();
+  }));
+}
+
+function requireWorkerTurn(worker, turn) {
+  if (!worker || worker.run_id !== turn.runId || !['working', 'waiting_reply'].includes(worker.state)) {
+    throw new Error('Worker run is no longer current.');
+  }
+}
+
+function checkWorkerTurn(conn, id, turn) {
+  if (turn) requireWorkerTurn(conn.get('SELECT run_id, state FROM roster WHERE swarm_id = ? AND name = ?', id, turn.name), turn);
+}
+
+// Keep the identity check and its write under the same SQLite write lock.
+function withWorkerTurn(conn, id, turn, write) {
+  if (!turn) return write();
+  return conn.transaction(() => {
+    checkWorkerTurn(conn, id, turn);
+    return write();
+  });
+}
+
 export async function postBoardMessage(swarmId, input = {}, options = {}) {
   const id = validateSwarmId(swarmId);
   return withDb(options.sessionsDir, (conn) => conn.transaction(() => {
     ensureSwarmInDb(conn, { ...options, swarmId: id });
-    return appendMessage(conn, id, { ...input, control: null, requestId: input.requestId ?? options.requestId }, options);
+    checkWorkerTurn(conn, id, options.workerTurn);
+    const message = appendMessage(conn, id, { ...input, control: null, requestId: input.requestId ?? options.requestId }, options);
+    if (options.parkForReply) {
+      conn.run("UPDATE roster SET state = 'waiting_reply', parked_on = ?, updated_at = ? WHERE swarm_id = ? AND name = ?",
+        message.meta?.call_id ?? 'board_ask:' + message.seq, nowIso(), id, message.from_agent);
+    }
+    return message;
   }), options.db);
 }
 
@@ -790,6 +848,7 @@ function changeChannel(swarmId, options, prepare) {
   const id = validateSwarmId(swarmId);
   return withDb(options.sessionsDir, (conn) => conn.transaction(() => {
     ensureSwarmInDb(conn, { ...options, swarmId: id });
+    checkWorkerTurn(conn, id, options.workerTurn);
     const { actor, text, control } = prepare(conn, id, registryInDb(conn, id));
     return appendMessage(conn, id, { from: actor, kind: 'system', text, control }, { skipRateLimit: true });
   }), options.db);
@@ -858,14 +917,14 @@ export async function markRead(swarmId, name, seq, { db, sessionsDir } = {}) {
   return withDb(sessionsDir, (conn) => advanceRead(conn, validateSwarmId(swarmId), name, seq), db);
 }
 
-export async function parkWorker(swarmId, name, { since, mentionsOnly = true, channel, db, sessionsDir } = {}) {
+export async function parkWorker(swarmId, name, { since, mentionsOnly = true, channel, db, sessionsDir, workerTurn } = {}) {
   if (!Number.isSafeInteger(since) || since < 0) throw new Error('Pass the highest sequence actually read as since.');
   return updateWorker(swarmId, name, { wake_mode: mentionsOnly ? 'mentions' : 'anything', wait_since: since,
-    parked_on: channel ? 'board_wait:' + channel : 'board_wait' }, { db, sessionsDir });
+    parked_on: channel ? 'board_wait:' + channel : 'board_wait' }, { db, sessionsDir, workerTurn });
 }
 
 export async function readBoardMessages(swarmId, {
-  since, seqs, limit = 20, channel, viewer, includeControl = true, sessionsDir, db,
+  since, seqs, limit = 20, channel, viewer, includeControl = true, sessionsDir, db, workerTurn,
 } = {}) {
   const id = validateSwarmId(swarmId);
   return withDb(sessionsDir, (conn) => {
@@ -896,7 +955,7 @@ export async function readBoardMessages(swarmId, {
       rows = rows.filter((m, i) => visible[i] && (includeControl || countsUnread(m)) && (!wanted || wanted.has(m.seq)));
       if (!exact && max < Infinity) rows = after === null ? rows.slice(-max) : rows.slice(0, max);
     }
-    if (worker && !channel && rows.length) advanceRead(conn, id, viewer, rows.at(-1).seq);
+    if (worker && !channel && rows.length) withWorkerTurn(conn, id, workerTurn, () => advanceRead(conn, id, viewer, rows.at(-1).seq));
     return rows;
   }, db);
 }

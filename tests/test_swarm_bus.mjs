@@ -1,7 +1,7 @@
 import { createGifEncoder } from '../mcp_app/swarm-gif.js';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer, get as httpGet } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -24,11 +24,11 @@ import {
 } from '../core/swarm-channels.mjs';
 import { BOARD_TOOLS, handleBoardMcpTool } from '../core/board-mcp.mjs';
 import { buildWorkerInstructions, handleBoardAction, handleSwarmAction, onWorkerTurnFinished } from '../core/swarm-engine.mjs';
-import { ensureBranchWorkspace, ensureShareWorktree } from '../core/worktrees.mjs';
+import { ensureBranchWorkspace, ensureShareWorktree, removeBranchWorkspace } from '../core/worktrees.mjs';
 import { narratorDirectory, publishNarratorView, readNarratorView } from '../core/swarm-narrator.mjs';
 import { detectMonitorStall, MONITOR_INTERVAL_MS, runMonitorTick, sweepSwarmMonitors } from '../core/swarm-monitor.mjs';
 import { runSwarmOperation } from '../core/swarm-service.mjs';
-import { reconcileRunState, saveRun, tryDelegateDispatch } from '../core/runs.mjs';
+import { reconcileRunState, runDirectory, saveRun, tryDelegateDispatch } from '../core/runs.mjs';
 import { handleTool, TOOLS } from '../core/mcp-server.mjs';
 import { runWait, waitForBoard } from '../core/wait.mjs';
 import { dispatchPageApi } from '../magpie_plugin/lib/page-api.mjs';
@@ -242,6 +242,9 @@ test('swarm-bus validates worker names, parses mentions & screenshots, and manag
       { path: 'C:\\x\\b.jpg', caption: 'After fix' },
     ],
   );
+
+  assert.deepEqual(parseScreenshots('Screenshot: `C:/screens/first view.WEBP` | before\nScreenshot: relative.png\nScreenshot: /var/notes.txt', { absoluteImagesOnly: true }),
+    [{ path: 'C:/screens/first view.WEBP', caption: 'before' }]);
 
   const swarmId = await resolveSwarmId({ hostConversationId: 'conv-42', cwd: dir, sessionsDir });
   assert.match(swarmId, /^conversation-[0-9a-f]{64}$/);
@@ -616,6 +619,67 @@ test('waitForBoard and gempt-wait --board wake on coordinator mentions and worke
   assert.equal((await read({ seqs: [post.seq] }))[0].text, text);
 });
 
+test('worker MCP dispatch enforces the normalized inherited access', async (t) => {
+  const sessionsDir = makeTmp(t);
+  const dispatches = [];
+  const options = { swarmId: 'delegation', sessionsDir, agentName: 'reader', dispatchRunImpl: async (args) => {
+    dispatches.push(args);
+    return { run_id: args.run_id };
+  } };
+  await ensureSwarm({ ...options, cwd: sessionsDir });
+  await upsertWorker(options.swarmId, { name: 'reader', access: 'inspect' }, options);
+  const add = (name, access) => handleBoardMcpTool('board_swarm', { action: 'add', name, access, brief: 'Read files' }, {}, options);
+  await assert.rejects(add('editor', ' change '), /inspect-only/);
+  await assert.rejects(add('invalid', ['inspect']), /Invalid access/);
+  await add('inherited', undefined);
+  await add('explicit', ' inspect ');
+  assert.deepEqual(dispatches.map(({ access, sandbox }) => [access, sandbox]), [['inspect', 'read-only'], ['inspect', 'read-only']]);
+  assert.equal(await getWorker(options.swarmId, 'editor', options), null);
+});
+
+test('explicit stdio board and swarm IDs respect the persisted workspace binding', async (t) => {
+  const sessionsDir = makeTmp(t);
+  const root = join(sessionsDir, 'one'), outside = join(sessionsDir, 'two');
+  mkdirSync(root);
+  mkdirSync(outside);
+  const env = { GEMPT_WORKSPACE_ROOT: root, GEMPT_SESSIONS_DIR: sessionsDir };
+  await ensureSwarm({ swarmId: 'foreign', sessionsDir, cwd: outside, title: 'Original' });
+  for (const [name, action] of [['gpt_board', 'read'], ['gpt_board', 'post'], ['gpt_swarm', 'status'], ['gpt_swarm', 'title']]) {
+    await assert.rejects(handleTool(name, { swarm_id: 'foreign', action, cwd: root, title: 'New', text: 'New' }, env), { status: 403 });
+  }
+  const overview = await getSwarmOverview('foreign', { sessionsDir });
+  assert.equal(overview.swarm.title, 'Original');
+  assert.equal(overview.swarm.cwd, outside);
+  assert.equal(overview.head, 0);
+  await handleTool('gpt_swarm', { swarm_id: 'local', action: 'title', title: 'Local' }, env);
+  assert.equal((await getSwarmOverview('local', { sessionsDir })).swarm.cwd, root);
+  await assert.rejects(handleTool('gpt_swarm', { swarm_id: 'local', action: 'title', cwd: outside, title: 'Moved' }, env), { status: 403 });
+  await ensureSwarm({ swarmId: 'unbound', sessionsDir });
+  await assert.rejects(handleTool('gpt_board', { swarm_id: 'unbound' }, env), { status: 403 });
+  await handleTool('gpt_board', { swarm_id: 'foreign' }, { GEMPT_SESSIONS_DIR: sessionsDir });
+});
+
+test('board questions, posts and waits require the current live worker turn', async (t) => {
+  const sessionsDir = makeTmp(t);
+  const options = { swarmId: 'reassigned', agentName: 'worker', sessionsDir, runId: 'old-run' };
+  for (const [run_id, state] of [['new-run', 'working'], ['old-run', 'killed'], ['old-run', 'stopped'], ['old-run', 'waiting']]) {
+    await upsertWorker(options.swarmId, { name: 'worker', run_id, state }, options);
+    for (const [name, args] of [['board_ask', { question: 'Which directory?' }], ['board_post', { text: 'Update' }], ['board_wait', { since: 0 }]]) {
+      await assert.rejects(handleBoardMcpTool(name, args, {}, options), /no longer current/);
+    }
+    const worker = await getWorker(options.swarmId, 'worker', options);
+    assert.equal(worker.state, state);
+    assert.equal(worker.parked_on, null);
+    assert.equal(await getBoardHead(options.swarmId, options), 0);
+  }
+  await updateWorker(options.swarmId, 'worker', { state: 'working' }, options);
+  const ask = await handleBoardMcpTool('board_ask', { question: 'Which directory?' }, {}, options);
+  const { message } = JSON.parse(ask.content[0].text);
+  const worker = await getWorker(options.swarmId, 'worker', options);
+  assert.equal(worker.state, 'waiting_reply');
+  assert.equal(worker.parked_on, 'board_ask:' + message.seq);
+});
+
 test('board-mcp stdio server exposes board_post, board_read, board_ask, and board_roster', async (t) => {
   const dir = makeTmp(t);
   const sessionsDir = join(dir, 'sessions');
@@ -757,7 +821,7 @@ test('board CLI binds worker identity, parks at the read cursor and asks with at
   const { sessionsDir, run } = boardCli(t);
   const agent = 'helper';
   const opts = { sessionsDir };
-  await upsertWorker('sw-cli', { name: agent, state: 'working' }, opts);
+  await upsertWorker('sw-cli', { name: agent, state: 'working', run_id: 'cli-run' }, opts);
   const post = run(['post', 'progress', '--from', agent], { agent });
   assert.equal(post.message.from_agent, agent);
   assert.equal(post.message.meta.run_id, 'cli-run');
@@ -791,7 +855,7 @@ test('board CLI preserves helper ownership and narrator restrictions for swarm a
   const opts = { sessionsDir };
   for (const worker of [
     { name: 'owner' }, { name: 'peer' }, { name: 'child', added_by: 'owner' }, { name: 'observer', role: 'narrator' },
-  ]) await upsertWorker('sw-cli', { state: 'stopped', ...worker }, opts);
+  ]) await upsertWorker('sw-cli', { state: worker.name === 'child' ? 'stopped' : 'working', run_id: 'cli-run', ...worker }, opts);
   const peer = { agent: 'peer' };
   const owner = { agent: 'owner' };
   const narrator = { agent: 'observer' };
@@ -819,6 +883,8 @@ test('board CLI preserves helper ownership and narrator restrictions for swarm a
     assert.equal(published.view.json.headline, 'Review');
   }
   assert.equal(readNarratorView(sessionsDir, 'sw-cli').html, '<p>Review</p>');
+  await updateWorker('sw-cli', 'observer', { run_id: 'replacement' }, opts);
+  run(['publish-view', '--args-json', payload], { ...narrator, error: /no longer current/ });
   await killWorkerRecord('sw-cli', 'observer', opts);
   run(['publish-view', '--args-json', payload], { ...narrator, error: /Only a live narrator/ });
 });
@@ -2113,7 +2179,10 @@ test('branch workspace clones isolate Git storage and kill cleans only clean sha
   writeFileSync(join(cwd, 'task.txt'), 'source');
   git(cwd, 'add', 'task.txt');
   git(cwd, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'start');
+  const persist = (run_id, state, extra = {}) => saveRun(join(runDirectory(run_id, sessionsDir), 'state.json'),
+    { run_id, state, ...extra });
   const opts = { sessionsDir, env, dispatchRunImpl: async ({ run_id, workspace }, dispatch) => {
+    persist(run_id, 'finished');
     assert.equal(workspace, 'share');
     const session_id = 'clean-branch';
     const allocation = ensureShareWorktree(cwd, session_id, dispatch.env);
@@ -2121,13 +2190,15 @@ test('branch workspace clones isolate Git storage and kill cleans only clean sha
   } };
   const add = await handleSwarmAction({ action: 'add', swarm_id: 'isolated', cwd, workspace: 'branch', name: 'clean', brief: 'Test' }, opts);
   const cloned = add.workers[0].worktree_path;
-  assert.equal(git(cloned, 'remote', 'get-url', 'origin'), cwd);
+  assert.equal(realpathSync.native(git(cloned, 'remote', 'get-url', 'origin')), realpathSync.native(cwd));
   assert.equal(git(cloned, 'rev-parse', 'HEAD'), git(cwd, 'rev-parse', 'HEAD'));
   const dirty = ensureBranchWorkspace(cwd, 'dirty-branch', env).worktree_root;
   writeFileSync(join(dirty, 'keep.txt'), 'in progress');
   const share = ensureShareWorktree(cwd, 'clean-share', env).worktree_root;
   for (const [name, workspace, path] of [['dirty', 'branch', dirty], ['share', 'share', share]]) {
-    await upsertWorker('isolated', { name, state: 'waiting', workspace, worktree_path: path, source_cwd: cwd }, opts);
+    const run_id = (name === 'dirty' ? 'd' : 'e').repeat(32);
+    persist(run_id, 'finished');
+    await upsertWorker('isolated', { name, run_id, state: 'waiting', workspace, worktree_path: path, source_cwd: cwd }, opts);
   }
   await updateWorker('isolated', 'clean', { state: 'waiting' }, opts);
   await upsertWorker('isolated', { name: 'helper', added_by: 'clean', state: 'waiting' }, opts);
@@ -2136,6 +2207,54 @@ test('branch workspace clones isolate Git storage and kill cleans only clean sha
   assert.equal(existsSync(share), false);
   assert.equal(existsSync(join(dirty, 'keep.txt')), true);
   assert.equal((await getWorker('isolated', 'helper', opts)).state, 'waiting');
+
+  const active = ensureBranchWorkspace(cwd, 'active-branch', env).worktree_root;
+  const run_id = 'a'.repeat(32);
+  persist(run_id, 'running', { pid: process.pid });
+  await upsertWorker('isolated', { name: 'active', run_id, state: 'working', workspace: 'branch', worktree_path: active, source_cwd: cwd }, opts);
+  const kill = () => handleSwarmAction({ action: 'kill', swarm_id: 'isolated', name: 'active' },
+    { ...opts, interruptRunImpl: async () => { throw new Error('No acknowledgement'); } });
+  assert.deepEqual((await kill()).cleaned_workspaces, []);
+  assert.deepEqual((await kill()).cleaned_workspaces, []);
+  assert.ok(existsSync(active));
+  rmSync(join(runDirectory(run_id, sessionsDir), 'state.json'));
+  assert.deepEqual((await kill()).cleaned_workspaces, []);
+  persist(run_id, 'interrupted', { pid: process.pid });
+  assert.deepEqual((await kill()).cleaned_workspaces, []);
+  persist(run_id, 'interrupted');
+  assert.deepEqual((await kill()).cleaned_workspaces, [active]);
+  assert.equal(existsSync(active), false);
+
+  const reused = ensureShareWorktree(cwd, 'reassigned-share', env).worktree_root;
+  persist(run_id, 'running', { pid: process.pid });
+  await upsertWorker('isolated', { name: 'reassigned', run_id, state: 'working', workspace: 'share', worktree_path: reused, source_cwd: cwd }, opts);
+  const concurrent = await handleSwarmAction({ action: 'kill', swarm_id: 'isolated', name: 'reassigned' },
+    { ...opts, interruptRunImpl: async () => {
+      persist(run_id, 'finished');
+      await updateWorker('isolated', 'reassigned', { state: 'working', run_id: 'f'.repeat(32) }, opts);
+      return { ok: true };
+    } });
+  assert.deepEqual(concurrent.cleaned_workspaces, []);
+  assert.ok(existsSync(reused));
+
+  const saved = ensureBranchWorkspace(cwd, 'saved-work', env).worktree_root;
+  git(saved, 'config', 'user.name', 'Fixture');
+  git(saved, 'config', 'user.email', 'fixture@example.test');
+  writeFileSync(join(saved, 'task.txt'), 'saved changes');
+  git(saved, 'stash', 'push');
+  const clean = () => removeBranchWorkspace(cwd, saved, env, { sessionsDir });
+  assert.equal(clean(), false);
+  git(saved, 'stash', 'pop');
+  const base = git(saved, 'rev-parse', 'HEAD');
+  git(saved, 'switch', '-c', 'local-work');
+  git(saved, 'commit', '-am', 'work on a different branch');
+  git(saved, 'switch', '--detach', base);
+  assert.equal(clean(), false);
+  git(saved, 'update-ref', 'refs/archive/work', git(saved, 'rev-parse', 'local-work'));
+  git(saved, 'branch', '-D', 'local-work');
+  assert.equal(clean(), false);
+  git(cwd, 'fetch', saved, 'refs/archive/work:refs/heads/preserved');
+  assert.equal(clean(), true);
 });
 
 test('models tools expose installed-runner metadata and desired model switches at the next safe turn', async (t) => {

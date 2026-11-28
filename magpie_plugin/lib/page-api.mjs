@@ -26,6 +26,7 @@ export async function dispatchPageApi({ method, url, rawPath = url.pathname, rea
   const { configPath, sessionsDir, magpieConfigDir, antigravityPluginDir,
     execEnabled, mcpToolsEnabled, appServer, probeTimeoutMs, agyBinDir } = options;
   const reply = (status, body, type = 'application/json; charset=utf-8') => ({ status, body, type });
+  if (options.sidecarJson && method === 'POST' && opaqueOrigin !== false) return reply(403, { error: 'invalid origin' });
   // Validate the raw segment before URL normalization can collapse dot paths.
   const activity = /^\/api\/(requests|sessions)(?:\/(.*))?$/.exec(rawPath);
   if (activity && method === 'GET') {

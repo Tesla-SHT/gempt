@@ -1,14 +1,14 @@
 {
   "name": "gempt",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "description": "Antigravity MCP orchestration that pairs Gemini with models from your Magpie gateway.",
   "author": {
     "name": "yizhang-dream",
     "url": "https://github.com/yizhang-dream"
   },
-  "homepage": "https://github.com/yizhang-dream/gempt#readme",
+  "homepage": "https://github.com/Tesla-SHT/gempt#readme",
   "bugs": {
-    "url": "https://github.com/yizhang-dream/gempt/issues"
+    "url": "https://github.com/Tesla-SHT/gempt/issues"
   },
   "type": "module",
   "bin": {
@@ -55,7 +55,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yizhang-dream/gempt.git"
+    "url": "git+https://github.com/Tesla-SHT/gempt.git"
   },
   "engines": {
     "node": ">=22.13.0",

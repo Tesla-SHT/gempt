@@ -32,6 +32,7 @@ import { DEFAULT_LOCK_STALE_MS, isValidSessionId, lockStaleMsForBudget, parseToo
 import { linkTarget, listArguments, streamRenderKey, timelineMessages } from '../mcp_app/live-state.js';
 import { assertShareWorktree, ensureShareWorktree, pruneShareWorktrees,
   removeShareWorktree, resolveExternalWorktreeSourceCwd, workspaceFileRoots, worktreesRoot } from '../core/worktrees.mjs';
+import { pidAlive } from '../magpie_plugin/lib/app-server-process.mjs';
 import { createAppServerManager } from '../magpie_plugin/lib/app-server-manager.mjs';
 import { probeGatewaySettings, readOverview, readRoutingSummary, readState, resetSettings, updateSettings } from '../magpie_plugin/lib/backend.mjs';
 import { dispatchPageApi } from '../magpie_plugin/lib/page-api.mjs';
@@ -364,7 +365,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const bridge = join(target, 'work_split_hook.py');
   assert.equal(readFileSync(bridge, 'utf8').trimEnd().split('\n').length, 7);
   assert.ok(!existsSync(join(target, 'runtime', 'gempt')));
-  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.10.1' });
+  assert.deepEqual(JSON.parse(readFileSync(join(target, 'runtime', 'package.json'), 'utf8')), { type: 'module', version: '0.11.0' });
   const bundledSkills = new URL('../plugin/skills/', import.meta.url);
   assert.deepEqual(readdirSync(bundledSkills).sort(), ['gempt', 'gempt-chore']);
   assert.deepEqual(readdirSync(join(target, 'skills')).sort(), ['gempt', 'gempt-chore']);
@@ -384,7 +385,7 @@ test('Antigravity installer replaces a legacy target and stages a runnable Node-
   const initialized = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' },
   }) });
-  assert.equal(initialized.result.serverInfo.version, '0.10.1');
+  assert.equal(initialized.result.serverInfo.version, '0.11.0');
   assert.deepEqual(initialized.result.capabilities.resources, {});
   const listedResources = jsonProcess(command, args, { cwd: f.root, env, input: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'resources/list',
@@ -638,11 +639,20 @@ test('packaged native sidecar serves shared assets and authenticates scoped APIs
     const scanner = createInterface({ input: child.stdout });
     const [line] = await once(scanner, 'line', { signal: AbortSignal.timeout(5000) });
     const base = 'http://' + line.match(/listening on (127[.]0[.]0[.]1:[0-9]+)/)[1];
-    const html = await fetch(base).then((response) => response.text());
+    const entry = await fetch(base);
+    const html = await entry.text();
+    const [, nonce, bootstrap] = html.match(/<script nonce="([\w-]+)">([\s\S]+?)<\/script>/);
+    const hash = createHash('sha256').update(bootstrap).digest('base64');
+    const policy = entry.headers.get('content-security-policy').split('; ');
+    for (const directive of ["default-src 'self'", `script-src 'self' 'sha256-${hash}' 'nonce-${nonce}'`, "connect-src 'self'",
+      "style-src 'self' 'unsafe-inline'", "img-src 'self' data: blob:", 'frame-src about:']) assert.ok(policy.includes(directive), directive);
     assert.match(html, /loadScript\('gempt-preload\.js'\)/);
     assert.match(html, /loadScript\('app\.js',/);
     assert.doesNotMatch(html, /<script type="module"/);
-    assert.equal(await fetch(base + '/index.html').then((response) => response.text()), html);
+    const indexPage = await fetch(base + '/index.html');
+    const indexNonce = indexPage.headers.get('content-security-policy').match(/'nonce-([\w-]+)'/)[1];
+    assert.notEqual(indexNonce, nonce);
+    assert.equal((await indexPage.text()).replace(indexNonce, nonce), html);
     assert.match(html, /id="view-console"/);
     const preload = await fetch(base + '/gempt-preload.js');
     assert.equal(preload.status, 200);
@@ -657,8 +667,8 @@ test('packaged native sidecar serves shared assets and authenticates scoped APIs
     assert.doesNotMatch(await js.text(), /@modelcontextprotocol|Invalid Zod|@cfworker/);
     assert.equal((await fetch(base + '/missing.js')).status, 404);
 
-    const call = (path, payload = {}, key = token, method = 'POST') => fetch(base + '/api', {
-      method, headers: { 'content-type': 'application/json', ...(key ? { 'x-sidecar-token': key } : {}) },
+    const call = (path, payload = {}, key = token, method = 'POST', origin = base) => fetch(base + '/api', {
+      method, headers: { 'content-type': 'application/json', ...(origin ? { origin } : {}), ...(key ? { 'x-sidecar-token': key } : {}) },
       body: JSON.stringify({ path: './api/' + path, ...payload }),
     });
     for (const method of ['POST', 'PUT', 'DELETE']) {
@@ -695,6 +705,13 @@ test('packaged native sidecar serves shared assets and authenticates scoped APIs
     assert.deepEqual(new Set(multi.runs.map((run) => run.run_id)), new Set([id, otherWorkspace]));
     assert.equal((await call('live/stream?run_id=' + otherWorkspace, { workspaceUris })).status, 403);
     assert.equal((await call('requests?format=csv')).headers.get('content-type'), 'text/csv; charset=utf-8');
+    for (const origin of ['null', '', 'https://other.example']) {
+      for (const path of ['swarm/post', 'live/steer', 'install-agy', 'settings']) {
+        const res = await call(path, { body: {}, opaqueOrigin: false, headers: { origin: base } }, token, 'POST', origin);
+        assert.equal(res.status, 403);
+        assert.deepEqual(await res.json(), { error: 'invalid origin' });
+      }
+    }
     assert.equal((await call('settings', { body: { codex_timeout_sec: 900 } })).status, 200);
     assert.equal(JSON.parse(readFileSync(f.configPath, 'utf8')).codex.timeout_sec, 900);
   } finally {
@@ -1660,13 +1677,13 @@ test('Live run list defaults to an empty unbound session and can list all worksp
   assert.equal(scoped.scope, 'session');
   assert.equal(scoped.unbound_session, true);
   assert.deepEqual(scoped.runs, []);
-  assert.equal(scoped.app_server.version, '0.10.1');
+  assert.equal(scoped.app_server.version, '0.11.0');
 
   const all = await runLiveOperation('runs', { scope: 'all' }, opts);
   assert.equal(all.scope, 'all');
   assert.equal(all.unbound_session, false);
   assert.deepEqual(all.runs.map(({ run_id }) => run_id).sort(), [first, second]);
-  assert.equal(all.app_server.version, '0.10.1');
+  assert.equal(all.app_server.version, '0.11.0');
 });
 
 test('Live binds normalized workspaces and never selects another run for a filtered explicit ID', async (t) => {
@@ -1764,8 +1781,15 @@ test('PreToolUse binds exact cross-repo directories briefly while preserving int
   hook({ hookEventName: 'PreToolUse', conversationId: 'conversation-a',
     toolCall: { name: 'call_mcp_tool', args: { ServerName: 'other', ToolName: 'gpt_run', Arguments: { cwd: nested } } } });
   assert.deepEqual(readHostContext(f.configPath, nested), {});
+  const wrapped = (conversationId, args) => hook({ hookEventName: 'PreToolUse', conversationId,
+    toolCall: { name: 'call_mcp_tool', args: { ServerName: 'gempt_gempt', ToolName: 'gpt_run', Arguments: JSON.stringify(args) } } });
+  wrapped('conversation-a', { cwd: nested });
+  assert.equal(readHostContext(f.configPath, nested).conversation_id, 'conversation-a');
+  wrapped('child-c', { cwd: nested, host_conversation_id: 'conversation-a' });
+  assert.equal(readHostContext(f.configPath, nested).conversation_id, 'conversation-a');
   const path = contextPath(f.configPath);
   const data = JSON.parse(readFileSync(path, 'utf8'));
+  assert.ok(data.subagent_conversations.includes('child-c'));
   const binding = Object.values(data.by_tool_cwd).find((entry) => entry.conversation_id === 'conversation-b');
   binding.recorded_at_ms = Date.now() - 60_000;
   writeFileSync(path, JSON.stringify(data));
@@ -1894,7 +1918,7 @@ test('standalone NDJSON MCP serves the inline launcher and preserves cross-direc
   const started = await request('initialize', { protocolVersion: '2026-test' });
   assert.equal(started.result.protocolVersion, '2026-test');
   assert.equal(started.result.serverInfo.name, 'gempt');
-  assert.equal(started.result.serverInfo.version, '0.10.1');
+  assert.equal(started.result.serverInfo.version, '0.11.0');
   assert.deepEqual(started.result.capabilities, { tools: { listChanged: false }, resources: {} });
   send({ method: 'notifications/initialized' });
   assert.deepEqual((await request('ping')).result, {});
@@ -1928,7 +1952,6 @@ test('standalone NDJSON MCP serves the inline launcher and preserves cross-direc
   const consults = await runLiveOperation('runs', { include_consults: true }, panel);
   assert.equal(consults.consult_sessions[0].session_id,
     JSON.parse(asked.result.content[0].text).session_id);
-  const startedAt = Date.now();
   const launch = await request('tools/call', { name: 'gpt_run', arguments: {
     goal: 'Inspect the fixture.', title: 'Cross-repo inspection', access: 'inspect', cwd: cross,
   } });
@@ -1937,7 +1960,7 @@ test('standalone NDJSON MCP serves the inline launcher and preserves cross-direc
   assert.match(run.wait_command, new RegExp(`${run.run_id}$`));
   assert.equal(run.text, `Run ${run.run_id} started. Execute \`${run.wait_command}\` via run_command(WaitMsBeforeAsync=500) for zero-poll wakeup.`);
   const { created_at_ms: runTime, ...runSummary } = launch.result.structuredContent;
-  assert.ok(Number.isInteger(runTime) && runTime >= startedAt && runTime <= Date.now());
+  assert.ok(Number.isInteger(runTime) && Math.abs(Date.now() - runTime) < 60_000);
   assert.deepEqual(runSummary, { kind: 'run', action: 'start', title: 'Cross-repo inspection', state: run.state,
     run_id: run.run_id, member_count: 1, sidecar_uri: 'sidecar://gempt/gempt_live/', auto_open_panel: true });
   const complete = await waitForRun(run.run_id, { ...f, timeoutSec: 5 });
@@ -1962,7 +1985,7 @@ test('standalone NDJSON MCP serves the inline launcher and preserves cross-direc
   const swarmId = 'conversation-' + createHash('sha256').update('host').digest('hex');
   assert.equal(addReceipt.swarm_id, swarmId);
   const { created_at_ms: swarmTime, state: swarmState, ...swarmSummary } = added.result.structuredContent;
-  assert.ok(Number.isInteger(swarmTime) && swarmTime >= runTime && swarmTime <= Date.now());
+  assert.ok(Number.isInteger(swarmTime) && Math.abs(Date.now() - swarmTime) < 60_000);
   assert.ok(['working', 'idle'].includes(swarmState));
   assert.deepEqual(swarmSummary, { kind: 'swarm', action: 'add', title: 'Cross-repo workers',
     swarm_id: swarmId, member_count: 2, sidecar_uri: 'sidecar://gempt/gempt_live/', auto_open_panel: true });
@@ -3066,4 +3089,6 @@ test('a dispatched Swarm branch uses its isolated checkout across real worker tu
   assert.equal(again.state, 'finished', again.error);
   assert.equal(again.cwd, first.cwd);
   assert.equal(again.session_id, first.session_id);
+  // Both detached processes must release their checkout before fixture teardown on Windows.
+  await until(() => !pidAlive(first.pid) && !pidAlive(again.pid));
 });

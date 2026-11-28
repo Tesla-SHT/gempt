@@ -1,15 +1,15 @@
-import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, readSync, realpathSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, readSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { antigravityApplicationData, readCoordinatorActivity } from './live-service.mjs';
 import { channelMentions, channelRegistry, controlOf, effectiveChannels, memberView, ROLE_WORKER_RE } from './swarm-channels.mjs';
+import { parseScreenshots } from './swarm-bus.mjs';
 import { withinPath } from './state.mjs';
 
 const CONVERSATION_ID = /^[0-9a-f-]{8,128}$/i;
 const VIEW_LIMIT = 64 * 1024;
 const goodViews = new Map();
 const rosterScans = new Map();
-const SCREENSHOT = /^\s*(?:[-*]\s*)?screenshot:\s*`?(\/[^\s`|]+\.(?:png|jpe?g|webp))`?\s*(?:\|\s*(.+?))?\s*$/gim;
 const swarmDir = (brain, id) => join(brain, id, '.system_generated', 'swarm');
 
 function rosterOwners(brain) {
@@ -24,15 +24,23 @@ function rosterOwners(brain) {
   return ids;
 }
 
-function readText(path, brain, maxBytes = Infinity) {
+function readText(path, maxBytes = Infinity) {
+  const boundary = dirname(path);
   let fd;
   try {
     const canonical = realpathSync(path);
-    if (!withinPath(canonical, brain)) return null;
+    if (!withinPath(canonical, boundary)) return null;
     fd = openSync(canonical, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
     const stat = fstatSync(fd);
     if (!stat.isFile() || stat.size > maxBytes) return null;
-    if (process.platform === 'linux' && !withinPath(realpathSync('/proc/self/fd/' + fd), brain)) return null;
+    if (process.platform === 'linux') {
+      if (!withinPath(realpathSync('/proc/self/fd/' + fd), boundary)) return null;
+    } else {
+      const openedPath = realpathSync(path);
+      if (!withinPath(openedPath, boundary)) return null;
+      const current = statSync(openedPath);
+      if (current.dev !== stat.dev || current.ino !== stat.ino) return null;
+    }
     let text;
     if (maxBytes === Infinity) text = readFileSync(fd, 'utf8');
     else {
@@ -76,7 +84,7 @@ function boardRows(raw, members) {
     const control = controlOf(row);
     const ts = Date.parse(String(row.time || '').replace(' ', 'T'));
     const screenshots = !control && members.get(agent)?.role === 'worker'
-      ? [...body.matchAll(SCREENSHOT)].map(([, path, caption]) => ({ path, caption: (caption || '').slice(0, 80) }))
+      ? parseScreenshots(body, { absoluteImagesOnly: true }).map(({ path, caption }) => ({ path, caption: caption.slice(0, 80) }))
       : [];
     rows.set(row.seq, {
       seq: row.seq, from_agent: agent, text: body, control, screenshots,
@@ -100,7 +108,7 @@ export function readNativeSwarm(conversationId, { env = process.env, appData } =
   let brain;
   const rosterAt = (id) => {
     const dir = swarmDir(brain, id);
-    const file = readText(join(dir, 'members.json'), brain);
+    const file = readText(join(dir, 'members.json'));
     const roster = parseObject(file?.text);
     return object(roster?.members) ? { id, dir, file, roster } : null;
   };
@@ -136,7 +144,7 @@ export function readNativeSwarm(conversationId, { env = process.env, appData } =
       roleWorker: !['coordinator', 'worker'].includes(role), narrator: role === 'narrator',
       wake_mode: row.wake_mode, wait_since: Number(row.wait_since) || 0, last_read_seq: Number(row.last_read_seq) || 0 }];
   }).sort((a, b) => Number(b.role === 'coordinator') - Number(a.role === 'coordinator') || a.name.localeCompare(b.name));
-  const board = readText(join(dir, 'board.jsonl'), brain);
+  const board = readText(join(dir, 'board.jsonl'));
   const messages = boardRows(board?.text || '', new Map(memberRows.map((m) => [m.name, m])));
   const channels = channelRegistry(messages).map((channel) => ({ ...channel, members: memberRows.filter((m) =>
     !m.killed && (m.channels.includes('*') || m.channels.includes(channel.name))).map((m) => m.name) }));
@@ -165,13 +173,13 @@ export function readNativeSwarm(conversationId, { env = process.env, appData } =
   const narrator = lead ? { ...lead, state: narratorState } : null;
 
   let viewDir = dir;
-  let viewFile = readText(join(dir, 'view.json'), brain, VIEW_LIMIT);
+  let viewFile = readText(join(dir, 'view.json'), VIEW_LIMIT);
   if (!viewFile && CONVERSATION_ID.test(narrator?.conversationId ?? '')) {
     const alternative = join(brain, narrator.conversationId, 'swarm_view');
-    const alternativeFile = readText(join(alternative, 'view.json'), brain, VIEW_LIMIT);
+    const alternativeFile = readText(join(alternative, 'view.json'), VIEW_LIMIT);
     if (alternativeFile) { viewDir = alternative; viewFile = alternativeFile; }
   }
-  const html = readText(join(viewDir, 'view.html'), brain, VIEW_LIMIT);
+  const html = readText(join(viewDir, 'view.html'), VIEW_LIMIT);
   const parsed = parseObject(viewFile?.text);
   const prior = goodViews.get(viewDir);
   goodViews.delete(viewDir);
@@ -183,7 +191,7 @@ export function readNativeSwarm(conversationId, { env = process.env, appData } =
   const json = good?.json ?? null;
   const view = { exists: Boolean(viewFile || html), origin: 'native', json, html: html?.text || null,
     jsonMtime: good?.mtime || 0, jsonError: viewFile && !parsed ? 'invalid_json' : '' };
-  const planFile = readText(join(dir, 'plan.json'), brain, VIEW_LIMIT);
+  const planFile = readText(join(dir, 'plan.json'), VIEW_LIMIT);
   const plan = parseObject(planFile?.text);
   const posted = new Map();
   for (const msg of messages) {

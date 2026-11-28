@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
-import { isValidSessionId } from './state.mjs';
+import { isValidSessionId, resolvePath, withinPath } from './state.mjs';
 import { removeBranchWorkspace, removeShareWorktree } from './worktrees.mjs';
 import { detectAvailableRunners, preferredRunnerForModel } from './runners/registry.mjs';
+import { pidAlive } from '../magpie_plugin/lib/app-server-process.mjs';
 import { sweepSwarmMonitors } from './swarm-monitor.mjs';
 import { SIDECAR_URI } from './mcp-app.mjs';
 import { readJsonSafe, readMagpieStatus, resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
@@ -13,7 +14,7 @@ import {
 } from './runs.mjs';
 import {
   addWorkerBriefs, archiveChannel, createChannel, listChannels, subscribeChannels, parkWorker, QUOTA_ERROR,
-  ensureSwarm, getBoardHead, getSwarmOverview, getWorker, killWorkerRecord, listRoster,
+  cleanKilledWorkspace, ensureSwarm, getBoardHead, getSwarmOverview, getWorker, killWorkerRecord, listRoster,
   listUndeliveredForWorker, markDelivered, postBoardMessage, readBoardMessages, readWorkerTurnPosts, resolveSwarmId,
   setSwarmPlan, setSwarmTitle, updateWorker, validateWorkerName,
 } from './swarm-bus.mjs';
@@ -28,9 +29,10 @@ function resolveEngineContext(args = {}, options = {}) {
   const configPath = resolveConfigPath(options.configPath || env.GEMPT_CONFIG);
   const sessionsDir = resolveSessionsDir(options.sessionsDir || env.GEMPT_SESSIONS_DIR);
   const rawCwd = typeof args.cwd === 'string' && args.cwd.trim() ? args.cwd.trim() : undefined;
-  const cwd = options.root && (rawCwd == null || typeof rawCwd === 'string')
-    ? resolve(options.root, rawCwd || '.')
-    : rawCwd;
+  const envRoot = env.GEMPT_WORKSPACE_ROOT?.trim();
+  const root = options.root || envRoot;
+  const defaultCwd = root && envRoot && withinPath(resolvePath(envRoot), resolvePath(root)) ? envRoot : root;
+  const cwd = rawCwd ? (root ? resolve(root, rawCwd) : rawCwd) : defaultCwd;
   const hostCtx = readHostContext(configPath, cwd);
   const hostConversationId = (typeof args.host_conversation_id === 'string' && args.host_conversation_id.trim())
     || hostCtx.conversation_id || null;
@@ -40,6 +42,8 @@ function resolveEngineContext(args = {}, options = {}) {
     configPath,
     sessionsDir,
     cwd,
+    workspaceRoots: options.workspaceRoots ?? (root ? [root] : null),
+    envRoot,
     hostConversationId,
     geminiFamily,
     dispatchRunImpl: options.dispatchRunImpl || dispatchRun,
@@ -491,21 +495,20 @@ function expandWorkerSpecs(args) {
   }];
 }
 
+function resolveActionSwarmId(swarmId, ctx, actor) {
+  return resolveSwarmId({ ...ctx, swarmId, bindingCwd: !actor || actor === 'coordinator' ? ctx.cwd : undefined });
+}
+
 export async function handleSwarmAction(args = {}, options = {}) {
   const action = String(args.action || 'status').trim();
   if (!VALID_SWARM_ACTIONS.includes(action)) {
     throw new Error(`Invalid swarm action '${action}'. Choose one of: ${VALID_SWARM_ACTIONS.join(', ')}.`);
   }
   const ctx = resolveEngineContext(args, options);
-  const swarmId = await resolveSwarmId({
-    swarmId: args.swarm_id,
-    hostConversationId: ctx.hostConversationId,
-    cwd: ctx.cwd,
-    sessionsDir: ctx.sessionsDir,
-  });
+  const swarmId = await resolveActionSwarmId(args.swarm_id, ctx, options.actor);
 
   const actor = options.actor || args.actor || 'coordinator';
-  const storage = { sessionsDir: ctx.sessionsDir, ...(actor === 'coordinator' ? { cwd: ctx.cwd, hostConversationId: ctx.hostConversationId } : {}) };
+  const storage = { sessionsDir: ctx.sessionsDir, workerTurn: options.workerTurn, ...(actor === 'coordinator' ? { cwd: ctx.cwd, hostConversationId: ctx.hostConversationId } : {}) };
   let parent;
   if (actor !== 'coordinator') {
     parent = await getWorker(swarmId, actor, storage);
@@ -602,11 +605,12 @@ export async function handleSwarmAction(args = {}, options = {}) {
 
   if (action === 'add') {
     const specs = expandWorkerSpecs(args);
-    if (parent?.access === 'inspect' && args.access === 'change') throw new Error('An inspect-only worker can add only inspect helpers.');
+    if (args.access !== undefined && typeof args.access !== 'string') throw new Error('Invalid access: expected a string.');
     const forkWorker = args.fork && args.fork !== 'coordinator' ? await getWorker(swarmId, args.fork, storage) : null;
     if (args.fork && args.fork !== 'coordinator' && !forkWorker) throw new Error(`Cannot fork unknown member '${args.fork}'.`);
     const isNarrator = args.role === 'narrator' || (!args.role && /^narrator(?:-\d+)?$/.test(args.name || ''));
-    const access = isNarrator ? 'inspect' : String(args.access || parent?.access || forkWorker?.access || 'change').trim();
+    const access = isNarrator ? 'inspect' : (args.access?.trim() || parent?.access || forkWorker?.access || 'change');
+    if (parent?.access === 'inspect' && access !== 'inspect') throw new Error('An inspect-only worker can add only inspect helpers.');
     if (!['change', 'inspect'].includes(access)) throw new Error(`Invalid access '${access}'.`);
     const workspace = String(args.workspace || 'inherit').trim();
     if (!['inherit', 'share', 'branch'].includes(workspace)) throw new Error(`Invalid workspace '${workspace}'.`);
@@ -777,7 +781,7 @@ export async function handleSwarmAction(args = {}, options = {}) {
       run_id: runId,
       parked_on: null,
       error: null,
-    }, { sessionsDir: ctx.sessionsDir, expectedState: worker.state, expectedRun: worker.run_id });
+    }, { ...storage, expectedState: worker.state, expectedRun: worker.run_id });
     if (!claimed) {
       throw new Error(`Worker '${workerName}' state changed concurrently; retry model switch.`);
     }
@@ -869,26 +873,26 @@ export async function handleSwarmAction(args = {}, options = {}) {
         ...storage, expectedState: worker.state, expectedRun: worker.run_id,
       });
       if (!killed) throw new Error(`Worker '${worker.name}' changed state concurrently; retry kill.`);
-      let safeToClean = !['working', 'waiting_reply'].includes(worker.state);
+      let interruptFailed = false;
       if (worker.run_id && ['working', 'waiting_reply'].includes(worker.state)) {
         try {
           const result = await ctx.interruptRunImpl(worker.run_id, { configPath: ctx.configPath, sessionsDir: ctx.sessionsDir, env: ctx.env });
-          let settled = result;
-          if (result?.cleared_unconfirmed) {
-            try { settled = ctx.readRunImpl(worker.run_id, ctx.sessionsDir, { readonly: true }); }
-            catch { /* Remote acknowledgement alone cannot prove that the workspace is idle. */ }
-          }
-          safeToClean = settled && !settled.remote_turn_unconfirmed && ['finished', 'failed', 'interrupted', 'stopped'].includes(settled.state);
-          interrupted = true;
-        } catch { /* A completed run can still be marked killed. */ }
+          interruptFailed = result?.ok === false;
+          interrupted ||= !interruptFailed;
+        } catch { interruptFailed = true; }
       }
-      if (safeToClean && worker.worktree_path && worker.source_cwd && ['share', 'branch'].includes(worker.workspace)) {
+      if (!interruptFailed && killed.run_id && worker.worktree_path && worker.source_cwd && ['share', 'branch'].includes(worker.workspace)) {
         try {
-          const clean = worker.workspace === 'branch' ? removeBranchWorkspace : removeShareWorktree;
-          if (clean(worker.source_cwd, worker.worktree_path, ctx.env, storage)) {
-            cleaned_workspaces.push(worker.worktree_path);
-            killed.worktree_path = null;
-            await updateWorker(swarmId, worker.name, { worktree_path: null }, storage);
+          const run = ctx.readRunImpl(killed.run_id, ctx.sessionsDir, { readonly: true });
+          if (!pidAlive(run?.pid) && !run?.remote_turn_unconfirmed && ['finished', 'failed', 'interrupted', 'stopped'].includes(run?.state)) {
+            const cleaned = await cleanKilledWorkspace(swarmId, killed, (current) => {
+              const clean = current.workspace === 'branch' ? removeBranchWorkspace : removeShareWorktree;
+              return clean(current.source_cwd, current.worktree_path, ctx.env, storage);
+            }, storage);
+            if (cleaned) {
+              cleaned_workspaces.push(killed.worktree_path);
+              killed.worktree_path = null;
+            }
           }
         } catch { /* Keep isolation data when ownership or Git cleanliness cannot be verified. */ }
       }
@@ -904,12 +908,7 @@ export async function handleBoardAction(args = {}, options = {}) {
     throw new Error(`Invalid board action '${action}'. Choose one of: ${VALID_BOARD_ACTIONS.join(', ')}.`);
   }
   const ctx = resolveEngineContext(args, options);
-  const swarmId = await resolveSwarmId({
-    swarmId: args.swarm_id,
-    hostConversationId: ctx.hostConversationId,
-    cwd: ctx.cwd,
-    sessionsDir: ctx.sessionsDir,
-  });
+  const swarmId = await resolveActionSwarmId(args.swarm_id, ctx, options.actor);
 
   if (action === 'post') {
     const from = String(args.from || options.defaultFrom || 'coordinator').trim().toLowerCase() || 'coordinator';
@@ -924,6 +923,7 @@ export async function handleBoardAction(args = {}, options = {}) {
       replyToSeq: args.reply_to_seq,
       meta: args.meta,
     }, { sessionsDir: ctx.sessionsDir,
+      workerTurn: options.workerTurn,
       ...(!options.actor || options.actor === 'coordinator' ? { hostConversationId: ctx.hostConversationId, cwd: ctx.cwd } : {}) });
     const deliveryOptions = { ...options, configPath: ctx.configPath, sessionsDir: ctx.sessionsDir, env: ctx.env };
     const deliveries = await routeBoardDeliveries(swarmId, deliveryOptions);
@@ -942,7 +942,7 @@ export async function handleBoardAction(args = {}, options = {}) {
     const messages = await readBoardMessages(swarmId, {
       since: args.since,
       channel: args.channel,
-      viewer: args.viewer || args.from || 'coordinator',
+      viewer: args.viewer || args.from || 'coordinator', workerTurn: options.workerTurn,
       seqs: args.seqs,
       limit: args.limit ?? 20,
       sessionsDir: ctx.sessionsDir,
@@ -964,7 +964,7 @@ export async function handleBoardAction(args = {}, options = {}) {
     if (channel && ![MAIN, ALL].includes(channel)) validateChannelName(channel);
     const viewer = args.viewer || args.from;
     if (viewer && !['coordinator', 'human'].includes(viewer)) {
-      const storage = { sessionsDir: ctx.sessionsDir };
+      const storage = { sessionsDir: ctx.sessionsDir, workerTurn: options.workerTurn };
       const parked = await parkWorker(swarmId, viewer, { ...storage, since: args.since, mentionsOnly, channel });
       if (!parked) throw new Error('Unknown worker.');
       const messages = await listUndeliveredForWorker(swarmId, viewer, { ...storage, since, channel, includeDelivered: true });

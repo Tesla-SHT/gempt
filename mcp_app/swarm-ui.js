@@ -733,7 +733,7 @@ export function mountSwarm({ transport, sidecar, navigate, openLink, copy, showT
       frame.title = tr("自定义视图");
       frame.setAttribute("sandbox", "allow-scripts");
       frame.referrerPolicy = "no-referrer";
-      const nonce = document.querySelector('script[src="./app.js"]')?.nonce;
+      const nonce = document.querySelector("script[nonce]")?.nonce;
       frame.srcdoc = buildNarratorSrcdoc(template, dataModel, meta, narratorTheme(), nonce);
       narratorFrame = frame;
       narratorFrameKey = key;

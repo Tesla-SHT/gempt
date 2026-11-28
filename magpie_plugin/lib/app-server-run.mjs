@@ -212,7 +212,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
           pendingChanged();
           if (isSwarm) {
             trackSwarmHook((async () => {
-              const { postBoardMessage, updateWorker } = await import('../../core/swarm-bus.mjs');
+              const { postBoardMessage } = await import('../../core/swarm-bus.mjs');
               const q = String(params.arguments?.question || '').trim() || 'Needs coordinator input.';
               const ctxLine = params.arguments?.context ? `\n\nContext: ${String(params.arguments.context).trim()}` : '';
               const mediaLines = Array.isArray(params.arguments?.media_paths)
@@ -227,11 +227,7 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
                   run_id: record.run_id,
                   reason: params.arguments?.reason || 'clarification',
                 },
-              }, { sessionsDir });
-              await updateWorker(swarmId, swarmAgent, {
-                state: 'waiting_reply',
-                parked_on: params.callId,
-              }, { sessionsDir });
+              }, { sessionsDir, workerTurn: { name: swarmAgent, runId: record.run_id }, parkForReply: true });
             })());
           }
         } else if (isBoardTool(params.tool)) {
@@ -391,7 +387,8 @@ export async function runAppServer({ configPath, env, runFile, sessionId, onIden
         if (isSwarm && !tools.size) {
           trackSwarmHook((async () => {
             const { updateWorker } = await import('../../core/swarm-bus.mjs');
-            await updateWorker(swarmId, swarmAgent, { state: 'working', parked_on: null }, { sessionsDir });
+            await updateWorker(swarmId, swarmAgent, { state: 'working', parked_on: null },
+              { sessionsDir, expectedState: 'waiting_reply', expectedRun: record.run_id });
           })());
         }
       } catch (err) {

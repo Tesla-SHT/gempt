@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { resolveConfigPath, resolveSessionsDir } from '../magpie_plugin/lib/backend.mjs';
 import { GEMPT_VERSION } from './config.mjs';
 import { isPlainObject, parseToolArguments, resolvePath } from './state.mjs';
-import { getWorker, getSwarmOverview, postBoardMessage, updateWorker } from './swarm-bus.mjs';
+import { getWorker, getSwarmOverview, postBoardMessage, withLiveNarrator } from './swarm-bus.mjs';
 import { TOOLS } from './tool-schemas.mjs';
 import { publishNarratorView } from './swarm-narrator.mjs';
 import { handleBoardAction, handleSwarmAction, routeBoardDeliveries } from './swarm-engine.mjs';
@@ -73,14 +73,15 @@ export async function handleBoardMcpTool(name, args = {}, env = process.env, ove
   const sessionsDir = resolveSessionsDir(overrides.sessionsDir || env.GEMPT_SESSIONS_DIR);
   const configPath = resolveConfigPath(overrides.configPath || env.GEMPT_CONFIG);
 
-  const options = { ...overrides, sessionsDir, configPath, env, actor: agentName };
   const runId = overrides.runId || env.GEMPT_RUN_ID || null;
-  if (['board_publish_view', 'board_post', 'board_ask', 'board_swarm'].includes(name)) {
+  const workerTurn = runId ? { runId, name: agentName } : undefined;
+  const options = { ...overrides, sessionsDir, configPath, env, actor: agentName, workerTurn };
+  if (name === 'board_publish_view') {
+    const view = await withLiveNarrator(swarmId, agentName, () => publishNarratorView(sessionsDir, swarmId, args), options);
+    return textResult({ ok: true, view });
+  }
+  if (['board_post', 'board_ask', 'board_swarm'].includes(name)) {
     const member = await getWorker(swarmId, agentName, { sessionsDir }).catch(() => null);
-    if (name === 'board_publish_view') {
-      if (member?.role !== 'narrator' || member.state === 'killed') throw new Error('Only a live narrator can publish a view.');
-      return textResult({ ok: true, view: publishNarratorView(sessionsDir, swarmId, args) });
-    }
     if (member?.role === 'narrator' && (name !== 'board_swarm' || !['status', 'models'].includes(args.action))) {
       throw new Error('Narrator is read-only except for publishing the view.');
     }
@@ -116,10 +117,7 @@ export async function handleBoardMcpTool(name, args = {}, env = process.env, ove
       kind: 'question',
       text: `@coordinator ${q}${ctxLine}${mediaLines}`,
       meta: { ...(runId ? { run_id: runId } : {}), reason: args.reason || 'clarification' },
-    }, { sessionsDir, hostConversationId: overrides.hostConversationId });
-    try {
-      await updateWorker(swarmId, agentName, { state: 'waiting_reply', parked_on: `board_ask:${message.seq}` }, { sessionsDir });
-    } catch { /* Sender may not be a roster worker (e.g., external helper). */ }
+    }, { sessionsDir, hostConversationId: overrides.hostConversationId, workerTurn, parkForReply: true });
     const deliveries = await routeBoardDeliveries(swarmId, options);
     return textResult({ ok: true, swarm_id: swarmId, message, head: message.seq, deliveries });
   }

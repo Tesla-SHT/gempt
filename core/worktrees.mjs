@@ -302,6 +302,32 @@ export function ensureBranchWorkspace(cwd, sessionId, env = process.env) {
   }
 }
 
+// A detached checkout can look clean even when a stash, another ref, or a
+// recently detached commit is the only remaining copy of someone's work.
+function cloneHistoryPreserved(source, target, env) {
+  const stash = git(target, ['stash', 'list'], env);
+  if (stash.status !== 0 || stash.stdout) return false;
+  const refs = git(target, ['for-each-ref', '--format=%(objectname) %(objecttype)'], env);
+  const reflog = git(target, ['reflog', 'show', '--all', '--format=%H'], env);
+  const sourceRefs = git(source, ['for-each-ref', '--format=%(objectname)'], env);
+  if ([refs, reflog, sourceRefs].some((result) => result.status !== 0)) return false;
+  const known = new Set(sourceRefs.stdout.trim().split(/\s+/));
+  const commits = new Set(reflog.stdout.trim().split(/\s+/).filter(Boolean));
+  for (const ref of refs.stdout.trim().split(/\r?\n/).filter(Boolean)) {
+    const [oid, type] = ref.split(' ');
+    if (known.has(oid)) continue;
+    if (type !== 'commit') return false;
+    commits.add(oid);
+  }
+  for (const oid of commits) {
+    if (known.has(oid)) continue;
+    if (git(source, ['merge-base', '--is-ancestor', oid, 'HEAD'], env).status === 0) continue;
+    const containing = git(source, ['for-each-ref', '--count=1', '--format=%(refname)', '--contains', oid], env);
+    if (containing.status !== 0 || !containing.stdout.trim()) return false;
+  }
+  return true;
+}
+
 export function removeBranchWorkspace(sourceCwd, workspace, env = process.env, { sessionsDir } = {}) {
   const root = join(worktreesRoot(env), 'branches');
   const target = resolvePath(workspace);
@@ -310,8 +336,8 @@ export function removeBranchWorkspace(sourceCwd, workspace, env = process.env, {
   const origin = git(target, ['remote', 'get-url', 'origin'], env);
   const status = git(target, ['status', '--porcelain', '--untracked-files=all', '--ignored=matching'], env);
   const head = git(target, ['rev-parse', 'HEAD'], env);
-  if (origin.status !== 0 || origin.stdout.trim() !== source || status.status !== 0 || status.stdout || head.status !== 0 ||
-      git(source, ['merge-base', '--is-ancestor', head.stdout.trim(), 'HEAD'], env).status !== 0) return false;
+  if (origin.status !== 0 || !isAbsolute(origin.stdout.trim()) || !samePath(resolvePath(origin.stdout.trim()), source) || status.status !== 0 || status.stdout || head.status !== 0 ||
+      git(source, ['merge-base', '--is-ancestor', head.stdout.trim(), 'HEAD'], env).status !== 0 || !cloneHistoryPreserved(source, target, env)) return false;
   rmSync(target, { recursive: true });
   syncPrunedWorktreeSessions(source, target, sessionsDir ?? resolveSessionsDir(env.GEMPT_SESSIONS_DIR));
   return true;

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -31,7 +31,7 @@ function fixture(t, { native = true } = {}) {
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, typeof contents === 'string' || Buffer.isBuffer(contents) ? contents : JSON.stringify(contents));
   };
-  const shot = join(brain, child, 'evidence.png');
+  const shot = join(brain, child, 'evidence frame.png');
   const secondShot = join(brain, narrator, 'reel.png');
   const members = { title: 'Native lab', members: {
     coordinator: { conversation_id: coordinator, role: 'coordinator', model: 'Gemini Pro', last_read_seq: 1 },
@@ -41,7 +41,7 @@ function fixture(t, { native = true } = {}) {
   const file = join(dir, 'board.jsonl');
   const board = [
     { seq: 1, agent: 'coordinator', text: '@builder Draft the panel', time: time(1) },
-    { seq: 2, agent: 'builder', text: `@coordinator Drafted #1\nScreenshot: ${shot} | Draft panel`, time: time(3), reply_to_seq: 1 },
+    { seq: 2, agent: 'builder', text: `@coordinator Drafted #1\nScreenshot: \`${shot}\` | Draft panel`, time: time(3), reply_to_seq: 1 },
   ];
   const post = (msg) => appendFileSync(file, JSON.stringify(msg) + '\n');
   if (native) {
@@ -98,6 +98,27 @@ test('reads native disk boards, role fallbacks, narrator files and reverse coord
   const listing = await f.http('/api/swarm/list', { scope: 'session' }, { conversationId: child });
   assert.equal(listing.swarms[0].id, snap.swarm_id);
   assert.equal(listing.swarms[0].source, 'native');
+});
+
+test('native board and narrator reads stay under their selected session directories', (t) => {
+  const f = fixture(t);
+  const linkDir = (path, target) => {
+    renameSync(path, target);
+    symlinkSync(target, path, process.platform === 'win32' ? 'junction' : 'dir');
+  };
+  const foreign = join(f.brain, unrelated);
+  mkdirSync(foreign);
+  linkDir(join(f.brain, narrator, 'swarm_view'), join(foreign, 'swarm_view'));
+  const board = readNativeSwarm(coordinator, f.options);
+  assert.equal(board.view.exists, false);
+  assert.equal(board.messages.length, 2);
+  if (process.platform !== 'win32') {
+    renameSync(f.file, join(foreign, 'board.jsonl'));
+    symlinkSync(join(foreign, 'board.jsonl'), f.file);
+    assert.equal(readNativeSwarm(coordinator, f.options).raw.board, '');
+  }
+  linkDir(f.dir, join(foreign, 'swarm'));
+  assert.equal(readNativeSwarm(coordinator, f.options), null);
 });
 
 function runFixture(f, id, props) {

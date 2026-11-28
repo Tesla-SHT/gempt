@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -83,17 +84,23 @@ document.addEventListener('DOMContentLoaded', () => {
 }, { once: true });`;
 const entryHash = createHash('sha256').update(bootstrap).digest('base64');
 
+const pagePolicy = (nonce) => [
+  "default-src 'self'", `script-src 'self' 'sha256-${entryHash}' 'nonce-${nonce}'`,
+  "style-src 'self' 'unsafe-inline'", "connect-src 'self'", "img-src 'self' data: blob:",
+  "frame-src about:", "object-src 'none'", "base-uri 'none'", "form-action 'none'",
+].join('; ');
+
 async function entryPage() {
   const { data, type } = await readPageAsset('/');
+  const nonce = randomBytes(24).toString('base64url');
   // The installed sidecar runs inside the directory the Magpie installer replaces.
   const port = Number(readPluginOptions(resolveMagpieConfigDir())?.port ?? process.env.GEMPT_MAGPIE_PLUGIN_PORT);
   const consolePort = Number.isInteger(port) && port > 0 && port <= 65535 ? port : 3498;
   const html = data.toString('utf8')
-    .replace("script-src 'self';", `script-src 'self' 'sha256-${entryHash}';`)
-    .replace('<link rel="stylesheet" href="./styles.css">', `<meta name="referrer" content="no-referrer">\n  <script>${bootstrap}</script>`)
+    .replace('<link rel="stylesheet" href="./styles.css">', `<meta name="referrer" content="no-referrer">\n  <script nonce="${nonce}">${bootstrap}</script>`)
     .replace('<html ', `<html data-sidecar data-install-page="http://127.0.0.1:${consolePort}/" `)
     .replace(/<script\s+(?:type="module"|defer)\s+src="\.\/app\.js"><\/script>/, '');
-  return new Response(html, { contentType: type, headers: { ...noStore, 'Content-Security-Policy': 'frame-src about:' } });
+  return new Response(html, { contentType: type, headers: { ...noStore, 'Content-Security-Policy': pagePolicy(nonce) } });
 }
 app.page('/', entryPage);
 app.page('/index.html', entryPage);
@@ -114,6 +121,7 @@ function workspacePath(uri) {
 
 // Live and history contain local data. Keep the SDK's token check on every
 // request, including those from an opaque iframe using its URL token.
+const trustedOrigin = new AsyncLocalStorage();
 const apiHeaders = { ...noStore, 'Access-Control-Allow-Origin': 'null' };
 app.api('/api', async ({ path, body, conversationId, workspaceUris }) => {
   try {
@@ -128,6 +136,7 @@ app.api('/api', async ({ path, body, conversationId, workspaceUris }) => {
       ? conversationId : app.config.conversationId || null;
     const result = await dispatchPageApi({
       method: body === undefined ? 'GET' : 'POST', url, rawPath, readBody: () => body,
+      opaqueOrigin: trustedOrigin.getStore() !== true,
     }, {
       ...options,
       sidecarJson: true,
@@ -146,6 +155,20 @@ app.api('/api', async ({ path, body, conversationId, workspaceUris }) => {
   }
 });
 const server = await app.run();
+// The SDK calls API handlers from IncomingMessage's end event with only
+// decoded client data. Bind the actual transport metadata to that request.
+server.prependListener('request', (request) => {
+  if (request.method !== 'POST' || request.url.split('?')[0] !== '/api') return;
+  const { origin, host } = request.headers;
+  const sameOrigin = origin === 'http://' + host || origin === 'https://' + host;
+  const localHost = ['127.0.0.1', 'localhost', '[::1]'].some((name) => host === name + ':' + request.socket.localPort);
+  const trusted = sameOrigin && (localHost || request.headers['sec-fetch-site'] === 'same-origin');
+  const emit = request.emit;
+  request.emit = function (event, ...args) {
+    if (event !== 'end') return emit.call(this, event, ...args);
+    return trustedOrigin.run(trusted, () => emit.call(this, event, ...args));
+  };
+});
 const sessionsDir = resolveSessionsDir(process.env.GEMPT_SESSIONS_DIR);
 const stopMonitor = startSwarmMonitor({ sessionsDir, dispatchAlert: (id) => routeBoardDeliveries(id, { sessionsDir }) });
 const watchedFiles = [

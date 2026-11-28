@@ -3,7 +3,7 @@ import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, 
 import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path';
 
 const runtime = existsSync(new URL('./runtime/core/host-context.mjs', import.meta.url)) ? './runtime/' : '../';
-const [{ WORKLOAD }, { bindToolCwd, readHostContext, updateHostContext }, { atomicJson, resolvePath, withLock, withinPath }, backend, { GEMPT_VERSION }, { resolveRunnerId }] = await Promise.all([
+const [{ WORKLOAD }, { bindToolCwd, readHostContext, updateHostContext }, { atomicJson, parseToolArguments, resolvePath, withLock, withinPath }, backend, { GEMPT_VERSION }, { resolveRunnerId }] = await Promise.all([
   import(`${runtime}core/assets.mjs`), import(`${runtime}core/host-context.mjs`),
   import(`${runtime}core/state.mjs`), import(`${runtime}magpie_plugin/lib/backend.mjs`), import(`${runtime}core/config.mjs`), import(`${runtime}core/runners/registry.mjs`),
 ]);
@@ -305,7 +305,7 @@ async function handle(payload) {
     const input = args || {};
     const toolName = name === 'call_mcp_tool' && input.ServerName === 'gempt_gempt' ? input.ToolName : name;
     if (gemptTools.has(toolName)) {
-      const toolInput = name === 'call_mcp_tool' ? input.Arguments : input;
+      const toolInput = name === 'call_mcp_tool' ? parseToolArguments(input.Arguments) : input;
       const parentId = text(toolInput?.host_conversation_id);
       if (toolName !== 'gpt_ctl') {
         await updateState(conversationId, (state) => setCount(state, key, 0));

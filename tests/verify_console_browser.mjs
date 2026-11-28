@@ -11,6 +11,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { serveAppServerSocket } from './app-server-fixture.mjs';
 import { updateHostContext } from '../core/host-context.mjs';
+import { publishNarratorView } from '../core/swarm-narrator.mjs';
 import { runDirectory, saveRun } from '../core/runs.mjs';
 import { resolvePath } from '../core/state.mjs';
 import { ensureSwarm, postBoardMessage, setSwarmPlan, upsertWorker } from '../core/swarm-bus.mjs';
@@ -18,7 +19,7 @@ import { updateSettings } from '../magpie_plugin/lib/backend.mjs';
 import { startServer } from '../magpie_plugin/lib/server.mjs';
 
 const narrow = process.argv.includes('--narrow');
-const output = process.env.GEMPT_VERIFY_DIR || join(tmpdir(), 'gempt-v0101-verify');
+const output = process.env.GEMPT_VERIFY_DIR || join(tmpdir(), 'gempt-v0110-verify');
 const root = mkdtempSync(join(tmpdir(), 'gempt-verify-'));
 const configPath = join(root, 'config.json');
 const sessionsDir = join(root, 'sessions');
@@ -255,7 +256,7 @@ async function verify() {
     input: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) + '\n', encoding: 'utf8', env,
   }));
   assert.deepEqual(tools.map(({ name }) => name).sort(), ['gpt_ask', 'gpt_board', 'gpt_ctl', 'gpt_run', 'gpt_swarm']);
-  assert.deepEqual(tools.filter(({ _meta }) => _meta?.ui || _meta?.['com.google.antigravity/ui']), []);
+  assert.deepEqual(tools.filter(({ _meta }) => _meta?.ui).map(({ name }) => name).sort(), ['gpt_run', 'gpt_swarm']);
   backend.listen(0, '127.0.0.1');
   await once(backend, 'listening');
   const url = 'http://127.0.0.1:' + backend.address().port;
@@ -388,6 +389,36 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
     assert.equal(JSON.parse(readFileSync(configPath)).codex.timeout_sec_customized, true);
   }
 
+  if (process.argv.includes('--sidecar-origin')) {
+    publishNarratorView(sessionsDir, swarmId, { view: { headline: 'narrator ready' },
+      html: '<script>parent.postMessage({ smokeHeadline: window.narrator.data.headline }, "*");</script>' });
+    for (const opaque of [false, true]) {
+      await open(url + '/native-host' + (opaque ? '?opaque&no-workspace' : ''), 540, 920, true);
+      await until(() => evaluate("return window.sidecar && $('language-toggle') && !$('language-toggle').disabled;"),
+        'Sidecar bootstrap, assets and authenticated reads').catch((error) => { throw new Error(error.message + ' ' + errors.join('\n')); });
+      assert.equal(await evaluate("return self.origin === 'null';"), opaque);
+      assert.ok(await evaluate("return [...document.styleSheets].some(sheet => sheet.href?.includes('styles.css'));"));
+      if (!opaque) {
+        await click('tab-swarm');
+        await until(() => evaluate("return !$('swarm-narrator-mode').hidden;"), 'custom narrator view');
+        await evaluate(`addEventListener('message', (event) => {
+          if (event.source === document.querySelector('#swarm-narrator-body iframe')?.contentWindow)
+            window.smokeHeadline ||= event.data?.smokeHeadline;
+        });`);
+        await click('swarm-narrator-mode');
+        assert.equal(await until(() => evaluate('return window.smokeHeadline;'), 'sandboxed narrator rendered'), 'narrator ready');
+      }
+      await evaluate(`fetch('./api?token=' + new URLSearchParams(location.search).get('token'), {
+        method: 'POST', body: JSON.stringify({ path: './api/settings', body: { codex_timeout_sec: 901 } })
+      }).then(response => window.originTestStatus = response.status);`);
+      assert.equal(await until(() => evaluate('return window.originTestStatus;'), 'Sidecar write status'), opaque ? 403 : 200);
+    }
+    assert.deepEqual(notFound, []);
+    assert.deepEqual(errors.filter((error) => !error.includes('403')), []);
+    console.log('Chrome OK · Sidecar bootstrap, styles, authenticated reads, same-origin writes and opaque write denial');
+    return;
+  }
+
   if (narrow) {
     await open(url + '/native-host', 540, 920, true);
     await until(() => evaluate("return !$('language-toggle')?.disabled;"), 'Sidecar header');
@@ -404,16 +435,15 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
       await shot('overview-540-' + language);
     }
     await click('tab-swarm');
-    await until(() => evaluate("return !$('swarm-single').hidden && $('swarm-single-worker').children.length === 1;"), 'compact Swarm');
-    await assertTopbar('compact Swarm');
-    assert.equal(await evaluate("return !$('swarm-edit-title').hidden || !$('swarm-subtabs').hidden;"), false);
-    assert.equal(await evaluate("return !$('swarm-single-steer').hidden;"), true);
+    await until(() => evaluate("return !$('swarm-subtabs').hidden && $('swarm-threads').querySelector('.sw-thread-member')?.textContent.includes('frontend');"), 'single-worker overview');
+    await assertTopbar('single-worker overview');
+    assert.equal(await evaluate("return !$('swarm-edit-title').hidden && !$('swarm-subtab-members').hidden;"), true);
     await shot('swarm-540-en');
     await seedSwarm(false);
     await click('refresh-btn');
     await until(() => evaluate("return !$('swarm-subtabs').hidden && $('swarm-threads').children.length === 2;"), 'expanded Swarm');
     assert.deepEqual(await evaluate("return [...$('swarm-subtabs').children].map(b => b.id);"),
-      ['swarm-subtab-overview', 'swarm-subtab-board', 'swarm-subtab-graph']);
+      ['swarm-subtab-overview', 'swarm-subtab-board', 'swarm-subtab-members', 'swarm-subtab-graph', 'swarm-subtab-raw']);
     await shot('swarm-540-overview');
     await click('swarm-subtab-board');
     await shot('swarm-540-board');
@@ -439,7 +469,7 @@ console.log(JSON.stringify({ response: { conversationMetadata: { metadata: { pro
     assert.equal(await evaluate("return !$('swarm-export').hidden && $('swarm-export').textContent;"), 'Export Mentions GIF');
     assert.deepEqual(errors, []);
     assert.deepEqual(notFound, []);
-    console.log('Chrome OK · 540px native Sidecar, bilingual Overview, compact and expanded Swarm, channel posting, Hive and Mentions');
+    console.log('Chrome OK · 540px native Sidecar, bilingual Overview, single-worker and expanded Swarm, channel posting, Hive and Mentions');
     return;
   }
   gatewayDelay = 400;

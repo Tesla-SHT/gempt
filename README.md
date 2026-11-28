@@ -1,4 +1,4 @@
-# GemPT v0.10.1
+# GemPT v0.11.0
 
 [English Quick Start & Docs](./README.en.md) · [Antigravity Plugin README](./plugin/README.md) · [Third-Party Licenses](./THIRD_PARTY_LICENSES.txt)
 
@@ -10,7 +10,7 @@ GemPT 让 Gemini 通过你的 [Magpie](https://github.com/yetone/magpie) 咨询�
 | --- | --- | --- |
 | **Node.js** | `>= 22.13.0` | 运行 MCP server、hooks、CLI 与安装器 |
 | **Magpie** | `>= 0.1.1340` | 本地网关（默认 `http://127.0.0.1:3425`），从 [yetone/magpie](https://github.com/yetone/magpie) / [usemagpie.ai](https://usemagpie.ai) 安装并登录 ChatGPT/Codex 订阅 |
-| **Magpie 侧 GemPT 插件** | `0.10.1` | 提供 `Plugins → GemPT` 面板，并托管共享 Codex `app-server`（Windows 跨 Magpie 热重载独立存活，支持面板一键重启）；**仅单独安装 Codex CLI 无法替代** |
+| **Magpie 侧 GemPT 插件** | `0.11.0` | 提供 `Plugins → GemPT` 面板，并托管共享 Codex `app-server`（Windows 跨 Magpie 热重载独立存活，支持面板一键重启）；**仅单独安装 Codex CLI 无法替代** |
 | **Codex CLI** | `@openai/codex`（已实测 `0.164.0`） | 仅 `gpt_run` 仓库执行需要；通过 `npm install -g @openai/codex` 安装（纯 `gpt_ask` 咨询可不装） |
 | **Git** | 任意现代版本 | 仅并发隔离 `workspace="share"` 需要 |
 
@@ -26,7 +26,7 @@ GemPT 让 Gemini 通过你的 [Magpie](https://github.com/yetone/magpie) 咨询�
 
 ```bash
 # 推荐：从 GitHub tag 安装
-magpie plugin add github:yizhang-dream/gempt#v0.10.1
+magpie plugin add github:Tesla-SHT/gempt#v0.11.0
 ```
 
 > 注：`gempt` 尚未发布到 npm registry，请勿直接运行裸包名命令 `magpie plugin add gempt`（当前会返回 404）。
@@ -43,10 +43,10 @@ magpie plugin add github:yizhang-dream/gempt#v0.10.1
 
 ```bash
 # 推荐：通过 GitHub tag 一键安装
-npx --yes github:yizhang-dream/gempt#v0.10.1 install-agy
+npx --yes github:Tesla-SHT/gempt#v0.11.0 install-agy
 ```
 
-> 注：`gempt` 尚未发布到 npm registry，请使用上述 GitHub tag 渠道或从本地源码安装（裸 npm 命令 `npx --yes gempt@0.10.1 install-agy` 尚未生效）。
+> 注：`gempt` 尚未发布到 npm registry，请使用上述 GitHub tag 渠道或从本地源码安装（裸 npm 命令 `npx --yes gempt@0.11.0 install-agy` 尚未生效）。
 
 从本地源码安装时：
 - **Linux / macOS**：`bash install.sh`（支持 `--target <目录>`）
@@ -116,7 +116,7 @@ gempt print-mcp --installed
 
 ## 升级与卸载
 
-- **升级**：在 Magpie 插件市场更新 **GemPT**（或重新运行 `magpie plugin add github:yizhang-dream/gempt#<新版本tag>`），并执行 `npx --yes github:yizhang-dream/gempt#<新版本tag> install-agy`。
+- **升级**：在 Magpie 插件市场更新 **GemPT**（或重新运行 `magpie plugin add github:Tesla-SHT/gempt#<新版本tag>`），并执行 `npx --yes github:Tesla-SHT/gempt#<新版本tag> install-agy`。
 - **卸载 Magpie 侧**：在 Magpie **Plugins** 页面移除 `gempt`，或执行 `magpie plugin remove gempt`。
 - **卸载 Antigravity 侧**：在 Antigravity Customizations 卸载 `gempt` 插件（或删除 `~/.gemini/config/plugins/gempt`），并删除 `~/bin/gempt-wait*`。
 - **清理个人配置（可选）**：删除 `~/.config/gempt/` 及本机隔离 worktree 目录（默认 `~/.cache/gempt-worktrees` 或 `%LOCALAPPDATA%\gempt-worktrees`）。
